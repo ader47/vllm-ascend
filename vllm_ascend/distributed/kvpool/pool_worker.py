@@ -203,18 +203,19 @@ class KVPoolWorker:
         self.token_database.set_block_len(self.block_len)
 
         if self.use_layerwise:
-            self.get_event = threading.Event()
+            self.layer_load_finished_events = [threading.Event() for i in range(self.num_layers)]
+            self.layer_save_finished_events = [threading.Event() for i in range(self.num_layers)]
             if self.kv_role in ['kv_producer', 'kv_both']:
                 ready_event_sending = threading.Event()
                 self.kv_send_thread = KVCacheStoreLayerSendingThread(
                     self.m_store, self.token_database, self.block_size,
                     self.tp_rank, self.dcp_size, self.put_step,
-                    ready_event_sending, self.num_layers)
+                    ready_event_sending, self.num_layers, self.layer_save_finished_events)
                 self.kv_send_thread.start()
             ready_event = threading.Event()
             self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
                 self.m_store, self.token_database, self.block_size,
-                self.tp_rank, self.dcp_size, ready_event, self.get_event)
+                self.tp_rank, self.dcp_size, ready_event, self.layer_load_finished_events)
             self.kv_recv_thread.start()
             ready_event.wait()
         else:
@@ -279,14 +280,19 @@ class KVPoolWorker:
                                                 ):] + size_list[:self.tp_rank %
                                                                 len(size_list)]
                     self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            if self.use_layerwise:
+                # start all load tasks
+                for layer_load_task in self.layer_load_tasks:
+                    self.kv_recv_thread.add_request(layer_load_task)
 
     def wait_for_layer_load(self) -> None:
-        for request in self.layer_load_tasks[self.current_layer]:
-            self.kv_recv_thread.add_request(request)  # type: ignore[union-attr, call-arg, arg-type]
-            is_finish = self.get_event.wait(timeout=3)  #try---cache
-            if not is_finish:
-                logger.info(f"Layerwise {self.current_layer} get failed")
-            self.get_event.clear()
+        if len(self.layer_load_tasks[self.current_layer]) == 0:
+            return
+        is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=3)  #try---cache
+        if not is_finish:
+            logger.info(f"Layerwise {self.current_layer} get failed")
+        self.layer_load_finished_events[self.current_layer].clear()
+        self.layer_load_tasks[self.current_layer].clear()
         # TODO add "Retrieved {num_retrieved_tokens} tokens" debug info
         #     if self.current_layer == self.num_layers - 1:
         #         assert ret_token_mask is not None
@@ -310,9 +316,15 @@ class KVPoolWorker:
                 if can_save is None or not can_save:
                     continue
                 self.store_layer(request, current_event)
-        # TODO Should a synchronization operation be added?
-        for request in self.layer_save_tasks[self.current_layer]:
-            self.kv_send_thread.add_request(request)  # type: ignore[union-attr, call-arg, arg-type]
+        if len(self.layer_save_tasks[self.current_layer]) == 0:
+            return
+        # TODO should put wait into model runner
+        self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
+        is_finish = self.layer_save_finished_events[self.current_layer].wait(timeout=3)  # try---cache
+        if not is_finish:
+            logger.info(f"Layerwise {self.current_layer} save failed")
+        self.layer_save_finished_events[self.current_layer].clear()
+        self.layer_save_tasks[self.current_layer].clear()
 
         self.current_layer = self.current_layer + 1
 
