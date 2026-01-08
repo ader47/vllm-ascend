@@ -49,6 +49,7 @@ class KVPoolScheduler:
                 "discard_partial_chunks", True))
         self._unfinished_requests: dict[str, tuple[Request, list[int]]] = {}
         self._unfinished_request_ids: set[str] = set()
+        self.kv_offload = True
 
     def get_num_new_matched_tokens(
         self,
@@ -206,18 +207,26 @@ class KVPoolScheduler:
                         f"Request {req_id} is not in _unfinished_requests, "
                         f"but it is scheduled to be cached")
                 new_block_ids = cached_reqs.new_block_ids[i]
-                if not new_block_ids:
+                if not new_block_ids and not self.kv_offload:
                     continue
-                request_tracker.update(new_block_ids)
+                if new_block_ids:
+                    request_tracker.update(new_block_ids)
 
                 last_chunk_tokens_num = ((len(request.prompt_token_ids) //
                                           self._block_size * self._block_size)
                                          if self._discard_partial_chunks else
                                          len(request.prompt_token_ids))
+                load_spec = None
+                if self.kv_offload:
+                    load_spec = LoadSpec(
+                        vllm_cached_tokens=0,
+                        kvpool_cached_tokens=cached_reqs.num_computed_tokens[i],
+                        can_load=True,
+                    )
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     self._block_size,
-                    load_spec=None,
+                    load_spec=load_spec,
                     skip_save=force_skip_save,
                     block_hashes=request.block_hashes,
                     is_last_chunk=request_tracker.token_len
