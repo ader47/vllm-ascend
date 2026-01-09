@@ -21,7 +21,8 @@ from vllm_ascend.distributed.kvpool.config_data import (
     LasyerMultiBlockReqMeta, ReqMeta)
 from vllm_ascend.distributed.kvpool.kv_transfer import (
     KVCacheStoreLayerRecvingThread, KVCacheStoreLayerSendingThread,
-    KVCacheStoreRecvingThread, KVCacheStoreSendingThread, KVTransferThread)
+    KVCacheStoreRecvingThread, KVCacheStoreSendingThread, KVTransferThread, KVCacheLoadAfterStoreLayerThread)
+from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
 
 backend_map: Dict[str, Type[Backend]] = {
     "mooncake": MooncakeBackend,
@@ -145,6 +146,12 @@ class KVPoolWorker:
 
         self.finished_store_req: set[str] = set()
 
+        self.layer_next_map = {i:i+24 for i in range(24)}
+        self.independent_layers = []
+        self.reuse_start = [i for i in range(24)]
+
+        self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
         first_kv_cache = first_kv_cache_tuple[0]
@@ -210,8 +217,16 @@ class KVPoolWorker:
                 self.kv_send_thread = KVCacheStoreLayerSendingThread(
                     self.m_store, self.token_database, self.block_size,
                     self.tp_rank, self.dcp_size, self.put_step,
-                    ready_event_sending, self.num_layers, self.layer_save_finished_events)
+                    ready_event_sending, self.num_layers, self.layer_save_finished_events, self.sync_save_events)
                 self.kv_send_thread.start()
+                ready_event_sending.wait()
+                ready_event_sending = threading.Event()
+                self.kv_recv_after_send_thread = KVCacheLoadAfterStoreLayerThread(
+                    self.m_store, self.token_database, self.block_size,
+                    self.tp_rank, self.dcp_size,
+                    ready_event_sending, self.layer_load_finished_events, self.layer_save_finished_events)
+                self.kv_recv_after_send_thread.start()
+                ready_event_sending.wait()
             ready_event = threading.Event()
             self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
                 self.m_store, self.token_database, self.block_size,
@@ -263,7 +278,7 @@ class KVPoolWorker:
                     mask_num = (request.load_spec.vllm_cached_tokens //
                                 self.block_size * self.block_size)
                     for start, end, key in self.token_database.process_tokens(
-                            token_len, request.block_hashes, mask_num):
+                            token_len, request.block_hashes, mask_num, req_id = request.req_id):
                         addr, size, _ = self.token_database.prepare_value(
                             start, end, request.block_ids)
                         key_list.append(key.to_string())
@@ -282,8 +297,10 @@ class KVPoolWorker:
                     self.m_store.get(key_list_c, addr_list_c, size_list_c)
             if self.use_layerwise:
                 # start all load tasks
-                for layer_load_task in self.layer_load_tasks:
-                    self.kv_recv_thread.add_request(layer_load_task)
+                for layer_id in self.reuse_start:
+                    layer_load_task = self.layer_load_tasks[layer_id]
+                    if len(layer_load_task) > 0:
+                        self.kv_recv_thread.add_request(layer_load_task)
 
     def wait_for_layer_load(self) -> None:
         if len(self.layer_load_tasks[self.current_layer]) == 0:
@@ -303,28 +320,41 @@ class KVPoolWorker:
                       connector_metadata: AscendConnectorMetadata) -> None:
         if self.current_layer == 0:
             self.layerwise_storers = []
-            current_event = None
+            # current_event = None
+            # for request in connector_metadata.requests:
+            #     can_save = request.can_save
+            #     if can_save is None or not can_save:
+            #         continue
+            #     current_event = torch.npu.Event()
+            #     current_event.record()
+            #     break
             for request in connector_metadata.requests:
-                can_save = request.can_save
-                if can_save is None or not can_save:
-                    continue
                 current_event = torch.npu.Event()
                 current_event.record()
-                break
-            for request in connector_metadata.requests:
-                can_save = request.can_save
-                if can_save is None or not can_save:
-                    continue
+                # can_save = request.can_save
+                # if can_save is None or not can_save:
+                #     continue
                 self.store_layer(request, current_event)
         if len(self.layer_save_tasks[self.current_layer]) == 0:
             return
-        # TODO should put wait into model runner
-        self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
-        is_finish = self.layer_save_finished_events[self.current_layer].wait(timeout=3)  # try---cache
-        if not is_finish:
-            logger.info(f"Layerwise {self.current_layer} save failed")
-        self.layer_save_finished_events[self.current_layer].clear()
-        self.layer_save_tasks[self.current_layer].clear()
+
+        if self.current_layer in self.layer_next_map.keys():
+            # logger.info(f"start save layer {self.current_layer}")
+            self.sync_save_events[self.current_layer].record()
+            self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
+            # logger.info(f"start load layer {self.current_layer + 24}")
+            # TODO 这里是否应该在主线程当中进行等待？使用原始的load线程进行加载？
+            # self.sync_load_events[self.current_layer].record()
+            self.kv_recv_after_send_thread.add_request((self.current_layer, self.layer_load_tasks[self.layer_next_map[self.current_layer]]))
+        else:
+            # TODO should put wait into model runner
+            self.sync_save_events[self.current_layer].record()
+            self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
+            is_finish = self.layer_save_finished_events[self.current_layer].wait(timeout=3)  # try---cache
+            if not is_finish:
+                logger.info(f"Layerwise {self.current_layer} save failed")
+            self.layer_save_finished_events[self.current_layer].clear()
+            self.layer_save_tasks[self.current_layer].clear()
 
         self.current_layer = self.current_layer + 1
 
@@ -382,7 +412,7 @@ class KVPoolWorker:
         keys = []
         first_flag = True
         for start, end, key in self.token_database.process_tokens(
-                token_len, request.block_hashes, mask_num):
+                token_len, request.block_hashes, mask_num, req_id = request.req_id):
             keys_multi_layer = key.split_layers(self.num_layers)
             starts.append(start)
             ends.append(end)
@@ -393,6 +423,8 @@ class KVPoolWorker:
             # Transpose the keys into layer major format
             keys = [list(row) for row in zip(*keys)]  # [num_layer,block_num]
             for layer_id, keys_multi_chunk in enumerate(keys):
+                if layer_id in self.independent_layers:
+                    continue
                 req_meta = LasyerMultiBlockReqMeta(request.req_id,
                                                    keys_multi_chunk, starts,
                                                    ends, request.block_ids,
@@ -435,7 +467,7 @@ class KVPoolWorker:
         ends = []
         keys = []
         for start, end, key in self.token_database.process_tokens(
-                request.token_len_chunk, request.block_hashes):
+                request.token_len_chunk, request.block_hashes, req_id = request.req_id):
             keys_multi_layer = key.split_layers(self.num_layers)
             starts.append(start)
             ends.append(end)
@@ -444,6 +476,8 @@ class KVPoolWorker:
         if keys:
             keys = [list(row) for row in zip(*keys)]  #[layer_num,block_num]
             for layer_id, keys_multi_chunk in enumerate(keys):
+                if layer_id in self.independent_layers:
+                    continue
                 req_meta = LasyerMultiBlockReqMeta(request.req_id,
                                                    keys_multi_chunk, starts,
                                                    ends, request.block_ids,
@@ -475,24 +509,24 @@ class KVPoolWorker:
 
     def get_and_clear_finished_requests(self, finished_req_ids) -> set[str]:
         finished_sending = set()
-        for req_id in self.kv_send_thread.stored_requests.copy(  # type: ignore[union-attr]
-        ):
-            if self.kv_send_thread.stored_requests[  # type: ignore[union-attr]
-                    req_id] == 0 and req_id in self.finished_store_req:
-                self.finished_store_req.remove(req_id)
-                finished_sending.add(req_id)
-                self.kv_send_thread.delete_finished_stored_request(  # type: ignore[union-attr]
-                    req_id)
-
-        for req_id in finished_req_ids:
-            req_remain_jobs = self.kv_send_thread.stored_requests.get(  # type: ignore[union-attr]
-                req_id)
-            if req_remain_jobs == 0:
-                finished_sending.add(req_id)
-                self.kv_send_thread.delete_finished_stored_request(  # type: ignore[union-attr]
-                    req_id)
-            elif req_remain_jobs is not None:
-                self.finished_store_req.add(req_id)
+        # for req_id in self.kv_send_thread.stored_requests.copy(  # type: ignore[union-attr]
+        # ):
+        #     if self.kv_send_thread.stored_requests[  # type: ignore[union-attr]
+        #             req_id] == 0 and req_id in self.finished_store_req:
+        #         self.finished_store_req.remove(req_id)
+        #         finished_sending.add(req_id)
+        #         self.kv_send_thread.delete_finished_stored_request(  # type: ignore[union-attr]
+        #             req_id)
+        #
+        # for req_id in finished_req_ids:
+        #     req_remain_jobs = self.kv_send_thread.stored_requests.get(  # type: ignore[union-attr]
+        #         req_id)
+        #     if req_remain_jobs == 0:
+        #         finished_sending.add(req_id)
+        #         self.kv_send_thread.delete_finished_stored_request(  # type: ignore[union-attr]
+        #             req_id)
+        #     elif req_remain_jobs is not None:
+        #         self.finished_store_req.add(req_id)
 
         return finished_sending
 

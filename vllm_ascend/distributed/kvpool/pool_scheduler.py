@@ -36,6 +36,8 @@ class KVPoolScheduler:
         self.dcp_size = getattr(vllm_config.parallel_config,
                                 "decode_context_parallel_size", 1)
 
+        self.kv_offload = True
+
         self._block_size = vllm_config.cache_config.block_size
         if self.pcp_size > 1:
             self._block_size *= self.pcp_size
@@ -43,13 +45,13 @@ class KVPoolScheduler:
             self._block_size *= self.dcp_size
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
-        # Whether to discard partial chunks
+        # Whether to discard partial chunks, for kv
         self._discard_partial_chunks = (
             vllm_config.kv_transfer_config.get_from_extra_config(
-                "discard_partial_chunks", True))
+                "discard_partial_chunks", not self.kv_offload))
         self._unfinished_requests: dict[str, tuple[Request, list[int]]] = {}
         self._unfinished_request_ids: set[str] = set()
-        self.kv_offload = True
+
 
     def get_num_new_matched_tokens(
         self,
@@ -153,7 +155,7 @@ class KVPoolScheduler:
         """
 
         force_skip_save = (self.kv_role == "kv_consumer"
-                           and not self.consumer_is_to_put)
+                           and not self.consumer_is_to_put) if not self.kv_offload else False
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)

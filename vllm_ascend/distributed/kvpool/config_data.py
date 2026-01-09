@@ -151,6 +151,7 @@ class ChunkedTokenDatabase():
         token_len: int,
         block_hashes: Union[list[BlockHash], list[str]],
         mask_num: int = 0,
+        req_id: str = 'no_need',
     ) -> Iterable[Tuple[int, int, PoolKey]]:
         """Process the tokens and return the corresponding cache engine keys.
 
