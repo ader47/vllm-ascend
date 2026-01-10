@@ -2403,10 +2403,25 @@ class NPUModelRunner(GPUModelRunner):
                                               Optional[torch.Tensor]]] = {}
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
         alignment = 2 * 1024 * 1024
+        # kv_cache_layer_groups = kv_cache_config.kv_cache_layer_groups
+        kv_cache_layer_groups = [
+            [f"model.layers.{i}.self_attn.attn", f"model.layers.{i+24}.self_attn.attn"] for i in range(24)
+        ]
+        kv_cache_layer_groups = None
+        print(f"==================> kv_cache_layer_groups {kv_cache_layer_groups}")
+        if kv_cache_layer_groups:
+            reuse_kv = {}
+            for group in kv_cache_layer_groups:
+                for layer_name in group:
+                    if layer_name in reuse_kv:
+                        raise(ValueError('Duplicate layer in kv_cache_layer_groups'))
+                    reuse_kv[layer_name] = group[0]
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             # TODO: REFACTOR ME to sharing hybrid cache
             for idx in range(len(kv_cache_tensor.shared_by)):
                 layer_name = kv_cache_tensor.shared_by[idx]
+                if torch.distributed.get_rank() == 0:
+                    logger.info(f'>>>>> init kv tensor, layer_name = {layer_name}')
                 if "linear_attn" in layer_name and layer_name not in kv_cache_raw_tensors.keys(
                 ):
                     # for mamba linear attention
@@ -2463,6 +2478,7 @@ class NPUModelRunner(GPUModelRunner):
                                         v_tensor_split_factor)
 
                     # for other attentions, e.g., self_attn, sliding window attn
+                    allocate_kv = True
                     if self.vllm_config.kv_transfer_config is None:
                         k_tensor = torch.zeros(k_tensor_size,
                                                dtype=torch.int8,
@@ -2477,43 +2493,42 @@ class NPUModelRunner(GPUModelRunner):
                                 dtype=torch.int8,
                                 device=self.device)
                     else:
-                        k_tensor = torch.zeros(k_tensor_size + alignment,
-                                               dtype=torch.int8,
-                                               device=self.device)
-                        v_tensor = torch.zeros(v_tensor_size + alignment,
-                                               dtype=torch.int8,
-                                               device=self.device)
-                        k_tensor = self._align_memory(
-                            k_tensor, alignment)[:k_tensor_size]
-                        v_tensor = self._align_memory(
-                            v_tensor, alignment)[:v_tensor_size]
-                        #### k cache: for deepseek sparse attention
-                        if dsa_k_cache_factor is not None and dsa_k_cache_size is not None:
-                            dsa_k_cache_tensor = torch.zeros(
-                                dsa_k_cache_size + alignment,
-                                dtype=torch.int8,
-                                device=self.device)
-                            dsa_k_cache_tensor = self._align_memory(
-                                dsa_k_cache_tensor,
-                                alignment)[:dsa_k_cache_size]
+                        if kv_cache_layer_groups is not None:
+                            if layer_name not in reuse_kv:
+                                # print(f"===============> layer_name {layer_name}")
+                                raise(ValueError('layer_name'))
+                            if reuse_kv[layer_name] != layer_name:
+                                allocate_kv = False
+                        if allocate_kv:
+                            k_tensor = torch.zeros(k_tensor_size + alignment,
+                                                dtype=torch.int8,
+                                                device=self.device)
+                            v_tensor = torch.zeros(v_tensor_size + alignment,
+                                                dtype=torch.int8,
+                                                device=self.device)
+                            k_tensor = self._align_memory(
+                                k_tensor, alignment)[:k_tensor_size]
+                            v_tensor = self._align_memory(
+                                v_tensor, alignment)[:v_tensor_size]
+                            #### k cache: for deepseek sparse attention
+                            if dsa_k_cache_factor is not None and dsa_k_cache_size is not None:
+                                dsa_k_cache_tensor = torch.zeros(
+                                    dsa_k_cache_size + alignment,
+                                    dtype=torch.int8,
+                                    device=self.device)
+                                dsa_k_cache_tensor = self._align_memory(
+                                    dsa_k_cache_tensor,
+                                    alignment)[:dsa_k_cache_size]
 
-                    REUSE = 24
-                    reuse_kvcache_layers = [REUSE + i for i in range(REUSE)]
-                    enable_kvcache_offload = True
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the kvcache between the self_attn specs in the same group
                         if ("attn" in layer_name_inner
                                 and "linear_attn" not in layer_name_inner):
-                            # TODO 复用
-                            if enable_kvcache_offload and (int(layer_name_inner.split('.')[2]) in reuse_kvcache_layers):
-                                print(f"==============> {layer_name_inner} reuse the KV Cache of {'model.layers.' + str(int(layer_name_inner.split('.')[2])-REUSE) + '.self_attn.attn'}")
-                                del k_tensor
-                                del v_tensor
-                                kv_cache_raw_tensors[layer_name_inner] = kv_cache_raw_tensors['model.layers.' + str(int(layer_name_inner.split('.')[2])-REUSE) + '.self_attn.attn']
-                                # TODO 需要判断什么时候加载
-                            else:
+                            if allocate_kv:
                                 kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor) if \
                                     not self.use_sparse else (k_tensor, v_tensor, dsa_k_cache_tensor)
+                            else:
+                                kv_cache_raw_tensors[layer_name_inner] = kv_cache_raw_tensors[reuse_kv[layer_name_inner]]
 
 
         layer_names = set()

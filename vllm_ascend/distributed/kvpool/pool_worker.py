@@ -410,7 +410,6 @@ class KVPoolWorker:
         starts = []
         ends = []
         keys = []
-        first_flag = True
         for start, end, key in self.token_database.process_tokens(
                 token_len, request.block_hashes, mask_num, req_id = request.req_id):
             keys_multi_layer = key.split_layers(self.num_layers)
