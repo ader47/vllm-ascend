@@ -2407,7 +2407,6 @@ class NPUModelRunner(GPUModelRunner):
         kv_cache_layer_groups = [
             [f"model.layers.{i}.self_attn.attn", f"model.layers.{i+24}.self_attn.attn"] for i in range(24)
         ]
-        kv_cache_layer_groups = None
         print(f"==================> kv_cache_layer_groups {kv_cache_layer_groups}")
         if kv_cache_layer_groups:
             reuse_kv = {}

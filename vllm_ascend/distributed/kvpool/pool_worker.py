@@ -309,7 +309,7 @@ class KVPoolWorker:
         if not is_finish:
             logger.info(f"Layerwise {self.current_layer} get failed")
         self.layer_load_finished_events[self.current_layer].clear()
-        self.layer_load_tasks[self.current_layer].clear()
+        # self.layer_load_tasks[self.current_layer].clear()
         # TODO add "Retrieved {num_retrieved_tokens} tokens" debug info
         #     if self.current_layer == self.num_layers - 1:
         #         assert ret_token_mask is not None
@@ -354,7 +354,7 @@ class KVPoolWorker:
             if not is_finish:
                 logger.info(f"Layerwise {self.current_layer} save failed")
             self.layer_save_finished_events[self.current_layer].clear()
-            self.layer_save_tasks[self.current_layer].clear()
+            # self.layer_save_tasks[self.current_layer].clear()
 
         self.current_layer = self.current_layer + 1
 
