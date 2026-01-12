@@ -400,7 +400,7 @@ class KVCacheLoadAfterStoreLayerThread(KVTransferThread):
         is_finish = self.layer_save_finished_events[wait_for_load].wait(timeout=3)  # try---cache
         if not is_finish:
             logger.info(f"Layerwise {wait_for_load} get failed")
-        self.layer_save_finished_events[wait_for_load].clear()
+        # self.layer_save_finished_events[wait_for_load].clear()
         if len(req_metas) == 0:
             return
         # start to load

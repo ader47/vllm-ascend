@@ -359,6 +359,14 @@ class KVPoolWorker:
         self.current_layer = self.current_layer + 1
 
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata):
+        print("wait for save")
+        # TODO 对是否需要存储的
+        # for layer_id in range(self.num_saves):
+        #     is_finish = self.layer_save_finished_events[layer_id].wait(timeout=3)  # try---cache
+        #     if not is_finish:
+        #         logger.info(f"Layerwise {self.current_layer} save failed")
+
+        # TODO 在这里等待判断是否所有的层都保存完整
         current_event = None
         for request in connector_metadata.requests:
             can_save = request.can_save
@@ -374,7 +382,7 @@ class KVPoolWorker:
                 continue
 
             request.current_event = current_event
-            self.kv_send_thread.add_stored_request(  # type: ignore[union-attr]   
+            self.kv_send_thread.add_stored_request(  # type: ignore[union-attr]
                 request.req_id)
             self.kv_send_thread.add_request(  # type: ignore[union-attr]
                 request, )

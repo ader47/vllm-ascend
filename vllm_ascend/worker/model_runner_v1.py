@@ -2405,9 +2405,10 @@ class NPUModelRunner(GPUModelRunner):
         alignment = 2 * 1024 * 1024
         # kv_cache_layer_groups = kv_cache_config.kv_cache_layer_groups
         kv_cache_layer_groups = [
-            [f"model.layers.{i}.self_attn.attn", f"model.layers.{i+24}.self_attn.attn"] for i in range(24)
+            [f"model.layers.{i}.self_attn.attn", f"model.layers.{i+30}.self_attn.attn"] for i in range(30)
         ]
-        print(f"==================> kv_cache_layer_groups {kv_cache_layer_groups}")
+        # kv_cache_layer_groups.append([f"model.layers.{61}.self_attn.attn", f"model.layers.{61}.self_attn.attn"])
+        # kv_cache_layer_groups = None
         if kv_cache_layer_groups:
             reuse_kv = {}
             for group in kv_cache_layer_groups:
@@ -2415,6 +2416,8 @@ class NPUModelRunner(GPUModelRunner):
                     if layer_name in reuse_kv:
                         raise(ValueError('Duplicate layer in kv_cache_layer_groups'))
                     reuse_kv[layer_name] = group[0]
+            reuse_kv[f"model.layers.{60}.self_attn.attn"] = f"model.layers.{60}.self_attn.attn"
+            print(f"================> reuse_kv {reuse_kv}")
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             # TODO: REFACTOR ME to sharing hybrid cache
             for idx in range(len(kv_cache_tensor.shared_by)):
@@ -2494,7 +2497,7 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         if kv_cache_layer_groups is not None:
                             if layer_name not in reuse_kv:
-                                # print(f"===============> layer_name {layer_name}")
+                                print(f"===============> layer_name {layer_name}")
                                 raise(ValueError('layer_name'))
                             if reuse_kv[layer_name] != layer_name:
                                 allocate_kv = False
@@ -2527,6 +2530,7 @@ class NPUModelRunner(GPUModelRunner):
                                 kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor) if \
                                     not self.use_sparse else (k_tensor, v_tensor, dsa_k_cache_tensor)
                             else:
+                                print("reuse")
                                 kv_cache_raw_tensors[layer_name_inner] = kv_cache_raw_tensors[reuse_kv[layer_name_inner]]
 
 
