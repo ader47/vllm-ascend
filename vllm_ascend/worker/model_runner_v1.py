@@ -2405,8 +2405,11 @@ class NPUModelRunner(GPUModelRunner):
         alignment = 2 * 1024 * 1024
         # kv_cache_layer_groups = kv_cache_config.kv_cache_layer_groups
         kv_cache_layer_groups = [
-            [f"model.layers.{i}.self_attn.attn", f"model.layers.{i+30}.self_attn.attn"] for i in range(30)
+            [f"model.layers.{i}.self_attn.attn", f"model.layers.{i+13}.self_attn.attn"] for i in range(13)
         ]
+        # kv_cache_layer_groups = [
+        #     [f"model.layers.{i}.self_attn.attn", f"model.layers.{i+30}.self_attn.attn"] for i in range(30)
+        # ]
         # kv_cache_layer_groups.append([f"model.layers.{61}.self_attn.attn", f"model.layers.{61}.self_attn.attn"])
         # kv_cache_layer_groups = None
         if kv_cache_layer_groups:
@@ -2416,7 +2419,8 @@ class NPUModelRunner(GPUModelRunner):
                     if layer_name in reuse_kv:
                         raise(ValueError('Duplicate layer in kv_cache_layer_groups'))
                     reuse_kv[layer_name] = group[0]
-            reuse_kv[f"model.layers.{60}.self_attn.attn"] = f"model.layers.{60}.self_attn.attn"
+            reuse_kv[f"model.layers.{26}.self_attn.attn"] = f"model.layers.{26}.self_attn.attn"
+            # reuse_kv[f"model.layers.{60}.self_attn.attn"] = f"model.layers.{60}.self_attn.attn"
             print(f"================> reuse_kv {reuse_kv}")
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             # TODO: REFACTOR ME to sharing hybrid cache

@@ -56,6 +56,8 @@ class MemcacheBackend(Backend):
             for value in res:
                 if value != 0:
                     logger.error(f"Failed to get key {key},res:{res}")
+                # else:
+                #     logger.info(f"Success to load key {key},res:{res}")
         except Exception as e:
             logger.error(f"Failed to get key {key}. {e}")
 
@@ -67,5 +69,7 @@ class MemcacheBackend(Backend):
             for value in res:
                 if value != 0:
                     logger.error(f"Failed to get key {key},res:{res}")
+                # else:
+                #     logger.info(f"Success to save key {key},res:{res}")
         except Exception as e:
             logger.error(f"Failed to put key {key},error:{e}")

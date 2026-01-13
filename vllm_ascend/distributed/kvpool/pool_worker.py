@@ -21,8 +21,9 @@ from vllm_ascend.distributed.kvpool.config_data import (
     LasyerMultiBlockReqMeta, ReqMeta)
 from vllm_ascend.distributed.kvpool.kv_transfer import (
     KVCacheStoreLayerRecvingThread, KVCacheStoreLayerSendingThread,
-    KVCacheStoreRecvingThread, KVCacheStoreSendingThread, KVTransferThread, KVCacheLoadAfterStoreLayerThread)
+    KVCacheStoreRecvingThread, KVCacheStoreSendingThread, KVTransferThread)
 from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
+import torch.distributed as dist
 
 backend_map: Dict[str, Type[Backend]] = {
     "mooncake": MooncakeBackend,
@@ -145,12 +146,13 @@ class KVPoolWorker:
         self.layer_save_tasks = [[] for i in range(self.num_layers)]
 
         self.finished_store_req: set[str] = set()
-
-        self.layer_next_map = {i:i+24 for i in range(24)}
-        self.independent_layers = []
-        self.reuse_start = [i for i in range(24)]
+        # self.
+        self.layer_next_map = {i:i+(self.num_layers // 2) for i in range(self.num_layers // 2)}
+        self.independent_layers = [self.num_layers -1]  if self.num_layers%2==1 else []
+        self.reuse_start = [i for i in range(self.num_layers // 2)]
 
         self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
+        self.sync_load_events = [torch.npu.Event() for i in range(self.num_layers)]
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
@@ -217,20 +219,20 @@ class KVPoolWorker:
                 self.kv_send_thread = KVCacheStoreLayerSendingThread(
                     self.m_store, self.token_database, self.block_size,
                     self.tp_rank, self.dcp_size, self.put_step,
-                    ready_event_sending, self.num_layers, self.layer_save_finished_events, self.sync_save_events)
+                    ready_event_sending, self.num_layers, self.layer_save_finished_events, self.layer_load_finished_events, self.sync_save_events, self.sync_load_events)
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
-                ready_event_sending = threading.Event()
-                self.kv_recv_after_send_thread = KVCacheLoadAfterStoreLayerThread(
-                    self.m_store, self.token_database, self.block_size,
-                    self.tp_rank, self.dcp_size,
-                    ready_event_sending, self.layer_load_finished_events, self.layer_save_finished_events)
-                self.kv_recv_after_send_thread.start()
-                ready_event_sending.wait()
+                # ready_event_sending = threading.Event()
+                # self.kv_recv_after_send_thread = KVCacheLoadAfterStoreLayerThread(
+                #     self.m_store, self.token_database, self.block_size,
+                #     self.tp_rank, self.dcp_size,
+                #     ready_event_sending, self.layer_load_finished_events, self.layer_save_finished_events, self.sync_load_events)
+                # self.kv_recv_after_send_thread.start()
+                # ready_event_sending.wait()
             ready_event = threading.Event()
             self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
                 self.m_store, self.token_database, self.block_size,
-                self.tp_rank, self.dcp_size, ready_event, self.layer_load_finished_events)
+                self.tp_rank, self.dcp_size, ready_event, self.layer_load_finished_events, self.layer_save_finished_events, self.sync_load_events)
             self.kv_recv_thread.start()
             ready_event.wait()
         else:
@@ -300,16 +302,19 @@ class KVPoolWorker:
                 for layer_id in self.reuse_start:
                     layer_load_task = self.layer_load_tasks[layer_id]
                     if len(layer_load_task) > 0:
+                        self.sync_load_events[layer_id].record()
+                        dist.barrier()
                         self.kv_recv_thread.add_request(layer_load_task)
 
     def wait_for_layer_load(self) -> None:
+        print(f"wait for layer load {self.current_layer}")
         if len(self.layer_load_tasks[self.current_layer]) == 0:
             return
         is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=3)  #try---cache
         if not is_finish:
             logger.info(f"Layerwise {self.current_layer} get failed")
+            print(self.layer_load_tasks[self.current_layer])
         self.layer_load_finished_events[self.current_layer].clear()
-        # self.layer_load_tasks[self.current_layer].clear()
         # TODO add "Retrieved {num_retrieved_tokens} tokens" debug info
         #     if self.current_layer == self.num_layers - 1:
         #         assert ret_token_mask is not None
@@ -318,6 +323,7 @@ class KVPoolWorker:
 
     def save_kv_layer(self,
                       connector_metadata: AscendConnectorMetadata) -> None:
+        print(f"save_kv_layer {self.current_layer}")
         if self.current_layer == 0:
             self.layerwise_storers = []
             # current_event = None
@@ -341,31 +347,24 @@ class KVPoolWorker:
         if self.current_layer in self.layer_next_map.keys():
             # logger.info(f"start save layer {self.current_layer}")
             self.sync_save_events[self.current_layer].record()
-            self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
-            # logger.info(f"start load layer {self.current_layer + 24}")
+            self.sync_load_events[self.current_layer].record()
+            self.kv_send_thread.add_request((self.layer_save_tasks[self.current_layer], self.layer_load_tasks[self.layer_next_map[self.current_layer]]))
+            # logger.info(f"start load layer {self.current_layer + 13}")
             # TODO 这里是否应该在主线程当中进行等待？使用原始的load线程进行加载？
             # self.sync_load_events[self.current_layer].record()
-            self.kv_recv_after_send_thread.add_request((self.current_layer, self.layer_load_tasks[self.layer_next_map[self.current_layer]]))
+            # self.kv_recv_after_send_thread.add_request((self.current_layer, self.layer_load_tasks[self.layer_next_map[self.current_layer]]))
         else:
             # TODO should put wait into model runner
             self.sync_save_events[self.current_layer].record()
-            self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
+            self.kv_send_thread.add_request((self.layer_save_tasks[self.current_layer], None))
             is_finish = self.layer_save_finished_events[self.current_layer].wait(timeout=3)  # try---cache
             if not is_finish:
                 logger.info(f"Layerwise {self.current_layer} save failed")
             self.layer_save_finished_events[self.current_layer].clear()
-            # self.layer_save_tasks[self.current_layer].clear()
 
         self.current_layer = self.current_layer + 1
 
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata):
-        print("wait for save")
-        # TODO 对是否需要存储的
-        # for layer_id in range(self.num_saves):
-        #     is_finish = self.layer_save_finished_events[layer_id].wait(timeout=3)  # try---cache
-        #     if not is_finish:
-        #         logger.info(f"Layerwise {self.current_layer} save failed")
-
         # TODO 在这里等待判断是否所有的层都保存完整
         current_event = None
         for request in connector_metadata.requests:
