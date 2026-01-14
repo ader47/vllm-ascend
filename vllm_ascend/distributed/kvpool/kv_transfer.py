@@ -265,6 +265,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         addr_list = []
         size_list = []
         layer_id = req_metas[0].layer_id
+        key_list_remove = []
         for req_meta in req_metas:
             starts = req_meta.starts
             ends = req_meta.ends
@@ -281,34 +282,40 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 # break
                 if is_last_chunk:
                     self.set_finished_request(req_meta.req_id)
-                break
-
+                continue
+            keys_str = []
             for key in keys:
-                key_list.append(key.to_string())
+                keys_str.append(key.to_string())
             # print(f"save look for repeat block {key_list}")
-            if 'last' in key_list[-1] and self.m_store.store.is_exist(key_list[-1]) == 1:
-                self.m_store.store.remove(key_list[-1])
-            skip_block_num = self.lookup(key_list)
+            skip_block_num = 0
+            if 'last' in keys_str[-1] and self.m_store.store.is_exist(keys_str[-1]) == 1:
+                key_list_remove.append(keys_str[-1])
+                if len(keys_str[:-1]) > 0:
+                    skip_block_num = self.lookup(keys_str[:-1])
+            else:
+                skip_block_num = self.lookup(keys_str)
             # print(f"==========> skip block: {skip_block_num}")
             # skip_block_num = 0
             # if skip_block_num == len(key_list):
             #     if is_last_chunk and layer_id == self.final_layer_id:
             #         self.set_finished_request(req_meta.req_id)
-            #     break
+            #     continue
 
             starts = starts[skip_block_num:]
             ends = ends[skip_block_num:]
-            key_list = key_list[skip_block_num:]
+            key_list.extend(keys_str[skip_block_num:])
 
-            for index, key in enumerate(key_list):
+            for index, key in enumerate(keys_str[skip_block_num:]):
                 addr, size = self.token_database.prepare_value_layer(
                     starts[index], ends[index], req_meta.block_ids, layer_id)
                 addr_list.append(addr)
                 size_list.append(size)
-            if layer_id == self.final_layer_id and is_last_chunk:
-                self.set_finished_request(req_meta.req_id)
+            # if layer_id == self.final_layer_id and is_last_chunk:
+            #     self.set_finished_request(req_meta.req_id)
 
         self.sync_save_events[layer_id].synchronize()
+        if len(key_list_remove) > 0:
+            self.m_store.store.remove_batch(key_list_remove)
         # print(f"=============> start save layer: {key_list}")
         if len(key_list) > 0:
             self.m_store.put(key_list, addr_list, size_list)
@@ -375,7 +382,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         # print(f"==========> start load layer 1: {key_list_c}")
         # TODO Dose there have length limit?
         self.sync_load_events[layer_id].synchronize()
-        self.m_store.get(key_list_c, addr_list_c, size_list_c)
+        if len(key_list_c) > 0:
+            self.m_store.get(key_list_c, addr_list_c, size_list_c)
         # print(f"==========> end load layer 1: {key_list_c}")
         self.layer_load_finished_events[layer_id].set()
         # req_metas.clear()

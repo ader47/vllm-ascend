@@ -355,19 +355,16 @@ class KVPoolWorker:
             # logger.info(f"start save layer {self.current_layer}")
             self.sync_save_events[self.current_layer].record()
             # torch.npu.synchronize()
-            # dist.barrier()
             # print(f"===============> self.layer_save_tasks[self.current_layer]{self.layer_save_tasks[self.current_layer]}")
             self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
             # logger.info(f"start load layer {self.current_layer + 24}")
             # TODO 这里是否应该在主线程当中进行等待？使用原始的load线程进行加载？
-            # print(f"================> self.layer_load_tasks[self.layer_next_map[self.current_layer]] {self.layer_load_tasks[self.layer_next_map[self.current_layer]]}")
             # torch.npu.synchronize()
             self.sync_load_events[self.current_layer].record()
             self.kv_recv_thread.add_request((self.current_layer, self.layer_load_tasks[self.layer_next_map[self.current_layer]]))
         else:
             # TODO should put wait into model runner
             # torch.npu.synchronize()
-            # dist.barrier()
             self.sync_save_events[self.current_layer].record()
             self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
             is_finish = self.layer_save_finished_events[self.current_layer].wait(timeout=3)  # try---cache
@@ -432,14 +429,14 @@ class KVPoolWorker:
         keys = []
         first_flag = True
         # TODO 只改变读取的时候
-        block_hashes = copy.deepcopy(request.block_hashes)
-        if (token_len % self.block_size) == 0:
-            block_hashes.pop()
-            block_hashes.append(f'{request.req_id}_lastblock')
+        # block_hashes = copy.deepcopy(request.block_hashes)
+        # if (token_len % self.block_size) == 0:
+        #     block_hashes.pop()
+        #     block_hashes.append(f'{request.req_id}_lastblock')
 
         for start, end, key in self.token_database.process_tokens(
-                token_len, block_hashes, mask_num, req_id = request.req_id):
-                # token_len, request.block_hashes, mask_num, req_id = request.req_id):
+                # token_len, block_hashes, mask_num, req_id = request.req_id):
+                token_len, request.block_hashes, mask_num, req_id = request.req_id):
             keys_multi_layer = key.split_layers(self.num_layers)
             starts.append(start)
             ends.append(end)
