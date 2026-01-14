@@ -278,7 +278,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 keys = keys[self.tp_rank % self.put_step::self.put_step]
             # TODO there maybe has some problem when only have one block.
             if not keys:
-                break
+                # break
                 if is_last_chunk:
                     self.set_finished_request(req_meta.req_id)
                 break
@@ -312,7 +312,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         # print(f"=============> start save layer: {key_list}")
         if len(key_list) > 0:
             self.m_store.put(key_list, addr_list, size_list)
-        self.layer_save_finished_events[req_metas[0].layer_id].set()
+        self.layer_save_finished_events[layer_id].set()
         # req_metas.clear()
         self.request_queue.task_done()
 
@@ -323,7 +323,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
     def __init__(self, m_store: Backend, token_database: ChunkedTokenDatabase,
                  block_size: int, tp_rank: int, dcp_size: int,
-                 ready_event: threading.Event, layer_load_finished_events: List[threading.Event], layer_save_finished_events: List[threading.Event]):
+                 ready_event: threading.Event, layer_load_finished_events: List[threading.Event], layer_save_finished_events: List[threading.Event], sync_load_events):
         super().__init__(m_store,
                          token_database,
                          block_size,
@@ -333,6 +333,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                          name="KVCacheStoreLayerRecvingThread")
         self.layer_load_finished_events = layer_load_finished_events
         self.layer_save_finished_events = layer_save_finished_events
+        self.sync_load_events = sync_load_events
 
     def add_request(  # type: ignore[override]
             self, req_metas: List[LasyerMultiBlockReqMeta]) -> torch.Tensor:
@@ -353,6 +354,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         addr_list = []
         size_list = []
         key_list = []
+        layer_id = req_metas[0].layer_id
         for req_meta in req_metas:
             for index, key in enumerate(req_meta.keys):
                 addr, size = self.token_database.prepare_value_layer(
@@ -372,8 +374,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                                                              len(size_list)]
         # print(f"==========> start load layer 1: {key_list_c}")
         # TODO Dose there have length limit?
+        self.sync_load_events[layer_id].synchronize()
         self.m_store.get(key_list_c, addr_list_c, size_list_c)
         # print(f"==========> end load layer 1: {key_list_c}")
-        self.layer_load_finished_events[req_metas[0].layer_id].set()
+        self.layer_load_finished_events[layer_id].set()
         # req_metas.clear()
         self.request_queue.task_done()

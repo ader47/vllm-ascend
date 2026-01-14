@@ -213,7 +213,8 @@ class KVPoolScheduler:
                     continue
                 if new_block_ids:
                     request_tracker.update(new_block_ids)
-
+                # print(f"=========> cached_reqs.num_computed_tokens[i] {cached_reqs.num_computed_tokens[i]}")
+                # print(f"=========> token_len {request_tracker.token_len}")
                 last_chunk_tokens_num = ((len(request.prompt_token_ids) //
                                           self._block_size * self._block_size)
                                          if self._discard_partial_chunks else

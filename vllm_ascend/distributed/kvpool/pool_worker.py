@@ -24,6 +24,9 @@ from vllm_ascend.distributed.kvpool.kv_transfer import (
     KVCacheStoreRecvingThread, KVCacheStoreSendingThread, KVTransferThread)
 from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
 
+import copy
+import torch.distributed as dist
+
 backend_map: Dict[str, Type[Backend]] = {
     "mooncake": MooncakeBackend,
     "memcache": MemcacheBackend,
@@ -149,6 +152,12 @@ class KVPoolWorker:
         self.layer_next_map = {i:i+13 for i in range(13)}
         self.independent_layers = [26]
         self.reuse_start = [i for i in range(13)]
+        # self.layer_next_map = {12:25}
+        # self.independent_layers = [i for i in range(12)]
+        # for i in range(13,25):
+        #     self.independent_layers.append(i)
+        # self.independent_layers.append(26)
+        # self.reuse_start = [12]
 
         self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
         self.sync_load_events = [torch.npu.Event() for i in range(self.num_layers)]
@@ -226,7 +235,7 @@ class KVPoolWorker:
             ready_event = threading.Event()
             self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
                 self.m_store, self.token_database, self.block_size,
-                self.tp_rank, self.dcp_size, ready_event, self.layer_load_finished_events, self.layer_save_finished_events)
+                self.tp_rank, self.dcp_size, ready_event, self.layer_load_finished_events, self.layer_save_finished_events, self.sync_load_events)
             self.kv_recv_thread.start()
             ready_event.wait()
         else:
@@ -300,12 +309,14 @@ class KVPoolWorker:
                 for layer_id in self.reuse_start:
                     layer_load_task = self.layer_load_tasks[layer_id]
                     if len(layer_load_task) > 0:
+                        # torch.npu.synchronize()
+                        self.sync_load_events[layer_id].record()
                         self.kv_recv_thread.add_request((None, layer_load_task))
 
     def wait_for_layer_load(self) -> None:
         if len(self.layer_load_tasks[self.current_layer]) == 0:
             return
-        # print(f"wait_for_layer_load {self.current_layer}")
+        # print(f"========> wait for layer load {self.current_layer}")
         is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=3)  #try---cache
         if not is_finish:
             logger.info(f"Layerwise {self.current_layer} get failed")
@@ -337,21 +348,26 @@ class KVPoolWorker:
                 #     continue
                 self.store_layer(request, current_event)
         if len(self.layer_save_tasks[self.current_layer]) == 0:
+            self.current_layer = self.current_layer + 1
             return
-        # print(f"save_kv_layer {self.current_layer}")
-
+        # print(f"=========> save kv layer {self.current_layer}")
         if self.current_layer in self.layer_next_map.keys():
             # logger.info(f"start save layer {self.current_layer}")
             self.sync_save_events[self.current_layer].record()
+            # torch.npu.synchronize()
+            # dist.barrier()
             # print(f"===============> self.layer_save_tasks[self.current_layer]{self.layer_save_tasks[self.current_layer]}")
             self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
             # logger.info(f"start load layer {self.current_layer + 24}")
             # TODO 这里是否应该在主线程当中进行等待？使用原始的load线程进行加载？
-            self.sync_load_events[self.current_layer].record()
             # print(f"================> self.layer_load_tasks[self.layer_next_map[self.current_layer]] {self.layer_load_tasks[self.layer_next_map[self.current_layer]]}")
+            # torch.npu.synchronize()
+            self.sync_load_events[self.current_layer].record()
             self.kv_recv_thread.add_request((self.current_layer, self.layer_load_tasks[self.layer_next_map[self.current_layer]]))
         else:
             # TODO should put wait into model runner
+            # torch.npu.synchronize()
+            # dist.barrier()
             self.sync_save_events[self.current_layer].record()
             self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
             is_finish = self.layer_save_finished_events[self.current_layer].wait(timeout=3)  # try---cache
@@ -415,14 +431,22 @@ class KVPoolWorker:
         ends = []
         keys = []
         first_flag = True
+        # TODO 只改变读取的时候
+        block_hashes = copy.deepcopy(request.block_hashes)
+        if (token_len % self.block_size) == 0:
+            block_hashes.pop()
+            block_hashes.append(f'{request.req_id}_lastblock')
+
         for start, end, key in self.token_database.process_tokens(
-                token_len, request.block_hashes, mask_num, req_id = request.req_id):
+                token_len, block_hashes, mask_num, req_id = request.req_id):
+                # token_len, request.block_hashes, mask_num, req_id = request.req_id):
             keys_multi_layer = key.split_layers(self.num_layers)
             starts.append(start)
             ends.append(end)
             keys.append(keys_multi_layer)
             ret_mask[start:end] = True
-
+        # if (token_len % self.block_size) == 0:
+        #     print(keys)
         if keys:
             # Transpose the keys into layer major format
             keys = [list(row) for row in zip(*keys)]  # [num_layer,block_num]
@@ -482,6 +506,7 @@ class KVPoolWorker:
             for layer_id, keys_multi_chunk in enumerate(keys):
                 if layer_id in self.independent_layers:
                     continue
+                # print(f"==========> add save task {layer_id}")
                 req_meta = LasyerMultiBlockReqMeta(request.req_id,
                                                    keys_multi_chunk, starts,
                                                    ends, request.block_ids,

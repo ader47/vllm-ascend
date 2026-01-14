@@ -291,7 +291,6 @@ class RequestTracker:
                 f"Unsupported new_block_ids type {type(new_block_ids)}")
         self.allocated_block_ids.extend(new_block_ids)
 
-
 @dataclass
 class ReqMeta:
     # Request id
