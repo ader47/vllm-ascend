@@ -175,6 +175,8 @@ class ChunkedTokenDatabase():
         """
         if req_id!='no_need' and token_len % self.block_size != 0:
             block_hashes.append(f'{req_id}_lastblock')
+        # else:
+        #     logger.info(f"====================> token len {token_len} process_tokens 179 special case happen!!!! req_id: {req_id}")
         if not block_hashes:
             return
         if not isinstance(block_hashes[0], str):
@@ -344,7 +346,7 @@ class ReqMeta:
         # setting
         num_tokens_to_save = ((input_token_len // block_size * block_size)
                               if discard_partial_chunks else input_token_len)
-
+        # logger.info(f"====================> num_tokens_to_save 1 {num_tokens_to_save}")
         skip_save = skip_save or num_tokens_to_save < chunk_boundary
         if skip_save and load_spec is None:
             return None
@@ -366,6 +368,7 @@ class ReqMeta:
         logger.debug(
             f"request:{tracker.req_id}, meta save spec:{not skip_save}, meta load spec:{load_spec}"
         )
+        # logger.info(f"====================> num_tokens_to_save 2{num_tokens_to_save}")
         return ReqMeta(
             req_id=tracker.req_id,
             token_len_chunk=num_tokens_to_save,

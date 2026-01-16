@@ -170,6 +170,7 @@ class KVPoolScheduler:
             num_tokens_to_compute = (
                 request.num_computed_tokens +
                 scheduler_output.num_scheduled_tokens[request.req_id])
+            # logger.info(f"====================> req_id {request.req_id} , num_computed_tokens: {request.num_computed_tokens}, num_scheduled_tokens {scheduler_output.num_scheduled_tokens[request.req_id]}, num_tokens_to_compute {num_tokens_to_compute}")
             request_tracker = RequestTracker.from_new_request(
                 request, num_tokens_to_compute)
             self._request_trackers[request.req_id] = request_tracker
@@ -201,9 +202,11 @@ class KVPoolScheduler:
                 if req_tuple:
                     request = req_tuple[0]
                     num_current_tokens = request_tracker.token_len
+
                     new_token_ids = request.all_token_ids[
                         num_current_tokens:num_current_tokens + num_new_tokens]
                     request_tracker.token_len += len(new_token_ids)
+                    # logger.info(f"===============> request_tracker.token_len previous {num_current_tokens}, num_scheduled_tokens[req_id] {num_new_tokens}, len(new_token_ids) {len(new_token_ids)}")
                 else:
                     raise ValueError(
                         f"Request {req_id} is not in _unfinished_requests, "

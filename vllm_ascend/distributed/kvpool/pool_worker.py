@@ -149,9 +149,9 @@ class KVPoolWorker:
 
         self.finished_store_req: set[str] = set()
 
-        self.num_reuse_layers = 3
+        self.num_reuse_layers = 3   # TODO 当作参数，配置方法？
         self.layer_next_map = {i:i+self.num_reuse_layers for i in range(self.num_layers - self.num_reuse_layers)}
-        self.independent_layers = []
+        self.independent_layers = []    # TODO 不是必要的
         self.offload_start_ids = [i for i in range(self.num_reuse_layers)]
         self.layers_need_to_save = [i for i in range(self.num_layers) if i not in self.independent_layers ]
 
@@ -259,13 +259,13 @@ class KVPoolWorker:
             if load_spec is None or not load_spec.can_load:  #load =0
                 continue
             token_len = request.token_len_chunk
-            if (load_spec.kvpool_cached_tokens % self.block_size
-                    != 0) and (load_spec.kvpool_cached_tokens
-                               == token_len - 1):
-                token_len = request.load_spec.kvpool_cached_tokens + 1
-            else:
-                token_len = request.load_spec.kvpool_cached_tokens
-            request.token_len_chunk = token_len
+            # if (load_spec.kvpool_cached_tokens % self.block_size
+            #         != 0) and (load_spec.kvpool_cached_tokens
+            #                    == token_len - 1):
+            #     token_len = request.load_spec.kvpool_cached_tokens + 1
+            # else:
+            #     token_len = request.load_spec.kvpool_cached_tokens
+            # request.token_len_chunk = token_len
             if self.use_layerwise:
                 self.retrieve_layer(request)
             else:
@@ -301,20 +301,29 @@ class KVPoolWorker:
         #   so only signal `layer_load_finished_events` to unblock dependent layers.
         # - In decode: load KV cache from storage (`layer_load_task` is valid),
         #   then signal `layer_load_finished_events` after loading completes.
-        if self.use_layerwise:
+        # TODO 在结束的时候还会再调用一次这个函数
+        if self.use_layerwise and metadata.unfinished_request_ids:
+            # if self.tp_rank == 0:
+            #     logger.info(f"=====================> start_load_kv add load task {metadata.unfinished_request_ids}")
             for layer_id in self.offload_start_ids:
                 layer_load_task = self.layer_load_tasks[layer_id]
                 self.kv_recv_thread.add_request((None, layer_load_task, layer_id))
 
     def wait_for_layer_load(self) -> None:
+        # if self.tp_rank == 0:
+        #     logger.info(f"=====================> wait_for_layer_load {self.current_layer}")
         is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=3)  #try---cache
         if not is_finish:
             logger.info(f"Layerwise {self.current_layer} load failed")
+        # if self.tp_rank == 0:
+        #     logger.info(f"======================> {self.current_layer} load clear")
         self.layer_load_finished_events[self.current_layer].clear()
 
 
     def save_kv_layer(self,
                       connector_metadata: AscendConnectorMetadata) -> None:
+        # if self.tp_rank == 0:
+        #     logger.info(f"=====================> save_kv_layer {self.current_layer}")
         if self.current_layer == 0:
             self.layerwise_storers = []
             # current_event = None
@@ -417,7 +426,8 @@ class KVPoolWorker:
         block_hashes_read = request.block_hashes \
             if (token_len % self.block_size) != 0\
             else request.block_hashes[:-1] + [f"{request.req_id}_lastblock"]
-
+        # logger.info(
+        #     f"=================> store layer {request.req_id} token_len_chunk : {request.token_len_chunk} block_ids: {request.block_ids} ")
         for start, end, key in self.token_database.process_tokens(
                 token_len, block_hashes_read, mask_num, req_id = request.req_id):
             keys_multi_layer = key.split_layers(self.num_layers)
@@ -425,6 +435,13 @@ class KVPoolWorker:
             ends.append(end)
             keys.append(keys_multi_layer)
             ret_mask[start:end] = True
+        # TODO 这个上一轮是没有存储的last block的，没有必要读取
+        # 同时避免prefill阶段读不到的问题
+        if (token_len-1) % self.block_size == 0:
+            starts.pop()
+            ends.pop()
+            keys.pop()
+
         if keys:
             # Transpose the keys into layer major format
             keys = [list(row) for row in zip(*keys)]  # [num_layer,block_num]
@@ -471,6 +488,7 @@ class KVPoolWorker:
         starts = []
         ends = []
         keys = []
+        # logger.info(f"=================> store layer {request.req_id} token_len_chunk : {request.token_len_chunk} block_ids: {request.block_ids} ")
         for start, end, key in self.token_database.process_tokens(
                 request.token_len_chunk, request.block_hashes, req_id = request.req_id):
             keys_multi_layer = key.split_layers(self.num_layers)

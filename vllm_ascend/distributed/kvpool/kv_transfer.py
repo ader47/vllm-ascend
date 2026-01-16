@@ -252,6 +252,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.put_step = put_step
         self.layer_save_finished_events = layer_save_finished_events
         self.sync_save_events = sync_save_events
+        self.req_ids = set()
 
     def add_request(  # type: ignore[override]
             self, req_metas: List[ReqMeta]) -> torch.Tensor:
@@ -266,7 +267,9 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         size_list = []
         layer_id = req_metas[0].layer_id
         key_list_remove = []
+        cur_req_ids = set()
         for req_meta in req_metas:
+            cur_req_ids.add(req_meta.req_id)
             starts = req_meta.starts
             ends = req_meta.ends
             keys = req_meta.keys
@@ -293,7 +296,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 if len(keys_str[:-1]) > 0:
                     skip_block_num = self.lookup(keys_str[:-1])
             else:
-                skip_block_num = self.lookup(keys_str)
+                if len(keys_str) > 0:
+                    skip_block_num = self.lookup(keys_str)
             # print(f"==========> skip block: {skip_block_num}")
             # skip_block_num = 0
             # if skip_block_num == len(key_list):
@@ -312,13 +316,32 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 size_list.append(size)
             # if layer_id == self.final_layer_id and is_last_chunk:
             #     self.set_finished_request(req_meta.req_id)
+        missing_reqs = list(self.req_ids - cur_req_ids)
+        for end_reqs in missing_reqs:
+            self.set_finished_request(end_reqs)
+        self.req_ids = cur_req_ids
 
         self.sync_save_events[layer_id].synchronize()
 
         if len(key_list_remove) > 0:
+            # batch_size = 512
+            # for i in range(0, len(key_list_remove), batch_size):
+            #     batch_keys = key_list[i:i + batch_size]
+            #     # 执行存储读取
+            #     self.m_store.store.remove_batch(batch_keys)
+            # logger.info(f"====================> remove {key_list_remove}")
             self.m_store.store.remove_batch(key_list_remove)
 
         if len(key_list) > 0:
+            # batch_size = 512
+            # for i in range(0, len(key_list), batch_size):
+            #     # 切片：取当前批次的 [i, i+batch_size)
+            #     batch_keys = key_list[i:i + batch_size]
+            #     batch_addrs = addr_list[i:i + batch_size]
+            #     batch_sizes = size_list[i:i + batch_size]
+            #     # 执行存储读取
+            #     self.m_store.get(batch_keys, batch_addrs, batch_sizes)
+            # logger.info(f"====================> save {key_list}")
             self.m_store.put(key_list, addr_list, size_list)
 
         assert not self.layer_save_finished_events[layer_id].is_set()
@@ -350,15 +373,17 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
     def _handle_request(  # type: ignore[override]
             self, data: List[LasyerMultiBlockReqMeta]):
-        wait_for_load, req_metas, layer_id = data
+        wait_for_save, req_metas, layer_id = data
 
-        if wait_for_load is not None:
-            is_finish = self.layer_save_finished_events[wait_for_load].wait(timeout=3)  # try---cache
+        if wait_for_save is not None:
+            is_finish = self.layer_save_finished_events[wait_for_save].wait(timeout=3)  # try---cache
             if not is_finish:
-                logger.info(f"Layerwise {wait_for_load} get failed")
-            self.layer_save_finished_events[wait_for_load].clear()
+                logger.info(f"Layerwise {wait_for_save} get failed")
+            self.layer_save_finished_events[wait_for_save].clear()
 
         if len(req_metas) == 0:
+            # if self.tp_rank == 0:
+                # logger.info(f"======================> {layer_id} load set")
             assert not self.layer_load_finished_events[layer_id].is_set()
             self.layer_load_finished_events[layer_id].set()
             return
@@ -386,8 +411,19 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                                                              len(size_list)]
         # TODO Dose there have length limit?
         if len(key_list_c) > 0:
+            # batch_size = 512
+            # for i in range(0, len(key_list_c), batch_size):
+            #     # 切片：取当前批次的 [i, i+batch_size)
+            #     batch_keys = key_list_c[i:i + batch_size]
+            #     batch_addrs = addr_list_c[i:i + batch_size]
+            #     batch_sizes = size_list_c[i:i + batch_size]
+            #     # 执行存储读取
+            #     self.m_store.get(batch_keys, batch_addrs, batch_sizes)
+            # logger.info(f"===================> load {key_list_c}")
             self.m_store.get(key_list_c, addr_list_c, size_list_c)
         assert not self.layer_load_finished_events[layer_id].is_set()
+        # if self.tp_rank == 0:
+        #     logger.info(f"======================> {layer_id} load set")
         self.layer_load_finished_events[layer_id].set()
         req_metas.clear()
         self.request_queue.task_done()
