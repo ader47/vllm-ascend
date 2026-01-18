@@ -150,13 +150,13 @@ class KVPoolWorker:
         self.finished_store_req: set[str] = set()
 
         self.num_reuse_layers = 3   # TODO 当作参数，配置方法？
+        self.num_reuse_layers = 30   # TODO 当作参数，配置方法？
         self.layer_next_map = {i:i+self.num_reuse_layers for i in range(self.num_layers - self.num_reuse_layers)}
         self.independent_layers = []    # TODO 不是必要的
         self.offload_start_ids = [i for i in range(self.num_reuse_layers)]
         self.layers_need_to_save = [i for i in range(self.num_layers) if i not in self.independent_layers ]
 
         self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
-        # self.sync_load_events = [torch.npu.Event() for i in range(self.num_layers)]
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
@@ -259,6 +259,7 @@ class KVPoolWorker:
             if load_spec is None or not load_spec.can_load:  #load =0
                 continue
             token_len = request.token_len_chunk
+            # TODO check this
             # if (load_spec.kvpool_cached_tokens % self.block_size
             #         != 0) and (load_spec.kvpool_cached_tokens
             #                    == token_len - 1):
@@ -326,18 +327,11 @@ class KVPoolWorker:
         #     logger.info(f"=====================> save_kv_layer {self.current_layer}")
         if self.current_layer == 0:
             self.layerwise_storers = []
-            # current_event = None
-            # for request in connector_metadata.requests:
-            #     can_save = request.can_save
-            #     if can_save is None or not can_save:
-            #         continue
-            #     current_event = torch.npu.Event()
-            #     current_event.record()
-            #     break
             for request in connector_metadata.requests:
-                # can_save = request.can_save
-                # if can_save is None or not can_save:
-                #     continue
+                # TODO verify this code
+                can_save = request.can_save
+                if can_save is None or not can_save:
+                    continue
                 self.store_layer(request)
         # skip independent layers
         if len(self.layer_save_tasks[self.current_layer]) == 0:
@@ -513,8 +507,8 @@ class KVPoolWorker:
     def get_finished(self,
                      finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         done_sending = (
-            self.get_and_clear_finished_requests(
-                finished_req_ids  # type: ignore[union-attr]
+            self.kv_send_thread.get_and_clear_finished_requests(
+                  # type: ignore[union-attr]
             ) if self.kv_role in ['kv_producer', 'kv_both']
             or self.consumer_is_to_put else set())
 
@@ -531,24 +525,24 @@ class KVPoolWorker:
 
     def get_and_clear_finished_requests(self, finished_req_ids) -> set[str]:
         finished_sending = set()
-        # for req_id in self.kv_send_thread.stored_requests.copy(  # type: ignore[union-attr]
-        # ):
-        #     if self.kv_send_thread.stored_requests[  # type: ignore[union-attr]
-        #             req_id] == 0 and req_id in self.finished_store_req:
-        #         self.finished_store_req.remove(req_id)
-        #         finished_sending.add(req_id)
-        #         self.kv_send_thread.delete_finished_stored_request(  # type: ignore[union-attr]
-        #             req_id)
-        #
-        # for req_id in finished_req_ids:
-        #     req_remain_jobs = self.kv_send_thread.stored_requests.get(  # type: ignore[union-attr]
-        #         req_id)
-        #     if req_remain_jobs == 0:
-        #         finished_sending.add(req_id)
-        #         self.kv_send_thread.delete_finished_stored_request(  # type: ignore[union-attr]
-        #             req_id)
-        #     elif req_remain_jobs is not None:
-        #         self.finished_store_req.add(req_id)
+        for req_id in self.kv_send_thread.stored_requests.copy(  # type: ignore[union-attr]
+        ):
+            if self.kv_send_thread.stored_requests[  # type: ignore[union-attr]
+                    req_id] == 0 and req_id in self.finished_store_req:
+                self.finished_store_req.remove(req_id)
+                finished_sending.add(req_id)
+                self.kv_send_thread.delete_finished_stored_request(  # type: ignore[union-attr]
+                    req_id)
+
+        for req_id in finished_req_ids:
+            req_remain_jobs = self.kv_send_thread.stored_requests.get(  # type: ignore[union-attr]
+                req_id)
+            if req_remain_jobs == 0:
+                finished_sending.add(req_id)
+                self.kv_send_thread.delete_finished_stored_request(  # type: ignore[union-attr]
+                    req_id)
+            elif req_remain_jobs is not None:
+                self.finished_store_req.add(req_id)
 
         return finished_sending
 
