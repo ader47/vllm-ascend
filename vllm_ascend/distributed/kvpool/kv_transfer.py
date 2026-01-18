@@ -35,6 +35,7 @@ class KVTransferThread(threading.Thread):
         # TODO(jianzs): make this configurable
         self.executor = ThreadPoolExecutor(max_workers=32)
         self.finished_requests: set[str] = set()
+        self.max_batch = 512
 
     def add_request(
         self,
@@ -324,25 +325,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.sync_save_events[layer_id].synchronize()
 
         if len(key_list_remove) > 0:
-            # batch_size = 512
-            # for i in range(0, len(key_list_remove), batch_size):
-            #     batch_keys = key_list[i:i + batch_size]
-            #     # 执行存储读取
-            #     self.m_store.store.remove_batch(batch_keys)
-            # logger.info(f"====================> remove {key_list_remove}")
-            self.m_store.store.remove_batch(key_list_remove)
+            for i in range(0, len(key_list), self.max_batch):
+                self.m_store.store.remove_batch(key_list_remove[i:i + self.max_batch])
 
         if len(key_list) > 0:
-            # batch_size = 512
-            # for i in range(0, len(key_list), batch_size):
-            #     # 切片：取当前批次的 [i, i+batch_size)
-            #     batch_keys = key_list[i:i + batch_size]
-            #     batch_addrs = addr_list[i:i + batch_size]
-            #     batch_sizes = size_list[i:i + batch_size]
-            #     # 执行存储读取
-            #     self.m_store.get(batch_keys, batch_addrs, batch_sizes)
-            # logger.info(f"====================> save {key_list}")
-            self.m_store.put(key_list, addr_list, size_list)
+            for i in range(0, len(key_list), self.max_batch):
+                self.m_store.put(key_list[i:i + self.max_batch], addr_list[i:i + self.max_batch], size_list[i:i + self.max_batch])
 
         assert not self.layer_save_finished_events[layer_id].is_set()
         self.layer_save_finished_events[layer_id].set()
@@ -382,8 +370,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self.layer_save_finished_events[wait_for_save].clear()
 
         if len(req_metas) == 0:
-            # if self.tp_rank == 0:
-                # logger.info(f"======================> {layer_id} load set")
             assert not self.layer_load_finished_events[layer_id].is_set()
             self.layer_load_finished_events[layer_id].set()
             return
@@ -409,21 +395,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         size_list_c = size_list[self.tp_rank %
                                 len(size_list):] + size_list[:self.tp_rank %
                                                              len(size_list)]
-        # TODO Dose there have length limit?
         if len(key_list_c) > 0:
-            # batch_size = 512
-            # for i in range(0, len(key_list_c), batch_size):
-            #     # 切片：取当前批次的 [i, i+batch_size)
-            #     batch_keys = key_list_c[i:i + batch_size]
-            #     batch_addrs = addr_list_c[i:i + batch_size]
-            #     batch_sizes = size_list_c[i:i + batch_size]
-            #     # 执行存储读取
-            #     self.m_store.get(batch_keys, batch_addrs, batch_sizes)
-            # logger.info(f"===================> load {key_list_c}")
-            self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            # backbend has the limitation of length, max batch size is 512
+            for i in range(0, len(key_list_c), self.max_batch):
+                self.m_store.get(key_list_c[i:i + self.max_batch], addr_list_c[i:i + self.max_batch], size_list_c[i:i + self.max_batch])
         assert not self.layer_load_finished_events[layer_id].is_set()
-        # if self.tp_rank == 0:
-        #     logger.info(f"======================> {layer_id} load set")
         self.layer_load_finished_events[layer_id].set()
         req_metas.clear()
         self.request_queue.task_done()
