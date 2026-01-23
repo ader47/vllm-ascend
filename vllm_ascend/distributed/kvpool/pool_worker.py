@@ -150,7 +150,7 @@ class KVPoolWorker:
         self.finished_store_req: set[str] = set()
 
         # TODO 记录每个请求当前decode数量，可以使用这个decode标识每个last block,之前的block 是否有必要删除？
-        self.seq_decode_num = {}
+        self.seq_last_block_id = {}
         self.num_reuse_layers = 3   # TODO 当作参数，配置方法？
         self.num_reuse_layers = 30   # TODO 当作参数，配置方法？
         self.layer_next_map = {i:i+self.num_reuse_layers for i in range(self.num_layers - self.num_reuse_layers)}
@@ -261,6 +261,7 @@ class KVPoolWorker:
         self.layerwise_retrievers = []
         for request in metadata.requests:
             if self.use_layerwise:
+                self.seq_last_block_id[request.req_id] = self.seq_last_block_id.get(request.req_id, -1) + 1
                 self.process_layer_data(request)
                 continue
             load_spec = request.load_spec
@@ -393,10 +394,10 @@ class KVPoolWorker:
         """
         token_len = request.token_len_chunk
         starts, ends, keys = [], [], []
-
         # Process tokens only once, building both 'starts', 'ends', and 'keys' in one loop
         for start, end, key in self.token_database.process_tokens(
-                token_len, request.block_hashes, req_id=request.req_id):
+                token_len, request.block_hashes, req_id=f"{request.req_id}_"
+                                                        f"{self.seq_last_block_id[request.req_id]}"):
             keys_multi_layer = key.split_layers(self.num_layers)
             starts.append(start)
             ends.append(end)
@@ -407,6 +408,7 @@ class KVPoolWorker:
             for layer_id, keys_multi_chunk in enumerate(keys):
                 if layer_id in self.independent_layers:
                     continue
+                # save
                 can_save = request.can_save
                 if can_save is not None and can_save:
                     req_meta = LasyerMultiBlockReqMeta(
@@ -415,6 +417,7 @@ class KVPoolWorker:
                     )
                     self.layer_save_tasks[layer_id].append(req_meta)
 
+                # load
                 load_spec = request.load_spec
                 if load_spec is not None and load_spec.can_load:  # load =0
                     # TODO 这里要判断需要加载的长度，使用load_spec里computed tokens而不能用序列长度，不然不支持chunked prefill。
@@ -424,15 +427,14 @@ class KVPoolWorker:
                             request.req_id, keys_multi_chunk[:-1], starts[:-1], ends[:-1],
                             request.block_ids, layer_id
                         )
-                    elif (token_len % self.block_size) == 0:
-                        req_meta = LasyerMultiBlockReqMeta(
-                            request.req_id, keys_multi_chunk[:-1] +
-                                            [PoolKey(self.metadata, f"{request.req_id}_lastblock").split_layers(self.num_layers)[layer_id]], starts, ends,
-                            request.block_ids, layer_id
-                        )
                     else:
                         req_meta = LasyerMultiBlockReqMeta(
-                            request.req_id, keys_multi_chunk, starts, ends,
+                            request.req_id, keys_multi_chunk[:-1] +
+                                            [PoolKey(self.metadata,
+                                                     f"{request.req_id}_"
+                                                     f"{self.seq_last_block_id[request.req_id] - 1}"
+                                                     f"_lastblock"
+                                                     ).split_layers(self.num_layers)[layer_id]], starts, ends,
                             request.block_ids, layer_id
                         )
                     self.layer_load_tasks[layer_id].append(req_meta)
@@ -446,9 +448,6 @@ class KVPoolWorker:
             # retrieved_tokens = torch.sum(ret_mask)
             # logger.debug(f"Retrieved {retrieved_tokens} out of {token_len} tokens")
             # Add layer loading task to the queue for retrieval
-
-        else:
-            pass
 
 
     def get_finished(self,
@@ -468,6 +467,9 @@ class KVPoolWorker:
             "Number of completed KV cache send requests: %d, receive "
             "requests: %d, tp_rank:%d", len(done_sending), len(done_recving),
             self.tp_rank)
+        # TODO 可以在这里进行异步删除操作
+        for req_id in finished_req_ids:
+            self.seq_last_block_id.pop(req_id)
         return done_sending, done_recving
 
     def get_and_clear_finished_requests(self, finished_req_ids) -> set[str]:
