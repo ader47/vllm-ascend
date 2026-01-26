@@ -2497,12 +2497,16 @@ class NPUModelRunner(GPUModelRunner):
                                 dsa_k_cache_tensor,
                                 alignment)[:dsa_k_cache_size]
                     # 12 25
-                    REUSE = 3
-                    reuse_kvcache_layers = [REUSE + i for i in range(24)]
+                    REUSE = 10
+                    numlayers = 60
+                    REUSE = 10
+                    numlayers = 60
+                    # REUSE = 3
+                    # numlayers = 27
 
-                    # REUSE = 13
-                    # reuse_kvcache_layers = [REUSE + i for i in range(REUSE)]
-                    # reuse_kvcache_layers = [25]
+                    reuse_kvcache_layers = [i for i in range(2 * REUSE ,numlayers)]
+                    # reuse_kvcache_layers = [58]
+
                     enable_kvcache_offload = True
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the kvcache between the self_attn specs in the same group
@@ -2510,10 +2514,10 @@ class NPUModelRunner(GPUModelRunner):
                                 and "linear_attn" not in layer_name_inner):
                             # TODO 复用
                             if enable_kvcache_offload and (int(layer_name_inner.split('.')[2]) in reuse_kvcache_layers):
-                                print(f"==============> {layer_name_inner} reuse the KV Cache of {'model.layers.' + str(int(layer_name_inner.split('.')[2])-REUSE) + '.self_attn.attn'}")
+                                print(f"==============> {layer_name_inner} reuse the KV Cache of {'model.layers.' + str(int(layer_name_inner.split('.')[2])-2 * REUSE) + '.self_attn.attn'}")
                                 del k_tensor
                                 del v_tensor
-                                kv_cache_raw_tensors[layer_name_inner] = kv_cache_raw_tensors['model.layers.' + str(int(layer_name_inner.split('.')[2])-REUSE) + '.self_attn.attn']
+                                kv_cache_raw_tensors[layer_name_inner] = kv_cache_raw_tensors['model.layers.' + str(int(layer_name_inner.split('.')[2])-2 * REUSE) + '.self_attn.attn']
                                 # TODO 需要判断什么时候加载
                             else:
                                 kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor) if \

@@ -146,6 +146,30 @@ class ChunkedTokenDatabase():
         addr_list = [addr_k, addr_v]
         return addr_list, size_list
 
+    def prepare_value_layers(self, start: int, end: int, block_ids: list[int],
+                            layers):
+        block_id = block_ids[start // self.block_size]
+        addr_lists = []
+        size_lists = []
+        for  layer_id in layers:
+            if self.use_mla:
+                addr_k = self.kv_caches_base_addr[layer_id *
+                                                  2] + block_id * self.block_len[0]
+                addr_v = self.kv_caches_base_addr[layer_id * 2 +
+                                                  1] + block_id * self.block_len[1]
+                length_k = int(self.block_len[0] / self.block_size * (end - start))
+                length_v = int(self.block_len[1] / self.block_size * (end - start))
+                size_lists += [length_k, length_v]
+            else:
+                addr_k = self.kv_caches_base_addr[layer_id *
+                                                  2] + block_id * self.block_len[0]
+                addr_v = self.kv_caches_base_addr[layer_id * 2 +
+                                                  1] + block_id * self.block_len[0]
+                length = int(self.block_len[0] / self.block_size * (end - start))
+                size_lists += [length, length]
+            addr_lists += [addr_k, addr_v]
+        return addr_lists, size_lists
+
     def process_tokens(
         self,
         token_len: int,
@@ -346,7 +370,6 @@ class ReqMeta:
         # setting
         num_tokens_to_save = ((input_token_len // block_size * block_size)
                               if discard_partial_chunks else input_token_len)
-        # logger.info(f"====================> num_tokens_to_save 1 {num_tokens_to_save}")
         skip_save = skip_save or num_tokens_to_save < chunk_boundary
         if skip_save and load_spec is None:
             return None

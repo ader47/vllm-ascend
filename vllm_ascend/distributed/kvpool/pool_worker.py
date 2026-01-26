@@ -149,14 +149,53 @@ class KVPoolWorker:
 
         self.finished_store_req: set[str] = set()
 
+
         # TODO 记录每个请求当前decode数量，可以使用这个decode标识每个last block,之前的block 是否有必要删除？
         self.seq_last_block_id = {}
-        self.num_reuse_layers = 3   # TODO 当作参数，配置方法？
-        self.num_reuse_layers = 30   # TODO 当作参数，配置方法？
-        self.layer_next_map = {i:i+self.num_reuse_layers for i in range(self.num_layers - self.num_reuse_layers)}
-        self.independent_layers = []    # TODO 不是必要的
-        self.offload_start_ids = [i for i in range(self.num_reuse_layers)]
-        self.layers_need_to_save = [i for i in range(self.num_layers) if i not in self.independent_layers ]
+        # self.num_reuse_layers = 3   # TODO 当作参数，配置方法？
+        # # self.num_reuse_layers = 30   # TODO 当作参数，配置方法？
+        # self.layer_next_map = {i:i+self.num_reuse_layers for i in range(self.num_layers - self.num_reuse_layers)}
+        # self.independent_layers = [i for i in range(self.layer_gap)]    # TODO 不是必要的
+        # self.offload_start_ids = [i for i in range(self.layer_gap, 2*self.layer_gap)]
+        # self.layers_need_to_save = [i for i in range(self.num_layers) if i not in self.independent_layers ]
+
+        # TODO 是否要在一开始和结尾设置一些独立层？
+        # 可以设置的参数有：
+        # 1. 组内的层数
+        # 2. 组数，是否有必要设置多组？ 两组是否已经足够用
+        # begin_independent_layers / (1) / (2) / (3) / (1) / (2) / (3) / end_independent_layers
+
+        self.layer_gap = 10
+        self.layer_next_map = {}
+        self.independent_layers = [60]    # independent layers 和 offload start_ids 不一样
+        # self.independent_layers.append(60)
+        self.offload_start_ids = [i for i in range(2 * self.layer_gap)]
+        self.layers_need_to_save = []
+        self.layers_need_to_load = []
+        for i in range(self.num_layers):
+            if i in self.independent_layers:
+                continue
+            if i % self.layer_gap == 0:
+                self.layers_need_to_load.append(i)
+            if (i + 1) % self.layer_gap == 0:
+                self.layers_need_to_save.append(i)
+        for layer_id in self.layers_need_to_save[:-2]:
+            self.layer_next_map[layer_id] = layer_id + self.layer_gap + 1
+        logger.info(f"====================> self.layer_next_map {self.layer_next_map}")
+        logger.info(f"====================> layers_need_to_save {self.layers_need_to_save}")
+        logger.info(f"====================> self.layers_need_to_load {self.layers_need_to_load}")
+
+
+
+        # self.layer_gap = 1
+        # self.layer_next_map = {}
+        # self.independent_layers = [i for i in range(20)] + [i for i in range(21,58)] + [i for i in range(59,61)]    # independent layers 和 offload start_ids 不一样
+        # # self.independent_layers.append(60)
+        # self.offload_start_ids = [20]
+        # self.layers_need_to_save = [20,58]
+        # self.layers_need_to_load = [20,58]
+        # self.layer_next_map[20] = 58
+
 
         self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
 
@@ -230,13 +269,13 @@ class KVPoolWorker:
                 self.kv_send_thread = KVCacheStoreLayerSendingThread(
                     self.m_store, self.token_database, self.block_size,
                     self.tp_rank, self.dcp_size, self.put_step,
-                    ready_event_sending, self.num_layers, self.layer_save_finished_events, self.sync_save_events)
+                    ready_event_sending, self.num_layers, self.layer_save_finished_events, self.sync_save_events, self.layer_gap)
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
             ready_event = threading.Event()
             self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
                 self.m_store, self.token_database, self.block_size,
-                self.tp_rank, self.dcp_size, ready_event, self.layer_load_finished_events, self.layer_save_finished_events)
+                self.tp_rank, self.dcp_size, ready_event, self.layer_load_finished_events, self.layer_save_finished_events, self.layer_gap)
             self.kv_recv_thread.start()
             ready_event.wait()
         else:
@@ -268,14 +307,6 @@ class KVPoolWorker:
             if load_spec is None or not load_spec.can_load:  #load =0
                 continue
             token_len = request.token_len_chunk
-            # TODO check this
-            # if (load_spec.kvpool_cached_tokens % self.block_size
-            #         != 0) and (load_spec.kvpool_cached_tokens
-            #                    == token_len - 1):
-            #     token_len = request.load_spec.kvpool_cached_tokens + 1
-            # else:
-            #     token_len = request.load_spec.kvpool_cached_tokens
-            # request.token_len_chunk = token_len
             if self.load_async:
                 self.kv_recv_thread.add_request(  # type: ignore[union-attr]
                     request, )
@@ -310,27 +341,20 @@ class KVPoolWorker:
         #   then signal `layer_load_finished_events` after loading completes.
         # TODO 在结束的时候还会再调用一次这个函数
         if self.use_layerwise and metadata.unfinished_request_ids:
-            # if self.tp_rank == 0:
-            #     logger.info(f"=====================>  load task {self.layer_load_tasks}")
-            #     logger.info(f"=====================>  save task {self.layer_save_tasks}")
-            for layer_id in self.offload_start_ids:
+            for layer_id in self.layers_need_to_load[:2]:
                 layer_load_task = self.layer_load_tasks[layer_id]
                 self.kv_recv_thread.add_request((None, layer_load_task, layer_id))
 
     def wait_for_layer_load(self) -> None:
-        # if self.tp_rank == 0:
-        #     logger.info(f"=====================> wait_for_layer_load {self.current_layer}")
+        if self.current_layer in self.independent_layers:
+            return
         is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=5)  #try---cache
         if not is_finish:
             logger.info(f"Layerwise {self.current_layer} load failed")
         self.layer_load_finished_events[self.current_layer].clear()
-        # if self.tp_rank == 0:
-        #     logger.info(f"======================> clear {self.current_layer} layer_load_finished_events")
 
     def save_kv_layer(self,
                       connector_metadata: AscendConnectorMetadata) -> None:
-        # if self.tp_rank == 0:
-        #     logger.info(f"=====================> save_kv_layer {self.current_layer}")
         # skip independent layers
         if len(self.layer_save_tasks[self.current_layer]) == 0:
             self.current_layer = self.current_layer + 1
@@ -344,8 +368,7 @@ class KVPoolWorker:
             # 1. wait for save, and clear save event
             # 2. start load, for prefill layer_load_tasks is None, skip load in the recv thread.
             # 3. set layer_load_finished_events (both prefill & decode)
-            if self.current_layer < self.num_layers - self.num_reuse_layers:
-                # logger.info(f"=====================> save_kv_layer {self.current_layer} and load {self.layer_next_map[self.current_layer]}")
+            if self.current_layer != self.layers_need_to_save[-2]:
                 self.kv_recv_thread.add_request(
                     (self.current_layer, self.layer_load_tasks[self.layer_next_map[self.current_layer]], self.layer_next_map[self.current_layer]))
         else:
@@ -356,7 +379,7 @@ class KVPoolWorker:
                 logger.info(f"Layerwise {self.current_layer} save failed")
             self.layer_save_finished_events[self.current_layer].clear()
             # Clear save events for tail layers—no downstream layers exist to reset them.
-            for i in range(self.num_reuse_layers - 1, 0, -1):
+            for i in range(2 * self.layer_gap - 1, 0, -1):
                 self.layer_save_finished_events[self.current_layer - i].clear()
 
         self.current_layer = self.current_layer + 1
@@ -409,35 +432,42 @@ class KVPoolWorker:
                 if layer_id in self.independent_layers:
                     continue
                 # save
-                can_save = request.can_save
-                if can_save is not None and can_save:
-                    req_meta = LasyerMultiBlockReqMeta(
-                        request.req_id, keys_multi_chunk, starts, ends,
-                        request.block_ids, layer_id, request.is_last_chunk
-                    )
-                    self.layer_save_tasks[layer_id].append(req_meta)
+                if layer_id in self.layers_need_to_save:
+                    layers = [i for i in range(layer_id - self.layer_gap + 1, layer_id + 1)]
+                    # logger.info(f"Layerwise {layer_id} need to save layers {layers}")
+                    can_save = request.can_save
+                    if can_save is not None and can_save:
+                        req_meta = LasyerMultiBlockReqMeta(
+                            request.req_id, keys_multi_chunk, starts, ends,
+                            request.block_ids, layer_id, request.is_last_chunk
+                        )
+                        req_meta.layers_need_to_save = layers
+                        self.layer_save_tasks[layer_id].append(req_meta)
 
                 # load
-                load_spec = request.load_spec
-                if load_spec is not None and load_spec.can_load:  # load =0
-                    # TODO 这里要判断需要加载的长度，使用load_spec里computed tokens而不能用序列长度，不然不支持chunked prefill。
-                    # TODO prefix cache的时候也不可以加载这个，chunk prefill的时候也不需要加载
-                    if (token_len - 1) % self.block_size == 0:
-                        req_meta = LasyerMultiBlockReqMeta(
-                            request.req_id, keys_multi_chunk[:-1], starts[:-1], ends[:-1],
-                            request.block_ids, layer_id
-                        )
-                    else:
-                        req_meta = LasyerMultiBlockReqMeta(
-                            request.req_id, keys_multi_chunk[:-1] +
-                                            [PoolKey(self.metadata,
-                                                     f"{request.req_id}_"
-                                                     f"{self.seq_last_block_id[request.req_id] - 1}"
-                                                     f"_lastblock"
-                                                     ).split_layers(self.num_layers)[layer_id]], starts, ends,
-                            request.block_ids, layer_id
-                        )
-                    self.layer_load_tasks[layer_id].append(req_meta)
+                if layer_id in self.layers_need_to_load:
+                    layers = [i for i in range(layer_id, layer_id + self.layer_gap)]
+                    load_spec = request.load_spec
+                    if load_spec is not None and load_spec.can_load:  # load =0
+                        # TODO 这里要判断需要加载的长度，使用load_spec里computed tokens而不能用序列长度，不然不支持chunked prefill。
+                        # TODO prefix cache的时候也不可以加载这个，chunk prefill的时候也不需要加载
+                        if (token_len - 1) % self.block_size == 0:
+                            req_meta = LasyerMultiBlockReqMeta(
+                                request.req_id, keys_multi_chunk[:-1], starts[:-1], ends[:-1],
+                                request.block_ids, layer_id
+                            )
+                        else:
+                            req_meta = LasyerMultiBlockReqMeta(
+                                request.req_id, keys_multi_chunk[:-1] +
+                                                [PoolKey(self.metadata,
+                                                         f"{request.req_id}_"
+                                                         f"{self.seq_last_block_id[request.req_id] - 1}"
+                                                         f"_lastblock"
+                                                         ).split_layers(self.num_layers)[layer_id]], starts, ends,
+                                request.block_ids, layer_id
+                            )
+                        req_meta.layers_need_to_load = layers
+                        self.layer_load_tasks[layer_id].append(req_meta)
 
             # Create the mask for this layer
             # ret_mask = torch.zeros(token_len, dtype=torch.bool, device="cpu")

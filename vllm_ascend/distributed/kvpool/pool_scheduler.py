@@ -73,7 +73,7 @@ class KVPoolScheduler:
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_load:
             return 0, False
 
-        if self._discard_partial_chunks:
+        if self._discard_partial_chunks or self.kv_offload:
             token_len = len(request.prompt_token_ids
                             ) // self._block_size * self._block_size
         else:
@@ -216,14 +216,14 @@ class KVPoolScheduler:
                     continue
                 if new_block_ids:
                     request_tracker.update(new_block_ids)
-                # print(f"=========> cached_reqs.num_computed_tokens[i] {cached_reqs.num_computed_tokens[i]}")
-                # print(f"=========> token_len {request_tracker.token_len}")
+                # TODO 要修改load spec 来控制加载的token数量，最好不要在worker当中进行控制。
                 last_chunk_tokens_num = ((len(request.prompt_token_ids) //
                                           self._block_size * self._block_size)
                                          if self._discard_partial_chunks else
                                          len(request.prompt_token_ids))
                 load_spec = None
                 if self.kv_offload:
+                    # TODO chunked prefill 这里只加载之前的
                     load_spec = LoadSpec(
                         vllm_cached_tokens=0,
                         kvpool_cached_tokens=cached_reqs.num_computed_tokens[i],
