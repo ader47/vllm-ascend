@@ -149,14 +149,22 @@ class KVPoolWorker:
 
         self.finished_store_req: set[str] = set()
 
-        # TODO 记录每个请求当前decode数量，可以使用这个decode标识每个last block,之前的block 是否有必要删除？
         self.seq_last_block_id = {}
-        self.num_reuse_layers = 3   # TODO 当作参数，配置方法？
-        self.num_reuse_layers = 30   # TODO 当作参数，配置方法？
-        self.layer_next_map = {i:i+self.num_reuse_layers for i in range(self.num_layers - self.num_reuse_layers)}
-        self.independent_layers = []    # TODO 不是必要的
-        self.offload_start_ids = [i for i in range(self.num_reuse_layers)]
+        self.num_reuse_layers = 20   # TODO 当作参数，配置方法？
+        self.layer_next_map = {i:i + self.num_reuse_layers for i in range(11, 31)}
+        self.independent_layers = [i for i in range(11)] + [i for i in range(51, 61)]    # TODO 不是必要的
+        self.offload_start_ids = [i for i in range(11, 31)]
         self.layers_need_to_save = [i for i in range(self.num_layers) if i not in self.independent_layers ]
+
+
+        # TODO 记录每个请求当前decode数量，可以使用这个decode标识每个last block,之前的block 是否有必要删除？
+        # self.seq_last_block_id = {}
+        # self.num_reuse_layers = 3   # TODO 当作参数，配置方法？
+        # self.num_reuse_layers = 30   # TODO 当作参数，配置方法？
+        # self.layer_next_map = {i:i+self.num_reuse_layers for i in range(self.num_layers - self.num_reuse_layers)}
+        # self.independent_layers = []    # TODO 不是必要的
+        # self.offload_start_ids = [i for i in range(self.num_reuse_layers)]
+        # self.layers_need_to_save = [i for i in range(self.num_layers) if i not in self.independent_layers ]
 
         self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
 
@@ -316,10 +324,16 @@ class KVPoolWorker:
             for layer_id in self.offload_start_ids:
                 layer_load_task = self.layer_load_tasks[layer_id]
                 self.kv_recv_thread.add_request((None, layer_load_task, layer_id))
+            # for layer_id in self.offload_start_ids:
+            #     is_finish = self.layer_load_finished_events[layer_id].wait(timeout=5)  # try---cache
+            #     if not is_finish:
+            #         logger.info(f"Layerwise {self.current_layer} load failed")
 
     def wait_for_layer_load(self) -> None:
         # if self.tp_rank == 0:
         #     logger.info(f"=====================> wait_for_layer_load {self.current_layer}")
+        if self.current_layer in self.independent_layers:
+            return
         is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=5)  #try---cache
         if not is_finish:
             logger.info(f"Layerwise {self.current_layer} load failed")
@@ -332,7 +346,7 @@ class KVPoolWorker:
         # if self.tp_rank == 0:
         #     logger.info(f"=====================> save_kv_layer {self.current_layer}")
         # skip independent layers
-        if len(self.layer_save_tasks[self.current_layer]) == 0:
+        if len(self.layer_save_tasks[self.current_layer]) == 0 or self.current_layer in self.independent_layers:
             self.current_layer = self.current_layer + 1
             return
         # Wait for KV cache saving to complete on the final layer that requires offloading.
@@ -344,7 +358,8 @@ class KVPoolWorker:
             # 1. wait for save, and clear save event
             # 2. start load, for prefill layer_load_tasks is None, skip load in the recv thread.
             # 3. set layer_load_finished_events (both prefill & decode)
-            if self.current_layer < self.num_layers - self.num_reuse_layers:
+            # if self.current_layer < self.num_layers - self.num_reuse_layers:
+            if self.current_layer in self.layer_next_map.keys():
                 # logger.info(f"=====================> save_kv_layer {self.current_layer} and load {self.layer_next_map[self.current_layer]}")
                 self.kv_recv_thread.add_request(
                     (self.current_layer, self.layer_load_tasks[self.layer_next_map[self.current_layer]], self.layer_next_map[self.current_layer]))

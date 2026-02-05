@@ -291,14 +291,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             for key in keys:
                 keys_str.append(key.to_string())
             # print(f"save look for repeat block {key_list}")
-            skip_block_num = 0
-            if 'last' in keys_str[-1] and self.m_store.store.is_exist(keys_str[-1]) == 1:
-                key_list_remove.append(keys_str[-1])
-                if len(keys_str[:-1]) > 0:
-                    skip_block_num = self.lookup(keys_str[:-1])
-            else:
-                if len(keys_str) > 0:
-                    skip_block_num = self.lookup(keys_str)
+            skip_block_num = self.lookup(keys_str)
             # TODO check this
             if skip_block_num == len(keys_str):
                 if is_last_chunk and layer_id == self.final_layer_id:
@@ -323,11 +316,6 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
 
         self.sync_save_events[layer_id].synchronize()
 
-        if len(key_list_remove) > 0:
-            # for i in range(0, len(key_list_remove), self.max_batch):
-            #     self.m_store.store.remove_batch(key_list_remove[i:i + self.max_batch])
-            for key in key_list_remove:
-                self.m_store.store.remove(key)
         if len(key_list) > 0:
             for i in range(0, len(key_list), self.max_batch):
                 self.m_store.put(key_list[i:i + self.max_batch], addr_list[i:i + self.max_batch], size_list[i:i + self.max_batch])
@@ -364,7 +352,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         wait_for_save, req_metas, layer_id = data
 
         if wait_for_save is not None:
-            is_finish = self.layer_save_finished_events[wait_for_save].wait(timeout=3)  # try---cache
+            is_finish = self.layer_save_finished_events[wait_for_save].wait(timeout=5)  # try---cache
             if not is_finish:
                 logger.info(f"Layerwise {wait_for_save} save failed")
             # if self.tp_rank == 0:

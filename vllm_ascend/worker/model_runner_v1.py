@@ -2497,9 +2497,14 @@ class NPUModelRunner(GPUModelRunner):
                                 dsa_k_cache_tensor,
                                 alignment)[:dsa_k_cache_size]
                     # 12 25
-                    REUSE = 3
-                    reuse_kvcache_layers = [REUSE + i for i in range(24)]
-
+                    # REUSE = 3
+                    # reuse_kvcache_layers = [REUSE + i for i in range(24)]
+                    REUSE = 20
+                    reuse_kvcache_layers = [REUSE + i for i in range(11, 30)]
+                    # REUSE = 30
+                    # reuse_kvcache_layers = [REUSE + i for i in range(61 - REUSE)]
+                    # REUSE = 20
+                    # reuse_kvcache_layers = [REUSE + i for i in range(10, 61 - REUSE)]
                     # REUSE = 13
                     # reuse_kvcache_layers = [REUSE + i for i in range(REUSE)]
                     # reuse_kvcache_layers = [25]
