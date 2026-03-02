@@ -2497,10 +2497,10 @@ class NPUModelRunner(GPUModelRunner):
                                 dsa_k_cache_tensor,
                                 alignment)[:dsa_k_cache_size]
                     # 12 25
-                    # REUSE = 3
-                    # reuse_kvcache_layers = [REUSE + i for i in range(24)]
-                    REUSE = 20
-                    reuse_kvcache_layers = [REUSE + i for i in range(11, 30)]
+                    REUSE = 3
+                    reuse_kvcache_layers = [REUSE + i for i in range(24)]
+                    # REUSE = 20
+                    # reuse_kvcache_layers = [REUSE + i for i in range(11, 30)]
                     # REUSE = 30
                     # reuse_kvcache_layers = [REUSE + i for i in range(61 - REUSE)]
                     # REUSE = 20
@@ -2508,7 +2508,7 @@ class NPUModelRunner(GPUModelRunner):
                     # REUSE = 13
                     # reuse_kvcache_layers = [REUSE + i for i in range(REUSE)]
                     # reuse_kvcache_layers = [25]
-                    enable_kvcache_offload = True
+                    enable_kvcache_offload = False
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the kvcache between the self_attn specs in the same group
                         if ("attn" in layer_name_inner

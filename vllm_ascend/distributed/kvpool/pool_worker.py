@@ -158,13 +158,13 @@ class KVPoolWorker:
 
 
         # TODO 记录每个请求当前decode数量，可以使用这个decode标识每个last block,之前的block 是否有必要删除？
-        # self.seq_last_block_id = {}
-        # self.num_reuse_layers = 3   # TODO 当作参数，配置方法？
+        self.seq_last_block_id = {}
+        self.num_reuse_layers = 3   # TODO 当作参数，配置方法？
         # self.num_reuse_layers = 30   # TODO 当作参数，配置方法？
-        # self.layer_next_map = {i:i+self.num_reuse_layers for i in range(self.num_layers - self.num_reuse_layers)}
-        # self.independent_layers = []    # TODO 不是必要的
-        # self.offload_start_ids = [i for i in range(self.num_reuse_layers)]
-        # self.layers_need_to_save = [i for i in range(self.num_layers) if i not in self.independent_layers ]
+        self.layer_next_map = {i:i+self.num_reuse_layers for i in range(self.num_layers - self.num_reuse_layers)}
+        self.independent_layers = []    # TODO 不是必要的
+        self.offload_start_ids = [i for i in range(self.num_reuse_layers)]
+        self.layers_need_to_save = [i for i in range(self.num_layers) if i not in self.independent_layers ]
 
         self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
 
@@ -228,6 +228,7 @@ class KVPoolWorker:
                         lengths.append(region_len)
         self.m_store.register_buffer(ptrs, lengths)
         self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
+        logger.info(f"=================> block len {self.block_len}")
         self.token_database.set_block_len(self.block_len)
 
         if self.use_layerwise:
@@ -330,14 +331,19 @@ class KVPoolWorker:
             #         logger.info(f"Layerwise {self.current_layer} load failed")
 
     def wait_for_layer_load(self) -> None:
+        return
         # if self.tp_rank == 0:
         #     logger.info(f"=====================> wait_for_layer_load {self.current_layer}")
-        if self.current_layer in self.independent_layers:
-            return
-        is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=5)  #try---cache
-        if not is_finish:
-            logger.info(f"Layerwise {self.current_layer} load failed")
-        self.layer_load_finished_events[self.current_layer].clear()
+
+
+        # if self.current_layer in self.independent_layers:
+        #     return
+        # is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=5)  #try---cache
+        # if not is_finish:
+        #     logger.info(f"Layerwise {self.current_layer} load failed")
+        # self.layer_load_finished_events[self.current_layer].clear()
+
+
         # if self.tp_rank == 0:
         #     logger.info(f"======================> clear {self.current_layer} layer_load_finished_events")
 
@@ -366,13 +372,13 @@ class KVPoolWorker:
         else:
             self.sync_save_events[self.current_layer].record()
             self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
-            is_finish = self.layer_save_finished_events[self.current_layer].wait(timeout=5)  # try---cache
-            if not is_finish:
-                logger.info(f"Layerwise {self.current_layer} save failed")
-            self.layer_save_finished_events[self.current_layer].clear()
-            # Clear save events for tail layers—no downstream layers exist to reset them.
-            for i in range(self.num_reuse_layers - 1, 0, -1):
-                self.layer_save_finished_events[self.current_layer - i].clear()
+            # is_finish = self.layer_save_finished_events[self.current_layer].wait(timeout=5)  # try---cache
+            # if not is_finish:
+            #     logger.info(f"Layerwise {self.current_layer} save failed")
+            # self.layer_save_finished_events[self.current_layer].clear()
+            # # Clear save events for tail layers—no downstream layers exist to reset them.
+            # for i in range(self.num_reuse_layers - 1, 0, -1):
+            #     self.layer_save_finished_events[self.current_layer - i].clear()
 
         self.current_layer = self.current_layer + 1
 
@@ -411,8 +417,8 @@ class KVPoolWorker:
         starts, ends, keys = [], [], []
         # Process tokens only once, building both 'starts', 'ends', and 'keys' in one loop
         for start, end, key in self.token_database.process_tokens(
-                token_len, request.block_hashes, req_id=f"{request.req_id}_"
-                                                        f"{self.seq_last_block_id[request.req_id]}"):
+                token_len, request.block_hashes, req_id=f"{request.req_id}"):
+                                                        # f"_{self.seq_last_block_id[request.req_id]}"):
             keys_multi_layer = key.split_layers(self.num_layers)
             starts.append(start)
             ends.append(end)
@@ -425,12 +431,14 @@ class KVPoolWorker:
                     continue
                 # save
                 can_save = request.can_save
+                req_meta_save = None
+                req_meta_load = None
                 if can_save is not None and can_save:
-                    req_meta = LasyerMultiBlockReqMeta(
+                    req_meta_save = LasyerMultiBlockReqMeta(
                         request.req_id, keys_multi_chunk, starts, ends,
                         request.block_ids, layer_id, request.is_last_chunk
                     )
-                    self.layer_save_tasks[layer_id].append(req_meta)
+                    # req_meta_save.key_gva_mapping = request.key_gva_mapping
 
                 # load
                 load_spec = request.load_spec
@@ -438,31 +446,62 @@ class KVPoolWorker:
                     # TODO 这里要判断需要加载的长度，使用load_spec里computed tokens而不能用序列长度，不然不支持chunked prefill。
                     # TODO prefix cache的时候也不可以加载这个，chunk prefill的时候也不需要加载
                     if (token_len - 1) % self.block_size == 0:
-                        req_meta = LasyerMultiBlockReqMeta(
+                        req_meta_load = LasyerMultiBlockReqMeta(
                             request.req_id, keys_multi_chunk[:-1], starts[:-1], ends[:-1],
                             request.block_ids, layer_id
                         )
                     else:
-                        req_meta = LasyerMultiBlockReqMeta(
-                            request.req_id, keys_multi_chunk[:-1] +
-                                            [PoolKey(self.metadata,
-                                                     f"{request.req_id}_"
-                                                     f"{self.seq_last_block_id[request.req_id] - 1}"
+                        unfull_key = PoolKey(self.metadata,
+                                                     f"{request.req_id}"
+                                                     # f"_{self.seq_last_block_id[request.req_id] - 1}"
                                                      f"_lastblock"
-                                                     ).split_layers(self.num_layers)[layer_id]], starts, ends,
+                                                     ).split_layers(self.num_layers)[layer_id]
+                        req_meta_load = LasyerMultiBlockReqMeta(
+                            request.req_id, keys_multi_chunk[:-1] +
+                                            [unfull_key.split_layers(self.num_layers)[layer_id]], starts, ends,
                             request.block_ids, layer_id
                         )
-                    self.layer_load_tasks[layer_id].append(req_meta)
-
-            # Create the mask for this layer
-            # ret_mask = torch.zeros(token_len, dtype=torch.bool, device="cpu")
-
-            # Set the mask based on starts and ends in the current layer
-            # for start, end in zip(starts, ends):
-            #     ret_mask[start:end] = True
-            # retrieved_tokens = torch.sum(ret_mask)
-            # logger.debug(f"Retrieved {retrieved_tokens} out of {token_len} tokens")
-            # Add layer loading task to the queue for retrieval
+                    # req_meta_load.key_gva_mapping = request.key_gva_mapping
+                # logger.info(f"==============> request.key_gva_mapping {request.key_gva_mapping}")
+                if req_meta_save is not None:
+                    keys_str = []
+                    gvas = []
+                    addr_list = []
+                    size_list = []
+                    for key in req_meta_save.keys:
+                        keys_str.append(key.to_string())
+                    for index, key in enumerate(keys_str):
+                        addr, size = self.token_database.prepare_value_layer(
+                            starts[index], ends[index], request.block_ids, layer_id)
+                        gvas.append(request.key_gva_mapping[key])
+                        gvas.append(request.key_gva_mapping[key] + self.token_database.block_len[0])
+                        addr_list.extend(addr)
+                        size_list.extend(size)
+                    req_meta_save.keys_str = copy.deepcopy(keys_str)
+                    req_meta_save.gvas = copy.deepcopy(gvas)
+                    req_meta_save.addr_list = copy.deepcopy(addr_list)
+                    req_meta_save.size_list = copy.deepcopy(size_list)
+                    self.layer_save_tasks[layer_id].append(req_meta_save)
+                if req_meta_load is not None:
+                    keys_str = []
+                    gvas = []
+                    addr_list = []
+                    size_list = []
+                    for key in req_meta_load.keys:
+                        keys_str.append(key.to_string())
+                    for index, key in enumerate(keys_str):
+                        addr, size = self.token_database.prepare_value_layer(
+                            starts[index], ends[index], request.block_ids, layer_id)
+                        gvas.append(request.key_gva_mapping[key])
+                        gvas.append(request.key_gva_mapping[key] + self.token_database.block_len[0])
+                        addr_list.extend(addr)
+                        size_list.extend(size)
+                    # logger.info(f"==============> keys_str {keys_str}   gvas {gvas}    addr_list {addr_list}")
+                    req_meta_load.keys_str = copy.deepcopy(keys_str)
+                    req_meta_load.gvas = copy.deepcopy(gvas)
+                    req_meta_load.addr_list = copy.deepcopy(addr_list)
+                    req_meta_load.size_list = copy.deepcopy(size_list)
+                    self.layer_load_tasks[layer_id].append(req_meta_load)
 
 
     def get_finished(self,

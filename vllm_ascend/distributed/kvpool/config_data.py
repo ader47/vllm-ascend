@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union, Dict, Any
 
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import \
@@ -243,8 +243,10 @@ class RequestTracker:
     #        preemption
     allocated_block_ids: list[int]
 
-    # The number of tokens that has been savd
+    # The number of tokens that has been saved
     num_saved_tokens: int = 0
+
+    key_gva_mapping: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def from_new_request(
@@ -303,6 +305,8 @@ class ReqMeta:
     block_ids: list[int]
 
     block_hashes: list[BlockHash]
+    # TODO int 类型好像会导致溢出
+    key_gva_mapping: Dict[str, Any] = None
 
     can_save: Optional[bool] = None
     # load_spec
@@ -368,11 +372,13 @@ class ReqMeta:
         logger.debug(
             f"request:{tracker.req_id}, meta save spec:{not skip_save}, meta load spec:{load_spec}"
         )
-        # logger.info(f"====================> num_tokens_to_save 2{num_tokens_to_save}")
+        # logger.info(f"====================> tracker.key_gva_mapping {tracker.key_gva_mapping}")
+        from copy import deepcopy
         return ReqMeta(
             req_id=tracker.req_id,
             token_len_chunk=num_tokens_to_save,
             block_ids=tracker.allocated_block_ids,
+            key_gva_mapping=deepcopy(tracker.key_gva_mapping),
             can_save=not skip_save,
             load_spec=load_spec,
             block_hashes=block_hashes,

@@ -1,3 +1,4 @@
+from copy import deepcopy
 from typing import Any, Optional
 
 import vllm.envs as envs
@@ -12,14 +13,14 @@ from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackEncoder
-
+from memcache_hybrid import DistributedObjectStore
 from vllm_ascend.distributed.kvpool.config_data import (
     AscendConnectorMetadata, LoadSpec, ReqMeta, RequestTracker)
 
 
 class KVPoolScheduler:
 
-    def __init__(self, vllm_config: "VllmConfig", use_layerwise):
+    def __init__(self, vllm_config: "VllmConfig", use_layerwise, page_size_bytes: int):
         self.use_layerwise = use_layerwise
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.consumer_is_to_load = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
@@ -51,6 +52,59 @@ class KVPoolScheduler:
                 "discard_partial_chunks", not self.kv_offload))
         self._unfinished_requests: dict[str, tuple[Request, list[int]]] = {}
         self._unfinished_request_ids: set[str] = set()
+        self.page_size_bytes = page_size_bytes
+        self.store_scheduler = DistributedObjectStore()
+        self.store_scheduler.init(device_id=0, init_bm=False)
+        self.use_mla = False
+        model_config = vllm_config.model_config
+        if (hasattr(model_config, "use_mla")
+                and isinstance(model_config.use_mla, bool)
+                and model_config.use_mla):
+            self.use_mla = True
+
+        # TODO 这里只需要申请，不需要读取，这里各种并行是不存在的，这里需要对并行size进行循环，访问每一个并行
+        self.tp_size = 16
+        self.pp_size = 1
+        self.pcp_size = 1
+        self.dcp_size = 1
+        if self.use_mla:
+            self.num_kv_head = 1
+        else:
+            self.num_kv_head = model_config.get_total_num_kv_heads()
+        if self.num_kv_head < self.tp_size:
+            self.put_step = self.tp_size // self.num_kv_head
+        else:
+            self.put_step = 1
+        self.num_layers = 61
+        self.model_name = model_config.model.split('/')[-1]
+
+    def generate_keys(self, chunk_hashes, req_id=''):
+        # TODO 应该要维护一个key和地址的映射关系，在写入的时候可以直接写
+        # TODO 先不考虑prefix cache，每次用完后都直接释放，后面淘汰可以根据
+        # TODO 现在alloc的时候，如果是以及存在的key是否会返回现有的地址，还是会重新生成一个新的地址？
+        keys = []
+        for layer_id in range(self.num_layers):
+            for pcp_rank in range(self.pcp_size):
+                for dcp_rank in range(self.dcp_size):
+                    for head_or_tp_rank in range(self.tp_size // self.put_step):
+                        # head_or_tp_rank = tp_rank // self.put_step
+                        for chunk_hash in chunk_hashes:
+                            keys.append(
+                                f"{self.model_name}"
+                                f"@pcp{pcp_rank}@dcp{dcp_rank}"
+                                f"@head_or_tp_rank:{head_or_tp_rank}"
+                                f"@{chunk_hash.hex()}@{layer_id}"
+                            )
+                        # TODO 需要生成最后一个unfull block的key用于申请地址。
+                        if req_id != '':
+                            hash = f"{req_id}_lastblock"
+                            keys.append(
+                                f"{self.model_name}"
+                                f"@pcp{pcp_rank}@dcp{dcp_rank}"
+                                f"@head_or_tp_rank:{head_or_tp_rank}"
+                                f"@{hash}@{layer_id}"
+                            )
+        return keys
 
 
     def get_num_new_matched_tokens(
@@ -180,6 +234,16 @@ class KVPoolScheduler:
                                          request.prompt_token_ids))
             request_tuple = self._unfinished_requests.get(request.req_id)
             request_real = request_tuple[0]  # type: ignore[index]
+
+            # TODO 要在这里形成所有的key以及size，并提前申请好空间，并记录好地址
+            # TODO 在host存储的时候，一个key中存储k 和 v 的时候，是连续存储的吗？ 每个key要申请两个空间，一个存放k一个存v。
+            # TODO 这里要考虑怎么动态获取地址大小，这里是ds v3的地址大小。
+            block_keys = self.generate_keys(request_real.block_hashes, req_id=request.req_id)
+            gvas = self.store_scheduler.batch_alloc(block_keys,
+                                                    [self.page_size_bytes for i in range(len(block_keys))])
+            key_gva_mapping = dict(zip(block_keys, gvas))
+            request_tracker.key_gva_mapping = deepcopy(key_gva_mapping)
+            # logger.info(f"=====================> key_gva_mapping {key_gva_mapping}")
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_size,
@@ -206,7 +270,6 @@ class KVPoolScheduler:
                     new_token_ids = request.all_token_ids[
                         num_current_tokens:num_current_tokens + num_new_tokens]
                     request_tracker.token_len += len(new_token_ids)
-                    # logger.info(f"===============> request_tracker.token_len previous {num_current_tokens}, num_scheduled_tokens[req_id] {num_new_tokens}, len(new_token_ids) {len(new_token_ids)}")
                 else:
                     raise ValueError(
                         f"Request {req_id} is not in _unfinished_requests, "
@@ -215,9 +278,13 @@ class KVPoolScheduler:
                 if not new_block_ids and not self.kv_offload:
                     continue
                 if new_block_ids:
+                    block_keys = self.generate_keys(request.block_hashes[-len(new_block_ids):])
+                    gvas = self.store_scheduler.batch_alloc(block_keys,
+                                                            [self.page_size_bytes for i in range(len(block_keys))])
+                    key_gva_mapping = dict(zip(block_keys, gvas))
+                    request_tracker.key_gva_mapping.update(key_gva_mapping)
                     request_tracker.update(new_block_ids)
-                # print(f"=========> cached_reqs.num_computed_tokens[i] {cached_reqs.num_computed_tokens[i]}")
-                # print(f"=========> token_len {request_tracker.token_len}")
+
                 last_chunk_tokens_num = ((len(request.prompt_token_ids) //
                                           self._block_size * self._block_size)
                                          if self._discard_partial_chunks else

@@ -117,14 +117,11 @@ class NPUWorker(WorkerBase):
 
         # binding cpu
         if get_ascend_config().enable_cpu_binding:
-            try:
-                bind_cpus(self.local_rank, ratio=1.0)
-            except RuntimeError as e:
-                logger.error(f"{e} in {self.local_rank}")
-            except ValueError as e:
-                logger.error(f"{e} in {self.local_rank}")
-            except Exception:
-                logger.info("Skip binding cpu.")
+        #     # 640
+        #     # 8 cards 2 Die
+        #     #  80 core
+        #     # tasset -c 630-629
+            bind_cpus(self.local_rank, ratio=0.1)
 
         if self.cache_config.cache_dtype == "auto":
             self.cache_dtype = self.model_config.dtype
@@ -518,7 +515,8 @@ class NPUWorker(WorkerBase):
                     torch_npu.profiler.ProfilerActivity.CPU,
                     torch_npu.profiler.ProfilerActivity.NPU,
                 ],
-                with_stack=envs_vllm.VLLM_TORCH_PROFILER_WITH_STACK,
+                # with_stack=envs_vllm.VLLM_TORCH_PROFILER_WITH_STACK,
+                with_stack=False,
                 profile_memory=envs_vllm.\
                     VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY,
                 with_modules=False,

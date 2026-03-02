@@ -236,7 +236,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         self.set_finished_request(req_id)
         self.request_queue.task_done()
 
-
 class KVCacheStoreLayerSendingThread(KVTransferThread):
 
     def __init__(self, m_store: Backend, token_database: ChunkedTokenDatabase,
@@ -270,6 +269,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         layer_id = req_metas[0].layer_id
         key_list_remove = []
         cur_req_ids = set()
+        gvas = []
         for req_meta in req_metas:
             cur_req_ids.add(req_meta.req_id)
             starts = req_meta.starts
@@ -279,48 +279,66 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             total_block = len(keys)
             is_last_chunk = req_meta.is_last_chunk
             if not self.dcp_size > 1:
-                starts = starts[self.tp_rank % self.put_step::self.put_step]
-                ends = ends[self.tp_rank % self.put_step::self.put_step]
-                keys = keys[self.tp_rank % self.put_step::self.put_step]
+                gvas_i = req_meta.gvas[self.tp_rank % self.put_step::self.put_step]
+                keys_str = req_meta.keys_str[self.tp_rank % self.put_step::self.put_step]
+                addr_list_i = req_meta.addr_list[self.tp_rank % self.put_step::self.put_step]
+                size_list_i = req_meta.size_list[self.tp_rank % self.put_step::self.put_step]
             # TODO there maybe has some problem when only have one block.
             if not keys:
                 if is_last_chunk:
                     self.set_finished_request(req_meta.req_id)
                 continue
-            keys_str = []
-            for key in keys:
-                keys_str.append(key.to_string())
-            # print(f"save look for repeat block {key_list}")
+            # keys_str = []
+            # for key in keys:
+            #     keys_str.append(key.to_string())
+            # if 'last' not in keys_str[-1]:
+            #     continue
+            # logger.info(f"===================> keys_str {keys_str}   =================> addr_list_i {addr_list_i}====================> size_list_i {size_list_i} ======================> gvas_i{gvas_i}")
             skip_block_num = self.lookup(keys_str)
             # TODO check this
             if skip_block_num == len(keys_str):
                 if is_last_chunk and layer_id == self.final_layer_id:
                     self.set_finished_request(req_meta.req_id)
                 continue
-            starts = starts[skip_block_num:]
-            ends = ends[skip_block_num:]
-            key_list.extend(keys_str[skip_block_num:])
 
-            for index, key in enumerate(keys_str[skip_block_num:]):
-                addr, size = self.token_database.prepare_value_layer(
-                    starts[index], ends[index], req_meta.block_ids, layer_id)
-                addr_list.append(addr)
-                size_list.append(size)
+            gvas.extend(gvas_i)
+            addr_list.extend(addr_list_i)
+            size_list.extend(size_list_i)
+
+
+            # starts = starts[skip_block_num:]
+            # ends = ends[skip_block_num:]
+            # key_list.extend(keys_str[skip_block_num:])
+
+            # TODO 这里主要就是需要得到每一层，每个块的头地址
+            # for index, key in enumerate(keys_str[skip_block_num:]):
+            #     addr, size = self.token_database.prepare_value_layer(
+            #         starts[index], ends[index], req_meta.block_ids, layer_id)
+            #     # addr_list.append(addr)
+            #     # size_list.append(size)
+            #
+            #     gvas.append(req_meta.key_gva_mapping[key])
+            #     gvas.append(req_meta.key_gva_mapping[key] + self.token_database.block_len[0])
+            #     addr_list.extend(addr)
+            #     size_list.extend(size)
+
             if layer_id == self.final_layer_id and is_last_chunk:
                 self.set_finished_request(req_meta.req_id)
-
-        # missing_reqs = list(self.req_ids - cur_req_ids)
-        # for end_reqs in missing_reqs:
-        #     self.set_finished_request(end_reqs)
-        # self.req_ids = cur_req_ids
 
         self.sync_save_events[layer_id].synchronize()
 
         if len(key_list) > 0:
-            for i in range(0, len(key_list), self.max_batch):
-                self.m_store.put(key_list[i:i + self.max_batch], addr_list[i:i + self.max_batch], size_list[i:i + self.max_batch])
+            # for i in range(0, len(key_list), self.max_batch):
+            #     self.m_store.put(key_list[i:i + self.max_batch], addr_list[i:i + self.max_batch],
+            #                      size_list[i:i + self.max_batch])
 
-        assert not self.layer_save_finished_events[layer_id].is_set(), f"thread: {layer_id} save failed "
+            res = self.m_store.store.batch_copy(gvas, addr_list, size_list, 0)
+            # if res!=0:
+            #     print(f"send failed {res}")
+            assert res == 0, "send failed"
+
+        # TODO unwait
+        # assert not self.layer_save_finished_events[layer_id].is_set(), f"thread: {layer_id} save failed "
         self.layer_save_finished_events[layer_id].set()
         req_metas.clear()
         self.request_queue.task_done()
@@ -360,7 +378,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self.layer_save_finished_events[wait_for_save].clear()
 
         if len(req_metas) == 0:
-            assert not self.layer_load_finished_events[layer_id].is_set()
+            # TODO unwait
+            # assert not self.layer_load_finished_events[layer_id].is_set()
             # if self.tp_rank == 0:
             #     logger.info(f"======================> set {layer_id} layer_load_finished_events")
             self.layer_load_finished_events[layer_id].set()
@@ -370,14 +389,25 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         size_list = []
         key_list = []
         layer_id = req_metas[0].layer_id
+        gvas = []
+
         for req_meta in req_metas:
-            for index, key in enumerate(req_meta.keys):
-                addr, size = self.token_database.prepare_value_layer(
-                    req_meta.starts[index], req_meta.ends[index],
-                    req_meta.block_ids, req_meta.layer_id)
-                key_list.append(key.to_string())
-                addr_list.append(addr)
-                size_list.append(size)
+            # TODO 优化点：没有必要每次都进行计算，可以存储在CPU当中，这样循环太慢了
+            gvas.extend(req_meta.gvas)
+            addr_list.extend(req_meta.addr_list)
+            size_list.extend(req_meta.size_list)
+            key_list.extend(req_meta.keys_str)
+            # for index, key in enumerate(req_meta.keys):
+            #     addr, size = self.token_database.prepare_value_layer(
+            #         req_meta.starts[index], req_meta.ends[index],
+            #         req_meta.block_ids, req_meta.layer_id)
+            #
+            #     gvas.append(req_meta.key_gva_mapping[key.to_string()])
+            #     gvas.append(req_meta.key_gva_mapping[key.to_string()] + self.token_database.block_len[0])
+            #     key_list.append(key.to_string())
+            #     addr_list.extend(addr)
+            #     size_list.extend(size)
+
         key_list_c = key_list[self.tp_rank %
                               len(key_list):] + key_list[:self.tp_rank %
                                                          len(key_list)]
@@ -388,12 +418,16 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                                 len(size_list):] + size_list[:self.tp_rank %
                                                              len(size_list)]
         if len(key_list_c) > 0:
-            # backend has the limitation of length, max batch size is 512
-            for i in range(0, len(key_list_c), self.max_batch):
-                self.m_store.get(key_list_c[i:i + self.max_batch], addr_list_c[i:i + self.max_batch], size_list_c[i:i + self.max_batch])
-        assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "
-        # if self.tp_rank == 0:
-        #     logger.info(f"======================> set {layer_id} layer_load_finished_events")
+            # for i in range(0, len(key_list_c), self.max_batch):
+            #     self.m_store.get(key_list_c[i:i + self.max_batch], addr_list_c[i:i + self.max_batch],
+            #                      size_list_c[i:i + self.max_batch])
+            res = self.m_store.store.batch_copy(gvas, addr_list_c, size_list_c, 1)
+            # if res!=0:
+                # logger.info(f"send failed {res} gvas {gvas} key {key_list_c} addr_list_c {addr_list_c} size_list_c {size_list_c} ")
+                # print(f"recv failed {res}")
+            assert res == 0, "recv failed"
+
+        # assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "
         self.layer_load_finished_events[layer_id].set()
         req_metas.clear()
         self.request_queue.task_done()
