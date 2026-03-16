@@ -364,7 +364,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         wait_for_save, req_metas, layer_id = data
 
         if wait_for_save is not None:
-            is_finish = self.layer_save_finished_events[wait_for_save].wait(timeout=3)  # try---cache
+            is_finish = self.layer_save_finished_events[wait_for_save].wait(timeout=10)  # try---cache
             if not is_finish:
                 logger.info(f"Layerwise {wait_for_save} save failed")
             # if self.tp_rank == 0:

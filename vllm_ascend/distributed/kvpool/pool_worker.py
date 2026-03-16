@@ -151,8 +151,9 @@ class KVPoolWorker:
 
         # TODO 记录每个请求当前decode数量，可以使用这个decode标识每个last block,之前的block 是否有必要删除？
         self.seq_last_block_id = {}
-        self.num_reuse_layers = 3   # TODO 当作参数，配置方法？
-        self.num_reuse_layers = 30   # TODO 当作参数，配置方法？
+        import os
+        self.num_reuse_layers = int(os.environ.get("NUM_REUSE_LAYERS"))   # TODO 当作参数，配置方法？
+        # self.num_reuse_layers = 30   # TODO 当作参数，配置方法？
         self.layer_next_map = {i:i+self.num_reuse_layers for i in range(self.num_layers - self.num_reuse_layers)}
         self.independent_layers = []    # TODO 不是必要的
         self.offload_start_ids = [i for i in range(self.num_reuse_layers)]
@@ -420,16 +421,16 @@ class KVPoolWorker:
                 # load
                 load_spec = request.load_spec
                 if load_spec is not None and load_spec.can_load:  # load =0
-                    # TODO 这里要判断需要加载的长度，使用load_spec里computed tokens而不能用序列长度，不然不支持chunked prefill。
-                    # TODO prefix cache的时候也不可以加载这个，chunk prefill的时候也不需要加载
-                    if (token_len - 1) % self.block_size == 0:
+                    token_len = load_spec.kvpool_cached_tokens
+                    num_saved_blocks = token_len // self.block_size
+                    if token_len % self.block_size == 0:
                         req_meta = LasyerMultiBlockReqMeta(
-                            request.req_id, keys_multi_chunk[:-1], starts[:-1], ends[:-1],
+                            request.req_id, keys_multi_chunk[:num_saved_blocks], starts[:num_saved_blocks], ends[:num_saved_blocks],
                             request.block_ids, layer_id
                         )
                     else:
                         req_meta = LasyerMultiBlockReqMeta(
-                            request.req_id, keys_multi_chunk[:-1] +
+                            request.req_id, keys_multi_chunk[:num_saved_blocks] +
                                             [PoolKey(self.metadata,
                                                      f"{request.req_id}_"
                                                      f"{self.seq_last_block_id[request.req_id] - 1}"
