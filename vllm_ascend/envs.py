@@ -132,6 +132,8 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING":
     lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", '0'))),
+    "NUM_TRANSFER_TASKS":
+    lambda: int(os.getenv("NUM_TRANSFER_TASKS", '256')),
 }
 
 # end-env-vars-definition

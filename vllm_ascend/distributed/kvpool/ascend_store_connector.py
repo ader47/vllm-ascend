@@ -20,7 +20,6 @@ from vllm_ascend.distributed.kvpool.pool_scheduler import (
     KVPoolScheduler, get_zmq_rpc_path_lookup)
 from vllm_ascend.distributed.kvpool.pool_worker import KVPoolWorker
 
-
 class AscendStoreConnector(KVConnectorBase_V1):
 
     def __init__(self,
@@ -127,7 +126,8 @@ class AscendStoreConnector(KVConnectorBase_V1):
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             return
-        self.connector_worker.save_kv_layer(self._get_connector_metadata())
+        if self.has_connector_metadata():
+            self.connector_worker.save_kv_layer(self._get_connector_metadata())
 
     def wait_for_save(self):
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:

@@ -120,7 +120,7 @@ else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
 import torch_npu
-
+import acl
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
 
@@ -1504,7 +1504,14 @@ class NPUModelRunner(GPUModelRunner):
                     total_num_scheduled_tokens,
                     model_instance=self.model):
                 self.maybe_setup_kv_connector(scheduler_output)
-
+                # TODO bind AIV
+                # acl.rt.set_device(get_tp_group().rank_in_group)
+                # ret = acl.rt.set_stream_res_limit(0, 1, 40)
+                # assert ret == 0
+                # ret = acl.rt.set_stream_res_limit(0, 0, 20)
+                # assert ret == 0
+                # ret = acl.rt.use_stream_res_in_current_thread(0)
+                # assert ret == 0
                 hidden_states = self._generate_process_reqs_hidden_states(
                     maybe_padded_num_tokens, input_ids, positions,
                     intermediate_tensors, inputs_embeds)
@@ -2081,6 +2088,7 @@ class NPUModelRunner(GPUModelRunner):
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
         # has num_tokens in total.
+        logger.info(f"===============> num_tokens: {num_tokens}, self.scheduler_config.max_num_batched_tokens {self.scheduler_config.max_num_batched_tokens}")
         assert num_tokens <= self.scheduler_config.max_num_batched_tokens
         max_num_reqs = self.max_num_reqs
         if uniform_decode:
@@ -2366,7 +2374,6 @@ class NPUModelRunner(GPUModelRunner):
         # Change the memory buffer to the desired shape
         kv_caches = self._reshape_kv_cache_tensors(kv_cache_config,
                                                    kv_cache_raw_tensors)
-
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items(
         ):
@@ -2579,7 +2586,6 @@ class NPUModelRunner(GPUModelRunner):
                     assert raw_v_tensor is not None
                     assert sum_page_size_bytes % kv_cache_spec.page_size_bytes == 0
                     num_blocks = sum_page_size_bytes // kv_cache_spec.page_size_bytes
-
                     # `num_blocks` is the number of blocks the model runner can use.
                     # `kv_cache_config.num_blocks` is the number of blocks that
                     # KVCacheManager may allocate.

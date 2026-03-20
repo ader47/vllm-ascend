@@ -1,4 +1,5 @@
 import math
+import os
 import threading
 from typing import Dict, Generator, Optional, Type
 
@@ -64,6 +65,7 @@ class KVPoolWorker:
         ) if self.dcp_size > 1 else 0
 
         self.kv_role = vllm_config.kv_transfer_config.kv_role
+
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "load_async", False)
         self.consumer_is_to_put = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
@@ -182,7 +184,7 @@ class KVPoolWorker:
 
         # Add cache index for efficient cleanup by req_id
         self.cache_by_req_id = collections.defaultdict(set)  # Maps req_id to set of cache keys
-
+        logger.info(f"=======================> int(os.environ.get('NUM_TRANSFER_TASKS')) {int(os.environ.get('NUM_TRANSFER_TASKS'))}")
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
         first_kv_cache = first_kv_cache_tuple[0]
@@ -357,29 +359,29 @@ class KVPoolWorker:
         # addr_list = []
         # size_list = []
         # key_list = []
-        # # gvas = []
+        # gvas = []
         #
         # for req_meta in req_metas:
         #     # TODO 优化点：没有必要每次都进行计算，可以存储在CPU当中，这样循环太慢了
-        #     # gvas.extend(req_meta.gvas)
-        #     # addr_list.extend(req_meta.addr_list)
-        #     # size_list.extend(req_meta.size_list)
-        #     key_list.extend(req_meta.keys_str)
+        #     gvas.extend(req_meta.gvas)
         #     addr_list.extend(req_meta.addr_list)
         #     size_list.extend(req_meta.size_list)
-        # key_list_c = key_list[self.tp_rank %
-        #                       len(key_list):] + key_list[:self.tp_rank %
-        #                                                  len(key_list)]
+        #     # key_list.extend(req_meta.keys_str)
+        #     # addr_list.extend(req_meta.addr_list)
+        #     # size_list.extend(req_meta.size_list)
+        # # key_list_c = key_list[self.tp_rank %
+        # #                       len(key_list):] + key_list[:self.tp_rank %
+        # #                                                  len(key_list)]
         # addr_list_c = addr_list[self.tp_rank %
         #                         len(addr_list):] + addr_list[:self.tp_rank %
         #                                                       len(addr_list)]
         # size_list_c = size_list[self.tp_rank %
         #                         len(size_list):] + size_list[:self.tp_rank %
         #                                                       len(size_list)]
-        # self.m_store.get(key_list_c, addr_list_c, size_list_c)
+        # # self.m_store.get(key_list_c, addr_list_c, size_list_c)
         #
-        # # res = self.m_store.store.batch_copy(gvas, addr_list_c, size_list_c, 1)
-        # # assert res == 0, "recv failed"
+        # res = self.m_store.store.batch_copy(gvas, addr_list_c, size_list_c, 1)
+        # assert res == 0, "recv failed"
         #
         # req_metas.clear()
         # if self.tp_rank == 0:
@@ -410,13 +412,13 @@ class KVPoolWorker:
         # size_list = []
         # layer_id = req_metas[0].layer_id
         # cur_req_ids = set()
-        # # gvas = []
+        # gvas = []
         # for req_meta in req_metas:
         #     cur_req_ids.add(req_meta.req_id)
         #     keys = req_meta.keys
         #     is_last_chunk = req_meta.is_last_chunk
         #     if not self.dcp_size > 1:
-        #         # gvas_i = req_meta.gvas[self.tp_rank % self.put_step::self.put_step]
+        #         gvas_i = req_meta.gvas[self.tp_rank % self.put_step::self.put_step]
         #         addr_list_i = req_meta.addr_list[self.tp_rank % self.put_step::self.put_step]
         #         size_list_i = req_meta.size_list[self.tp_rank % self.put_step::self.put_step]
         #         keys_str = req_meta.keys_str[self.tp_rank % self.put_step::self.put_step]
@@ -426,25 +428,25 @@ class KVPoolWorker:
         #             self.set_finished_request(req_meta.req_id)
         #         continue
         #
-        #     # gvas.extend(gvas_i)
-        #     # addr_list.extend(addr_list_i)
-        #     # size_list.extend(size_list_i)
+        #     gvas.extend(gvas_i)
+        #     addr_list.extend(addr_list_i)
+        #     size_list.extend(size_list_i)
         #
-        #     skip_block_num = self.lookup1(keys_str)
+        #     # skip_block_num = self.lookup1(keys_str)
         #     # TODO check this
         #     # if skip_block_num == len(keys_str):
         #     #     if is_last_chunk and layer_id == self.final_layer_id:
         #     #         self.set_finished_request(req_meta.req_id)
         #     #     continue
-        #     key_list.extend(keys_str[skip_block_num:])
-        #     addr_list.extend(addr_list_i[skip_block_num:])
-        #     size_list.extend(size_list_i[skip_block_num:])
+        #     # key_list.extend(keys_str[skip_block_num:])
+        #     # addr_list.extend(addr_list_i[skip_block_num:])
+        #     # size_list.extend(size_list_i[skip_block_num:])
         #
         # self.sync_save_events[layer_id].synchronize()
         # if len(key_list) > 0:
-        #     self.m_store.put(key_list, addr_list, size_list)
+        #     # self.m_store.put(key_list, addr_list, size_list)
         #
-        #     # res = self.m_store.store.batch_copy(gvas, addr_list, size_list, 0)
+        #     res = self.m_store.store.batch_copy(gvas, addr_list, size_list, 0)
         #     # assert res == 0, "send failed"
         #
         # req_metas.clear()
@@ -465,11 +467,11 @@ class KVPoolWorker:
             # 2. start load, for prefill layer_load_tasks is None, skip load in the recv thread.
             # 3. set layer_load_finished_events (both prefill & decode)
             # if self.current_layer < self.num_layers - self.num_reuse_layers:
-            if self.current_layer in self.layer_next_map.keys():
-                # logger.info(f"=====================> save_kv_layer {self.current_layer} and load {self.layer_next_map[self.current_layer]}")
-                self.kv_recv_thread.add_request(
-                    (self.current_layer, self.layer_load_tasks[self.layer_next_map[self.current_layer]],
-                     self.layer_next_map[self.current_layer]))
+            # if self.current_layer in self.layer_next_map.keys():
+            #     # logger.info(f"=====================> save_kv_layer {self.current_layer} and load {self.layer_next_map[self.current_layer]}")
+            #     self.kv_recv_thread.add_request(
+            #         (self.current_layer, self.layer_load_tasks[self.layer_next_map[self.current_layer]],
+            #          self.layer_next_map[self.current_layer]))
         else:
             self.sync_save_events[self.current_layer].record()
             self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
@@ -537,27 +539,76 @@ class KVPoolWorker:
         """
         # Preallocate lists with known size
         keys_count = len(req_meta.keys)
-        keys_str = [None] * keys_count
-        gvas = []  # This list is currently empty but maintained for compatibility
-        addr_list = [None] * keys_count
-        size_list = [None] * keys_count
-
-        # Generate keys_str
+        keys_str = []
+        # # gvas = []  # This list is currently empty but maintained for compatibility
+        # addr_list = []
+        # size_list = []
+        #
+        # # Generate addr_list and size_list
+        # # TODO 缓存起来
         for i in range(keys_count):
-            keys_str[i] = req_meta.keys[i].to_string()
-
-        # Generate addr_list and size_list
-        for i in range(keys_count):
-            addr, size = self.token_database.prepare_value_layer(
-                starts[i], ends[i], request.block_ids, layer_id)
-            addr_list[i] = addr
-            size_list[i] = size
-
-        # Avoid deepcopy when possible - use direct assignment since we're creating new lists
+            keys_str.append(req_meta.keys[i].to_string())
+        #     addr, size = self.token_database.prepare_value_layer(
+        #         starts[i], ends[i], request.block_ids, layer_id)
+        #     addr_list.extend(addr)
+        #     size_list.extend(size)
+        #     # gvas.append(request.key_gva_mapping[keys_str[i]])
+        #     # gvas.append(request.key_gva_mapping[keys_str[i]] + self.block_len[0])
+        #
+        # # Avoid deepcopy when possible - use direct assignment since we're creating new lists
         req_meta.keys_str = keys_str
-        req_meta.gvas = gvas
-        req_meta.addr_list = addr_list
-        req_meta.size_list = size_list
+        # # req_meta.gvas = gvas
+        # req_meta.addr_list = addr_list
+        # req_meta.size_list = size_list
+        # req_meta.host_base_addr = request.host_base_addr
+        all_blocks = 512
+        # with num_transfer_tasks_lock:
+        #     global NUM_TRANSFER_TASKS
+        num_transfer_tasks = int(os.environ.get('NUM_TRANSFER_TASKS'))
+        # logger.info(f"num_transfer_tasks: {num_transfer_tasks}")
+        # logger.info(f"req_id : {request.req_id}")
+        # num_transfer_tasks = os.getenv('NUM_TRANSFER_TASKS')
+        # assert num_transfer_tasks is None, "num_transfer_tasks cannot be None"
+        #
+        # # num_transfer_tasks = 512
+        blocks_per_task = all_blocks // num_transfer_tasks
+
+        k_gvas = [request.host_base_addr + i * blocks_per_task * self.token_database.block_len[0]
+                  for i in range(num_transfer_tasks)]
+        v_gvas = [k_gvas[-1] + self.token_database.block_len[0] + i * blocks_per_task * self.token_database.block_len[1]
+                  for i in range(num_transfer_tasks)]
+        gvas = k_gvas + v_gvas
+
+        # k_gvas1 = [request.host_base_addr1 + i * blocks_per_task * self.token_database.block_len[0]
+        #           for i in range(num_transfer_tasks)]
+        # v_gvas1 = [k_gvas1[-1] + self.token_database.block_len[0] + i * blocks_per_task * self.token_database.block_len[1]
+        #           for i in range(num_transfer_tasks)]
+        # gvas1 = k_gvas1 + v_gvas1
+
+
+        npu_base_addr_0 =  self.token_database.kv_caches_base_addr[0] + 512 * self.token_database.block_len[0]
+        npu_base_addr_1 =  self.token_database.kv_caches_base_addr[1] + 512 * self.token_database.block_len[1]
+        k_addrs = [npu_base_addr_0 + i * blocks_per_task * self.token_database.block_len[0]
+                   for i in range(num_transfer_tasks)]
+        v_addrs = [npu_base_addr_1 + i * blocks_per_task * self.token_database.block_len[1]
+                   for i in range(num_transfer_tasks)]
+        addrs = k_addrs + v_addrs
+
+        k_sizes = [blocks_per_task * self.token_database.block_len[0] - 1 for _ in range(num_transfer_tasks)]
+        v_sizes = [blocks_per_task * self.token_database.block_len[1] - 1 for _ in range(num_transfer_tasks)]
+        sizes = k_sizes + v_sizes
+
+        req_meta.gvas = gvas[self.tp_rank %
+                              len(gvas):] + gvas[:self.tp_rank %
+                                                         len(gvas)]
+        # req_meta.gvas1 = gvas1
+        req_meta.addr_list = addrs[self.tp_rank %
+                              len(addrs):] + addrs[:self.tp_rank %
+                                                         len(addrs)]
+        req_meta.size_list = sizes[self.tp_rank %
+                              len(sizes):] + sizes[:self.tp_rank %
+                                                         len(sizes)]
+
 
     def _get_load_spec_cache_key(self, load_spec):
         """
@@ -703,6 +754,7 @@ class KVPoolWorker:
         if not keys:
             return
         # Only process further if keys are present
+        # TODO 要缓存这里计算之后的key，性能会更好
         keys = [list(row) for row in zip(*keys)]
 
         for layer_id, keys_multi_chunk in enumerate(keys):
@@ -738,6 +790,7 @@ class KVPoolWorker:
 
             if req_meta_save is not None:
                 self._prepare_req_meta_data(req_meta_save, starts, ends, request, layer_id)
+                # if len(self.layer_save_tasks[layer_id]) == 0:
                 self.layer_save_tasks[layer_id].append(req_meta_save)
 
             if req_meta_load is not None:
@@ -746,21 +799,23 @@ class KVPoolWorker:
                 load_starts = starts[:-1] if (token_len - 1) % self.block_size == 0 else starts
                 load_ends = ends[:-1] if (token_len - 1) % self.block_size == 0 else ends
                 self._prepare_req_meta_data(req_meta_load, load_starts, load_ends, request, layer_id)
-                self.layer_load_tasks[layer_id].append(req_meta_load)
+                if len(self.layer_load_tasks[layer_id]) == 0:
+                    self.layer_load_tasks[layer_id].append(req_meta_load)
 
     def get_finished(self,
                      finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
-        done_sending = (
-            self.kv_send_thread.get_and_clear_finished_requests(
-                # type: ignore[union-attr]
-            ) if self.kv_role in ['kv_producer', 'kv_both']
-                 or self.consumer_is_to_put else set())
-
-        done_recving = (
-            self.kv_recv_thread.
-            get_and_clear_finished_requests(  # type: ignore[union-attr]
-            ) if self.load_async else set())
-
+        # done_sending = (
+        #     self.kv_send_thread.get_and_clear_finished_requests(
+        #         # type: ignore[union-attr]
+        #     ) if self.kv_role in ['kv_producer', 'kv_both']
+        #          or self.consumer_is_to_put else set())
+        #
+        # done_recving = (
+        #     self.kv_recv_thread.
+        #     get_and_clear_finished_requests(  # type: ignore[union-attr]
+        #     ) if self.load_async else set())
+        done_sending = finished_req_ids
+        done_recving = finished_req_ids
         logger.debug(
             "Number of completed KV cache send requests: %d, receive "
             "requests: %d, tp_rank:%d", len(done_sending), len(done_recving),

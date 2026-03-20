@@ -53,8 +53,13 @@ class KVPoolScheduler:
         self._unfinished_requests: dict[str, tuple[Request, list[int]]] = {}
         self._unfinished_request_ids: set[str] = set()
         self.page_size_bytes = page_size_bytes
-        self.store_scheduler = DistributedObjectStore()
-        self.store_scheduler.init(device_id=0, init_bm=False)
+        logger.info(f"==============> page_size_bytes {page_size_bytes}")
+        use_memfabric = True
+        if use_memfabric:
+            self.store_scheduler = DistributedObjectStore()
+            self.store_scheduler.init(device_id=0, init_bm=False)
+        else:
+            self.store_scheduler = None
         self.use_mla = False
         model_config = vllm_config.model_config
         if (hasattr(model_config, "use_mla")
@@ -77,6 +82,7 @@ class KVPoolScheduler:
             self.put_step = 1
         self.num_layers = 61
         self.model_name = model_config.model.split('/')[-1]
+        self.host_base_addr = None
 
     def generate_keys(self, chunk_hashes, req_id=''):
         # TODO 应该要维护一个key和地址的映射关系，在写入的时候可以直接写
@@ -234,16 +240,19 @@ class KVPoolScheduler:
                                          request.prompt_token_ids))
             request_tuple = self._unfinished_requests.get(request.req_id)
             request_real = request_tuple[0]  # type: ignore[index]
-
-            # TODO 要在这里形成所有的key以及size，并提前申请好空间，并记录好地址
-            # TODO 在host存储的时候，一个key中存储k 和 v 的时候，是连续存储的吗？ 每个key要申请两个空间，一个存放k一个存v。
-            # TODO 这里要考虑怎么动态获取地址大小，这里是ds v3的地址大小。
+            # TODO 这里要将keys按照层组织，可以按层方位到指定层所有的keys。
             block_keys = self.generate_keys(request_real.block_hashes, req_id=request.req_id)
-            gvas = self.store_scheduler.batch_alloc(block_keys,
-                                                    [self.page_size_bytes for i in range(len(block_keys))])
+            if self.store_scheduler is not None:
+                gvas = self.store_scheduler.batch_alloc(block_keys,
+                                                        [self.page_size_bytes for i in range(len(block_keys))])
+            else:
+                gvas = [None] * len(block_keys)
             key_gva_mapping = dict(zip(block_keys, gvas))
-            request_tracker.key_gva_mapping = deepcopy(key_gva_mapping)
+            request_tracker.key_gva_mapping = key_gva_mapping
             # logger.info(f"=====================> key_gva_mapping {key_gva_mapping}")
+            if self.host_base_addr is None:
+                self.host_base_addr = self.store_scheduler.batch_alloc(["host_base_addr"], [self.page_size_bytes * 512])[0]
+                self.host_base_addr1 = self.store_scheduler.batch_alloc(["host_base_addr1"], [self.page_size_bytes * 512])[0]
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_size,
@@ -255,6 +264,8 @@ class KVPoolScheduler:
                 discard_partial_chunks=self._discard_partial_chunks,
             )
             if req_meta is not None:
+                req_meta.host_base_addr = self.host_base_addr
+                req_meta.host_base_addr1 = self.host_base_addr1
                 meta.add_request(req_meta)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -279,8 +290,11 @@ class KVPoolScheduler:
                     continue
                 if new_block_ids:
                     block_keys = self.generate_keys(request.block_hashes[-len(new_block_ids):])
-                    gvas = self.store_scheduler.batch_alloc(block_keys,
-                                                            [self.page_size_bytes for i in range(len(block_keys))])
+                    if self.store_scheduler is not None:
+                        gvas = self.store_scheduler.batch_alloc(block_keys,
+                                                                [self.page_size_bytes for i in range(len(block_keys))])
+                    else:
+                        gvas = [None] * len(block_keys)
                     key_gva_mapping = dict(zip(block_keys, gvas))
                     request_tracker.key_gva_mapping.update(key_gva_mapping)
                     request_tracker.update(new_block_ids)
@@ -307,6 +321,7 @@ class KVPoolScheduler:
                     discard_partial_chunks=self._discard_partial_chunks,
                 )
                 if req_meta is not None:
+                    req_meta.host_base_addr = self.host_base_addr
                     meta.add_request(req_meta)
 
         request_ids = [
@@ -341,6 +356,7 @@ class KVPoolScheduler:
                     discard_partial_chunks=self._discard_partial_chunks,
                 )
                 if req_meta is not None:
+                    req_meta.host_base_addr = self.host_base_addr
                     meta.add_request(req_meta)
         return meta
 

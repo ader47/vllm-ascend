@@ -20,7 +20,7 @@ from vllm.logger import logger
 from vllm.platforms import current_platform
 
 from vllm_ascend.attention.utils import using_paged_attention
-
+from vllm_ascend.attention.utils import wait_for_kv_layer_from_connector, maybe_save_kv_layer_to_connector
 from ..utils import weak_ref_tensors
 
 
@@ -394,6 +394,9 @@ def update_mla_attn_params(update_stream, forward_context, runtime_shape,
             torch.npu.graph_task_update_end(update_stream)
 
             event.record(update_stream)
+
+            wait_for_kv_layer_from_connector('')
+            maybe_save_kv_layer_to_connector('',[])
 
 
 def update_attn_dcp_pcp_params(update_stream, forward_context, runtime_shape):

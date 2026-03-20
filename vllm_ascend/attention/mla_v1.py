@@ -1243,7 +1243,6 @@ class AscendMLAImpl(MLAAttentionImpl):
             graph_params = get_graph_params()
         if forward_context.capturing:
             stream = torch_npu.npu.current_stream()
-
             event = torch.npu.ExternalEvent()
             event.wait(stream)
             event.reset(stream)
@@ -1494,7 +1493,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         o_proj_input = torch.empty(o_proj_input_shape,
                                    dtype=hidden_states.dtype,
                                    device=hidden_states.device)
-
+        # logger.info(f"============> forward!!!")
         # MLA Preprocess
         if self.enable_mlapo and not has_prefill:
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(

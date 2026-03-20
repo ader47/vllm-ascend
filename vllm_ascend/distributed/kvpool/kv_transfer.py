@@ -1,5 +1,7 @@
+import os
 import queue
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List
@@ -263,87 +265,75 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             self, req_metas: List[LasyerMultiBlockReqMeta]):
         if len(req_metas) == 0:
             return
-        key_list = []
-        addr_list = []
-        size_list = []
+        # key_list = []
+        # addr_list = []
+        # size_list = []
         layer_id = req_metas[0].layer_id
-        key_list_remove = []
+        # key_list_remove = []
         cur_req_ids = set()
-        gvas = []
+        # gvas = []
         for req_meta in req_metas:
             cur_req_ids.add(req_meta.req_id)
-            starts = req_meta.starts
-            ends = req_meta.ends
+            # starts = req_meta.starts
+            # ends = req_meta.ends
             keys = req_meta.keys
-            current_event = req_meta.current_event
-            total_block = len(keys)
+            # current_event = req_meta.current_event
+            # total_block = len(keys)
             is_last_chunk = req_meta.is_last_chunk
-            if not self.dcp_size > 1:
-                gvas_i = req_meta.gvas[self.tp_rank % self.put_step::self.put_step]
-                keys_str = req_meta.keys_str[self.tp_rank % self.put_step::self.put_step]
-                addr_list_i = req_meta.addr_list[self.tp_rank % self.put_step::self.put_step]
-                size_list_i = req_meta.size_list[self.tp_rank % self.put_step::self.put_step]
-            # TODO there maybe has some problem when only have one block.
+            # if not self.dcp_size > 1:
+                # gvas_i = req_meta.gvas[self.tp_rank % self.put_step::self.put_step]
+                # keys_str = req_meta.keys_str[self.tp_rank % self.put_step::self.put_step]
+                # addr_list_i = req_meta.addr_list[self.tp_rank % self.put_step::self.put_step]
+                # size_list_i = req_meta.size_list[self.tp_rank % self.put_step::self.put_step]
+        #     # TODO there maybe has some problem when only have one block.
             if not keys:
                 if is_last_chunk:
                     self.set_finished_request(req_meta.req_id)
                 continue
-            # keys_str = []
-            # for key in keys:
-            #     keys_str.append(key.to_string())
-            # if 'last' not in keys_str[-1]:
-            #     continue
-            # logger.info(f"===================> keys_str {keys_str}   =================> addr_list_i {addr_list_i}====================> size_list_i {size_list_i} ======================> gvas_i{gvas_i}")
-            skip_block_num = self.lookup(keys_str)
-            # TODO check this
-            if skip_block_num == len(keys_str):
-                if is_last_chunk and layer_id == self.final_layer_id:
-                    self.set_finished_request(req_meta.req_id)
-                continue
+        #     # keys_str = []
+        #     # for key in keys:
+        #     #     keys_str.append(key.to_string())
+        #     # if 'last' not in keys_str[-1]:
+        #     #     continue
+        #     # logger.info(f"===================> keys_str {keys_str}   =================> addr_list_i {addr_list_i}====================> size_list_i {size_list_i} ======================> gvas_i{gvas_i}")
+        #     # skip_block_num = self.lookup(keys_str)
+        #     # # TODO check this
+        #     if skip_block_num == len(keys_str):
+        #         if is_last_chunk and layer_id == self.final_layer_id:
+        #             self.set_finished_request(req_meta.req_id)
+        #         continue
 
-            gvas.extend(gvas_i)
-            addr_list.extend(addr_list_i)
-            size_list.extend(size_list_i)
-
-
-            # starts = starts[skip_block_num:]
-            # ends = ends[skip_block_num:]
-            # key_list.extend(keys_str[skip_block_num:])
-
-            # TODO 这里主要就是需要得到每一层，每个块的头地址
-            # for index, key in enumerate(keys_str[skip_block_num:]):
-            #     addr, size = self.token_database.prepare_value_layer(
-            #         starts[index], ends[index], req_meta.block_ids, layer_id)
-            #     # addr_list.append(addr)
-            #     # size_list.append(size)
-            #
-            #     gvas.append(req_meta.key_gva_mapping[key])
-            #     gvas.append(req_meta.key_gva_mapping[key] + self.token_database.block_len[0])
-            #     addr_list.extend(addr)
-            #     size_list.extend(size)
-
+        #     gvas.extend(gvas_i)
+        #     addr_list.extend(addr_list_i)
+        #     size_list.extend(size_list_i)
+        #
+        #     # key_list.extend(keys_str[skip_block_num:])
+        #     # size_list.extend(size_list_i[skip_block_num:])
+        #     # addr_list.extend(addr_list_i[skip_block_num:])
+        #
             if layer_id == self.final_layer_id and is_last_chunk:
                 self.set_finished_request(req_meta.req_id)
 
-        self.sync_save_events[layer_id].synchronize()
+        # self.sync_save_events[layer_id].synchronize()
 
-        if len(key_list) > 0:
+        # if len(key_list) > 0:
             # for i in range(0, len(key_list), self.max_batch):
             #     self.m_store.put(key_list[i:i + self.max_batch], addr_list[i:i + self.max_batch],
             #                      size_list[i:i + self.max_batch])
 
-            res = self.m_store.store.batch_copy(gvas, addr_list, size_list, 0)
-            # if res!=0:
-            #     print(f"send failed {res}")
-            assert res == 0, "send failed"
+            # res = self.m_store.store.batch_copy(gvas, addr_list, size_list, 0)
+            # if res != 0:
+            #     logger.info(
+            #         f"send failed {res} gvas {gvas} addr_list {addr_list} size_list {size_list} key_list {key_list}")
 
         # TODO unwait
-        # assert not self.layer_save_finished_events[layer_id].is_set(), f"thread: {layer_id} save failed "
+        # assert not self.layer_save_finished_events                [layer_id].is_set(), f"thread: {layer_id} save failed "
         self.layer_save_finished_events[layer_id].set()
         req_metas.clear()
         self.request_queue.task_done()
 
 
+MODULE_TRANSFER_SEMAPHORE = threading.Semaphore(1)  # 最多2个线程同时传输
 
 
 class KVCacheStoreLayerRecvingThread(KVTransferThread):
@@ -360,10 +350,30 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                          name="KVCacheStoreLayerRecvingThread")
         self.layer_load_finished_events = layer_load_finished_events
         self.layer_save_finished_events = layer_save_finished_events
-
+        # from vllm.distributed.parallel_state import get_tp_group
+        # self.tp_group = get_tp_group()
+        self.kv_cache = torch.tensor([512,128,512]).to(f"npu:{self.tp_rank}")
+        self.count = 0
     def add_request(  # type: ignore[override]
             self, req_metas: List[LasyerMultiBlockReqMeta]) -> torch.Tensor:
         self.request_queue.put(req_metas)
+
+    def run(self):
+        """Run the thread to handle KV cache transfer requests."""
+        self.m_store.set_device()
+        self.ready_event.set()
+        while True:
+            # try:
+            request_data = self.request_queue.get()
+            if request_data is None:
+                logger.warning("Received a None request!")
+                self.request_queue.task_done()
+                continue
+            self._handle_request(request_data)
+            # TODO 不删除，让数据传输一直存在
+            self.request_queue.put(request_data)
+
+            time.sleep(0.001)
 
     def _handle_request(  # type: ignore[override]
             self, data: List[LasyerMultiBlockReqMeta]):
@@ -390,14 +400,21 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         key_list = []
         layer_id = req_metas[0].layer_id
         gvas = []
+        # gvas1 = []
 
-        for req_meta in req_metas:
-            # TODO 优化点：没有必要每次都进行计算，可以存储在CPU当中，这样循环太慢了
-            gvas.extend(req_meta.gvas)
-            addr_list.extend(req_meta.addr_list)
-            size_list.extend(req_meta.size_list)
-            key_list.extend(req_meta.keys_str)
-            # for index, key in enumerate(req_meta.keys):
+        # for req_meta in req_metas:
+        # #     # TODO 优化点：没有必要每次都进行计算，可以存储在CPU当中，这样循环太慢了
+        #     gvas.extend(req_meta.gvas)
+        #     # gvas1.extend(req_meta.gvas1)
+        #     addr_list.extend(req_meta.addr_list)
+        #     size_list.extend(req_meta.size_list)
+        #     key_list.extend(req_meta.keys_str)
+        #     for i in range(1):
+        #         addr_list.append(req_meta.addr_list[i*2:i*2+2])
+        #         size_list.append(req_meta.size_list[i*2:i*2+2])
+        #         key_list.append(req_meta.keys_str[i]+f'@TP{self.tp_rank}@count{self.count}')
+        # self.count += 1
+        #     # for index, key in enumerate(req_meta.keys):
             #     addr, size = self.token_database.prepare_value_layer(
             #         req_meta.starts[index], req_meta.ends[index],
             #         req_meta.block_ids, req_meta.layer_id)
@@ -408,26 +425,51 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             #     addr_list.extend(addr)
             #     size_list.extend(size)
 
-        key_list_c = key_list[self.tp_rank %
-                              len(key_list):] + key_list[:self.tp_rank %
-                                                         len(key_list)]
-        addr_list_c = addr_list[self.tp_rank %
-                                len(addr_list):] + addr_list[:self.tp_rank %
-                                                             len(addr_list)]
-        size_list_c = size_list[self.tp_rank %
-                                len(size_list):] + size_list[:self.tp_rank %
-                                                             len(size_list)]
-        if len(key_list_c) > 0:
-            # for i in range(0, len(key_list_c), self.max_batch):
-            #     self.m_store.get(key_list_c[i:i + self.max_batch], addr_list_c[i:i + self.max_batch],
-            #                      size_list_c[i:i + self.max_batch])
-            res = self.m_store.store.batch_copy(gvas, addr_list_c, size_list_c, 1)
-            # if res!=0:
-                # logger.info(f"send failed {res} gvas {gvas} key {key_list_c} addr_list_c {addr_list_c} size_list_c {size_list_c} ")
+        # gvas = gvas[self.tp_rank %
+        #                       len(gvas):] + gvas[:self.tp_rank %
+        #                                                  len(gvas)]
+        # addr_list_c = addr_list[self.tp_rank %
+        #                         len(addr_list):] + addr_list[:self.tp_rank %
+        #                                                      len(addr_list)]
+        # size_list_c = size_list[self.tp_rank %
+        #                         len(size_list):] + size_list[:self.tp_rank %
+        #                                                      len(size_list)]
+        # logger.info(f"=================> num_trasfer = {num_trasfer}")
+        # if len(key_list) > 0:
+        #     # for i in range(0, len(key_list), self.max_batch):
+        #     for i in range(1):
+        #         # logger.info(f"===========> key_list {key_list[:5]}, size_list {size_list[:5]}, addr_list {addr_list[:5]}")
+        #         self.m_store.put(key_list, addr_list, size_list)
+        #         self.m_store.get(key_list, addr_list, size_list)
+                # self.m_store.get(key_list[i:i + self.max_batch], addr_list[i:i + self.max_batch],
+                #                  size_list[i:i + self.max_batch])
+            # 之前在申请的时候，直接申请一个大的block，可以放下所有的block
+            # 然后使用kv_caches_base_addr，这个可以分成k和v，以及host需要是可以放下全部kv 的block，先传输整体的k然后再传输整体的v
+        # logger.info(f"=================> {len(gvas)}")
+        # else:
+        # with MODULE_TRANSFER_SEMAPHORE:
+        # if self.tp_rank in [0]:
+        # if self.tp_rank in [0,2,4,6,8,10,12,14]:
+        # res = self.m_store.store.batch_copy(gvas, addr_list_c, size_list_c, 1)
+        # 顺序执行：确保 TP ranks 一个接一个读取
+        # if self.tp_rank == 0:
+        # res = self.m_store.store.batch_copy(gvas, addr_list_c, size_list_c, 0)
+        # logger.info(f"=================> req_metas[0].gvas {len(req_metas[0].gvas)}")
+        # if self.tp_rank==0:
+        res = self.m_store.store.batch_copy(req_metas[0].gvas, req_metas[0].addr_list, req_metas[0].size_list, 1)
+        assert res == 0, "recv failed"
+        # self.tp_group.broadcast(self.kv_cache, src=0)
+                # for i in range(len(gvas)):
+        #     res = self.m_store.store.batch_copy([gvas[i]], [addr_list_c[i]], [size_list_c[i]], 1)
+        #     time.sleep(0.001)
+        # logger.info(f"transfer {len(gvas)}")
+        #     logger.info(f" {gvas} addr_list_c {addr_list_c} size_list_c {size_list_c} ")
                 # print(f"recv failed {res}")
-            assert res == 0, "recv failed"
+        # assert res == 0, "recv failed"
+        # self.kv_cache.to(f"npu:{self.tp_rank}")
+        # self.kv_cache.to(f"cpu")
 
         # assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "
         self.layer_load_finished_events[layer_id].set()
-        req_metas.clear()
+        # req_metas.clear()
         self.request_queue.task_done()
