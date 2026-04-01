@@ -329,28 +329,35 @@ class ChunkedTokenDatabase:
         token_len: int,
         block_hashes: BlockHashList | list[str],
         mask_num: int = 0,
-        kv_cache_group_id: int = 0,
-        cache_role: str = "kv",
-        cache_family: str | None = None,
+        req_id = 'no_need',
     ) -> Iterable[tuple[int, int, PoolKey]]:
-        """Process the tokens and return the corresponding cache engine keys."""
-        if not block_hashes:
-            return
-        group_block_size = self.get_block_size(kv_cache_group_id)
-        if cache_family is None:
-            cache_family = self.group_cache_families.get(cache_role, {}).get(kv_cache_group_id, "default")
-        cache_family_ratio = max(infer_cache_family_ratio(cache_family), 1)
-        group_block_size *= cache_family_ratio
-        block_hashes = get_block_hashes(
-            block_hashes,
-            group_block_size,
-            self.hash_block_size,
-        )
+        """Process the tokens and return the corresponding cache engine keys.
+
+        :param Union[torch.Tensor, List[int]] tokens: The tokens to process.
+
+        :param Optional[torch.Tensor] mask: The mask for the tokens. Should
+            have the same length as tokens. And the mask should ALWAYS be like
+            FFFFFTTTTTTT, where True means the tokens needs to be matched,
+            and the Falses will ALWAYS be at the PREFIX of the tensor.
+
+        :param bool make_key: Whether to make the cache engine key or not.
+            If False, the hash value will be returned instead.
+
+        :returns: A iterable of tuples with three elements. The first element
+            is the start index of the tokens for the key. The second element
+            is the end index of the tokens for the key. The third element is
+            the cache engine key (or hash) for the tokens.
+
+        :raises: ValueError if the number of Falses in the mask is not a
+            multiple of the chunk size.
+        """
+        if req_id != 'no_need' and token_len % self.block_size != 0:
+            block_hashes.append(f'{req_id}_lastblock')
         if not block_hashes:
             return
         if not isinstance(block_hashes[0], str):
             block_hashes = [
-                h.hex()  # type: ignore[union-attr]
+                h.hex() if not isinstance(h, str) else h   # type: ignore[union-attr]
                 for h in block_hashes
             ]
         start_idx = 0
@@ -358,7 +365,8 @@ class ChunkedTokenDatabase:
             start_idx = chunk_id * group_block_size
             if start_idx >= token_len:
                 break
-            end_idx = min(start_idx + group_block_size, token_len)
+            # end_idx = min(start_idx + self.block_size, token_len)
+            end_idx = start_idx + self.block_size
             if start_idx < mask_num:
                 continue
             else:
