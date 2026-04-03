@@ -221,6 +221,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         enable_c8_quant: bool,
         resharding_stream: torch.npu.Stream,
         callback_func: Callable[..., None] = lambda x: None,
+        layer_transfer_finished_events = None
     ):
         super().__init__(daemon=True, name="KVCacheSendingLayerThread")
         self.engine = engine
@@ -259,6 +260,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.enable_c8_quant = enable_c8_quant
         self.ready_event = ready_event
         self.callback_func = callback_func
+        self.layer_transfer_finished_events = layer_transfer_finished_events
 
     def run(self):
         local_rank = get_world_group().local_rank
@@ -432,6 +434,7 @@ class KVCacheSendingLayerThread(threading.Thread):
 
     def _transfer_kv_cache(self, send_task: SendTask):
         layer_name = send_task.layer_name
+        assert not self.layer_transfer_finished_events[send_task.layer_idx].is_set()
         layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
         key = send_task.k_cache
         value = send_task.v_cache
@@ -491,25 +494,12 @@ class KVCacheSendingLayerThread(threading.Thread):
                     )
                     self.failed_reqs.add(req_id)
                 else:
-                    req_end_time = time.perf_counter()
-                    total_transfer_size = sum(transfer_meta.length) / 1024
-                    req_transfer_elapsed = (req_end_time - req_start_time) * 1000
-                    logger.debug(
-                        "Layer%d KV cache transfer task %dKB to remote_session_id [%s] took %.3f ms.",
-                        send_task.layer_idx,
-                        total_transfer_size,
-                        session_id,
-                        req_transfer_elapsed,
-                    )
-                if send_task.layer_idx == (self.total_layers - 1):
-                    for req_id in transfer_meta.req_ids:
-                        req_meta = send_task.send_request[req_id]
-                        if req_meta.chunk_finish:
-                            if req_id in self.failed_reqs:
-                                self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=False)
-                                self.failed_reqs.discard(req_id)
-                            else:
-                                self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
+                    if send_task.layer_idx == (self.total_layers - 1):
+                        for req_id in transfer_meta.req_ids:
+                            req_meta = send_task.send_request[req_id]
+                            if req_meta.chunk_finish:
+                                self.callback_func(req_id, req_meta, layer_group_idx)
+        self.layer_transfer_finished_events[send_task.layer_idx].set()
 
 
 class KVCacheRecvingLayerThread(threading.Thread):
@@ -686,6 +676,7 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
             self.connector_worker = MooncakeLayerwiseConnectorWorker(vllm_config, kv_cache_config, str(self.engine_id))
+            self.connector_worker.layer_transfer_finished_events = vllm_config.layer_transfer_finished_events
 
     ############################################################
     # Scheduler Side Methods
@@ -1283,6 +1274,7 @@ class MooncakeLayerwiseConnectorWorker:
                 enable_c8_quant=self.enable_c8_quant,
                 resharding_stream=self.resharding_stream,
                 callback_func=self.send_done_send_signal,
+                layer_transfer_finished_events=self.layer_transfer_finished_events
             )
             self.kv_send_layer_thread.start()
             ready_event.wait()
