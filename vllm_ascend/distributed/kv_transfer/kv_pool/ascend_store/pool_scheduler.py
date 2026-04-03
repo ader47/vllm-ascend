@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackEncoder
+from memcache_hybrid import DistributedObjectStore  # type: ignore
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
@@ -36,12 +37,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 
 
 class KVPoolScheduler:
-    def __init__(
-        self,
-        vllm_config: "VllmConfig",
-        use_layerwise,
-        kv_cache_config: KVCacheConfig | None = None,
-    ):
+    def __init__(self, vllm_config: "VllmConfig", use_layerwise, page_size_bytes: int):
         self.use_layerwise = use_layerwise
         self.kv_cache_config = kv_cache_config
         hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
@@ -221,6 +217,57 @@ class KVPoolScheduler:
             for group_id, blocks in enumerate(block_ids)
         ]
         return tuple(clipped) if isinstance(block_ids, tuple) else clipped
+
+        self.page_size_bytes = page_size_bytes
+        logger.info(f"==============> page_size_bytes {page_size_bytes}")
+        use_memfabric = True
+        if use_memfabric:
+            self.store_scheduler = DistributedObjectStore()
+            self.store_scheduler.init(device_id=0, init_bm=False)
+        else:
+            self.store_scheduler = None
+        model_config = vllm_config.model_config
+        # TODO 这里只需要申请，不需要读取，这里各种并行是不存在的，这里需要对并行size进行循环，访问每一个并行
+        self.tp_size = 2
+        self.pp_size = 1
+        self.pcp_size = 1
+        self.dcp_size = 1
+        self.num_kv_head = model_config.get_total_num_kv_heads()
+        if self.num_kv_head < self.tp_size:
+            self.put_step = self.tp_size // self.num_kv_head
+        else:
+            self.put_step = 1
+        self.num_layers = 27
+        self.model_name = model_config.model.split('/')[-1]
+        self.host_base_addr = None
+
+    def generate_keys(self, chunk_hashes, req_id=''):
+        # TODO 应该要维护一个key和地址的映射关系，在写入的时候可以直接写
+        # TODO 先不考虑prefix cache，每次用完后都直接释放，后面淘汰可以根据
+        # TODO 现在alloc的时候，如果是以及存在的key是否会返回现有的地址，还是会重新生成一个新的地址？
+        keys = []
+        for layer_id in range(self.num_layers):
+            for pcp_rank in range(self.pcp_size):
+                for dcp_rank in range(self.dcp_size):
+                    for head_or_tp_rank in range(self.tp_size // self.put_step):
+                        # head_or_tp_rank = tp_rank // self.put_step
+                        for chunk_hash in chunk_hashes:
+                            keys.append(
+                                f"{self.model_name}"
+                                f"@pcp{pcp_rank}@dcp{dcp_rank}"
+                                f"@head_or_tp_rank:{head_or_tp_rank}"
+                                f"@{chunk_hash.hex()}@{layer_id}"
+                            )
+                        # TODO 需要生成最后一个unfull block的key用于申请地址。
+                        if req_id != '':
+                            hash = f"{req_id}_lastblock"
+                            keys.append(
+                                f"{self.model_name}"
+                                f"@pcp{pcp_rank}@dcp{dcp_rank}"
+                                f"@head_or_tp_rank:{head_or_tp_rank}"
+                                f"@{hash}@{layer_id}"
+                            )
+        return keys
 
     def get_num_new_matched_tokens(
         self,
@@ -402,6 +449,15 @@ class KVPoolScheduler:
                 if self._discard_partial_chunks
                 else len(request.prompt_token_ids)
             )
+            # TODO 这里要将keys按照层组织，可以按层方位到指定层所有的keys。
+            block_keys = self.generate_keys(request_real.block_hashes, req_id=request.req_id)
+            if self.store_scheduler is not None:
+                gvas = self.store_scheduler.batch_alloc(block_keys,
+                                                        [self.page_size_bytes for i in range(len(block_keys))])
+            else:
+                gvas = [None] * len(block_keys)
+            key_gva_mapping = dict(zip(block_keys, gvas))
+            request_tracker.key_gva_mapping = key_gva_mapping
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
@@ -415,7 +471,7 @@ class KVPoolScheduler:
                 kv_cache_group_families=self.kv_cache_group_families,
             )
             if req_meta is not None:
-                self.touch_sending_mamba_blocks(req_meta)
+                req_meta.key_gva_mapping = key_gva_mapping
                 meta.add_request(req_meta)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -484,6 +540,14 @@ class KVPoolScheduler:
                     # if num_computed_token >= len(request.prompt_token_ids):
                     #     continue
                     if new_block_ids is not None:
+                        block_keys = self.generate_keys(request.block_hashes[-len(new_block_ids):])
+                        if self.store_scheduler is not None:
+                            gvas = self.store_scheduler.batch_alloc(block_keys,
+                                                                    [self.page_size_bytes for i in range(len(block_keys))])
+                        else:
+                            gvas = [None] * len(block_keys)
+                        key_gva_mapping = dict(zip(block_keys, gvas))
+                        request_tracker.key_gva_mapping.update(key_gva_mapping)
                         request_tracker.update(new_block_ids)
 
                     last_chunk_tokens_num = (
@@ -509,6 +573,7 @@ class KVPoolScheduler:
                         original_block_size=self.original_block_size,
                         kv_cache_group_families=self.kv_cache_group_families,
                     )
+                    req_meta.key_gva_mapping = request_tracker.key_gva_mapping
                 if req_meta is not None:
                     self.touch_sending_mamba_blocks(req_meta)
                     meta.add_request(req_meta)
