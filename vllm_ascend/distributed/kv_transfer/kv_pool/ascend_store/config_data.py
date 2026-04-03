@@ -309,19 +309,45 @@ class ChunkedTokenDatabase:
             size_list.append(size)
         return addr_list, size_list, block_id
 
-    def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
-        group_block_size = self.get_block_size(0)
-        block_id = block_ids[start // group_block_size]
-        addr_list: list[int] = []
-        size_list: list[int] = []
-        group_addrs, group_block_len, group_block_stride = self._get_group_buffers(0)
-        length = len(group_block_len)
-        for i in range(length):
-            addr = self.kv_caches_base_addr[layer_id * length + i] + block_id * self.block_len[i]
+    def prepare_block_info(self, start: int, end: int, block_ids: list[int]) -> tuple[int, list[int]]:
+        block_id = block_ids[start // self.block_size]
+        size_list = []
+        for i in range(len(self.block_len)):
             size = int(self.block_len[i] / self.block_size * (end - start))
-            addr_list.append(addr)
             size_list.append(size)
-        return addr_list, size_list, block_id
+        return block_id, size_list
+
+    def prepare_addr_from_block_id(self, block_id: int, layer_id: int) -> list[int]:
+        length = len(self.block_len)
+        base_offset = layer_id * length
+        return [
+            self.kv_caches_base_addr[base_offset + i] + block_id * self.block_len[i]
+            for i in range(length)
+        ]
+
+    def prepare_addrs_from_block_ids(self, block_ids: list[int], layer_id: int) -> list[int]:
+        length = len(self.block_len)
+        base_offset = layer_id * length
+        return [
+            self.kv_caches_base_addr[base_offset + i] + block_id * self.block_len[i]
+            for block_id in block_ids
+            for i in range(length)
+        ]
+
+    def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
+        block_id = block_ids[start // self.block_size]
+        length = len(self.block_len)
+        base_offset = layer_id * length
+        token_count = end - start
+        addr_list = [
+            self.kv_caches_base_addr[base_offset + i] + block_id * self.block_len[i]
+            for i in range(length)
+        ]
+        size_list = [
+            int(self.block_len[i] / self.block_size * token_count)
+            for i in range(length)
+        ]
+        return addr_list, size_list
 
     def process_tokens(
         self,
@@ -498,31 +524,17 @@ class RequestTracker:
     # NOTE: This field will only be used when you enable kv-event
     token_ids: list[int] | None = None
 
-    def __init__(
-        self,
-        req_id: str,
-        token_len: int,
-        allocated_block_ids_by_group: list[list[int]] | None = None,
-        allocated_block_ids: list[int] | list[list[int]] | None = None,
-        num_saved_tokens: int = 0,
-        token_ids: list[int] | None = None,
-    ) -> None:
-        self.req_id = req_id
-        self.token_len = token_len
-        block_ids = allocated_block_ids_by_group
-        if block_ids is None:
-            block_ids = normalize_block_ids_by_group(allocated_block_ids or [])
-        self.allocated_block_ids_by_group = block_ids
-        self.num_saved_tokens = num_saved_tokens
-        self.token_ids = token_ids
+    key_gva_mapping: dict[str, int | None] | None = None
 
-    @property
-    def allocated_block_ids(self) -> list[int]:
-        return self.allocated_block_ids_by_group[0] if self.allocated_block_ids_by_group else []
+    block_keys_by_layer: list[list[str]] | None = None
 
-    @allocated_block_ids.setter
-    def allocated_block_ids(self, block_ids: list[int] | list[list[int]]) -> None:
-        self.allocated_block_ids_by_group = normalize_block_ids_by_group(block_ids)
+    starts: list[int] | None = None
+    ends: list[int] | None = None
+
+    block_ids_per_chunk: list[int] | None = None
+    sizes_per_chunk: list[list[int]] | None = None
+
+    processed_block_count: int = 0
 
     @staticmethod
     def from_new_request(
@@ -627,6 +639,17 @@ class ReqMeta:
     def block_ids(self, block_ids: list[int] | list[list[int]]) -> None:
         self.block_ids_by_group = normalize_block_ids_by_group(block_ids)
 
+    key_gva_mapping: dict[str, int | None] | None = None
+    block_keys_by_layer: list[list[str]] | None = None
+
+    starts: list[int] | None = None
+    ends: list[int] | None = None
+
+    block_ids_per_chunk: list[int] | None = None
+    sizes_per_chunk: list[list[int]] | None = None
+
+    processed_block_count: int = 0
+
     @staticmethod
     def from_request_tracker(
         tracker: RequestTracker,
@@ -707,7 +730,7 @@ class AscendConnectorMetadata(KVConnectorMetadata):
 @dataclass(init=False)
 class LayerMultiBlockReqMeta:
     req_id: str
-    keys: list[LayerPoolKey]
+    keys: list[str]
     starts: list[int]
     ends: list[int]
     block_ids_by_group: list[list[int]]
@@ -715,68 +738,7 @@ class LayerMultiBlockReqMeta:
     block_hashes: list[Any] = field(default_factory=list)
     is_last_chunk: bool | None = True
     current_event: torch.npu.Event | None = None
-    token_ids: list[int] | None = None
-    original_block_size: list[int] | int | None = None
-    kv_cache_group_id: int = 0
-
-    def __init__(
-        self,
-        req_id: str,
-        keys: list[LayerPoolKey],
-        starts: list[int],
-        ends: list[int],
-        block_ids_by_group: list[list[int]] | None = None,
-        layer_id: int = 0,
-        is_last_chunk: bool | None = True,
-        current_event: torch.npu.Event | None = None,
-        block_ids: list[int] | list[list[int]] | None = None,
-        token_ids: list[int] | None = None,
-        original_block_size: list[int] | int | None = None,
-        block_hashes: list[Any] | None = None,
-        kv_cache_group_id: int = 0,
-    ) -> None:
-        self.req_id = req_id
-        self.keys = keys
-        self.starts = starts
-        self.ends = ends
-        if block_ids_by_group is None:
-            block_ids_by_group = normalize_block_ids_by_group(block_ids or [])
-        self.block_ids_by_group = block_ids_by_group
-        self.layer_id = layer_id
-        self.is_last_chunk = is_last_chunk
-        self.current_event = current_event
-        self.token_ids = token_ids
-        self.original_block_size = original_block_size
-        self.block_hashes = [] if block_hashes is None else block_hashes
-        self.kv_cache_group_id = kv_cache_group_id
-
-    @property
-    def block_ids(self) -> list[int]:
-        return self.block_ids_by_group[0] if self.block_ids_by_group else []
-
-    @block_ids.setter
-    def block_ids(self, block_ids: list[int] | list[list[int]]) -> None:
-        self.block_ids_by_group = normalize_block_ids_by_group(block_ids)
-
-
-@dataclass
-class AscendStoreKVConnectorWorkerMetadata(KVConnectorWorkerMetadata):
-    completed_events: dict[int, int] = field(default_factory=dict)
-    """key: event_id, value: completed worker count"""
-
-    def mark_completed_events(self, event_id: int | None) -> None:
-        if event_id is not None:
-            self.completed_events[event_id] = 1
-
-    def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetadata:
-        assert isinstance(other, AscendStoreKVConnectorWorkerMetadata), (
-            "aggregate worker metadata must be type of AscendStoreKVConnectorWorkerMetadata"
-        )
-
-        merged: dict[int, int] = dict(self.completed_events)
-        for event_id in other.completed_events:
-            if event_id not in merged:
-                merged[event_id] = other.completed_events[event_id]
-            else:
-                merged[event_id] = merged[event_id] + other.completed_events[event_id]
-        return AscendStoreKVConnectorWorkerMetadata(merged)
+    key_gva_mapping: dict[str, int | None] | None = None
+    addr_list: list[int] | None = None
+    size_list: list[int] | None = None
+    gvas_list: list[int] | None = None
