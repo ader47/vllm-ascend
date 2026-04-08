@@ -1675,8 +1675,8 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         decode_preprocess_res = None
         prefill_preprocess_res = None
-        if has_prefill:
-            wait_for_kv_layer_from_connector(layer_name)
+        # if has_prefill:
+        wait_for_kv_layer_from_connector(layer_name)
         # Preprocess for decode tokens
         if self.is_kv_producer and not self.is_kv_both:
             attn_metadata.reshape_cache_event = torch.npu.Event()
@@ -1798,6 +1798,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
 
         del o_proj_input
-        if self.is_kv_producer and not self.is_kv_both:
-            maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+
+        # if has_prefill:
+        maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
         return output_padded
