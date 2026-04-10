@@ -728,9 +728,7 @@ class AscendConnectorMetadata(KVConnectorMetadata):
 class LayerMultiBlockReqMeta:
     req_id: str
     keys: list[str]
-    starts: list[int]
-    ends: list[int]
-    block_ids_by_group: list[list[int]]
+    block_ids: list[int]
     layer_id: int
     block_hashes: list[Any] = field(default_factory=list)
     is_last_chunk: bool | None = True
