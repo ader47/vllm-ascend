@@ -137,7 +137,6 @@ class KVPoolScheduler:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
-        return 0, False
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_load:
             return 0, False
 
@@ -150,7 +149,7 @@ class KVPoolScheduler:
             return 0, False
 
         num_external_hit_tokens = self.client.lookup(token_len, request.block_hashes)
-
+        # logger.info(f">>>>>>>>>>>>>>>>>>>>>>> num_external_hit_tokens {num_external_hit_tokens}")
         if num_external_hit_tokens == request.num_tokens:
             num_external_hit_tokens -= 1
 
@@ -465,6 +464,9 @@ class KVPoolScheduler:
         tracker = self._request_trackers.get(request.request_id)
         if tracker is not None and tracker.num_saved_tokens <= 0:
             return False, None
+        # TODO current not support PREFIX CACHE
+        res = self.store_scheduler.remove_batch(list(tracker.key_gva_mapping.keys()))
+        logger.info(f">>>>>>>>>>>>>>>>>>>> res {res} remove {len(list(tracker.key_gva_mapping.keys()))} keys of request {request.request_id}")
         delay_free_blocks = len(block_ids) > 0
         if delay_free_blocks:
             logger.debug("Delaying free of %d blocks for request %s", len(block_ids), request.request_id)
