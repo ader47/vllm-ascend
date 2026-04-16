@@ -2926,11 +2926,11 @@ class NPUModelRunner(GPUModelRunner):
                         sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
                     assert raw_k_tensor is not None
                     assert raw_v_tensor is not None
-                    logger.info(f">>>>>>>>>>>>>>>>>>>> sum_page_size_bytes {sum_page_size_bytes} , raw_k_tensor.numel() {raw_k_tensor.numel()}, "
-                                f"raw_v_tensor.numel() {raw_v_tensor.numel()}, "
-                                f"raw_dsa_k_tensor.numel() {raw_dsa_k_tensor.numel()}, "
-                                f" current_kv_cache_spec.page_size_bytes {current_kv_cache_spec.page_size_bytes}")
-                    # assert sum_page_size_bytes % current_kv_cache_spec.page_size_bytes == 0
+                    # logger.info(f">>>>>>>>>>>>>>>>>>>> sum_page_size_bytes {sum_page_size_bytes} , raw_k_tensor.numel() {raw_k_tensor.numel()}, "
+                    #             f"raw_v_tensor.numel() {raw_v_tensor.numel()}, "
+                    #             f"raw_dsa_k_tensor.numel() {raw_dsa_k_tensor.numel()}, "
+                    #             f" current_kv_cache_spec.page_size_bytes {current_kv_cache_spec.page_size_bytes}")
+                    assert sum_page_size_bytes % current_kv_cache_spec.page_size_bytes == 0
                     num_blocks = sum_page_size_bytes // current_kv_cache_spec.page_size_bytes
 
                     # `num_blocks` is the number of blocks the model runner can use.
@@ -2940,8 +2940,8 @@ class NPUModelRunner(GPUModelRunner):
                     # different memory capacities, `num_blocks` can be different on
                     # different GPUs, and `kv_cache_config.num_blocks` is set to
                     # the min of all `num_blocks`. Verify it here.
-                    logger.info(f">>>>>>>>>>>>>>>>>>>> kv_cache_config.num_blocks {kv_cache_config.num_blocks}")
-                    logger.info(f">>>>>>>>>>>>>>>>>>>> num_blocks {num_blocks}")
+                    # logger.info(f">>>>>>>>>>>>>>>>>>>> kv_cache_config.num_blocks {kv_cache_config.num_blocks}")
+                    # logger.info(f">>>>>>>>>>>>>>>>>>>> num_blocks {num_blocks}")
                     # num_blocks
                     # assert num_blocks >= kv_cache_config.num_blocks
                     kv_cache_config.num_blocks = num_blocks
