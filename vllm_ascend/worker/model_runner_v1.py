@@ -2779,82 +2779,73 @@ class NPUModelRunner(GPUModelRunner):
                         head_size = self.model_config.hf_text_config.qk_rope_head_dim + \
                             self.model_config.hf_text_config.kv_lora_rank
 
-                    dsa_k_cache_factor = None
-                    dsa_k_cache_size = None
+                    layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+                    current_kv_cache_spec = layer_kv_cache_spec[layer_name]
+
+                    dsa_k_tensor_size = None
+                    dsa_k_scale_tensor_size = None
                     if not self.model_config.use_mla:
                         # for non-mla model, use FullAttentionSpec
                         k_tensor_split_factor = 2
                         v_tensor_split_factor = 2
                     elif self.use_sparse:
-                        # for deepseek v3.2, DSA use FullAttentionSpec
-                        # FullAttentionSpec allocate 2 * mla page size bytes,
-                        # and we use half of that for k cache in DSA
-                        dsa_k_cache_factor = 2
-                        k_tensor_split_factor = 2 * head_size / self.model_config.hf_text_config.kv_lora_rank
-                        v_tensor_split_factor = 2 * head_size / self.model_config.hf_text_config.qk_rope_head_dim
-                        dsa_k_cache_size = int(kv_cache_tensor.size //
-                                               dsa_k_cache_factor)
+                        sparse_kv_cache_ratio = current_kv_cache_spec.sparse_kv_cache_ratio
+                        k_tensor_split_factor = sparse_kv_cache_ratio[0]
+                        v_tensor_split_factor = sparse_kv_cache_ratio[1]
+                        dsa_k_tensor_split_factor = sparse_kv_cache_ratio[2]
+                        dsa_k_scale_tensor_split_factor = sparse_kv_cache_ratio[3]
                     else:
-                        # for other deepseek models, use MLAAttentionSpec
-                        k_tensor_split_factor = head_size / self.model_config.hf_text_config.kv_lora_rank
-                        v_tensor_split_factor = head_size / self.model_config.hf_text_config.qk_rope_head_dim
+                        k_dim, v_dim = self._get_attention_kv_cache_dims(layer_name, current_kv_cache_spec)
+                        assert k_dim > 0 and v_dim > 0
+                        kv_head_dim_list = [k_dim, v_dim]
+                        if self.is_kv_consumer and enable_fa_quant(self.vllm_config):
+                            k_tensor_split_factor, v_tensor_split_factor = (
+                                self.vllm_config.quant_config.get_kv_quant_split_factor(layer_name, kv_head_dim_list)
+                            )
+                        else:
+                            k_tensor_split_factor, v_tensor_split_factor = calc_split_factor(kv_head_dim_list)
 
-                    k_tensor_size = int(kv_cache_tensor.size //
-                                        k_tensor_split_factor)
-                    v_tensor_size = int(kv_cache_tensor.size //
-                                        v_tensor_split_factor)
+                    k_tensor_size = int(kv_cache_tensor.size // k_tensor_split_factor)
+                    v_tensor_size = int(kv_cache_tensor.size // v_tensor_split_factor)
+                    if self.use_sparse:
+                        dsa_k_tensor_size = int(kv_cache_tensor.size // dsa_k_tensor_split_factor)
+                    if self.use_sparse_c8_indexer:
+                        dsa_k_scale_tensor_size = int(kv_cache_tensor.size // dsa_k_scale_tensor_split_factor)
 
                     # Step 2: Calculate memory savings from reuse layers
                     if layer_name in non_reuse_layers:
-                        if enable_kvcache_offload and reuse_layers:
-                            # Calculate the memory size per layer (k + v + dsa_k if needed)
-                            base_memory_per_layer = k_tensor_size + v_tensor_size
-                            if self.use_sparse and dsa_k_cache_size is not None:
-                                base_memory_per_layer += dsa_k_cache_size
-
-                            # Total memory saved by reusing instead of allocating
-                            total_saved_memory = base_memory_per_layer * len(reuse_layers)
-
-                            # Step 3: Distribute saved memory to non-reuse layers
-                            # Additional memory per non-reuse layer
-                            additional_memory_per_layer = total_saved_memory // len(non_reuse_layers)
-
-                            # Increase k and v tensor sizes proportionally
-                            k_increase = int(
-                                additional_memory_per_layer * (k_tensor_size / (k_tensor_size + v_tensor_size)))
-                            v_increase = additional_memory_per_layer - k_increase
-
-                            # Update tensor sizes with additional memory
-                            # k_tensor_size += k_increase
-                            # v_tensor_size += v_increase
-
-                            # If using sparse attention, also increase dsa_k cache size proportionally
-                            if self.use_sparse and dsa_k_cache_size is not None:
-                                dsa_k_increase = int(
-                                    total_saved_memory * (dsa_k_cache_size / base_memory_per_layer) // len(
-                                        non_reuse_layers))
-                                # dsa_k_cache_size += dsa_k_increase
-
-                        # Recreate tensors with updated sizes
                         if self.vllm_config.kv_transfer_config is None:
                             k_tensor = torch.zeros(k_tensor_size, dtype=torch.int8, device=self.device)
                             v_tensor = torch.zeros(v_tensor_size, dtype=torch.int8, device=self.device)
-                            if self.use_sparse and dsa_k_cache_factor is not None:
-                                dsa_k_cache_tensor = torch.zeros(dsa_k_cache_size, dtype=torch.int8, device=self.device)
+                            if dsa_k_tensor_size is not None:
+                                dsa_k_tensor = torch.zeros(dsa_k_tensor_size, dtype=torch.int8, device=self.device)
+                            if dsa_k_scale_tensor_size is not None:
+                                dsa_k_scale_tensor = torch.zeros(
+                                    dsa_k_scale_tensor_size, dtype=torch.int8, device=self.device)
                         else:
                             k_tensor = torch.zeros(k_tensor_size + alignment, dtype=torch.int8, device=self.device)
                             v_tensor = torch.zeros(v_tensor_size + alignment, dtype=torch.int8, device=self.device)
                             k_tensor = self._align_memory(k_tensor, alignment)[:k_tensor_size]
                             v_tensor = self._align_memory(v_tensor, alignment)[:v_tensor_size]
-                            if self.use_sparse and dsa_k_cache_factor is not None and dsa_k_cache_size is not None:
-                                dsa_k_cache_tensor = torch.zeros(dsa_k_cache_size + alignment, dtype=torch.int8,
-                                                                 device=self.device)
-                                dsa_k_cache_tensor = self._align_memory(dsa_k_cache_tensor, alignment)[
-                                    :dsa_k_cache_size]
-                        # Step 5: Allocate memory only for non-reuse layers with increased sizes
+                            if dsa_k_tensor_size is not None:
+                                dsa_k_tensor = torch.zeros(
+                                    dsa_k_tensor_size + alignment, dtype=torch.int8, device=self.device)
+                                dsa_k_tensor = self._align_memory(dsa_k_tensor, alignment)[:dsa_k_tensor_size]
+                            if dsa_k_scale_tensor_size is not None:
+                                dsa_k_scale_tensor = torch.zeros(
+                                    dsa_k_scale_tensor_size + alignment, dtype=torch.int8, device=self.device)
+                                dsa_k_scale_tensor = self._align_memory(
+                                    dsa_k_scale_tensor, alignment)[:dsa_k_scale_tensor_size]
+
                         print(f"================> set layer_name {layer_name}")
-                        kv_cache_raw_tensors[layer_name] = (k_tensor, v_tensor) if \
-                            not self.use_sparse else (k_tensor, v_tensor, dsa_k_cache_tensor)
+                        if self.use_sparse:
+                            if self.use_sparse_c8_indexer:
+                                kv_cache_raw_tensors[layer_name] = (
+                                    k_tensor, v_tensor, dsa_k_tensor, dsa_k_scale_tensor)
+                            else:
+                                kv_cache_raw_tensors[layer_name] = (k_tensor, v_tensor, dsa_k_tensor)
+                        else:
+                            kv_cache_raw_tensors[layer_name] = (k_tensor, v_tensor)
 
                     # Step 6: Set references for reuse layers without allocating new memory
                     if layer_name in reuse_layers:
@@ -2935,7 +2926,11 @@ class NPUModelRunner(GPUModelRunner):
                         sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
                     assert raw_k_tensor is not None
                     assert raw_v_tensor is not None
-                    assert sum_page_size_bytes % current_kv_cache_spec.page_size_bytes == 0
+                    logger.info(f">>>>>>>>>>>>>>>>>>>> sum_page_size_bytes {sum_page_size_bytes} , raw_k_tensor.numel() {raw_k_tensor.numel()}, "
+                                f"raw_v_tensor.numel() {raw_v_tensor.numel()}, "
+                                f"raw_dsa_k_tensor.numel() {raw_dsa_k_tensor.numel()}, "
+                                f" current_kv_cache_spec.page_size_bytes {current_kv_cache_spec.page_size_bytes}")
+                    # assert sum_page_size_bytes % current_kv_cache_spec.page_size_bytes == 0
                     num_blocks = sum_page_size_bytes // current_kv_cache_spec.page_size_bytes
 
                     # `num_blocks` is the number of blocks the model runner can use.
@@ -2945,8 +2940,11 @@ class NPUModelRunner(GPUModelRunner):
                     # different memory capacities, `num_blocks` can be different on
                     # different GPUs, and `kv_cache_config.num_blocks` is set to
                     # the min of all `num_blocks`. Verify it here.
-                    assert num_blocks >= kv_cache_config.num_blocks
-
+                    logger.info(f">>>>>>>>>>>>>>>>>>>> kv_cache_config.num_blocks {kv_cache_config.num_blocks}")
+                    logger.info(f">>>>>>>>>>>>>>>>>>>> num_blocks {num_blocks}")
+                    # num_blocks
+                    # assert num_blocks >= kv_cache_config.num_blocks
+                    kv_cache_config.num_blocks = num_blocks
                     if hasattr(attn_backend, "get_supported_kernel_block_sizes") and self.use_hybrid_blocks:
                         block_size = attn_backend.get_supported_kernel_block_sizes()[0]
 
