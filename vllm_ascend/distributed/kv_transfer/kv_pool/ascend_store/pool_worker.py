@@ -225,11 +225,26 @@ class KVPoolWorker:
         self._request_addr_tracker: dict[str, dict[int, dict]] = {}
 
         import os
-        self.num_reuse_layers = 3   # TODO 当作参数，配置方法？
-        # self.num_reuse_layers = 30   # TODO 当作参数，配置方法？
-        self.layer_next_map = {i:i+self.num_reuse_layers for i in range(self.num_layers - self.num_reuse_layers)}
-        self.independent_layers = []    # TODO 不是必要的
-        self.offload_start_ids = [i for i in range(self.num_reuse_layers)]
+        NUM_SHARED_BUFFERS = 2
+        INDEPENDENT_LAYER_INDICES = {0, self.num_layers - 1}
+        self.independent_layers = list(INDEPENDENT_LAYER_INDICES)
+
+        shared_layer_indices = [i for i in range(self.num_layers)
+                                if i not in INDEPENDENT_LAYER_INDICES]
+        buffer_owner_indices = shared_layer_indices[:NUM_SHARED_BUFFERS]
+        buffer_owner_set = set(buffer_owner_indices)
+
+        self.reuse_mapping = {}
+        for i, layer_idx in enumerate(shared_layer_indices):
+            if layer_idx not in buffer_owner_set:
+                owner_idx = shared_layer_indices[i % NUM_SHARED_BUFFERS]
+                self.reuse_mapping[layer_idx] = owner_idx
+
+        self.layer_next_map = {}
+        for i in range(len(shared_layer_indices) - 1):
+            self.layer_next_map[shared_layer_indices[i]] = shared_layer_indices[i + 1]
+
+        self.offload_start_ids = buffer_owner_indices
         self.layers_need_to_save = [i for i in range(self.num_layers) if i not in self.independent_layers]
         self.sync_save_events = None
 
@@ -259,30 +274,22 @@ class KVPoolWorker:
             first_kv_cache.shape,
         )
 
-        registered_regions: dict[int, tuple[int, int]] = {}
+        self.kv_caches = kv_caches
+        self.kv_caches_base_addr = []
+        ptrs = []
+        lengths = []
+        length = len(self.block_len)
+        registered_addrs = set()
         for cache_or_caches in kv_caches.values():
-            for cache in self._as_cache_tuple(cache_or_caches):
+            for i, cache in enumerate(cache_or_caches, 0):
                 base_addr = cache.data_ptr()
-                _, _, region_len, _ = self._get_cache_block_metadata(cache)
-                if not isinstance(region_len, int):
-                    region_len = 0
-                storage_key = self._get_storage_key(cache)
-                start = base_addr
-                end = base_addr + region_len
-                if storage_key in registered_regions:
-                    old_start, old_end = registered_regions[storage_key]
-                    registered_regions[storage_key] = (min(old_start, start), max(old_end, end))
-                else:
-                    registered_regions[storage_key] = (start, end)
-
-        ptrs = [start for start, _ in registered_regions.values()]
-        lengths = [end - start for start, end in registered_regions.values()]
-
-        if self.kv_cache_config is not None and self.use_hybrid:
-            for group_id, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
-                self._infer_cache_group_metadata(group_id, group_spec.layer_names)
-        else:
-            self._infer_cache_group_metadata(0, list(kv_caches.keys()))
+                if base_addr in registered_addrs:
+                    continue
+                registered_addrs.add(base_addr)
+                region_len = self.num_blocks * self.block_len[i % length]
+                self.kv_caches_base_addr.append(base_addr)
+                ptrs.append(base_addr)
+                lengths.append(region_len)
 
         self.m_store.register_buffer(ptrs, lengths)
         self.token_database.set_group_buffers(
@@ -621,7 +628,7 @@ class KVPoolWorker:
     def process_layer_data(self, request: ReqMeta) -> None:
         # TODO 是否可以在这里对不同线程的key做区分？
         block_keys_by_layer = request.block_keys_by_layer or []
-        last_block_keys_by_layer = request.last_block_keys_by_layer or [[] for _ in range(len(self.num_layers))]
+        last_block_keys_by_layer = request.last_block_keys_by_layer or [[] for _ in range(self.num_layers)]
         num_keys_per_block = self.tp_size // self.put_step * self.pcp_size * self.dcp_size
         for layer_id, (block_keys, last_block_keys) in enumerate(zip(block_keys_by_layer, last_block_keys_by_layer)):
             if layer_id in self.independent_layers:
@@ -636,32 +643,32 @@ class KVPoolWorker:
         self.layer_load_finished_events[self.current_layer].clear()
 
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
-        # skip independent layers
+        if self.current_layer in self.independent_layers:
+            self.current_layer = self.current_layer + 1
+            return
         if len(self.layer_save_tasks[self.current_layer]) == 0:
             self.current_layer = self.current_layer + 1
             return
         # Wait for KV cache saving to complete on the final layer that requires offloading.
         if self.current_layer != self.layers_need_to_save[-1]:
-            # add current layer save task
             self.sync_save_events[self.current_layer].record()
             self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
             # add load task, in both prefill and decode stages
             # 1. wait for save, and clear save event
             # 2. start load, for prefill layer_load_tasks is None, skip load in the recv thread.
             # 3. set layer_load_finished_events (both prefill & decode)
-            if self.current_layer < self.num_layers - self.num_reuse_layers:
+            if self.current_layer in self.layer_next_map:
+                next_layer = self.layer_next_map[self.current_layer]
                 self.kv_recv_thread.add_request(
-                    (self.current_layer, self.layer_load_tasks[self.layer_next_map[self.current_layer]], self.layer_next_map[self.current_layer]))
+                    (self.current_layer, self.layer_load_tasks[next_layer], next_layer))
         else:
             self.sync_save_events[self.current_layer].record()
             self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
-            is_finish = self.layer_save_finished_events[self.current_layer].wait(timeout=10)  # try---cache
+            is_finish = self.layer_save_finished_events[self.current_layer].wait(timeout=10)
             if not is_finish:
                 logger.info(f"Layerwise {self.current_layer} save failed")
-            self.layer_save_finished_events[self.current_layer].clear()
-            # Clear save events for tail layers—no downstream layers exist to reset them.
-            for i in range(self.num_reuse_layers - 1, 0, -1):
-                self.layer_save_finished_events[self.current_layer - i].clear()
+            for layer_id in self.layers_need_to_save:
+                self.layer_save_finished_events[layer_id].clear()
 
         self.current_layer = self.current_layer + 1
 
