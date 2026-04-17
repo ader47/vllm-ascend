@@ -137,6 +137,7 @@ class KVPoolScheduler:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
+        return 0, False
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_load:
             return 0, False
 
