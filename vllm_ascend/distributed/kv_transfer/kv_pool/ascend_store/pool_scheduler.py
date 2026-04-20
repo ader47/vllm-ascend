@@ -99,10 +99,10 @@ class KVPoolScheduler:
             chunk_keys = [
                 f"{self.model_name}@pcp{pcp_rank}@dcp{dcp_rank}"
                 f"@head_or_tp_rank:{head_or_tp_rank}@{chunk_hash.hex()}@{layer_id}"
+                for chunk_hash in chunk_hashes
                 for pcp_rank in range(self.pcp_size)
                 for dcp_rank in range(self.dcp_size)
                 for head_or_tp_rank in range(self.tp_size // self.put_step)
-                for chunk_hash in chunk_hashes
             ]
 
             last_block_keys = []
@@ -466,8 +466,12 @@ class KVPoolScheduler:
         if tracker is not None and tracker.num_saved_tokens <= 0:
             return False, None
         # TODO current not support PREFIX CACHE
-        res = self.store_scheduler.remove_batch(list(tracker.key_gva_mapping.keys()))
-        logger.info(f">>>>>>>>>>>>>>>>>>>> res {res} remove {len(list(tracker.key_gva_mapping.keys()))} keys of request {request.request_id}")
+        # 16384
+        keys_to_remove = list(tracker.key_gva_mapping.keys())
+        res = 0
+        for i in range(0,len(list(keys_to_remove)),16384):
+            res +=sum(self.store_scheduler.remove_batch(keys_to_remove[i:i+16384]))
+        logger.info(f">>>>>>>>>>>>>>>>>>>> res {res} remove keys of request {request.request_id}")
         delay_free_blocks = len(block_ids) > 0
         if delay_free_blocks:
             logger.debug("Delaying free of %d blocks for request %s", len(block_ids), request.request_id)

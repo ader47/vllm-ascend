@@ -94,7 +94,8 @@ class KVPoolWorker:
             self.num_kv_head = 1
         else:
             self.num_kv_head = model_config.get_total_num_kv_heads()
-
+        logger.info(f">>>>>>>>>>>>>>>>>>>>>>>>>>>>>> self.num_kv_head {self.num_kv_head}")
+        # self.num_kv_head 4 qwen3
         if self.num_kv_head < self.tp_size:
             self.put_step = self.tp_size // self.num_kv_head
             self.head_or_tp_rank = self.tp_rank // self.put_step
@@ -213,7 +214,7 @@ class KVPoolWorker:
                 self.kv_caches_base_addr.append(base_addr)
                 ptrs.append(base_addr)
                 lengths.append(region_len)
-
+        logger.info(f">>>>>>>>>>>>>>>>>>>>>> tp rank {self.tp_rank}>>>>>>>>>>>>>>>>>>>self.kv_caches_base_addr {self.kv_caches_base_addr}")
         self.m_store.register_buffer(ptrs, lengths)
         self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
         self.token_database.set_block_len(self.block_len)
@@ -402,7 +403,7 @@ class KVPoolWorker:
         key = last_block_keys[my_key_index]
         last_block_start = num_blocks * self.block_size
         last_block_end = last_block_start + self.block_size
-
+        logger.info(f">>>>>>>>>>>>>> tp rank {self.tp_rank}>>>>>>> key {key} >>>>>>>>> last_block_start {last_block_start} last_block_end {last_block_end}")
         last_block_addr = []
         last_block_size = []
         last_block_gvas = []
@@ -445,6 +446,7 @@ class KVPoolWorker:
         req_meta.addr_list = final_addr_list
         req_meta.size_list = final_size_list
         req_meta.gvas_list = final_gvas_list
+        logger.info(f">>>>>>>>>>>>>>>>>>>>> tp rank {self.tp_rank}>>>>>>>>>>>> final_addr_list {final_addr_list} >>>>>>>>>>>>> final_size_list {final_size_list} ")
         return req_meta
 
     def _process_save_for_layer(
@@ -465,7 +467,7 @@ class KVPoolWorker:
 
         tracker = self._get_or_init_layer_tracker(request.req_id, layer_id)
         num_blocks = request.token_len_chunk // self.block_size
-
+        # TODO 这里的保存的块是不是全部层的？
         has_last_block = request.token_len_chunk % self.block_size != 0
         self._process_chunks_incremental(
             tracker, block_keys, request.block_ids, layer_id,
@@ -498,19 +500,21 @@ class KVPoolWorker:
         my_key_index = (self.pcp_rank * self.dcp_size * (self.tp_size // self.put_step) +
                         self.dcp_rank * (self.tp_size // self.put_step) +
                         self.head_or_tp_rank)
+        logger.info(f">>>>>>>>>>>>>>>>block_keys {block_keys} ")
+        logger.info(f">>>>>>>>>>>>>>>>my_key_index {my_key_index} my_key_index + num_saved_blocks * num_keys_per_block {my_key_index + num_saved_blocks * num_keys_per_block} num_keys_per_block {num_keys_per_block}")
         load_keys = block_keys[my_key_index: my_key_index + num_saved_blocks * num_keys_per_block: num_keys_per_block]
 
         load_tracker_key = f"{request.req_id}_load"
         tracker = self._get_or_init_layer_tracker(request.req_id, layer_id, load_tracker_key)
 
         self._process_chunks_incremental(
-            tracker, load_keys, request.block_ids, layer_id,
+            tracker, block_keys, request.block_ids, layer_id,
             request.key_gva_mapping, num_keys_per_block, num_saved_blocks)
 
         self._process_last_block(
             tracker, last_block_keys if has_load_last_block else [], request.block_ids, layer_id,
             request.key_gva_mapping, num_saved_blocks, has_load_last_block)
-
+        logger.info(f">>>>>>>>>>>>>>>>>>>>> load_keys {load_keys}")
         req_meta = self._build_req_meta(request, load_keys, last_block_keys if request.last_block_keys_by_layer else [], layer_id, tracker)
         self.layer_load_tasks[layer_id].append(req_meta)
 
