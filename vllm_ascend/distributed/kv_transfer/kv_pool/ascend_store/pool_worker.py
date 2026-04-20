@@ -94,7 +94,6 @@ class KVPoolWorker:
             self.num_kv_head = 1
         else:
             self.num_kv_head = model_config.get_total_num_kv_heads()
-        logger.info(f">>>>>>>>>>>>>>>>>>>>>>>>>>>>>> self.num_kv_head {self.num_kv_head}")
         # self.num_kv_head 4 qwen3
         if self.num_kv_head < self.tp_size:
             self.put_step = self.tp_size // self.num_kv_head
@@ -183,16 +182,10 @@ class KVPoolWorker:
         logger.info("num_blocks: %s", self.num_blocks)
         block_rank = 3
         self.block_len = []
-        if self.use_mla or self.use_sparse:
-            for i in range(len(first_kv_cache_tuple)):
-                block_shape = first_kv_cache_tuple[i].shape[-block_rank:]
-                logger.info("block_shape: %s", block_shape)
-                self.block_len.append(first_kv_cache[i].element_size() * math.prod(block_shape))
-        else:
-            # [num_block, block_size, num_head, hidden_dim]
-            block_shape = first_kv_cache.shape[-block_rank:]
+        for i in range(len(first_kv_cache_tuple)):
+            block_shape = first_kv_cache_tuple[i].shape[-block_rank:]
             logger.info("block_shape: %s", block_shape)
-            self.block_len = [first_kv_cache.element_size() * math.prod(block_shape)]
+            self.block_len.append(first_kv_cache_tuple[i].element_size() * math.prod(block_shape))
 
         logger.info(
             "Registering KV_Caches. use_mla: %s, use_sparse: %s, shape %s",
@@ -214,7 +207,6 @@ class KVPoolWorker:
                 self.kv_caches_base_addr.append(base_addr)
                 ptrs.append(base_addr)
                 lengths.append(region_len)
-        logger.info(f">>>>>>>>>>>>>>>>>>>>>> tp rank {self.tp_rank}>>>>>>>>>>>>>>>>>>>self.kv_caches_base_addr {self.kv_caches_base_addr}")
         self.m_store.register_buffer(ptrs, lengths)
         self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
         self.token_database.set_block_len(self.block_len)
@@ -403,7 +395,6 @@ class KVPoolWorker:
         key = last_block_keys[my_key_index]
         last_block_start = num_blocks * self.block_size
         last_block_end = last_block_start + self.block_size
-        logger.info(f">>>>>>>>>>>>>> tp rank {self.tp_rank}>>>>>>> key {key} >>>>>>>>> last_block_start {last_block_start} last_block_end {last_block_end}")
         last_block_addr = []
         last_block_size = []
         last_block_gvas = []
@@ -446,7 +437,6 @@ class KVPoolWorker:
         req_meta.addr_list = final_addr_list
         req_meta.size_list = final_size_list
         req_meta.gvas_list = final_gvas_list
-        logger.info(f">>>>>>>>>>>>>>>>>>>>> tp rank {self.tp_rank}>>>>>>>>>>>> final_addr_list {final_addr_list} >>>>>>>>>>>>> final_size_list {final_size_list} ")
         return req_meta
 
     def _process_save_for_layer(
@@ -500,8 +490,6 @@ class KVPoolWorker:
         my_key_index = (self.pcp_rank * self.dcp_size * (self.tp_size // self.put_step) +
                         self.dcp_rank * (self.tp_size // self.put_step) +
                         self.head_or_tp_rank)
-        logger.info(f">>>>>>>>>>>>>>>>block_keys {block_keys} ")
-        logger.info(f">>>>>>>>>>>>>>>>my_key_index {my_key_index} my_key_index + num_saved_blocks * num_keys_per_block {my_key_index + num_saved_blocks * num_keys_per_block} num_keys_per_block {num_keys_per_block}")
         load_keys = block_keys[my_key_index: my_key_index + num_saved_blocks * num_keys_per_block: num_keys_per_block]
 
         load_tracker_key = f"{request.req_id}_load"
@@ -514,7 +502,6 @@ class KVPoolWorker:
         self._process_last_block(
             tracker, last_block_keys if has_load_last_block else [], request.block_ids, layer_id,
             request.key_gva_mapping, num_saved_blocks, has_load_last_block)
-        logger.info(f">>>>>>>>>>>>>>>>>>>>> load_keys {load_keys}")
         req_meta = self._build_req_meta(request, load_keys, last_block_keys if request.last_block_keys_by_layer else [], layer_id, tracker)
         self.layer_load_tasks[layer_id].append(req_meta)
 
