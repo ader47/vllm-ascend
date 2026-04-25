@@ -1,7 +1,7 @@
-import re
 from typing import Any
 
 import vllm.envs as envs
+from memcache_hybrid import DistributedObjectStore  # type: ignore
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
@@ -16,9 +16,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
-from memcache_hybrid import DistributedObjectStore  # type: ignore
 
-import vllm_ascend.envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
     AscendStoreKVConnectorWorkerMetadata,
@@ -29,26 +27,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     infer_group_cache_families,
     normalize_block_ids_by_group,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.key_lru_cache import (
-    KeyLRUCache,
-)
-
-
-def _parse_dram_size(value: str) -> int:
-    if not value or value == "0":
-        return 0
-    try:
-        return int(value)
-    except ValueError:
-        pass
-    cleaned = value.strip().lower()
-    unit_multipliers = {"gb": 1024**3, "mb": 1024**2, "kb": 1024, "b": 1}
-    match = re.match(r"^\s*([\d.]+)\s*(gb|mb|kb|b)?\s*$", cleaned)
-    if not match:
-        raise ValueError(f"Invalid DRAM size format: '{value}'")
-    number = float(match.group(1))
-    unit = match.group(2) or "b"
-    return int(number * unit_multipliers[unit])
 
 
 class KVPoolScheduler:
@@ -120,117 +98,7 @@ class KVPoolScheduler:
                 "discard_partial_chunks", not self.prefill_offload))
         self._unfinished_requests: dict[str, tuple[Request, list[int]]] = {}
         self._unfinished_request_ids: set[str] = set()
-        self._block_pool: BlockPool | None = None
-        self.sending_event_id = 0
-        # {event_id, flattened block_ids}
-        self.sending_blocks: dict[int, list[int]] = {}
-        # {event_id, completed_woke_count}
-        self.sending_events: dict[int, int] = {}
-        self._expected_worker_count = vllm_config.parallel_config.world_size
-
-    def _infer_group_families(self) -> list[str]:
-        kv_cache_groups = self.kv_cache_config.kv_cache_groups if self.kv_cache_config is not None else None
-        return infer_group_cache_families(kv_cache_groups, self.compress_ratios, self.hf_config)
-
-    def _infer_group_block_sizes(
-        self,
-        vllm_config: "VllmConfig",
-        kv_cache_config: KVCacheConfig | None,
-    ) -> list[int]:
-        if kv_cache_config is None or not self.use_hybrid:
-            return [vllm_config.cache_config.block_size]
-
-        block_sizes: list[int] = []
-        for kv_cache_group in kv_cache_config.kv_cache_groups:
-            kv_cache_spec = kv_cache_group.kv_cache_spec
-            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-                kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
-            block_sizes.append(kv_cache_spec.block_size)
-        return block_sizes
-
-    def _get_group_block_size(self, group_id: int) -> int:
-        if group_id >= len(self.grouped_block_size):
-            return self.grouped_block_size[0]
-        return self.grouped_block_size[group_id]
-
-    def _get_group_family(self, families: list[str], group_id: int) -> str:
-        if group_id >= len(families):
-            return "default"
-        return families[group_id]
-
-    def _infer_cache_transfer_granularity(self) -> int:
-        granularities = [self.lcm_block_size]
-        for group_id in self.kv_cache_group_ids:
-            granularities.append(
-                get_cache_family_granularity(
-                    self._get_group_block_size(group_id),
-                    self._get_group_family(self.kv_cache_group_families, group_id),
-                )
-            )
-        return math.lcm(*granularities)
-
-    def _floor_to_cache_transfer_granularity(self, token_len: int) -> int:
-        return token_len // self.cache_transfer_granularity * self.cache_transfer_granularity
-
-    @staticmethod
-    def _uses_hybrid_kv_cache(vllm_config: "VllmConfig", kv_cache_config: KVCacheConfig | None) -> bool:
-        if kv_cache_config is None:
-            return False
-        if getattr(vllm_config.scheduler_config, "disable_hybrid_kv_cache_manager", False):
-            return False
-        return len(kv_cache_config.kv_cache_groups) > 1 and any(
-            not isinstance(group.kv_cache_spec, FullAttentionSpec) for group in kv_cache_config.kv_cache_groups
-        )
-
-    def _infer_mamba_groups(self):
-        if self.kv_cache_config is None or not self.use_hybrid:
-            return []
-        mamba_group_ids: list[int] = []
-        for group_id, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
-            kv_cache_spec = kv_cache_group.kv_cache_spec
-            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-                kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
-            if isinstance(kv_cache_spec, MambaSpec):
-                mamba_group_ids.append(group_id)
-        return mamba_group_ids
-
-    def _infer_swa_blocks(self) -> list[int]:
-        if self.kv_cache_config is None:
-            return []
-
-        num_swa_blocks: list[int] = []
-        for group in self.kv_cache_config.kv_cache_groups:
-            kv_cache_spec = group.kv_cache_spec
-            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-                group_specs = []
-                for layer_name in group.layer_names:
-                    layer_spec = kv_cache_spec.kv_cache_specs[layer_name]
-                    if layer_spec not in group_specs:
-                        group_specs.append(layer_spec)
-            else:
-                group_specs = [kv_cache_spec]
-
-            first_spec = group_specs[0]
-            if isinstance(first_spec, SlidingWindowSpec):
-                num_swa_blocks.append(cdiv(first_spec.sliding_window, first_spec.block_size) + 1)
-            else:
-                num_swa_blocks.append(0)
-            if any(isinstance(spec, MambaSpec) for spec in group_specs):
-                self.need_truncate = True
-        return num_swa_blocks
-
-    def get_sw_clipped_blocks(
-        self,
-        block_ids: tuple[list[int], ...] | list[list[int]],
-    ) -> tuple[list[int], ...] | list[list[int]]:
-        if len(block_ids) == 0 or not self.use_hybrid:
-            return block_ids
-        assert len(block_ids) == len(self.num_swa_blocks), "Number of KV cache groups must match"
-        clipped = [
-            blocks[-self.num_swa_blocks[group_id] :] if self.num_swa_blocks[group_id] > 0 else blocks
-            for group_id, blocks in enumerate(block_ids)
-        ]
-        return tuple(clipped) if isinstance(block_ids, tuple) else clipped
+        self._req_cached_gvas: dict[str, list[int]] = {}
 
         self.page_size_bytes = page_size_bytes
         logger.info(f"==============> page_size_bytes {page_size_bytes}")
@@ -258,53 +126,39 @@ class KVPoolScheduler:
         INDEPENDENT_LAYER_INDICES = {0, self.num_layers - 1}
         self.independent_layers = list(INDEPENDENT_LAYER_INDICES)
 
-        dram_size_str = ascend_envs.VLLM_ASCEND_KV_POOL_DRAM_SIZE
-        dram_size_bytes = _parse_dram_size(dram_size_str)
         keys_per_block_hash = (
             self.pcp_size * self.dcp_size
             * (self.tp_size // self.put_step)
             * (self.num_layers - len(self.independent_layers))
         )
         self.keys_per_block_hash = keys_per_block_hash
-        memory_per_block_hash = keys_per_block_hash * self.page_size_bytes
-        lru_capacity = dram_size_bytes // memory_per_block_hash
-        logger.info(
-            "KV pool LRU capacity calculated from DRAM size %s: %d "
-            "(keys_per_block_hash=%d, memory_per_block_hash=%d)",
-            dram_size_str, lru_capacity,
-            keys_per_block_hash, memory_per_block_hash,
-        )
-        self.key_lru_cache = KeyLRUCache(lru_capacity, self.store_scheduler)
-        self._req_last_block_gvas: dict[str, dict[str, int | None]] = {}
 
-    def _generate_keys_and_alloc(self, block_hashes, req_id='', has_last_block=False) -> tuple[list[str], str | None, dict[str, int | None]]:
-        chunk_keys, last_block_key, block_hash_groups = self.generate_keys(block_hashes, req_id=req_id, has_last_block=has_last_block)
+    def _generate_keys_and_alloc(
+        self,
+        block_hashes,
+        req_id='',
+        has_last_block=False,
+    ) -> tuple[list[str], str | None, list[int], int | None]:
+        chunk_keys, last_block_key, _ = self.generate_keys(
+            block_hashes, req_id=req_id, has_last_block=has_last_block)
         alloc_size = self.page_size_bytes * self.keys_per_block_hash
-        need_alloc_last_block = has_last_block and req_id not in self._req_last_block_gvas
 
-        if need_alloc_last_block:
-            all_keys = chunk_keys + ([last_block_key] if last_block_key else [])
-            gvas = self.key_lru_cache.batch_get_and_alloc(
-                all_keys, alloc_size, block_hash_groups)
-            key_gva_mapping: dict[str, Any] = dict(zip(all_keys, gvas))
-            if last_block_key:
-                self._req_last_block_gvas[req_id] = {
-                    last_block_key: key_gva_mapping.get(last_block_key)
-                }
-        else:
-            chunk_block_hash_groups = {
-                k: v for k, v in block_hash_groups.items()
-                if not k.endswith(b'_lastblock')
-            }
-            gvas = self.key_lru_cache.batch_get_and_alloc(
-                chunk_keys, alloc_size,
-                chunk_block_hash_groups if chunk_block_hash_groups else None)
-            # TODO here should verify the gvas is not None
-            key_gva_mapping: dict[str, Any] = dict(zip(chunk_keys, gvas))
-            if has_last_block and req_id in self._req_last_block_gvas:
-                key_gva_mapping.update(self._req_last_block_gvas[req_id])
+        all_keys = chunk_keys + ([last_block_key] if last_block_key else [])
+        cached_gvas = self._req_cached_gvas.get(req_id)
 
-        return chunk_keys, last_block_key, key_gva_mapping
+        num_cached = min(len(cached_gvas), len(chunk_keys)) if cached_gvas else 0
+        chunk_gvas: list[int] = list(cached_gvas[:num_cached]) if cached_gvas else []
+        last_block_gva = None
+        keys_to_alloc = all_keys[num_cached:]
+        if keys_to_alloc:
+            new_gvas = self.store_scheduler.batch_alloc(
+                keys_to_alloc, [alloc_size] * len(keys_to_alloc))
+            num_new_chunk_keys = len(chunk_keys) - num_cached
+            chunk_gvas.extend(new_gvas[:num_new_chunk_keys])
+            if last_block_key and len(new_gvas) > num_new_chunk_keys:
+                last_block_gva = new_gvas[-1]
+
+        return chunk_keys, last_block_key, chunk_gvas, last_block_gva
 
     def generate_keys(self, chunk_hashes, req_id='', has_last_block=False):
         block_hash_groups: dict[bytes, list[str]] = {}
@@ -351,14 +205,44 @@ class KVPoolScheduler:
             return 0, False
 
         num_blocks = token_len // self._block_size
-        num_hit_blocks = 0
-        for bh in request.block_hashes[:num_blocks]:
-            if self.key_lru_cache.has_block(bh):
-                num_hit_blocks += 1
-            else:
-                break
-        num_external_hit_tokens = num_hit_blocks * self._block_size
+        block_hashes_to_check = request.block_hashes[:num_blocks]
+        keys_to_check = [
+            f"{self.model_name}@{bh.hex()}" for bh in block_hashes_to_check
+        ]
+        remaining_keys = keys_to_check
+        cached_gvas = self._req_cached_gvas.get(request.request_id)
+        if cached_gvas is None:
+            cached_gvas = []
+        if cached_gvas:
+            num_cached = len(cached_gvas)
+            cached_keys = keys_to_check[:num_cached]
+            exist_results = self.store_scheduler.exists(cached_keys)
+            valid_count = 0
+            for result in exist_results:
+                if result == 1:
+                    valid_count += 1
+                else:
+                    break
+            if valid_count < num_cached:
+                raise ValueError(
+                    f"Request {request.request_id}: cached gvas key(s) no longer exist "
+                    f"in store (expected {num_cached}, valid {valid_count})")
+            remaining_keys = remaining_keys[num_cached:]
 
+        num_hit_blocks = len(cached_gvas)
+        if remaining_keys:
+            key_infos = self.store_scheduler.get_batch_key_info(remaining_keys)
+            for key_info in key_infos:
+                sizes = key_info.size_list()
+                if sizes and sizes[0] > 0:
+                    cached_gvas.append(key_info.gva_list()[0])
+                    num_hit_blocks += 1
+                else:
+                    break
+        self._req_cached_gvas[request.request_id] = cached_gvas
+        num_external_hit_tokens = num_hit_blocks * self._block_size
+        # TODO 这里没有命中的可以提前申请空间，避免后面申请的时候掩盖不住，这个可以异步进行。
+        # 先exists判断是否存在，然后异步获取地址和申请空间，这样是否更高效一点？
         if num_external_hit_tokens == request.num_tokens:
             num_external_hit_tokens -= 1
 
@@ -465,12 +349,13 @@ class KVPoolScheduler:
             self._unfinished_requests.pop(finished_req_id, None)
             self._unfinished_request_ids.discard(finished_req_id)
             self._preempted_req_ids.discard(finished_req_id)
-            self._req_last_block_gvas.pop(finished_req_id, None)
+            self._req_cached_gvas.pop(finished_req_id, None)
 
         for req_id in scheduler_output.preempted_req_ids:
             self._preempted_req_ids.update(scheduler_output.preempted_req_ids)
             self._request_trackers.pop(req_id, None)
             self._unfinished_requests.pop(req_id, None)
+            self._req_cached_gvas.pop(req_id, None)
 
         meta = AscendConnectorMetadata(self._unfinished_request_ids, scheduler_output.preempted_req_ids)
 
@@ -509,9 +394,10 @@ class KVPoolScheduler:
             num_blocks = len(unfolded_block_ids)
             has_last_block = num_tokens_to_compute % self._block_size != 0
 
-            block_keys, last_block_key, key_gva_mapping = self._generate_keys_and_alloc(
+            block_keys, last_block_key, chunk_gvas, last_block_gva = self._generate_keys_and_alloc(
                 request_real.block_hashes[:num_blocks], req_id=request.req_id, has_last_block=has_last_block)
-            request_tracker.key_gva_mapping = key_gva_mapping
+            request_tracker.chunk_gvas = chunk_gvas
+            request_tracker.last_block_gva = last_block_gva
             request_tracker.block_keys = block_keys
             request_tracker.last_block_key = last_block_key
 
@@ -527,9 +413,8 @@ class KVPoolScheduler:
                 kv_cache_group_families=self.kv_cache_group_families,
             )
             if req_meta is not None:
-                req_meta.key_gva_mapping = key_gva_mapping
-                req_meta.block_keys = block_keys
-                req_meta.last_block_key = last_block_key
+                req_meta.chunk_gvas = chunk_gvas
+                req_meta.last_block_gva = last_block_gva
                 meta.add_request(req_meta)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -565,9 +450,11 @@ class KVPoolScheduler:
 
                     num_blocks = len(new_block_ids)
                     has_last_block = num_tokens_to_compute % self._block_size != 0
-                    block_keys, last_block_key, key_gva_mapping = self._generate_keys_and_alloc(
+                    block_keys, last_block_key, chunk_gvas, last_block_gva = self._generate_keys_and_alloc(
                         request_real.block_hashes[:num_blocks], req_id=req_id, has_last_block=has_last_block)
 
+                    request_tracker.chunk_gvas = chunk_gvas
+                    request_tracker.last_block_gva = last_block_gva
                     request_tracker.block_keys = block_keys
                     request_tracker.last_block_key = last_block_key
 
@@ -588,9 +475,8 @@ class KVPoolScheduler:
                         kv_cache_group_families=self.kv_cache_group_families,
                     )
                     if req_meta is not None:
-                        req_meta.key_gva_mapping = key_gva_mapping
-                        req_meta.block_keys = block_keys
-                        req_meta.last_block_key = last_block_key
+                        req_meta.chunk_gvas = chunk_gvas
+                        req_meta.last_block_gva = last_block_gva
 
                 # decode/chunked request
                 else:
@@ -612,8 +498,8 @@ class KVPoolScheduler:
                     new_hash_count = current_hash_count - prev_hash_count
                     if new_hash_count > 0:
                         new_block_hashes = request.block_hashes[prev_hash_count : current_hash_count]
-                        new_block_keys, _, key_gva_mapping = self._generate_keys_and_alloc(new_block_hashes)
-                        request_tracker.key_gva_mapping.update(key_gva_mapping)
+                        new_block_keys, _, new_chunk_gvas, _ = self._generate_keys_and_alloc(new_block_hashes)
+                        request_tracker.chunk_gvas.extend(new_chunk_gvas)
 
                         if request_tracker.block_keys is None:
                             request_tracker.block_keys = new_block_keys
@@ -645,9 +531,8 @@ class KVPoolScheduler:
                         original_block_size=self.original_block_size,
                         kv_cache_group_families=self.kv_cache_group_families,
                     )
-                    req_meta.key_gva_mapping = request_tracker.key_gva_mapping
-                    req_meta.block_keys = request_tracker.block_keys
-                    req_meta.last_block_key = request_tracker.last_block_key
+                    req_meta.chunk_gvas = request_tracker.chunk_gvas
+                    req_meta.last_block_gva = request_tracker.last_block_gva
                 if req_meta is not None:
                     self.touch_sending_mamba_blocks(req_meta)
                     meta.add_request(req_meta)
@@ -674,9 +559,10 @@ class KVPoolScheduler:
                 num_blocks = num_tokens_to_compute // self._block_size
                 has_last_block = num_tokens_to_compute % self._block_size != 0
                 block_hashes_for_keys = request.block_hashes[:num_blocks]
-                block_keys, last_block_key, key_gva_mapping = self._generate_keys_and_alloc(
+                block_keys, last_block_key, chunk_gvas, last_block_gva = self._generate_keys_and_alloc(
                     block_hashes_for_keys, req_id=request_id, has_last_block=has_last_block)
-                request_tracker.key_gva_mapping = key_gva_mapping
+                request_tracker.chunk_gvas = chunk_gvas
+                request_tracker.last_block_gva = last_block_gva
                 request_tracker.block_keys = block_keys
                 request_tracker.last_block_key = last_block_key
 
@@ -690,9 +576,8 @@ class KVPoolScheduler:
                     kv_cache_group_families=self.kv_cache_group_families,
                 )
                 if req_meta is not None:
-                    req_meta.key_gva_mapping = key_gva_mapping
-                    req_meta.block_keys = block_keys
-                    req_meta.last_block_key = last_block_key
+                    req_meta.chunk_gvas = chunk_gvas
+                    req_meta.last_block_gva = last_block_gva
                     meta.add_request(req_meta)
         return meta
 
@@ -764,11 +649,6 @@ class KVPoolScheduler:
         if tracker is not None and tracker.num_saved_tokens <= 0:
             return False, None
         delay_free_blocks = len(block_ids) > 0
-        # if self.key_lru_cache is not None and request.block_hashes:
-        #     removed_keys = self.key_lru_cache.remove_blocks(
-        #         request.block_hashes[:len(block_ids)])
-        #     if removed_keys and self.store_scheduler is not None:
-        #         self.store_scheduler.remove_batch(removed_keys)
         if delay_free_blocks:
             if logger.isEnabledFor(10):
                 logger.debug("Delaying free of %d blocks for request %s", len(block_ids), request.request_id)

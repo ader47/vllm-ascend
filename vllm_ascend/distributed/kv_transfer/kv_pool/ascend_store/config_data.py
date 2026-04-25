@@ -522,7 +522,8 @@ class RequestTracker:
     # NOTE: This field will only be used when you enable kv-event
     token_ids: list[int] | None = None
 
-    key_gva_mapping: dict[str, int | None] = field(default_factory=dict)
+    chunk_gvas: list[int] = field(default_factory=list)
+    last_block_gva: int | None = None
 
     block_keys: list[str] | None = None
 
@@ -636,9 +637,8 @@ class ReqMeta:
     def block_ids(self, block_ids: list[int] | list[list[int]]) -> None:
         self.block_ids_by_group = normalize_block_ids_by_group(block_ids)
 
-    key_gva_mapping: dict[str, int | None] = field(default_factory=dict)
-    block_keys: list[str] | None = None
-    last_block_key: str | None = None
+    chunk_gvas: list[int] = field(default_factory=list)
+    last_block_gva: int | None = None
 
     starts: list[int] | None = None
     ends: list[int] | None = None
@@ -725,13 +725,13 @@ class AscendConnectorMetadata(KVConnectorMetadata):
 @dataclass(init=False)
 class LayerMultiBlockReqMeta:
     req_id: str
-    keys: list[str]
     block_ids: list[int]
     layer_id: int
     block_hashes: list[Any] = field(default_factory=list)
     is_last_chunk: bool | None = True
     current_event: torch.npu.Event | None = None
-    key_gva_mapping: dict[str, int | None] = field(default_factory=dict)
+    chunk_gvas: list[int] = field(default_factory=list)
+    last_block_gva: int | None = None
     addr_list: list[int] | None = None
     size_list: list[int] | None = None
     gvas_list: list[int] | None = None
