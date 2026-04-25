@@ -2,12 +2,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Optional
 
+import numpy as np
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import NewRequestData
+from vllm_ascend.memcache_comm_fence import AttentionComputeStartGate
 
 
 # Parameters related to the key
@@ -268,16 +270,18 @@ class RequestTracker:
     # NOTE: This field will only be used when you enable kv-event
     token_ids: list[int] | None = None
 
-    key_gva_mapping: dict[str, int | None] = field(default_factory=dict)
+    block_gvas: list[int] = field(default_factory=list)
+    gva_block_offset: int = 0
+    last_block_gva: int | None = None
 
-    block_keys_by_layer: list[list[str]] | None = None
+    block_keys: list[str] = field(default_factory=list)
 
     starts: list[int] | None = None
     ends: list[int] | None = None
 
     sizes_per_chunk: list[list[int]] | None = None
 
-    last_block_keys_by_layer: list[list[str]] | None = None
+    last_block_key: str | None = None
 
     @staticmethod
     def from_new_request(
@@ -330,12 +334,17 @@ class RequestTracker:
 class ReqMeta:
     # Request id
     req_id: str
-    # Number of tokens in this chunk
-    token_len_chunk: int
+    # End token for full-block KV save.
+    save_end_token: int
+    # Token length after this scheduled step finishes.
+    target_token_len: int
 
     block_ids: list[int]
 
     block_hashes: list[BlockHash]
+
+    # First token that has not been saved before this metadata was built.
+    save_start_token: int = 0
 
     can_save: bool | None = None
     # load_spec
@@ -350,14 +359,17 @@ class ReqMeta:
     token_ids: list[int] | None = None
     original_block_size: int | None = None
 
-    key_gva_mapping: dict[str, int | None] = field(default_factory=dict)
-    block_keys_by_layer: list[list[str]] | None = None
-    last_block_keys_by_layer: list[list[str]] | None = None
+    last_block_gva: int | None = None
+    partial_block_index: int | None = None
 
     starts: list[int] | None = None
     ends: list[int] | None = None
 
     sizes_per_chunk: list[list[int]] | None = None
+
+    block_ids_np: np.ndarray | None = None
+    block_gvas_np: np.ndarray | None = None
+    gva_block_offset: int = 0
 
     @staticmethod
     def from_request_tracker(
@@ -387,7 +399,8 @@ class ReqMeta:
         """
         if block_hashes is None:
             block_hashes = []
-        input_token_len = tracker.token_len
+        target_token_len = tracker.token_len
+        previous_saved_tokens = tracker.num_saved_tokens
 
         # For save operation: do not save if the following condition is met
         # 1. has already been saved before (num_saved_tokens > 0)
@@ -395,15 +408,38 @@ class ReqMeta:
         chunk_boundary = cdiv(tracker.num_saved_tokens + 1, block_size) * block_size if discard_partial_chunks else 0
         # Calculate number of tokens to save based on discard_partial_chunks
         # setting
-        num_tokens_to_save = (input_token_len // block_size * block_size) if discard_partial_chunks else input_token_len
+        num_tokens_to_save = (
+            target_token_len // block_size * block_size
+        ) if discard_partial_chunks else target_token_len
+        full_block_count = target_token_len // block_size
+        boundary_without_hash = (
+            target_token_len > 0
+            and target_token_len % block_size == 0
+            and full_block_count > len(block_hashes)
+        )
+        if boundary_without_hash:
+            num_tokens_to_save = len(block_hashes) * block_size
+        if tracker.last_block_gva is not None and (
+            target_token_len % block_size != 0 or boundary_without_hash
+        ):
+            partial_block_index = (
+                full_block_count
+                if target_token_len % block_size != 0
+                else full_block_count - 1
+            )
+        else:
+            partial_block_index = None
 
-        skip_save = skip_save or num_tokens_to_save < chunk_boundary
+        skip_save = skip_save or (num_tokens_to_save < chunk_boundary and partial_block_index is None)
         if skip_save and load_spec is None:
             return None
 
         # If we need to save, update the number of saved tokens
         if not skip_save:
-            tracker.num_saved_tokens = num_tokens_to_save
+            tracker.num_saved_tokens = max(
+                tracker.num_saved_tokens,
+                num_tokens_to_save,
+            )
 
         # Get the token ids for kv event generation in kv_transfer
         token_ids = None
@@ -423,7 +459,9 @@ class ReqMeta:
         logger.debug(f"request:{tracker.req_id}, meta save spec:{not skip_save}, meta load spec:{load_spec}")
         return ReqMeta(
             req_id=tracker.req_id,
-            token_len_chunk=num_tokens_to_save,
+            save_end_token=num_tokens_to_save,
+            target_token_len=target_token_len,
+            save_start_token=previous_saved_tokens,
             block_ids=tracker.allocated_block_ids,
             can_save=not skip_save,
             load_spec=load_spec,
@@ -431,14 +469,27 @@ class ReqMeta:
             is_last_chunk=is_last_chunk,
             token_ids=token_ids,
             original_block_size=original_block_size,
+            last_block_gva=tracker.last_block_gva,
+            partial_block_index=partial_block_index,
+            block_ids_np=np.asarray(tracker.allocated_block_ids, dtype=np.int64),
+            block_gvas_np=np.asarray(tracker.block_gvas, dtype=np.int64),
+            gva_block_offset=tracker.gva_block_offset,
         )
 
 
 class AscendConnectorMetadata(KVConnectorMetadata):
-    def __init__(self, unfinished_request_ids, preempted_req_ids):
+    def __init__(
+        self,
+        unfinished_request_ids,
+        preempted_req_ids,
+        loading_req_ids: set[str] | None = None,
+        delayed_free_req_ids: set[str] | None = None,
+    ):
         self.requests = []
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
+        self.loading_req_ids = loading_req_ids or set()
+        self.delayed_free_req_ids = delayed_free_req_ids or set()
 
     def add_request(self, req_meta: ReqMeta) -> None:
         """Add a request to the metadata.
@@ -450,14 +501,35 @@ class AscendConnectorMetadata(KVConnectorMetadata):
 
 
 @dataclass
-class LayerMultiBlockReqMeta:
-    req_id: str
-    keys: list[str]
-    block_ids: list[int]
+class LayerBatchReqMeta:
+    req_ids: list[str]
     layer_id: int
-    is_last_chunk: bool | None = True
-    current_event: torch.npu.Event | None = None
-    key_gva_mapping: dict[str, int | None] = field(default_factory=dict)
-    addr_list: list[int] | None = None
-    size_list: list[int] | None = None
-    gvas_list: list[int] | None = None
+    is_last_chunks: list[bool | None] = field(default_factory=list)
+    addr_array: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int64))
+    size_array: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int64))
+    gvas_array: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int64))
+
+
+@dataclass
+class LayerBlockRange:
+    request: ReqMeta
+    start_block: int
+    end_block: int
+    partial_block_index: int | None = None
+
+
+@dataclass
+class LayerTransferTask:
+    layer_id: int
+    block_ranges: list[LayerBlockRange]
+
+
+@dataclass
+class LayerLoadTask:
+    wait_for_save_layer: int | None
+    transfer_tasks: list[LayerTransferTask]
+    layer_id: int
+    attention_start_gate: AttentionComputeStartGate | None = None

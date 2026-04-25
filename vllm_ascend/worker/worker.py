@@ -24,9 +24,11 @@ from types import NoneType
 import torch
 import torch.nn as nn
 import torch_npu
-import vllm.envs as envs_vllm
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
+
+import vllm.envs as envs_vllm
+import vllm_ascend.envs as envs_ascend
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
@@ -45,11 +47,9 @@ from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, D
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
-
-import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
-from vllm_ascend.cpu_binding import bind_cpus
+from vllm_ascend.cpu_binding import bind_cpus, get_cpu_binding_rank
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
@@ -64,6 +64,7 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
+
 from vllm.utils.torch_utils import set_random_seed  # noqa: E402
 
 torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
@@ -542,10 +543,14 @@ class NPUWorker(WorkerBase):
         # Bind after warmup so hot allocations are already materialized on the
         # worker process before migratepages/taskset run.
         if get_ascend_config().enable_cpu_binding:
+            bind_cpus(get_cpu_binding_rank(self.local_rank, self.parallel_config))
+        if has_kv_transfer_group():
             try:
-                bind_cpus(self.local_rank)
+                connector = get_kv_transfer_group()
+                if hasattr(connector, "init_backend"):
+                    connector.init_backend()
             except Exception as e:
-                logger.warning(f"Bind cpus failed in rank{self.local_rank}: {e} Skip binding cpu.")
+                logger.warning(f"Init KV transfer backend failed in rank{self.local_rank}: {e}")
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)

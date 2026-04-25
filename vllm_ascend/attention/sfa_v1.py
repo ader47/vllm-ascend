@@ -4,8 +4,9 @@ from typing import TYPE_CHECKING, TypeVar
 import scipy  # type: ignore
 import torch
 import torch_npu
-import vllm.envs as envs_vllm
 from torch import nn
+
+import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.logger import logger
@@ -18,7 +19,6 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
-
 from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -37,6 +37,9 @@ from vllm_ascend.attention.utils import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.memcache_comm_fence import (
+    record_attention_compute_start,
+)
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
     post_process_after_loading_for_shard_weight_series,
@@ -977,6 +980,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)
 
+        record_attention_compute_start()
         # DSV3.2 currently has graph compilation issues when using torch_npu.npu.lightning_indexer.
         # So two branches are maintained temporarily.
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
@@ -1107,7 +1111,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 num_input_tokens=num_input_tokens,
             )
             k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
-            wait_for_kv_layer_from_connector(layer_name)
         # native
         else:
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
@@ -1124,8 +1127,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_c = self.q_a_layernorm(q_c)
 
             k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
-
-            wait_for_kv_layer_from_connector(layer_name)
 
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
@@ -1230,6 +1231,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
 
+        wait_for_kv_layer_from_connector(layer_name)
         topk_indices = self.indexer_select_post_process(
             x=hidden_states,
             q_c=q_c,

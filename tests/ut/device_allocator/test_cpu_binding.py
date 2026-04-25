@@ -20,7 +20,13 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, mock_open, patch
 
 import vllm_ascend.cpu_binding as cpu_binding_module
-from vllm_ascend.cpu_binding import CpuAlloc, DeviceInfo, bind_cpus, is_arm_cpu
+from vllm_ascend.cpu_binding import (
+    CpuAlloc,
+    DeviceInfo,
+    bind_cpus,
+    get_cpu_binding_rank,
+    is_arm_cpu,
+)
 from vllm_ascend.utils import AscendDeviceType
 
 
@@ -39,6 +45,7 @@ def make_cpu_alloc(rank_id=0):
     cpu_alloc.assign_main = {}
     cpu_alloc.assign_acl = {}
     cpu_alloc.assign_rel = {}
+    cpu_alloc.assign_memcache = {}
     return cpu_alloc
 
 
@@ -342,11 +349,18 @@ class TestCpuAlloc(unittest.TestCase):
     @patch("vllm_ascend.cpu_binding.execute_command")
     def test_allocate(self, _mock_execute_command):
         self.cpu_alloc.device_info.running_npu_list = [0]
+        self.cpu_alloc.npu_cpu_pool = {0: list(range(24))}
+        self.cpu_alloc.allocate()
+        self.assertEqual(self.cpu_alloc.assign_main[0], list(range(2, 14)))
+        self.assertEqual(self.cpu_alloc.assign_acl[0], [14])
+        self.assertEqual(self.cpu_alloc.assign_rel[0], [15])
+        self.assertEqual(self.cpu_alloc.assign_memcache[0], list(range(16, 24)))
         self.cpu_alloc.npu_cpu_pool = {0: [0, 1, 2, 3, 4]}
         self.cpu_alloc.allocate()
         self.assertEqual(self.cpu_alloc.assign_main[0], [2])
         self.assertEqual(self.cpu_alloc.assign_acl[0], [3])
         self.assertEqual(self.cpu_alloc.assign_rel[0], [4])
+        self.assertEqual(self.cpu_alloc.assign_memcache[0], [])
         self.cpu_alloc.npu_cpu_pool = {0: [0, 1]}
         with self.assertRaises(RuntimeError):
             self.cpu_alloc.allocate()
@@ -457,19 +471,24 @@ class TestCpuBindingSupplemental(unittest.TestCase):
             cpu_alloc.build_cpu_pools()
 
     @patch("vllm_ascend.cpu_binding.get_ascend_device_type", return_value=AscendDeviceType.A2)
-    def test_build_cpu_pools_topo_mode_builds_and_splits_duplicate_groups(self, _mock_get_device_type):
+    def test_build_cpu_pools_uses_global_slice_for_all_device_types(self, _mock_get_device_type):
         cpu_alloc = make_cpu_alloc()
         cpu_alloc.device_info.running_npu_list = [0, 1, 2]
-        cpu_alloc.device_info.allowed_cpus = [0, 1, 2, 3]
+        cpu_alloc.device_info.allowed_cpus = list(range(15))
+        cpu_alloc.device_info.total_logic_npus = 3
         cpu_alloc.device_info.npu_affinity = {0: [0, 1], 1: [2, 3], 2: [2, 3]}
 
-        with (
-            patch.object(cpu_alloc, "build_cpu_node_map"),
-            patch.object(cpu_alloc, "extend_numa", side_effect=lambda cpus: cpus),
-        ):
+        with patch.object(cpu_alloc, "build_cpu_node_map"):
             cpu_alloc.build_cpu_pools()
 
-        self.assertEqual(cpu_alloc.npu_cpu_pool, {0: [0, 1], 1: [2], 2: [3]})
+        self.assertEqual(
+            cpu_alloc.npu_cpu_pool,
+            {
+                0: [0, 1, 2, 3, 4],
+                1: [5, 6, 7, 8, 9],
+                2: [10, 11, 12, 13, 14],
+            },
+        )
 
     @patch("vllm_ascend.cpu_binding.logger.info")
     def test_print_plan_handles_empty_release_assignment(self, mock_logger_info):
@@ -479,6 +498,7 @@ class TestCpuBindingSupplemental(unittest.TestCase):
         cpu_alloc.assign_main = {1: [2, 3]}
         cpu_alloc.assign_acl = {1: [4]}
         cpu_alloc.assign_rel = {1: []}
+        cpu_alloc.assign_memcache = {1: [5, 6]}
 
         cpu_alloc.print_plan()
 
@@ -492,6 +512,7 @@ class TestCpuBindingSupplemental(unittest.TestCase):
         cpu_alloc.assign_main = {1: [2, 3]}
         cpu_alloc.assign_acl = {1: [4]}
         cpu_alloc.assign_rel = {1: [5]}
+        cpu_alloc.assign_memcache = {1: [6, 7]}
 
         cpu_alloc.print_plan()
 
@@ -734,6 +755,64 @@ class TestCpuBindingSupplemental(unittest.TestCase):
 
 
 class TestBindingSwitch(unittest.TestCase):
+    def test_get_cpu_binding_rank_offsets_local_dp_rank(self):
+        parallel_config = SimpleNamespace(
+            rank=None,
+            data_parallel_rank_local=1,
+            data_parallel_size_local=2,
+            local_world_size=8,
+            world_size=8,
+        )
+
+        self.assertEqual(get_cpu_binding_rank(3, parallel_config), 11)
+
+    def test_get_cpu_binding_rank_prefers_global_rank_in_local_dp(self):
+        parallel_config = SimpleNamespace(
+            rank=14,
+            data_parallel_rank_local=1,
+            data_parallel_size_local=2,
+            local_world_size=8,
+            world_size=8,
+        )
+
+        self.assertEqual(get_cpu_binding_rank(0, parallel_config), 14)
+
+    def test_get_cpu_binding_rank_wraps_global_rank_to_node_local_rank(self):
+        parallel_config = SimpleNamespace(
+            rank=30,
+            data_parallel_rank_local=1,
+            data_parallel_size_local=2,
+            local_world_size=8,
+            world_size=16,
+        )
+
+        self.assertEqual(get_cpu_binding_rank(0, parallel_config), 14)
+
+    def test_get_cpu_binding_rank_keeps_local_rank_without_local_dp(self):
+        parallel_config = SimpleNamespace(
+            rank=9,
+            data_parallel_rank_local=0,
+            data_parallel_size_local=1,
+            local_world_size=8,
+            world_size=8,
+        )
+
+        self.assertEqual(get_cpu_binding_rank(3, parallel_config), 3)
+
+    def test_get_current_npu_accepts_global_npu_id_when_index_is_invalid(self):
+        cpu_alloc = make_cpu_alloc(rank_id=8)
+        cpu_alloc.device_info.running_npu_list = [8, 9]
+        cpu_alloc.npu_cpu_pool = {8: [0, 1], 9: [2, 3]}
+
+        self.assertEqual(cpu_alloc.get_current_npu(), 8)
+
+    def test_get_current_npu_prefers_visible_index(self):
+        cpu_alloc = make_cpu_alloc(rank_id=1)
+        cpu_alloc.device_info.running_npu_list = [8, 9]
+        cpu_alloc.npu_cpu_pool = {1: [0, 1], 8: [2, 3], 9: [4, 5]}
+
+        self.assertEqual(cpu_alloc.get_current_npu(), 9)
+
     @patch("vllm_ascend.cpu_binding.platform.machine")
     def test_is_arm_cpu(self, mock_machine):
         mock_machine.return_value = "x86_64"
