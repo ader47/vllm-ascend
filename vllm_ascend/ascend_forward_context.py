@@ -147,6 +147,7 @@ def set_ascend_forward_context(
         forward_context.prefetch_mlp_down_proj = False
         forward_context.model_instance = model_instance
         forward_context.is_draft_model = is_draft_model
+        forward_context.is_draft_model_prefill = False
 
         if num_tokens is None and attn_metadata is not None:
             num_tokens = attn_metadata.num_actual_tokens
@@ -270,7 +271,7 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         # TODO: drop the EP-size guard when dispatch_ffn_combine supports larger EP sizes
         # TODO: drop speculative method guard when dispatch_gmm_combine_decode supports w16a16
         fused_mc2_enable = envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2
-        dispatch_ffn_combine_enable = get_ep_group().world_size <= 32 and (not is_draft_model)
+        dispatch_ffn_combine_enable = get_ep_group().world_size <= 32
         if num_tokens <= mc2_tokens_capacity:
             fused_decode_enable = fused_mc2_enable
             if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
@@ -317,6 +318,7 @@ class _ExtraForwardContextProxy:
         "num_tokens_across_dp",
         "mc2_mask",
         "is_draft_model",
+        "is_draft_model_prefill",
         "prefetch_mlp_gate_up_proj",
         "prefetch_mlp_down_proj",
         "model_instance",
