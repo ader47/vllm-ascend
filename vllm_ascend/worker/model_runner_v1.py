@@ -25,7 +25,7 @@ from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from multiprocessing import Manager
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, Union
 
 import numpy as np
 import torch
@@ -160,6 +160,7 @@ torch.npu.config.allow_internal_format = True
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+KVCacheRawTensor: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...]
 
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
@@ -221,6 +222,16 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
+
+
+class DynamicPrefillKVPool(NamedTuple):
+    backing_tensor: torch.Tensor
+    layer_names: list[str]
+    part_sizes_per_block: tuple[int, ...]
+    max_blocks: int
+    min_physical_buffers: int
+    alignment: int
+    use_alignment: bool
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -356,6 +367,21 @@ class NPUModelRunner(GPUModelRunner):
         if vllm_config.kv_transfer_config is not None:
             self.is_kv_producer = vllm_config.kv_transfer_config.is_kv_producer
             self.is_kv_consumer = vllm_config.kv_transfer_config.is_kv_consumer
+
+        kv_connector_extra_config = (
+            vllm_config.kv_transfer_config.kv_connector_extra_config
+            if vllm_config.kv_transfer_config is not None else {}
+        )
+        self.enable_dynamic_prefill_kv_reuse = kv_connector_extra_config.get(
+            "dynamic_prefill_kv_reuse",
+            self.is_kv_producer and kv_connector_extra_config.get("use_layerwise", False),
+        )
+        self.dynamic_prefill_min_physical_kv_buffers = 2
+        self.dynamic_prefill_kv_pool: DynamicPrefillKVPool | None = None
+        self.dynamic_prefill_kv_caches: dict[str, KVCacheRawTensor] | None = None
+        self.dynamic_prefill_current_block_capacity = 0
+        self.dynamic_prefill_current_physical_buffers = 0
+        self.dynamic_prefill_layer_to_buffer: dict[str, int] = {}
 
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.uniform_decode_query_len, self.dtype, self.device)
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
@@ -1621,6 +1647,8 @@ class NPUModelRunner(GPUModelRunner):
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
+
+        self._maybe_switch_dynamic_prefill_kv_reuse(cudagraph_mode)
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
@@ -2930,6 +2958,8 @@ class NPUModelRunner(GPUModelRunner):
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
+        if self.dynamic_prefill_kv_pool is not None:
+            self.dynamic_prefill_kv_caches = kv_caches
 
         from vllm.v1.worker.utils import bind_kv_cache
 
@@ -2965,8 +2995,321 @@ class NPUModelRunner(GPUModelRunner):
         head_size_v = kv_cache_spec.head_size_v if hasattr(kv_cache_spec, "head_size_v") else kv_cache_spec.head_size
         return kv_cache_spec.head_size, head_size_v
 
+    @staticmethod
+    def _align_offset(offset: int, alignment: int) -> int:
+        return ((offset + alignment - 1) // alignment) * alignment
+
+    @staticmethod
+    def _get_layer_index_from_name(layer_name: str) -> int:
+        for part in layer_name.split("."):
+            if part.isdigit():
+                return int(part)
+        return 0
+
+    def _get_attention_raw_part_sizes(
+        self,
+        layer_name: str,
+        kv_cache_tensor_size: int,
+        kv_cache_spec: AttentionSpec,
+    ) -> tuple[int, ...]:
+        if not self.model_config.use_mla:
+            return (kv_cache_tensor_size // 2, kv_cache_tensor_size // 2)
+
+        if self.use_sparse:
+            sparse_kv_cache_ratio = kv_cache_spec.sparse_kv_cache_ratio
+            part_sizes = [
+                kv_cache_tensor_size // sparse_kv_cache_ratio[0],
+                kv_cache_tensor_size // sparse_kv_cache_ratio[1],
+                kv_cache_tensor_size // sparse_kv_cache_ratio[2],
+            ]
+            if self.use_sparse_c8_indexer:
+                part_sizes.append(kv_cache_tensor_size // sparse_kv_cache_ratio[3])
+            return tuple(part_sizes)
+
+        k_dim, v_dim = self._get_attention_kv_cache_dims(layer_name, kv_cache_spec)
+        assert k_dim > 0 and v_dim > 0
+        kv_head_dim_list = [k_dim, v_dim]
+        if self.is_kv_consumer and enable_fa_quant(self.vllm_config):
+            split_factors = self.vllm_config.quant_config.get_kv_quant_split_factor(
+                layer_name, kv_head_dim_list)
+        else:
+            split_factors = calc_split_factor(kv_head_dim_list)
+        return (
+            kv_cache_tensor_size // split_factors[0],
+            kv_cache_tensor_size // split_factors[1],
+        )
+
+    def _get_attn_layer_tensor_sizes(
+        self,
+        kv_cache_config: KVCacheConfig,
+    ) -> dict[str, int]:
+        tensor_sizes: dict[str, int] = {}
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            for layer_name in kv_cache_tensor.shared_by:
+                if "attn" in layer_name and "linear_attn" not in layer_name:
+                    tensor_sizes[layer_name] = kv_cache_tensor.size
+        return tensor_sizes
+
+    def _try_create_dynamic_prefill_kv_pool(
+        self,
+        kv_cache_config: KVCacheConfig,
+    ) -> dict[str, KVCacheRawTensor] | None:
+        if not getattr(self, "enable_dynamic_prefill_kv_reuse", False):
+            return None
+        if self.use_hybrid_blocks or self.hybrid_with_attn_and_mamba:
+            logger.info("Dynamic prefill KV reuse is disabled for hybrid KV cache.")
+            return None
+        if kv_cache_config.num_blocks <= 0:
+            return None
+
+        layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        tensor_sizes = self._get_attn_layer_tensor_sizes(kv_cache_config)
+        layer_names = [
+            name for name in sorted(tensor_sizes, key=self._get_layer_index_from_name)
+            if name not in self.runner_only_attn_layers
+        ]
+        if len(layer_names) <= 1:
+            return None
+        expected_layer_names = {
+            layer_name
+            for group in kv_cache_config.kv_cache_groups
+            for layer_name in group.layer_names
+            if layer_name not in self.runner_only_attn_layers
+        }
+        if expected_layer_names != set(layer_names):
+            logger.info(
+                "Dynamic prefill KV reuse is disabled because the KV cache contains non-attention layers.")
+            return None
+
+        ref_part_sizes_per_block: tuple[int, ...] | None = None
+        for layer_name in layer_names:
+            kv_cache_spec = layer_kv_cache_spec.get(layer_name)
+            if not isinstance(kv_cache_spec, AttentionSpec):
+                logger.info("Dynamic prefill KV reuse is disabled for non-attention KV cache.")
+                return None
+            part_sizes = self._get_attention_raw_part_sizes(
+                layer_name,
+                tensor_sizes[layer_name],
+                kv_cache_spec,
+            )
+            if any(part_size % kv_cache_config.num_blocks != 0 for part_size in part_sizes):
+                logger.info(
+                    "Dynamic prefill KV reuse is disabled because %s has non-uniform per-block KV parts.",
+                    layer_name,
+                )
+                return None
+            part_sizes_per_block = tuple(
+                part_size // kv_cache_config.num_blocks for part_size in part_sizes)
+            if ref_part_sizes_per_block is None:
+                ref_part_sizes_per_block = part_sizes_per_block
+            elif part_sizes_per_block != ref_part_sizes_per_block:
+                logger.info(
+                    "Dynamic prefill KV reuse is disabled because KV cache layouts differ across layers.")
+                return None
+
+        assert ref_part_sizes_per_block is not None
+        min_physical_buffers = min(
+            max(getattr(self, "dynamic_prefill_min_physical_kv_buffers", 2), 1),
+            len(layer_names),
+        )
+        alignment = 2 * 1024 * 1024
+        use_alignment = self.vllm_config.kv_transfer_config is not None
+        max_reuse_pool_size = self._get_dynamic_prefill_pool_required_size(
+            kv_cache_config.num_blocks,
+            min_physical_buffers,
+            ref_part_sizes_per_block,
+            alignment,
+            use_alignment,
+        )
+        no_reuse_block_capacity = max(
+            kv_cache_config.num_blocks * min_physical_buffers // len(layer_names),
+            1,
+        )
+        no_reuse_pool_size = self._get_dynamic_prefill_pool_required_size(
+            no_reuse_block_capacity,
+            len(layer_names),
+            ref_part_sizes_per_block,
+            alignment,
+            use_alignment,
+        )
+        pool_size = max(max_reuse_pool_size, no_reuse_pool_size)
+        backing_tensor = torch.zeros(pool_size, dtype=torch.int8, device=self.device)
+        self.dynamic_prefill_kv_pool = DynamicPrefillKVPool(
+            backing_tensor=backing_tensor,
+            layer_names=layer_names,
+            part_sizes_per_block=ref_part_sizes_per_block,
+            max_blocks=kv_cache_config.num_blocks,
+            min_physical_buffers=min_physical_buffers,
+            alignment=alignment,
+            use_alignment=use_alignment,
+        )
+        logger.info(
+            "Dynamic prefill KV reuse enabled: layers=%s, max_blocks=%s, min_physical_buffers=%s, pool_size=%s",
+            len(layer_names),
+            kv_cache_config.num_blocks,
+            min_physical_buffers,
+            pool_size,
+        )
+        return self._build_dynamic_prefill_raw_tensors(
+            block_capacity=kv_cache_config.num_blocks,
+            num_physical_buffers=min_physical_buffers,
+        )
+
+    def _get_dynamic_prefill_pool_required_size(
+        self,
+        block_capacity: int,
+        num_physical_buffers: int,
+        part_sizes_per_block: tuple[int, ...],
+        alignment: int,
+        use_alignment: bool,
+    ) -> int:
+        offset = 0
+        for _ in range(num_physical_buffers):
+            for part_size_per_block in part_sizes_per_block:
+                if use_alignment:
+                    offset = self._align_offset(offset, alignment)
+                offset += part_size_per_block * block_capacity
+        return offset
+
+    def _select_dynamic_prefill_physical_buffers(self, block_capacity: int) -> int:
+        pool = self.dynamic_prefill_kv_pool
+        assert pool is not None
+        if block_capacity > pool.max_blocks:
+            raise RuntimeError(
+                f"Prefill requires block id capacity {block_capacity}, "
+                f"but dynamic KV pool was initialized for {pool.max_blocks} blocks.")
+        for num_buffers in range(len(pool.layer_names), pool.min_physical_buffers - 1, -1):
+            required_size = self._get_dynamic_prefill_pool_required_size(
+                block_capacity,
+                num_buffers,
+                pool.part_sizes_per_block,
+                pool.alignment,
+                pool.use_alignment,
+            )
+            if required_size <= pool.backing_tensor.numel():
+                return num_buffers
+        return pool.min_physical_buffers
+
+    def _build_dynamic_prefill_raw_tensors(
+        self,
+        block_capacity: int,
+        num_physical_buffers: int,
+    ) -> dict[str, KVCacheRawTensor]:
+        pool = self.dynamic_prefill_kv_pool
+        assert pool is not None
+
+        physical_buffers: list[tuple[torch.Tensor, ...]] = []
+        offset = 0
+        for _ in range(num_physical_buffers):
+            parts: list[torch.Tensor] = []
+            for part_size_per_block in pool.part_sizes_per_block:
+                if pool.use_alignment:
+                    offset = self._align_offset(offset, pool.alignment)
+                part_size = part_size_per_block * block_capacity
+                parts.append(pool.backing_tensor[offset:offset + part_size])
+                offset += part_size
+            physical_buffers.append(tuple(parts))
+
+        if offset > pool.backing_tensor.numel():
+            raise RuntimeError(
+                f"Dynamic prefill KV pool is too small: need {offset}, "
+                f"allocated {pool.backing_tensor.numel()}.")
+
+        layer_to_buffer: dict[str, int] = {}
+        kv_cache_raw_tensors: dict[str, KVCacheRawTensor] = {}
+        for layer_idx, layer_name in enumerate(pool.layer_names):
+            buffer_idx = layer_idx % num_physical_buffers
+            layer_to_buffer[layer_name] = buffer_idx
+            kv_cache_raw_tensors[layer_name] = physical_buffers[buffer_idx]
+
+        self.dynamic_prefill_layer_to_buffer = layer_to_buffer
+        self.dynamic_prefill_current_block_capacity = block_capacity
+        self.dynamic_prefill_current_physical_buffers = num_physical_buffers
+        return kv_cache_raw_tensors
+
+    def _current_prefill_block_capacity(self) -> int:
+        if not hasattr(self.input_batch.block_table, "block_tables"):
+            return self.kv_cache_config.num_blocks
+
+        num_reqs = self.input_batch.num_reqs
+        max_block_id = -1
+        for block_table in self.input_batch.block_table.block_tables:
+            num_blocks_per_row = block_table.num_blocks_per_row[:num_reqs]
+            for row_idx, num_blocks in enumerate(num_blocks_per_row):
+                if num_blocks <= 0:
+                    continue
+                row_blocks = block_table.block_table.np[row_idx, :num_blocks]
+                if row_blocks.size > 0:
+                    max_block_id = max(max_block_id, int(row_blocks.max()))
+        return max(max_block_id + 1, 1)
+
+    def _rebind_kv_caches(self, kv_caches: dict[str, KVCacheRawTensor]) -> None:
+        forward_context = self.compilation_config.static_forward_context
+        for layer_name, kv_cache in kv_caches.items():
+            if layer_name in forward_context:
+                forward_context[layer_name].kv_cache = kv_cache
+
+        try:
+            from vllm.v1.worker.utils import extract_layer_index
+        except ImportError:
+            extract_layer_index = None
+
+        num_attn_module = (
+            2 if self.speculative_config is not None
+            and self.speculative_config.use_eagle()
+            and self.speculative_config.method == "eagle3" else 1
+        )
+        index2name = defaultdict(list)
+        for layer_name in kv_caches:
+            if extract_layer_index is None:
+                layer_index = self._get_layer_index_from_name(layer_name)
+            else:
+                layer_index = extract_layer_index(layer_name, num_attn_module)
+            index2name[layer_index].append(layer_name)
+
+        rebound_kv_caches = [
+            kv_caches[index2name[layer_index][0]]
+            for layer_index in sorted(index2name)
+        ]
+        self.kv_caches[:] = rebound_kv_caches
+
+    def _maybe_switch_dynamic_prefill_kv_reuse(self, cudagraph_mode: CUDAGraphMode) -> None:
+        if self.dynamic_prefill_kv_pool is None:
+            return
+        if cudagraph_mode != CUDAGraphMode.NONE:
+            return
+        if not getattr(self, "with_prefill", False):
+            return
+
+        block_capacity = self._current_prefill_block_capacity()
+        num_physical_buffers = self._select_dynamic_prefill_physical_buffers(block_capacity)
+        if (
+            block_capacity == self.dynamic_prefill_current_block_capacity
+            and num_physical_buffers == self.dynamic_prefill_current_physical_buffers
+        ):
+            return
+
+        raw_tensors = self._build_dynamic_prefill_raw_tensors(block_capacity, num_physical_buffers)
+        kv_caches = self._reshape_kv_cache_tensors(self.kv_cache_config, raw_tensors)
+        for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
+            kv_caches[layer_name] = kv_caches[target_layer_name]
+        self.dynamic_prefill_kv_caches = kv_caches
+        self._rebind_kv_caches(kv_caches)
+        if has_kv_transfer_group():
+            kv_transfer_group = get_kv_transfer_group()
+            if hasattr(kv_transfer_group, "update_kv_cache_mapping"):
+                kv_transfer_group.update_kv_cache_mapping(
+                    kv_caches,
+                    num_physical_buffers=num_physical_buffers,
+                )
+        logger.debug(
+            "Switched dynamic prefill KV reuse: block_capacity=%s, physical_buffers=%s",
+            block_capacity,
+            num_physical_buffers,
+        )
+
     def _allocate_kv_cache_tensors(
-            self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
+            self, kv_cache_config: KVCacheConfig) -> dict[str, KVCacheRawTensor]:
         """
         Initializes the KV cache buffer with the correct size. The buffer needs
         to be reshaped to the desired shape before being used by the models.
@@ -2987,6 +3330,10 @@ class NPUModelRunner(GPUModelRunner):
                                               Optional[torch.Tensor]]] = {}
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
         alignment = 2 * 1024 * 1024
+
+        dynamic_prefill_raw_tensors = self._try_create_dynamic_prefill_kv_pool(kv_cache_config)
+        if dynamic_prefill_raw_tensors is not None:
+            return dynamic_prefill_raw_tensors
 
         # KV cache offloading configuration
         # NUM_SHARED_BUFFERS: number of shared KV cache buffers for round-robin reuse
@@ -3167,7 +3514,7 @@ class NPUModelRunner(GPUModelRunner):
     def _reshape_kv_cache_tensors(
         self,
         kv_cache_config: KVCacheConfig,
-        kv_cache_raw_tensors: dict[str, torch.Tensor],
+        kv_cache_raw_tensors: dict[str, KVCacheRawTensor],
     ) -> dict[str, torch.Tensor]:
         """
         Reshape the KV cache tensors to the desired shape and dtype.

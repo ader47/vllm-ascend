@@ -174,7 +174,17 @@ class AscendStoreConnector(KVConnectorBase_V1):
     ############################################################
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
+        self.kv_caches = kv_caches
         self.connector_worker.register_kv_caches(kv_caches)
+
+    def update_kv_cache_mapping(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        num_physical_buffers: int | None = None,
+    ) -> None:
+        assert self.connector_worker is not None
+        self.kv_caches = kv_caches
+        self.connector_worker.update_kv_cache_mapping(kv_caches, num_physical_buffers)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -183,7 +193,7 @@ class AscendStoreConnector(KVConnectorBase_V1):
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.use_layerwise:
             return
-        self.connector_worker.wait_for_layer_load()
+        self.connector_worker.wait_for_layer_load(layer_name)
 
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
@@ -194,7 +204,7 @@ class AscendStoreConnector(KVConnectorBase_V1):
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             return
-        self.connector_worker.save_kv_layer(self._get_connector_metadata())
+        self.connector_worker.save_kv_layer(self._get_connector_metadata(), layer_name)
 
     def wait_for_save(self):
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:

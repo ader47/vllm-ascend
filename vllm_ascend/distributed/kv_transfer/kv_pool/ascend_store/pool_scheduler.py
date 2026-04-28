@@ -28,6 +28,10 @@ class KVPoolScheduler:
             "consumer_is_to_put", False
         )
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get("load_async", False)
+        self.dynamic_prefill_kv_reuse = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "dynamic_prefill_kv_reuse",
+            self.kv_role in ["kv_producer", "kv_both"] and use_layerwise,
+        )
         # request_id -> (vllm cached tokes, kvpool cached tokens)
         self.load_specs: dict[str, LoadSpec] = {}
         self.pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
@@ -73,7 +77,7 @@ class KVPoolScheduler:
         self.model_name = model_config.model.split('/')[-1]
 
         # Define independent layers (same as pool_worker.py)
-        INDEPENDENT_LAYER_INDICES = {0, self.num_layers - 1}
+        INDEPENDENT_LAYER_INDICES = set() if self.dynamic_prefill_kv_reuse else {0, self.num_layers - 1}
         self.independent_layers = list(INDEPENDENT_LAYER_INDICES)
 
         keys_per_block_hash = (

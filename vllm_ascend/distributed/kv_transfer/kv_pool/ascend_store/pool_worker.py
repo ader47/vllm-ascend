@@ -1,6 +1,7 @@
 import importlib
 import math
 import threading
+from collections.abc import Sequence
 
 import torch
 from vllm.config import VllmConfig
@@ -75,6 +76,10 @@ class KVPoolWorker:
 
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get("load_async", False)
+        self.dynamic_prefill_kv_reuse = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "dynamic_prefill_kv_reuse",
+            self.kv_role in ["kv_producer", "kv_both"] and use_layerwize,
+        )
         self.consumer_is_to_put = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "consumer_is_to_put", False
         )
@@ -171,7 +176,7 @@ class KVPoolWorker:
 
         NUM_SHARED_BUFFERS = 2
         self.NUM_SHARED_BUFFERS = NUM_SHARED_BUFFERS
-        INDEPENDENT_LAYER_INDICES = {0, self.num_layers - 1}
+        INDEPENDENT_LAYER_INDICES = set() if self.dynamic_prefill_kv_reuse else {0, self.num_layers - 1}
         self.independent_layers = list(INDEPENDENT_LAYER_INDICES)
 
         shared_layer_indices = [i for i in range(self.num_layers)
@@ -190,7 +195,85 @@ class KVPoolWorker:
             self.layer_next_map[shared_layer_indices[i]] = shared_layer_indices[i + NUM_SHARED_BUFFERS]
         self.offload_start_ids = buffer_owner_indices
         self.layers_need_to_save = [i for i in range(self.num_layers) if i not in self.independent_layers]
+        self.has_layer_reuse = len(self.layer_next_map) > 0
+        self.force_initial_layer_load = False
+        self.pending_save_layers: set[int] = set()
         self.sync_save_events = None
+
+    @staticmethod
+    def _layer_id_from_name(layer_name: str | None) -> int | None:
+        if layer_name is None:
+            return None
+        for part in layer_name.split("."):
+            if part.isdigit():
+                return int(part)
+        return None
+
+    @staticmethod
+    def _cache_parts(cache_or_caches: torch.Tensor | Sequence[torch.Tensor]) -> Sequence[torch.Tensor]:
+        if isinstance(cache_or_caches, torch.Tensor):
+            return (cache_or_caches,)
+        return cache_or_caches
+
+    @staticmethod
+    def _registration_region(cache: torch.Tensor, fallback_len: int) -> tuple[int, int]:
+        try:
+            storage = cache.untyped_storage()
+            nbytes = storage.nbytes() if callable(storage.nbytes) else storage.nbytes
+            return storage.data_ptr(), nbytes
+        except Exception:
+            return cache.data_ptr(), fallback_len
+
+    def _sorted_kv_cache_items(
+        self,
+        kv_caches: dict[str, torch.Tensor | Sequence[torch.Tensor]],
+    ) -> list[tuple[str, torch.Tensor | Sequence[torch.Tensor]]]:
+        return sorted(
+            kv_caches.items(),
+            key=lambda item: self._layer_id_from_name(item[0]) or 0,
+        )
+
+    def _set_kv_cache_address_table(
+        self,
+        kv_caches: dict[str, torch.Tensor | Sequence[torch.Tensor]],
+    ) -> None:
+        kv_caches_base_addr = []
+        for _, cache_or_caches in self._sorted_kv_cache_items(kv_caches):
+            for cache in self._cache_parts(cache_or_caches):
+                kv_caches_base_addr.append(cache.data_ptr())
+        self.kv_caches = kv_caches
+        self.kv_caches_base_addr = kv_caches_base_addr
+        self.token_database.set_kv_caches_base_addr(kv_caches_base_addr)
+
+    def _set_dynamic_layerwise_schedule(self, num_physical_buffers: int) -> None:
+        if not self.dynamic_prefill_kv_reuse:
+            return
+        num_physical_buffers = max(min(num_physical_buffers, self.num_layers), 1)
+        old_physical_buffers = self.NUM_SHARED_BUFFERS
+        self.NUM_SHARED_BUFFERS = num_physical_buffers
+        self.independent_layers = []
+        self.layers_need_to_save = list(range(self.num_layers))
+        self.has_layer_reuse = num_physical_buffers < self.num_layers
+        self.pending_save_layers.clear()
+        if self.has_layer_reuse:
+            self.offload_start_ids = list(range(num_physical_buffers))
+            self.layer_next_map = {
+                layer_id: layer_id + num_physical_buffers
+                for layer_id in range(self.num_layers - num_physical_buffers)
+            }
+        else:
+            self.offload_start_ids = list(range(self.num_layers))
+            self.layer_next_map = {}
+        self.force_initial_layer_load = old_physical_buffers != num_physical_buffers
+
+    def update_kv_cache_mapping(
+        self,
+        kv_caches: dict[str, torch.Tensor | Sequence[torch.Tensor]],
+        num_physical_buffers: int | None = None,
+    ) -> None:
+        if num_physical_buffers is not None:
+            self._set_dynamic_layerwise_schedule(num_physical_buffers)
+        self._set_kv_cache_address_table(kv_caches)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
@@ -212,24 +295,23 @@ class KVPoolWorker:
             first_kv_cache.shape,
         )
 
-        self.kv_caches = kv_caches
-        self.kv_caches_base_addr = []
         ptrs = []
         lengths = []
+        registered_regions = set()
         length = len(self.block_len)
-        for cache_or_caches in kv_caches.values():
-            for i, cache in enumerate(cache_or_caches, 0):
-                base_addr = cache.data_ptr()
-                if base_addr not in self.kv_caches_base_addr:
-                    region_len = self.num_blocks * self.block_len[i % length]
+        for _, cache_or_caches in self._sorted_kv_cache_items(kv_caches):
+            for i, cache in enumerate(self._cache_parts(cache_or_caches), 0):
+                region_len = self.num_blocks * self.block_len[i % length]
+                base_addr, register_len = self._registration_region(cache, region_len)
+                if base_addr not in registered_regions:
                     ptrs.append(base_addr)
-                    lengths.append(region_len)
-                self.kv_caches_base_addr.append(base_addr)
+                    lengths.append(register_len)
+                    registered_regions.add(base_addr)
 
         self.m_store.register_buffer(ptrs, lengths)
         self.page_size_bytes = sum(self.block_len)
-        self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
         self.token_database.set_block_len(self.block_len)
+        self._set_kv_cache_address_table(kv_caches)
 
         if self.use_layerwise:
             self.get_event = threading.Event()
@@ -340,6 +422,8 @@ class KVPoolWorker:
             for layer_id in self.offload_start_ids:
                 layer_load_task = self.layer_load_tasks[layer_id]
                 self.kv_recv_thread.add_request((None, layer_load_task, layer_id))
+            if self.has_layer_reuse:
+                self.force_initial_layer_load = False
 
     def _get_or_init_layer_tracker(self, req_id: str, layer_id: int, tracker_key: str | None = None, initial_processed_count: int = 0) -> dict:
         key = tracker_key if tracker_key else req_id
@@ -499,43 +583,63 @@ class KVPoolWorker:
             self._process_save_for_layer(request, layer_id)
             self._process_load_for_layer(request, layer_id)
 
-    def wait_for_layer_load(self) -> None:
-        if self.current_layer in self.independent_layers:
-            if self.current_layer == self.independent_layers[0]:
-                for layer_id in self.offload_start_ids:
-                    logger.debug(f">>>>>>>>>>>>>>>>>>>> load layer {layer_id}")
-                    layer_load_task = self.layer_load_tasks[layer_id]
-                    self.kv_recv_thread.add_request((None, layer_load_task, layer_id))
-            self.layer_load_finished_events[self.current_layer].clear()
+    def wait_for_layer_load(self, layer_name: str | None = None) -> None:
+        layer_id = self._layer_id_from_name(layer_name)
+        if layer_id is None:
+            layer_id = self.current_layer
+        if not self.has_layer_reuse and not self.force_initial_layer_load:
             return
-        is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=10)
+        if layer_id in self.independent_layers:
+            current_layer_id = layer_id
+            if layer_id == self.independent_layers[0]:
+                for offload_layer_id in self.offload_start_ids:
+                    logger.debug(f">>>>>>>>>>>>>>>>>>>> load layer {offload_layer_id}")
+                    layer_load_task = self.layer_load_tasks[offload_layer_id]
+                    self.kv_recv_thread.add_request((None, layer_load_task, offload_layer_id))
+            self.layer_load_finished_events[current_layer_id].clear()
+            return
+        is_finish = self.layer_load_finished_events[layer_id].wait(timeout=10)
         if not is_finish:
-            logger.info("Layerwise %d load wait timed out", self.current_layer)
-        logger.debug(f">>>>>>>>>>>>>>>>>>>> clear load layer {self.current_layer}")
-        self.layer_load_finished_events[self.current_layer].clear()
+            logger.info("Layerwise %d load wait timed out", layer_id)
+        logger.debug(f">>>>>>>>>>>>>>>>>>>> clear load layer {layer_id}")
+        self.layer_load_finished_events[layer_id].clear()
 
-    def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
+    def save_kv_layer(self, connector_metadata: AscendConnectorMetadata, layer_name: str | None = None) -> None:
+        layer_id = self._layer_id_from_name(layer_name)
+        if layer_id is None:
+            layer_id = self.current_layer
         # Wait for KV cache saving to complete on the final layer that requires offloading.
-        if self.current_layer in self.layers_need_to_save:
-            self.sync_save_events[self.current_layer].record()
-            self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
+        if layer_id in self.layers_need_to_save:
+            self.sync_save_events[layer_id].record()
+            if self.layer_save_tasks[layer_id]:
+                self.pending_save_layers.add(layer_id)
+            self.kv_send_thread.add_request(self.layer_save_tasks[layer_id])
             # add load task, in both prefill and decode stages
             # 1. wait for save, and clear save event
             # 2. start load, for prefill layer_load_tasks is None, skip load in the recv thread.
             # 3. set layer_load_finished_events (both prefill & decode)
-            if self.current_layer in self.layer_next_map:
-                next_layer = self.layer_next_map[self.current_layer]
+            if self.has_layer_reuse and layer_id in self.layer_next_map:
+                next_layer = self.layer_next_map[layer_id]
                 self.kv_recv_thread.add_request(
-                    (self.current_layer, self.layer_load_tasks[next_layer], next_layer))
-        if self.current_layer == self.num_layers - 1:
-            is_finish = self.layer_save_finished_events[self.layers_need_to_save[-1]].wait(timeout=10)
-            if not is_finish:
-                logger.info("Layerwise %d save wait timed out", self.current_layer)
-            for layer_id in self.layers_need_to_save[-1*self.NUM_SHARED_BUFFERS:]:
-                logger.debug(f">>>>>>>>>>>>>>>>>>>> clear save layer {layer_id}")
-                self.layer_save_finished_events[layer_id].clear()
+                    (layer_id, self.layer_load_tasks[next_layer], next_layer))
+        if layer_id == self.num_layers - 1:
+            if self.has_layer_reuse:
+                save_wait_layers = self.layers_need_to_save[-1*self.NUM_SHARED_BUFFERS:]
+            else:
+                save_wait_layers = sorted(self.pending_save_layers)
+            for save_layer_id in save_wait_layers:
+                is_finish = self.layer_save_finished_events[save_layer_id].wait(timeout=10)
+                if not is_finish:
+                    logger.info("Layerwise %d save wait timed out", save_layer_id)
+                    continue
+                logger.debug(f">>>>>>>>>>>>>>>>>>>> clear save layer {save_layer_id}")
+                self.layer_save_finished_events[save_layer_id].clear()
+                self.pending_save_layers.discard(save_layer_id)
+            if self.has_layer_reuse:
+                self.pending_save_layers.clear()
+            self.force_initial_layer_load = False
 
-        self.current_layer = self.current_layer + 1
+        self.current_layer = layer_id + 1
 
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata):
         current_event = None
