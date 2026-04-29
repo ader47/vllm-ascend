@@ -1161,8 +1161,6 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
 
-            wait_for_kv_layer_from_connector(layer_name)
-
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
                 k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping_cp, attn_metadata)
@@ -1266,22 +1264,17 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
 
-        topk_num_tokens = num_input_tokens or hidden_states.shape[0]
-        if self.skip_topk:
-            topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
-        else:
-            topk_indices = self.indexer_select_post_process(
-                x=hidden_states,
-                q_c=q_c,
-                kv_cache=kv_cache,
-                attn_metadata=attn_metadata,
-                cos=cos,
-                sin=sin,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-            )
-            if self.use_index_cache:
-                self._update_indexcache_topk_indices(topk_indices)
+        wait_for_kv_layer_from_connector(layer_name)
+        topk_indices = self.indexer_select_post_process(
+            x=hidden_states,
+            q_c=q_c,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            cos=cos,
+            sin=sin,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+        )
 
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
