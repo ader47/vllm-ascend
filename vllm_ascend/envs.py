@@ -114,7 +114,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    "VLLM_KV_CACHE_REUSE_LAYERS": lambda: bool(
+    "VLLM_KV_CACHE_REUSE_LAYERS": lambda: int(
         int(os.getenv("VLLM_KV_CACHE_REUSE_LAYERS", "0"))
     ),
     # The DRAM size allocated for KV pool storage (e.g., "2GB", "512MB", "1073741824").
