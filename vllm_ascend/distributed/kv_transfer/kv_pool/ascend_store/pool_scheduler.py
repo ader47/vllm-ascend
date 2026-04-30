@@ -102,6 +102,9 @@ class KVPoolScheduler:
         request_tracker: RequestTracker,
         has_last_block=False,
     ) -> None:
+        if not self.use_layerwise:
+            return
+
         keys_to_alloc, last_block_key = self.generate_keys(
             block_hashes,
             req_id=request_tracker.req_id,
@@ -182,22 +185,35 @@ class KVPoolScheduler:
         #         raise ValueError(
         #             f"Request {request.request_id}: cached gvas key(s) no longer exist in store")
         #     remaining_keys = remaining_keys[len(cached_gvas):]
-        cached_gvas = []
+        cached_gvas: list[int] = []
         num_remote_hit_blocks = 0
         if remaining_keys:
-            key_infos = self.store_scheduler.batch_get_key_info(remaining_keys)
-            for key_info in key_infos:
-                sizes = key_info.size()
-                if sizes and sizes > 0:
-                    cached_gvas.append(key_info.gva_list()[0])
-                    num_remote_hit_blocks += 1
-                else:
-                    break
+            if self.use_layerwise:
+                key_infos = self.store_scheduler.batch_get_key_info(remaining_keys)
+                for key_info in key_infos:
+                    sizes = key_info.size()
+                    if sizes and sizes > 0:
+                        cached_gvas.append(key_info.gva_list()[0])
+                        num_remote_hit_blocks += 1
+                    else:
+                        break
+            else:
+                exists_states = self.store_scheduler.batch_is_exist(remaining_keys)
+                for exists in exists_states:
+                    if exists == 1:
+                        num_remote_hit_blocks += 1
+                    else:
+                        break
         num_hit_blocks = local_hit_blocks + num_remote_hit_blocks
         num_external_hit_tokens = num_hit_blocks * self._block_size
-        tracker.block_keys = keys_to_check[local_hit_blocks:num_hit_blocks]
-        tracker.chunk_gvas = cached_gvas[:num_remote_hit_blocks]
-        tracker.gva_block_offset = local_hit_blocks
+        if self.use_layerwise:
+            tracker.block_keys = keys_to_check[local_hit_blocks:num_hit_blocks]
+            tracker.chunk_gvas = cached_gvas[:num_remote_hit_blocks]
+            tracker.gva_block_offset = local_hit_blocks
+        else:
+            tracker.block_keys = []
+            tracker.chunk_gvas = []
+            tracker.gva_block_offset = 0
         # TODO 这里没有命中的可以提前申请空间，避免后面申请的时候掩盖不住，这个可以异步进行。
         # 先exists判断是否存在，然后异步获取地址和申请空间，这样是否更高效一点？
         if num_external_hit_tokens == request.num_tokens:
