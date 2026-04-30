@@ -1,3 +1,4 @@
+import re
 from functools import partial
 
 import vllm
@@ -23,6 +24,8 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_ascend import envs
 
+LAYER_INDEX_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
 
 def get_kv_cache_reuse_layers(max_layers: int | None = None) -> int | None:
     """Return configured KV cache reuse slots, or None when disabled."""
@@ -37,6 +40,88 @@ def get_kv_cache_reuse_layers(max_layers: int | None = None) -> int | None:
             f"of KV cache layers, got {reuse_layers} > {max_layers}."
         )
     return reuse_layers
+
+
+def get_kv_cache_independent_layer_indices(total_layers: int) -> set[int]:
+    """Return global layer indices that should not share KV cache storage."""
+    independent_layers = envs.VLLM_ASCEND_KV_CACHE_REUSE_INDEPENDENT_LAYERS
+    if not independent_layers:
+        return set()
+
+    indices: set[int] = set()
+    for raw_index in independent_layers.split(","):
+        raw_index = raw_index.strip()
+        if not raw_index:
+            continue
+        try:
+            index = int(raw_index)
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_ASCEND_KV_CACHE_REUSE_INDEPENDENT_LAYERS must be a "
+                f"comma-separated list of integers, got {raw_index!r}."
+            ) from exc
+        if index < 0:
+            index += total_layers
+        if index < 0 or index >= total_layers:
+            raise ValueError(
+                "VLLM_ASCEND_KV_CACHE_REUSE_INDEPENDENT_LAYERS contains "
+                f"out-of-range layer index {raw_index!r} for {total_layers} "
+                "model layers."
+            )
+        indices.add(index)
+    return indices
+
+
+def _get_layer_index(layer_name: str) -> int:
+    match = LAYER_INDEX_PATTERN.search(layer_name)
+    if match is None:
+        raise ValueError(
+            "VLLM_ASCEND_KV_CACHE_REUSE_INDEPENDENT_LAYERS requires layer "
+            f"names to contain a '.layers.<index>.' segment, got {layer_name!r}."
+        )
+    return int(match.group(1))
+
+
+def _split_kv_cache_storage_slots(
+    layer_names: list[str],
+    reuse_layers: int | None,
+    independent_layer_indices: set[int],
+) -> list[list[str]]:
+    if reuse_layers is None:
+        return [[layer_name] for layer_name in layer_names]
+    if not independent_layer_indices:
+        shared_slots = [[] for _ in range(reuse_layers)]
+        for i, layer_name in enumerate(layer_names):
+            shared_slots[i % reuse_layers].append(layer_name)
+        return [slot for slot in shared_slots if slot]
+
+    independent_slots: list[list[str]] = []
+    reusable_layer_names: list[str] = []
+    for layer_name in layer_names:
+        if _get_layer_index(layer_name) in independent_layer_indices:
+            independent_slots.append([layer_name])
+        else:
+            reusable_layer_names.append(layer_name)
+
+    storage_slots = independent_slots
+    if reusable_layer_names:
+        shared_slots = [[] for _ in range(reuse_layers)]
+        for i, layer_name in enumerate(reusable_layer_names):
+            shared_slots[i % reuse_layers].append(layer_name)
+        storage_slots.extend(slot for slot in shared_slots if slot)
+
+    return storage_slots
+
+
+def get_kv_cache_reuse_storage_layers(total_layers: int) -> int | None:
+    reuse_layers = get_kv_cache_reuse_layers(total_layers)
+    if reuse_layers is None:
+        return None
+
+    independent_layer_indices = get_kv_cache_independent_layer_indices(total_layers)
+    num_reusable_layers = total_layers - len(independent_layer_indices)
+    num_shared_slots = min(reuse_layers, num_reusable_layers)
+    return len(independent_layer_indices) + num_shared_slots
 
 
 def get_num_blocks(
@@ -54,8 +139,9 @@ def get_num_blocks(
         available_memory: Memory available for KV cache in bytes.
         page_size: The page size of the KV cache.
     """
-    reuse_layers = get_kv_cache_reuse_layers(num_layers)
-    effective_layers = reuse_layers if reuse_layers is not None else num_layers
+    effective_layers = get_kv_cache_reuse_storage_layers(num_layers)
+    if effective_layers is None:
+        effective_layers = num_layers
     num_blocks = int(available_memory // page_size // effective_layers)
     num_blocks = max(num_blocks, 0)
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
@@ -93,7 +179,9 @@ def get_kv_cache_config_from_groups(
         # different hidden size. Allocate different amount of memory for each
         # layer based on its hidden size.
         group = kv_cache_groups[0]
-        reuse_layers = get_kv_cache_reuse_layers(len(group.layer_names))
+        total_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+        reuse_layers = get_kv_cache_reuse_layers(total_layers)
+        independent_layer_indices = get_kv_cache_independent_layer_indices(total_layers)
         per_layer_specs = group.kv_cache_spec.kv_cache_specs
 
         if reuse_layers is not None:
@@ -108,9 +196,7 @@ def get_kv_cache_config_from_groups(
         if reuse_layers is None:
             storage_slots = [[layer_name] for layer_name in group.layer_names]
         else:
-            storage_slots = [[] for _ in range(reuse_layers)]
-            for i, layer_name in enumerate(group.layer_names):
-                storage_slots[i % reuse_layers].append(layer_name)
+            storage_slots = _split_kv_cache_storage_slots(group.layer_names, reuse_layers, independent_layer_indices)
 
         page_size = sum(
             max(per_layer_specs[layer_name].page_size_bytes for layer_name in slot) for slot in storage_slots
@@ -137,18 +223,43 @@ def get_kv_cache_config_from_groups(
 
         page_size = get_uniform_page_size([group.kv_cache_spec for group in kv_cache_groups])
         assert group_size > 0, "group_size must be greater than 0"
-        reuse_layers = get_kv_cache_reuse_layers(group_size)
-        storage_group_size = reuse_layers if reuse_layers is not None else group_size
-        num_blocks = get_num_blocks(vllm_config, storage_group_size, available_memory, page_size)
-        kv_cache_tensors = []
-        for i in range(storage_group_size):
-            shared_by = []
+        total_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+        reuse_layers = get_kv_cache_reuse_layers(total_layers)
+        independent_layer_indices = get_kv_cache_independent_layer_indices(total_layers)
+
+        if reuse_layers is None:
+            storage_slots = []
+            for i in range(group_size):
+                shared_by = []
+                for group in kv_cache_groups:
+                    if i < len(group.layer_names):
+                        shared_by.append(group.layer_names[i])
+                storage_slots.append(shared_by)
+        else:
+            independent_slots: list[list[str]] = []
+            reusable_layers_by_group: list[list[str]] = []
             for group in kv_cache_groups:
-                shared_by.extend(
-                    layer_name
-                    for layer_index, layer_name in enumerate(group.layer_names)
-                    if layer_index % storage_group_size == i
-                )
+                reusable_layer_names = []
+                for layer_name in group.layer_names:
+                    if independent_layer_indices and _get_layer_index(layer_name) in independent_layer_indices:
+                        independent_slots.append([layer_name])
+                    else:
+                        reusable_layer_names.append(layer_name)
+                reusable_layers_by_group.append(reusable_layer_names)
+
+            shared_slots = [[] for _ in range(reuse_layers)]
+            for reusable_layer_names in reusable_layers_by_group:
+                for i, layer_name in enumerate(reusable_layer_names):
+                    shared_slots[i % reuse_layers].append(layer_name)
+
+            storage_slots = independent_slots
+            storage_slots.extend(slot for slot in shared_slots if slot)
+
+        num_blocks = int(available_memory // page_size // len(storage_slots))
+        num_blocks = max(num_blocks, 0)
+        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+        kv_cache_tensors = []
+        for shared_by in storage_slots:
             kv_cache_tensors.append(KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by))
 
     return KVCacheConfig(
@@ -223,13 +334,13 @@ def get_kv_cache_configs(
 
     # Check if the available memory is enough per worker.
     total_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
-    reuse_layers = get_kv_cache_reuse_layers(total_layers)
+    reuse_storage_layers = get_kv_cache_reuse_storage_layers(total_layers)
     for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
         if not groups:
             continue
         effective_avail_mem = avail_mem
-        if reuse_layers is not None:
-            effective_avail_mem = avail_mem * total_layers // reuse_layers
+        if reuse_storage_layers is not None:
+            effective_avail_mem = avail_mem * total_layers // reuse_storage_layers
         _check_enough_kv_cache_memory(
             effective_avail_mem,
             partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),

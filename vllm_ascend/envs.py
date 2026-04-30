@@ -119,6 +119,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Valid range is validated against model layers at runtime.
     # This variable is not sensitive.
     "VLLM_ASCEND_KV_CACHE_REUSE_LAYERS": lambda: int(os.getenv("VLLM_ASCEND_KV_CACHE_REUSE_LAYERS", "0")),
+    # Comma-separated global layer indices that keep dedicated KV cache
+    # storage when VLLM_ASCEND_KV_CACHE_REUSE_LAYERS is enabled.
+    # Empty string: no independent layers. Negative indices are resolved
+    # against the model layer count, e.g. -1 means the last model layer.
+    # This variable is not sensitive.
+    "VLLM_ASCEND_KV_CACHE_REUSE_INDEPENDENT_LAYERS": lambda: os.getenv(
+        "VLLM_ASCEND_KV_CACHE_REUSE_INDEPENDENT_LAYERS", ""
+    ),
     # The DRAM size allocated for KV pool storage (e.g., "2GB", "512MB", "1073741824").
     # Used to calculate LRU cache capacity for KV block management.
     # If not set, defaults to "0" which means LRU capacity falls back to a fixed value.
