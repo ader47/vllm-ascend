@@ -1,6 +1,6 @@
 from typing import Any
 
-import vllm.envs as envs
+import vllm.envs as vllm_envs
 from memcache_hybrid import DistributedObjectStore  # type: ignore
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
@@ -9,6 +9,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
     LoadSpec,
@@ -20,14 +21,14 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 class KVPoolScheduler:
     def __init__(self, vllm_config: "VllmConfig", use_layerwise, page_size_bytes: int):
         self.use_layerwise = use_layerwise
+        # Layerwise controls the pool granularity; KV cache reuse turns it into layerwise offload.
+        self.layerwise_offload = self.use_layerwise and ascend_envs.VLLM_ASCEND_KV_CACHE_REUSE_LAYERS > 0
         self.kv_role = vllm_config.kv_transfer_config.kv_role
-        self.consumer_is_to_load = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
-            "consumer_is_to_load", False
-        )
-        self.consumer_is_to_put = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
-            "consumer_is_to_put", False
-        )
-        self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get("load_async", False)
+        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self.consumer_is_to_load = extra_config.get("consumer_is_to_load", False)
+        self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
+        self.load_async = extra_config.get("load_async", False)
+        self.save_decode_full_blocks = extra_config.get("save_decode_full_blocks", False)
         # request_id -> (vllm cached tokes, kvpool cached tokens)
         self.load_specs: dict[str, LoadSpec] = {}
         pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
@@ -42,7 +43,7 @@ class KVPoolScheduler:
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
         self._preempted_req_ids: set[str] = set()
-        self.prefill_offload = True
+        self.prefill_offload = self.layerwise_offload
         # Whether to discard partial chunks
         self._discard_partial_chunks = (
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -73,14 +74,17 @@ class KVPoolScheduler:
 
         # Define independent layers (same as pool_worker.py)
         INDEPENDENT_LAYER_INDICES = {0, num_layers - 1}
-        independent_layers = list(INDEPENDENT_LAYER_INDICES)
+        layer_count = num_layers - len(INDEPENDENT_LAYER_INDICES) if self.layerwise_offload else num_layers
 
         keys_per_block_hash = (
             pcp_size * dcp_size
             * (tp_size // put_step)
-            * (num_layers - len(independent_layers))
+            * layer_count
         )
         self.keys_per_block_hash = keys_per_block_hash
+
+    def _has_partial_block_to_save(self, token_len: int) -> bool:
+        return not self._discard_partial_chunks and token_len % self._block_size != 0
 
     def _get_or_create_request_tracker(self, req_id: str) -> RequestTracker:
         tracker = self._request_trackers.get(req_id)
@@ -316,7 +320,7 @@ class KVPoolScheduler:
             )
 
             num_blocks = num_tokens_to_compute // self._block_size
-            has_last_block = num_tokens_to_compute % self._block_size != 0
+            has_last_block = self._has_partial_block_to_save(num_tokens_to_compute)
 
             self._generate_keys_and_alloc(
                 request_real.block_hashes[num_hit_blocks:num_blocks],
@@ -382,7 +386,7 @@ class KVPoolScheduler:
                     num_hit_blocks = len(request_tracker.block_keys)
 
                     num_blocks = len(new_block_ids)
-                    has_last_block = num_tokens_to_compute % self._block_size != 0
+                    has_last_block = self._has_partial_block_to_save(num_tokens_to_compute)
                     self._generate_keys_and_alloc(
                         request_real.block_hashes[num_hit_blocks:num_blocks],
                         request_tracker=request_tracker,
@@ -407,6 +411,8 @@ class KVPoolScheduler:
 
                 # decode/chunked request
                 else:
+                    if self.use_layerwise and not self.layerwise_offload and not self.save_decode_full_blocks:
+                        continue
                     request_tracker = self._request_trackers.get(req_id)
                     if request_tracker is None:
                         raise ValueError(
@@ -428,7 +434,7 @@ class KVPoolScheduler:
                     prev_hash_count = prev_token_count // self._block_size
                     current_hash_count = request_tracker.token_len // self._block_size
                     new_hash_count = current_hash_count - prev_hash_count
-                    has_last_block = request_tracker.token_len % self._block_size != 0
+                    has_last_block = self._has_partial_block_to_save(request_tracker.token_len)
                     if new_hash_count > 0 or has_last_block:
                         self._generate_keys_and_alloc(
                             request.block_hashes[prev_hash_count:current_hash_count],
@@ -482,7 +488,7 @@ class KVPoolScheduler:
                 self._request_trackers[request_id] = request_tracker
 
                 num_blocks = num_tokens_to_compute // self._block_size
-                has_last_block = num_tokens_to_compute % self._block_size != 0
+                has_last_block = self._has_partial_block_to_save(num_tokens_to_compute)
                 block_hashes_for_keys = request.block_hashes[:num_blocks]
                 self._generate_keys_and_alloc(
                     block_hashes_for_keys,
@@ -524,7 +530,7 @@ class KVPoolScheduler:
 
 def get_zmq_rpc_path_lookup(vllm_config: "VllmConfig") -> str:
     dp_rank = vllm_config.parallel_config.data_parallel_rank
-    base_url = envs.VLLM_RPC_BASE_PATH
+    base_url = vllm_envs.VLLM_RPC_BASE_PATH
     # Default to 0 if not configured
     rpc_port = 0
     if vllm_config is not None:

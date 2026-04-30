@@ -503,7 +503,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         num_ranks_per_layer: int,
         page_size_bytes: int,
         ready_event: threading.Event,
-        num_layers: int,
+        final_layer_id: int,
         layer_save_finished_events: list[threading.Event],
         sync_save_events: list[torch.npu.Event],
         enable_kv_event: bool = False,
@@ -519,7 +519,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             ready_event,
             name="KVCacheStoreLayerSendingThread",
         )
-        self.final_layer_id = num_layers - 1
+        self.final_layer_id = final_layer_id
         self.put_step = put_step
         self.enable_kv_event = enable_kv_event
         self.layer_save_finished_events = layer_save_finished_events
@@ -620,7 +620,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         get_event: threading.Event,
         layer_load_finished_events: list[threading.Event],
         layer_save_finished_events: list[threading.Event],
-        num_layers: int,
+        final_layer_id: int,
         h2d_stagger_us: int = 0,
         h2d_stagger_group_size: int = 0,
         h2d_stagger_dynamic_addrs_per_us: int = 0,
@@ -639,7 +639,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.get_event = get_event
         self.layer_load_finished_events = layer_load_finished_events
         self.layer_save_finished_events = layer_save_finished_events
-        self.final_layer_id = num_layers - 1
+        self.final_layer_id = final_layer_id
         self.h2d_stagger_us = h2d_stagger_us
         self.h2d_stagger_group_size = h2d_stagger_group_size
         self.h2d_stagger_dynamic_addrs_per_us = h2d_stagger_dynamic_addrs_per_us
