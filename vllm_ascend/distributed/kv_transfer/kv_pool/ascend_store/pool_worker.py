@@ -440,7 +440,12 @@ class KVPoolWorker:
             self._process_save_for_layer_batch(requests, layer_id)
             self._process_load_for_layer_batch(requests, layer_id)
 
-    def _submit_layer_load(self, wait_for_save: int | None, layer_id: int) -> None:
+    def _submit_layer_load(
+        self,
+        wait_for_save: int | None,
+        layer_id: int,
+        load_start_event: torch.npu.Event | None = None,
+    ) -> None:
         assert self.kv_recv_thread is not None
         layer_load_task = self.layer_load_tasks[layer_id]
         self.kv_recv_thread.add_request(
@@ -448,24 +453,30 @@ class KVPoolWorker:
                 wait_for_save_layer=wait_for_save,
                 transfer_tasks=layer_load_task,
                 layer_id=layer_id,
+                load_start_event=load_start_event,
             )
         )
 
-    def _submit_ready_layer_loads(self) -> None:
+    def _submit_ready_layer_loads(
+        self,
+        load_start_event: torch.npu.Event | None,
+    ) -> None:
         if self.current_layer in self.independent_layers:
             if self.current_layer == self.independent_layers[0]:
                 for layer_id in self.offload_start_ids:
                     logger.debug(f">>>>>>>>>>>>>>>>>>>> load layer {layer_id}")
-                    self._submit_layer_load(None, layer_id)
+                    self._submit_layer_load(None, layer_id, load_start_event)
             return
 
         prev_layer = self.current_layer - 1
         if prev_layer in self.layer_next_map:
             next_layer = self.layer_next_map[prev_layer]
-            self._submit_layer_load(prev_layer, next_layer)
+            self._submit_layer_load(prev_layer, next_layer, load_start_event)
 
     def wait_for_layer_load(self) -> None:
-        self._submit_ready_layer_loads()
+        load_start_event = torch.npu.Event()
+        load_start_event.record()
+        self._submit_ready_layer_loads(load_start_event)
         if self.current_layer in self.independent_layers:
             self.layer_load_finished_events[self.current_layer].clear()
             return

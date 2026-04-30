@@ -499,3 +499,4 @@ class LayerLoadTask:
     wait_for_save_layer: int | None
     transfer_tasks: list[LayerTransferTask]
     layer_id: int
+    load_start_event: torch.npu.Event | None = None

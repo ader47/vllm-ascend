@@ -729,6 +729,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             req_meta.size_array,
             (self.tp_rank * len(req_meta.size_array)) // self.tp_size,
         )
+        if data.load_start_event is not None:
+            data.load_start_event.synchronize()
         self._stagger_h2d_submit(layer_id, len(gvas_list_c))
         res = self.m_store.store.batch_copy(gvas_list_c, addr_list_c, size_list_c, 1)
         if res != 0:
