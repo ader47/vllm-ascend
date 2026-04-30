@@ -124,30 +124,6 @@ def get_kv_cache_reuse_storage_layers(total_layers: int) -> int | None:
     return len(independent_layer_indices) + num_shared_slots
 
 
-def get_num_blocks(
-    vllm_config: VllmConfig,
-    num_layers: int,
-    available_memory: int,
-    page_size: int,
-) -> int:
-    """
-    Get the number of kv cache blocks.
-
-    Args:
-        vllm_config: The global VllmConfig
-        num_layers: The number of layers
-        available_memory: Memory available for KV cache in bytes.
-        page_size: The page size of the KV cache.
-    """
-    effective_layers = get_kv_cache_reuse_storage_layers(num_layers)
-    if effective_layers is None:
-        effective_layers = num_layers
-    num_blocks = int(available_memory // page_size // effective_layers)
-    num_blocks = max(num_blocks, 0)
-    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-    return num_blocks
-
-
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -181,22 +157,26 @@ def get_kv_cache_config_from_groups(
         group = kv_cache_groups[0]
         total_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         reuse_layers = get_kv_cache_reuse_layers(total_layers)
-        independent_layer_indices = get_kv_cache_independent_layer_indices(total_layers)
+        independent_layer_indices = (
+            get_kv_cache_independent_layer_indices(total_layers) if reuse_layers is not None else set()
+        )
         per_layer_specs = group.kv_cache_spec.kv_cache_specs
-
-        if reuse_layers is not None:
-            page_sizes = {per_layer_specs[layer_name].page_size_bytes for layer_name in group.layer_names}
-            if len(page_sizes) != 1:
-                raise ValueError(
-                    "VLLM_ASCEND_KV_CACHE_REUSE_LAYERS is not supported for "
-                    "UniformTypeKVCacheSpecs with different per-layer page "
-                    f"sizes, got {sorted(page_sizes)}."
-                )
 
         if reuse_layers is None:
             storage_slots = [[layer_name] for layer_name in group.layer_names]
         else:
             storage_slots = _split_kv_cache_storage_slots(group.layer_names, reuse_layers, independent_layer_indices)
+            for slot in storage_slots:
+                if len(slot) <= 1:
+                    continue
+                page_sizes = {per_layer_specs[layer_name].page_size_bytes for layer_name in slot}
+                if len(page_sizes) != 1:
+                    raise ValueError(
+                        "VLLM_ASCEND_KV_CACHE_REUSE_LAYERS is not supported "
+                        "for sharing UniformTypeKVCacheSpecs layers with "
+                        "different page sizes in the same storage slot, got "
+                        f"{sorted(page_sizes)} for layers {slot}."
+                    )
 
         page_size = sum(
             max(per_layer_specs[layer_name].page_size_bytes for layer_name in slot) for slot in storage_slots
@@ -225,7 +205,9 @@ def get_kv_cache_config_from_groups(
         assert group_size > 0, "group_size must be greater than 0"
         total_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         reuse_layers = get_kv_cache_reuse_layers(total_layers)
-        independent_layer_indices = get_kv_cache_independent_layer_indices(total_layers)
+        independent_layer_indices = (
+            get_kv_cache_independent_layer_indices(total_layers) if reuse_layers is not None else set()
+        )
 
         if reuse_layers is None:
             storage_slots = []
@@ -378,6 +360,5 @@ def get_kv_cache_configs(
     return kv_cache_configs
 
 
-vllm.v1.core.kv_cache_utils.get_num_blocks = get_num_blocks
 vllm.v1.core.kv_cache_utils.get_kv_cache_configs = get_kv_cache_configs
 vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = get_kv_cache_config_from_groups
