@@ -1,6 +1,5 @@
 from typing import Any
 
-from memcache_hybrid import DistributedObjectStore  # type: ignore
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
@@ -9,6 +8,9 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request
 
 from vllm_ascend import envs as ascend_envs
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import (
+    MemcacheBackend,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
     LoadSpec,
@@ -52,8 +54,10 @@ class KVPoolScheduler:
 
         self.page_size_bytes = page_size_bytes
         logger.info(f"==============> page_size_bytes {page_size_bytes}")
-        self.store_scheduler = DistributedObjectStore()
-        self.store_scheduler.init(device_id=0, init_bm=False)
+        self.store_scheduler = MemcacheBackend(
+            vllm_config.parallel_config,
+            init_buffer_manager=False,
+        )
 
         model_config = vllm_config.model_config
         tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -113,11 +117,11 @@ class KVPoolScheduler:
         alloc_size = self.page_size_bytes * self.keys_per_block_hash
 
         last_block_gva = request_tracker.last_block_gva
-        num_new_chunk_keys= len(keys_to_alloc)
+        num_new_chunk_keys = len(keys_to_alloc)
         if last_block_key and last_block_gva is None:
             keys_to_alloc.append(last_block_key)
         if keys_to_alloc:
-            new_gvas = self.store_scheduler.batch_alloc(
+            new_gvas = self.store_scheduler.alloc(
                 keys_to_alloc, [alloc_size] * len(keys_to_alloc))
             if any(gva <= 0 for gva in new_gvas):
                 raise ValueError(
@@ -189,7 +193,7 @@ class KVPoolScheduler:
         num_remote_hit_blocks = 0
         if remaining_keys:
             if self.use_layerwise:
-                key_infos = self.store_scheduler.batch_get_key_info(remaining_keys)
+                key_infos = self.store_scheduler.get_key_info(remaining_keys)
                 for key_info in key_infos:
                     sizes = key_info.size()
                     if sizes and sizes > 0:
@@ -198,7 +202,7 @@ class KVPoolScheduler:
                     else:
                         break
             else:
-                exists_states = self.store_scheduler.batch_is_exist(remaining_keys)
+                exists_states = self.store_scheduler.exists(remaining_keys)
                 for exists in exists_states:
                     if exists == 1:
                         num_remote_hit_blocks += 1
