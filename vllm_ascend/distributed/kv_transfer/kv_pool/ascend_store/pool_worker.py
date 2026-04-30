@@ -385,6 +385,9 @@ class KVPoolWorker:
                 continue
             save_start_block = request.save_start_token // self.block_size
             save_end_block = request.token_len_chunk // self.block_size
+            save_start_block = max(save_start_block, request.gva_block_offset)
+            if save_start_block >= save_end_block and request.partial_block_index is None:
+                continue
             partial_block_index = request.partial_block_index
             request_block_ranges.append(
                 LayerBlockRange(
@@ -410,12 +413,13 @@ class KVPoolWorker:
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
             cached_tokens = request.load_spec.kvpool_cached_tokens
+            load_start_block = 0 if self.layerwise_offload else request.load_spec.vllm_cached_tokens // self.block_size
             full_blocks = cached_tokens // self.block_size
             partial_block_index = full_blocks if cached_tokens % self.block_size != 0 else None
             request_block_ranges.append(
                 LayerBlockRange(
                     request=request,
-                    start_block=0,
+                    start_block=load_start_block,
                     end_block=full_blocks,
                     partial_block_index=partial_block_index,
                 )
