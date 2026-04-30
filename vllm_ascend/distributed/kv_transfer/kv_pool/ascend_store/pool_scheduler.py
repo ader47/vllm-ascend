@@ -30,15 +30,15 @@ class KVPoolScheduler:
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get("load_async", False)
         # request_id -> (vllm cached tokes, kvpool cached tokens)
         self.load_specs: dict[str, LoadSpec] = {}
-        self.pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
-        self.dcp_size = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
+        pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
+        dcp_size = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
 
         self.original_block_size = vllm_config.cache_config.block_size
         self._block_size = vllm_config.cache_config.block_size
-        if self.pcp_size > 1:
-            self._block_size *= self.pcp_size
-        if self.dcp_size > 1:
-            self._block_size *= self.dcp_size
+        if pcp_size > 1:
+            self._block_size *= pcp_size
+        if dcp_size > 1:
+            self._block_size *= dcp_size
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
         self._preempted_req_ids: set[str] = set()
@@ -56,30 +56,29 @@ class KVPoolScheduler:
         self.store_scheduler.init(device_id=0, init_bm=False)
 
         model_config = vllm_config.model_config
-        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
-        self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
-        self.use_mla = False
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        use_mla = False
         if hasattr(model_config, "use_mla") and isinstance(model_config.use_mla, bool) and model_config.use_mla:
-            self.use_mla = True
-        if self.use_mla:
-            self.num_kv_head = 1
+            use_mla = True
+        if use_mla:
+            num_kv_head = 1
         else:
-            self.num_kv_head = model_config.get_total_num_kv_heads()
-        if self.num_kv_head < self.tp_size:
-            self.put_step = self.tp_size // self.num_kv_head
+            num_kv_head = model_config.get_total_num_kv_heads()
+        if num_kv_head < tp_size:
+            put_step = tp_size // num_kv_head
         else:
-            self.put_step = 1
-        self.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+            put_step = 1
+        num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.model_name = model_config.model.split('/')[-1]
 
         # Define independent layers (same as pool_worker.py)
-        INDEPENDENT_LAYER_INDICES = {0, self.num_layers - 1}
-        self.independent_layers = list(INDEPENDENT_LAYER_INDICES)
+        INDEPENDENT_LAYER_INDICES = {0, num_layers - 1}
+        independent_layers = list(INDEPENDENT_LAYER_INDICES)
 
         keys_per_block_hash = (
-            self.pcp_size * self.dcp_size
-            * (self.tp_size // self.put_step)
-            * (self.num_layers - len(self.independent_layers))
+            pcp_size * dcp_size
+            * (tp_size // put_step)
+            * (num_layers - len(independent_layers))
         )
         self.keys_per_block_hash = keys_per_block_hash
 
