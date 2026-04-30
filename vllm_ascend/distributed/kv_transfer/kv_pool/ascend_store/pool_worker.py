@@ -59,7 +59,6 @@ class KVPoolWorker:
     ):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
-        self.dp_rank = parallel_config.data_parallel_rank
         self.use_mla = False
         if hasattr(model_config, "use_mla") and isinstance(model_config.use_mla, bool) and model_config.use_mla:
             self.use_mla = True
@@ -89,7 +88,6 @@ class KVPoolWorker:
             extra_config.get("h2d_stagger_dynamic_addrs_per_us", 0))
         self.h2d_stagger_max_us = int(
             extra_config.get("h2d_stagger_max_us", 0))
-        self.original_block_size = vllm_config.cache_config.block_size
         self.block_size = vllm_config.cache_config.block_size
 
         if self.pcp_size > 1:
@@ -175,7 +173,6 @@ class KVPoolWorker:
         self.layer_save_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
         self.layer_load_finished_events = None
         self.layer_save_finished_events = None
-        self.layer_transfer_finished_events = None
         NUM_SHARED_BUFFERS = 2
         self.NUM_SHARED_BUFFERS = NUM_SHARED_BUFFERS
         INDEPENDENT_LAYER_INDICES = {0, self.num_layers - 1}
@@ -184,13 +181,6 @@ class KVPoolWorker:
         shared_layer_indices = [i for i in range(self.num_layers)
                                 if i not in INDEPENDENT_LAYER_INDICES]
         buffer_owner_indices = shared_layer_indices[:NUM_SHARED_BUFFERS]
-        buffer_owner_set = set(buffer_owner_indices)
-
-        self.reuse_mapping = {}
-        for i, layer_idx in enumerate(shared_layer_indices):
-            if layer_idx not in buffer_owner_set:
-                owner_idx = shared_layer_indices[i % NUM_SHARED_BUFFERS]
-                self.reuse_mapping[layer_idx] = owner_idx
 
         self.layer_next_map = {}
         for i in range(len(shared_layer_indices) - NUM_SHARED_BUFFERS):
@@ -261,7 +251,6 @@ class KVPoolWorker:
                     self.layer_save_finished_events,
                     self.sync_save_events,
                     self.enable_kv_events,
-                    self.layer_transfer_finished_events
                 )
                 self.kv_send_thread.start()
             ready_event = threading.Event()
