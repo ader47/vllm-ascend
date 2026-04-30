@@ -595,7 +595,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         for req_id in req_meta.req_ids:
             self.dec_stored_request(req_id)
         self.sync_save_events[layer_id].synchronize()
-        res = self.m_store.store.batch_copy(gvas_list, addr_list, size_list, 0)
+        res = self.m_store.copy_to_global(gvas_list, addr_list, size_list)
         # wait for KV transfer (PD)
         # if self.layer_transfer_finished_events is not None:
         #     is_finish = self.layer_transfer_finished_events[layer_id].wait(timeout=10)  # try---cache
@@ -738,7 +738,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             (self.tp_rank * len(req_meta.size_array)) // self.tp_size,
         )
         self._stagger_h2d_submit(layer_id, len(gvas_list_c))
-        res = self.m_store.store.batch_copy(gvas_list_c, addr_list_c, size_list_c, 1)
+        res = self.m_store.copy_to_local(gvas_list_c, addr_list_c, size_list_c)
         if res != 0:
             logger.error("Layerwise %d load batch_copy failed with return code %d", layer_id, res)
         assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "

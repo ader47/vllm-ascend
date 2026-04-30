@@ -1,5 +1,6 @@
 # Standard
 from enum import Enum
+from typing import Any
 
 import torch
 from vllm.config import ParallelConfig
@@ -18,7 +19,7 @@ class MmcDirect(Enum):
 
 
 class MemcacheBackend(Backend):
-    def __init__(self, parallel_config: ParallelConfig):
+    def __init__(self, parallel_config: ParallelConfig, init_buffer_manager: bool = True):
         try:
             from memcache_hybrid import DistributedObjectStore  # type: ignore
         except ImportError as e:
@@ -28,14 +29,20 @@ class MemcacheBackend(Backend):
                 "to run vLLM with MemcacheConnector."
             ) from e
         try:
-            soc_version = get_ascend_device_type()
-            if soc_version in {AscendDeviceType.A2}:
-                tmp_tensor = torch.zeros(1, device="npu")
-                output_tensor_list = [torch.empty_like(tmp_tensor) for _ in range(torch.distributed.get_world_size())]
-                torch.distributed.all_gather(output_tensor_list, tmp_tensor, group=get_world_group().device_group)
-            self.local_rank = get_world_group().local_rank
             self.store = DistributedObjectStore()
-            res = self.store.init(self.local_rank)
+            if init_buffer_manager:
+                soc_version = get_ascend_device_type()
+                if soc_version in {AscendDeviceType.A2}:
+                    tmp_tensor = torch.zeros(1, device="npu")
+                    output_tensor_list = [
+                        torch.empty_like(tmp_tensor) for _ in range(torch.distributed.get_world_size())
+                    ]
+                    torch.distributed.all_gather(output_tensor_list, tmp_tensor, group=get_world_group().device_group)
+                self.local_rank = get_world_group().local_rank
+                res = self.store.init(self.local_rank)
+            else:
+                self.local_rank = 0
+                res = self.store.init(device_id=0, init_bm=False)
             assert res == 0
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -58,6 +65,18 @@ class MemcacheBackend(Backend):
 
     def exists(self, keys: list[str]) -> list[int]:
         return self.store.batch_is_exist(keys)
+
+    def alloc(self, keys: list[str], sizes: list[int]) -> list[int]:
+        return self.store.batch_alloc(keys, sizes)
+
+    def get_key_info(self, keys: list[str]) -> list[Any]:
+        return self.store.batch_get_key_info(keys)
+
+    def copy_to_global(self, gvas: list[int], addrs: list[int], sizes: list[int]) -> int:
+        return self.store.batch_copy(gvas, addrs, sizes, MmcDirect.COPY_L2G.value)
+
+    def copy_to_local(self, gvas: list[int], addrs: list[int], sizes: list[int]) -> int:
+        return self.store.batch_copy(gvas, addrs, sizes, MmcDirect.COPY_G2L.value)
 
     def get(self, key: list[str], addr: list[list[int]], size: list[list[int]]):
         try:
