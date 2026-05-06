@@ -1,7 +1,8 @@
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
+import numpy as np
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
@@ -124,16 +125,44 @@ class ChunkedTokenDatabase:
             size_list.append(size)
         return addr_list, size_list, block_id
 
+    def prepare_block_info(self, start: int, end: int, block_ids: list[int]) -> tuple[int, list[int]]:
+        block_id = block_ids[start // self.block_size]
+        size_list = []
+        for i in range(len(self.block_len)):
+            size = int(self.block_len[i] / self.block_size * (end - start))
+            size_list.append(size)
+        return block_id, size_list
+
+    def prepare_addr_from_block_id(self, block_id: int, layer_id: int) -> list[int]:
+        length = len(self.block_len)
+        base_offset = layer_id * length
+        return [
+            self.kv_caches_base_addr[base_offset + i] + block_id * self.block_len[i]
+            for i in range(length)
+        ]
+
+    def prepare_addrs_from_block_ids(self, block_ids: list[int], layer_id: int) -> list[int]:
+        length = len(self.block_len)
+        base_offset = layer_id * length
+        return [
+            self.kv_caches_base_addr[base_offset + i] + block_id * self.block_len[i]
+            for block_id in block_ids
+            for i in range(length)
+        ]
+
     def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
         block_id = block_ids[start // self.block_size]
-        addr_list = []
-        size_list = []
         length = len(self.block_len)
-        for i in range(length):
-            addr = self.kv_caches_base_addr[layer_id * length] + block_id * self.block_len[i]
-            size = int(self.block_len[i] / self.block_size * (end - start))
-            addr_list.append(addr)
-            size_list.append(size)
+        base_offset = layer_id * length
+        token_count = end - start
+        addr_list = [
+            self.kv_caches_base_addr[base_offset + i] + block_id * self.block_len[i]
+            for i in range(length)
+        ]
+        size_list = [
+            int(self.block_len[i] / self.block_size * token_count)
+            for i in range(length)
+        ]
         return addr_list, size_list
 
     def process_tokens(
@@ -141,6 +170,7 @@ class ChunkedTokenDatabase:
         token_len: int,
         block_hashes: list[BlockHash] | list[str],
         mask_num: int = 0,
+        req_id = 'no_need',
     ) -> Iterable[tuple[int, int, PoolKey]]:
         """Process the tokens and return the corresponding cache engine keys.
 
@@ -162,11 +192,13 @@ class ChunkedTokenDatabase:
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
+        if req_id != 'no_need' and token_len % self.block_size != 0:
+            block_hashes.append(f'{req_id}_lastblock')
         if not block_hashes:
             return
         if not isinstance(block_hashes[0], str):
             block_hashes = [
-                h.hex()  # type: ignore[union-attr]
+                h.hex() if not isinstance(h, str) else h   # type: ignore[union-attr]
                 for h in block_hashes
             ]
         start_idx = 0
@@ -174,7 +206,8 @@ class ChunkedTokenDatabase:
             start_idx = chunk_id * self.block_size
             if start_idx >= token_len:
                 break
-            end_idx = min(start_idx + self.block_size, token_len)
+            # end_idx = min(start_idx + self.block_size, token_len)
+            end_idx = start_idx + self.block_size
             if start_idx < mask_num:
                 continue
             else:
@@ -236,6 +269,18 @@ class RequestTracker:
     # NOTE: This field will only be used when you enable kv-event
     token_ids: list[int] | None = None
 
+    chunk_gvas: list[int] = field(default_factory=list)
+    last_block_gva: int | None = None
+
+    block_keys: list[str] = field(default_factory=list)
+
+    starts: list[int] | None = None
+    ends: list[int] | None = None
+
+    sizes_per_chunk: list[list[int]] | None = None
+
+    last_block_key: str | None = None
+
     @staticmethod
     def from_new_request(
         new_request: "NewRequestData",
@@ -294,6 +339,9 @@ class ReqMeta:
 
     block_hashes: list[BlockHash]
 
+    # First token that has not been saved before this metadata was built.
+    save_start_token: int = 0
+
     can_save: bool | None = None
     # load_spec
     load_spec: LoadSpec | None = None
@@ -306,6 +354,17 @@ class ReqMeta:
     # TODO: add lora_request which used for gen lora_id/lora_name in kv event
     token_ids: list[int] | None = None
     original_block_size: int | None = None
+
+    last_block_gva: int | None = None
+    partial_block_index: int | None = None
+
+    starts: list[int] | None = None
+    ends: list[int] | None = None
+
+    sizes_per_chunk: list[list[int]] | None = None
+
+    block_ids_np: np.ndarray | None = None
+    chunk_gvas_np: np.ndarray | None = None
 
     @staticmethod
     def from_request_tracker(
@@ -336,6 +395,7 @@ class ReqMeta:
         if block_hashes is None:
             block_hashes = []
         input_token_len = tracker.token_len
+        previous_saved_tokens = tracker.num_saved_tokens
 
         # For save operation: do not save if the following condition is met
         # 1. has already been saved before (num_saved_tokens > 0)
@@ -344,8 +404,13 @@ class ReqMeta:
         # Calculate number of tokens to save based on discard_partial_chunks
         # setting
         num_tokens_to_save = (input_token_len // block_size * block_size) if discard_partial_chunks else input_token_len
+        partial_block_index = (
+            input_token_len // block_size
+            if input_token_len % block_size != 0 and tracker.last_block_gva is not None
+            else None
+        )
 
-        skip_save = skip_save or num_tokens_to_save < chunk_boundary
+        skip_save = skip_save or (num_tokens_to_save < chunk_boundary and partial_block_index is None)
         if skip_save and load_spec is None:
             return None
 
@@ -372,6 +437,7 @@ class ReqMeta:
         return ReqMeta(
             req_id=tracker.req_id,
             token_len_chunk=num_tokens_to_save,
+            save_start_token=previous_saved_tokens,
             block_ids=tracker.allocated_block_ids,
             can_save=not skip_save,
             load_spec=load_spec,
@@ -379,6 +445,10 @@ class ReqMeta:
             is_last_chunk=is_last_chunk,
             token_ids=token_ids,
             original_block_size=original_block_size,
+            last_block_gva=tracker.last_block_gva,
+            partial_block_index=partial_block_index,
+            block_ids_np=np.asarray(tracker.allocated_block_ids, dtype=np.int64),
+            chunk_gvas_np=np.asarray(tracker.chunk_gvas, dtype=np.int64),
         )
 
 
@@ -398,12 +468,34 @@ class AscendConnectorMetadata(KVConnectorMetadata):
 
 
 @dataclass
-class LayerMultiBlockReqMeta:
-    req_id: str
-    keys: list[LayerPoolKey]
-    starts: list[int]
-    ends: list[int]
-    block_ids: list[int]
+class LayerBatchReqMeta:
+    req_ids: list[str]
     layer_id: int
-    is_last_chunk: bool | None = True
-    current_event: torch.npu.Event | None = None
+    is_last_chunks: list[bool | None] = field(default_factory=list)
+    addr_array: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int64))
+    size_array: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int64))
+    gvas_array: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int64))
+
+
+@dataclass
+class LayerBlockRange:
+    request: ReqMeta
+    start_block: int
+    end_block: int
+    partial_block_index: int | None = None
+
+
+@dataclass
+class LayerTransferTask:
+    layer_id: int
+    block_ranges: list[LayerBlockRange]
+
+
+@dataclass
+class LayerLoadTask:
+    wait_for_save_layer: int | None
+    transfer_tasks: list[LayerTransferTask]
+    layer_id: int
