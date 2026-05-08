@@ -44,7 +44,7 @@ from vllm_ascend.ops.layer_shard_linear import (
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.ops.triton.get_topk_indices import (
     CacheMissTopKScratch,
-    get_cache_miss_topk_indices_triton,
+    get_cache_miss_topk_indices_triton_compact,
 )
 from vllm_ascend.ops.triton.rope import rope_forward_triton
 from vllm_ascend.quantization.methods import AscendW8A8LinearMethod
@@ -1213,7 +1213,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         torch.npu.synchronize()
         t1 = time.time()
-        topk_indices = get_cache_miss_topk_indices_triton(
+        (
+            miss_indices_with_offset,
+            miss_slots,
+            miss_count,
+        ) = get_cache_miss_topk_indices_triton_compact(
             req_ids_tensor,
             topk_indices_old,
             topk_indices,
@@ -1221,15 +1225,21 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         torch.npu.synchronize()
         t2 = time.time()
-        print(f">>>>>>>>>>> get_cache_miss_topk_indices_triton {(t2-t1)*1000:.2f}ms")
+        print(
+            f">>>>>>>>>>> get_cache_miss_topk_indices_triton_compact "
+            f"{(t2-t1)*1000:.2f}ms")
 
         # common
         t1 = time.time()
-        valid_mask = topk_indices >= 0
+        compact_positions = self.sparse_topk_indices[:num_reqs, :topk_indices.shape[1]]
+        valid_mask = compact_positions < miss_count.unsqueeze(1)
+        req_offsets = req_ids_tensor.unsqueeze(1) * cache_miss_scratch["token_limit"]
+        miss_indices = miss_indices_with_offset - req_offsets
+        miss_indices = torch.where(valid_mask, miss_indices, 0)
         num_offloaded_blocks = attn_metadata.num_offloaded_blocks[:num_reqs].unsqueeze(1)
         offload_thresholds = num_offloaded_blocks * self.block_size
-        npu_mask = (topk_indices >= offload_thresholds) & valid_mask
-        cpu_mask = (topk_indices < offload_thresholds) & valid_mask
+        npu_mask = (miss_indices >= offload_thresholds) & valid_mask
+        cpu_mask = (miss_indices < offload_thresholds) & valid_mask
         t2 = time.time()
         # print(f">>>>>>>>>>> time 2 {(t2-t1)*1000:.2f}ms")
 
@@ -1238,16 +1248,26 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # load npu
         t1 = time.time()
-        block_indices = torch.clamp(topk_indices // self.block_size, min=0)
+        block_indices = torch.clamp(miss_indices // self.block_size, min=0)
         block_ids = torch.gather(block_table, 1, block_indices)
-        offsets_in_block = topk_indices % self.block_size
+        offsets_in_block = miss_indices % self.block_size
         npu_mask = npu_mask.unsqueeze(-1).unsqueeze(-1)
-        topk_buffer_k[...] = torch.where(npu_mask, kv_cache[0][block_ids, offsets_in_block], topk_buffer_k)
-        topk_buffer_v[...] = torch.where(npu_mask, kv_cache[1][block_ids, offsets_in_block], topk_buffer_v)
+        slot_indices = torch.clamp(
+            miss_slots.to(torch.int64),
+            min=0,
+        ).unsqueeze(-1).unsqueeze(-1)
+        loaded_k = kv_cache[0][block_ids, offsets_in_block]
+        loaded_v = kv_cache[1][block_ids, offsets_in_block]
+        slot_indices_k = slot_indices.expand_as(loaded_k)
+        slot_indices_v = slot_indices.expand_as(loaded_v)
+        current_k = torch.gather(topk_buffer_k, 1, slot_indices_k)
+        current_v = torch.gather(topk_buffer_v, 1, slot_indices_v)
+        topk_buffer_k.scatter_(1, slot_indices_k, torch.where(npu_mask, loaded_k, current_k))
+        topk_buffer_v.scatter_(1, slot_indices_v, torch.where(npu_mask, loaded_v, current_v))
         t2 = time.time()
         # print(f">>>>>>>>>>> time 3 {(t2-t1)*1000:.2f}ms")
         # load cpu
-        cpu_token_indices = torch.where(cpu_mask, topk_indices, -1)
+        cpu_token_indices = torch.where(cpu_mask, miss_indices, -1)
         # maybe_load_kv_token_wise_graph(layer_name, num_reqs, cpu_token_indices, cpu_mask, forward_context.capturing)
 
         # generate new block_table & indices

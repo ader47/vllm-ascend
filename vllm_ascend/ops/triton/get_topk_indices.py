@@ -474,9 +474,13 @@ def mark_and_compact_cache_miss_slots_kernel(
     num_slots = tl.sum(avail_mask.to(tl.int32), axis=0)
     miss_rank_safe = tl.where(miss_mask, miss_rank, 0)
     avail_rank_safe = tl.where(avail_mask, avail_rank, 0)
+    safe_slot_mask = mask & ((~avail_mask) | (avail_rank >= num_miss))
+    safe_slot_rank = tl.cumsum(safe_slot_mask.to(tl.int32), axis=0) - 1
+    safe_slot = tl.sum(tl.where(safe_slot_mask & (safe_slot_rank == 0), cols, 0), axis=0)
 
     tl.store(slot_scratch_ptr + row_off + avail_rank_safe, cols, mask=avail_mask)
     tl.store(miss_scratch_ptr + row_off + miss_rank_safe, new_with_offset, mask=miss_mask)
+    tl.store(slot_scratch_ptr + row_off + cols, safe_slot, mask=mask & (cols >= num_miss))
     tl.store(miss_count_ptr + pid, num_miss)
     tl.store(slot_count_ptr + pid, num_slots)
 
@@ -578,9 +582,13 @@ def compact_cache_miss_slots_kernel(
     num_slots = tl.sum(avail_mask.to(tl.int32), axis=0)
     miss_rank_safe = tl.where(miss_mask, miss_rank, 0)
     avail_rank_safe = tl.where(avail_mask, avail_rank, 0)
+    safe_slot_mask = mask & ((~avail_mask) | (avail_rank >= num_miss))
+    safe_slot_rank = tl.cumsum(safe_slot_mask.to(tl.int32), axis=0) - 1
+    safe_slot = tl.sum(tl.where(safe_slot_mask & (safe_slot_rank == 0), cols, 0), axis=0)
 
     tl.store(slot_scratch_ptr + row_off + avail_rank_safe, cols, mask=avail_mask)
     tl.store(miss_scratch_ptr + row_off + miss_rank_safe, new_with_offset, mask=miss_mask)
+    tl.store(slot_scratch_ptr + row_off + cols, safe_slot, mask=mask & (cols >= num_miss))
     tl.store(miss_count_ptr + pid, num_miss)
     tl.store(slot_count_ptr + pid, num_slots)
 
@@ -620,8 +628,32 @@ def apply_cache_miss_slots_kernel(
     miss_token = miss_with_offset - req_offset
     out_mask = miss_mask & update_mask
 
-    tl.store(old_ptr + row_off + slots, miss_with_offset, mask=update_mask)
+    tl.store(old_ptr + row_off + slots, miss_with_offset, mask=out_mask)
     tl.store(out_ptr + row_off + slots, miss_token.to(tl.int32), mask=out_mask)
+
+
+@triton.jit
+def update_cache_miss_slots_kernel(
+        old_ptr,
+        slot_scratch_ptr,
+        miss_scratch_ptr,
+        miss_count_ptr,
+        num_reqs,
+        topk: tl.constexpr,
+        BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= num_reqs:
+        return
+
+    row_off = pid * topk
+    cols = tl.arange(0, BLOCK)
+    num_miss = tl.load(miss_count_ptr + pid).to(tl.int32)
+    mask = cols < num_miss
+
+    slots = tl.load(slot_scratch_ptr + row_off + cols, mask=mask, other=0).to(tl.int32)
+    miss_with_offset = tl.load(miss_scratch_ptr + row_off + cols, mask=mask, other=-1).to(tl.int64)
+    tl.store(old_ptr + row_off + slots, miss_with_offset, mask=mask)
 
 
 @triton.jit
@@ -847,6 +879,88 @@ def get_cache_miss_topk_indices_triton_bitmap(
     )
 
     return out
+
+
+def get_cache_miss_topk_indices_triton_compact(
+    req_ids_tensor: torch.Tensor,
+    topk_indices_old: torch.Tensor,
+    topk_indices_new: torch.Tensor,
+    token_limit: int = 65536,
+    old_marker: torch.Tensor | None = None,
+    new_marker: torch.Tensor | None = None,
+    slot_scratch: torch.Tensor | None = None,
+    miss_scratch: torch.Tensor | None = None,
+    miss_count: torch.Tensor | None = None,
+    slot_count: torch.Tensor | None = None,
+    stamp_tensor: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+):
+    del out
+    num_reqs, topk = topk_indices_new.shape
+    assert topk == topk_indices_old.shape[1]
+
+    if old_marker is None:
+        old_marker = torch.zeros(
+            (num_reqs, token_limit),
+            dtype=torch.int32,
+            device=topk_indices_new.device,
+        )
+    if new_marker is None:
+        new_marker = torch.zeros(
+            (num_reqs, token_limit),
+            dtype=torch.int32,
+            device=topk_indices_new.device,
+        )
+    if slot_scratch is None:
+        slot_scratch = torch.empty(
+            topk_indices_new.shape,
+            dtype=torch.int32,
+            device=topk_indices_new.device,
+        )
+    if miss_scratch is None:
+        miss_scratch = torch.empty(
+            topk_indices_old.shape,
+            dtype=topk_indices_old.dtype,
+            device=topk_indices_old.device,
+        )
+    if miss_count is None:
+        miss_count = torch.empty((num_reqs,), dtype=torch.int32, device=topk_indices_new.device)
+    if slot_count is None:
+        slot_count = torch.empty((num_reqs,), dtype=torch.int32, device=topk_indices_new.device)
+    if stamp_tensor is None:
+        stamp_tensor = torch.ones((1,), dtype=torch.int32, device=topk_indices_new.device)
+
+    grid = (num_reqs,)
+    BLOCK = triton.next_power_of_2(topk)
+
+    mark_and_compact_cache_miss_slots_kernel[grid](
+        req_ids_tensor,
+        topk_indices_old,
+        topk_indices_new,
+        old_marker,
+        new_marker,
+        slot_scratch,
+        miss_scratch,
+        miss_count,
+        slot_count,
+        num_reqs,
+        stamp_tensor,
+        topk=topk,
+        TOKEN_LIMIT=token_limit,
+        BLOCK=BLOCK,
+    )
+
+    update_cache_miss_slots_kernel[grid](
+        topk_indices_old,
+        slot_scratch,
+        miss_scratch,
+        miss_count,
+        num_reqs,
+        topk=topk,
+        BLOCK=BLOCK,
+    )
+
+    return miss_scratch, slot_scratch, miss_count
 
 
 def get_cache_miss_topk_indices_triton_exact(
