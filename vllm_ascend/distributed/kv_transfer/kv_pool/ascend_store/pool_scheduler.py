@@ -27,6 +27,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     infer_group_cache_families,
     normalize_block_ids_by_group,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    get_layerwise_config,
+)
 
 
 class KVPoolScheduler:
@@ -121,9 +124,9 @@ class KVPoolScheduler:
         self.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.model_name = model_config.model.split('/')[-1]
 
-        # Define independent layers (same as pool_worker.py)
-        INDEPENDENT_LAYER_INDICES = {0, self.num_layers - 1}
-        self.independent_layers = sorted(INDEPENDENT_LAYER_INDICES)
+        # Keep this in sync with pool_worker.py because it affects allocation size.
+        layerwise_config = get_layerwise_config(self.num_layers)
+        self.independent_layers = layerwise_config.independent_layers
 
         keys_per_block_hash = (
             self.pcp_size * self.dcp_size
