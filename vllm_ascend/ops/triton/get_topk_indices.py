@@ -947,10 +947,15 @@ def get_cache_miss_topk_indices_triton(
     topk_indices_new: torch.Tensor,
     **kwargs,
 ):
-    return get_cache_miss_topk_indices_triton_exact(
+    topk_indices_new_sorted, _ = torch.sort(topk_indices_new, dim=1)
+    topk_indices_old_slots = torch.argsort(topk_indices_old, dim=1)
+    topk_indices_old_sorted = torch.gather(topk_indices_old, 1, topk_indices_old_slots)
+    return get_cache_miss_topk_indices_triton_sorted(
         req_ids_tensor,
         topk_indices_old,
-        topk_indices_new,
+        topk_indices_new_sorted,
+        topk_indices_old_sorted,
+        topk_indices_old_slots,
         **kwargs,
     )
 
@@ -1015,6 +1020,7 @@ def get_cache_miss_topk_indices_triton_sorted(
     miss_count: torch.Tensor | None = None,
     slot_count: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    **_: object,
 ):
     num_reqs, topk = topk_indices_new_sorted.shape
     assert topk == topk_indices_old.shape[1]
@@ -1197,10 +1203,10 @@ class CacheMissTopKScratch:
         if needs_alloc:
             self.old_marker = None
             self.new_marker = None
-            self.slot_scratch = None
-            self.miss_scratch = None
-            self.miss_count = None
-            self.slot_count = None
+            self.slot_scratch = torch.empty(scratch_shape, dtype=torch.int32, device=device)
+            self.miss_scratch = torch.empty(scratch_shape, dtype=history_dtype, device=device)
+            self.miss_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
+            self.slot_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
             self.stamp_tensor = None
             self.out = torch.empty(scratch_shape, dtype=torch.int32, device=device)
             self.token_limit = token_limit
@@ -1219,10 +1225,10 @@ class CacheMissTopKScratch:
             "stamp_tensor": None,
             "old_marker": None,
             "new_marker": None,
-            "slot_scratch": None,
-            "miss_scratch": None,
-            "miss_count": None,
-            "slot_count": None,
+            "slot_scratch": self.slot_scratch[:num_reqs, :topk],
+            "miss_scratch": self.miss_scratch[:num_reqs, :topk],
+            "miss_count": self.miss_count[:num_reqs],
+            "slot_count": self.slot_count[:num_reqs],
             "out": self.out[:num_reqs, :topk],
         }
 
