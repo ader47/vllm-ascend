@@ -4,6 +4,61 @@ import triton.language as tl
 
 
 @triton.jit
+def sorted_dense_cache_miss_kernel(
+        req_ids_ptr,
+        old_sorted_ptr,
+        new_sorted_ptr,
+        history_out_ptr,
+        out_ptr,
+        miss_count_ptr,
+        num_reqs,
+        topk: tl.constexpr,
+        TOKEN_LIMIT: tl.constexpr,
+        BLOCK: tl.constexpr,
+        LOGK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= num_reqs:
+        return
+
+    req_id = tl.load(req_ids_ptr + pid).to(tl.int64)
+    req_offset = req_id * TOKEN_LIMIT
+    row_off = pid * topk
+    cols = tl.arange(0, BLOCK)
+    mask = cols < topk
+
+    new_token = tl.load(new_sorted_ptr + row_off + cols, mask=mask, other=-1).to(tl.int64)
+    new_valid = mask & (new_token >= 0) & (new_token < TOKEN_LIMIT)
+    new_with_offset = new_token + req_offset
+
+    lo = tl.full((BLOCK,), 0, tl.int32)
+    hi = tl.full((BLOCK,), topk, tl.int32)
+    for _ in range(LOGK):
+        mid = (lo + hi) // 2
+        mid_valid = new_valid & (mid < topk)
+        mid_safe = tl.where(mid_valid, mid, 0)
+        old_mid = tl.load(old_sorted_ptr + row_off + mid_safe, mask=mid_valid, other=-1).to(tl.int64)
+        go_right = old_mid < new_with_offset
+        lo = tl.where(new_valid & go_right, mid + 1, lo)
+        hi = tl.where(new_valid & ~go_right, mid, hi)
+
+    lo_safe = tl.where(lo < topk, lo, 0)
+    old_found = tl.load(old_sorted_ptr + row_off + lo_safe, mask=new_valid & (lo < topk), other=-1).to(tl.int64)
+    miss_mask = new_valid & (old_found != new_with_offset)
+
+    miss_rank = tl.cumsum(miss_mask.to(tl.int32), axis=0) - 1
+    miss_rank_safe = tl.where(miss_mask, miss_rank, 0)
+    num_miss = tl.sum(miss_mask.to(tl.int32), axis=0)
+
+    tl.store(out_ptr + row_off + cols, tl.full((BLOCK,), -1, tl.int32), mask=mask)
+    tl.store(out_ptr + row_off + miss_rank_safe, new_token.to(tl.int32), mask=miss_mask)
+    tl.store(miss_count_ptr + pid, num_miss)
+
+    history_value = tl.where(new_valid, new_with_offset, tl.full((BLOCK,), -1, tl.int64))
+    tl.store(history_out_ptr + row_off + cols, history_value, mask=mask)
+
+
+@triton.jit
 def sorted_compact_cache_miss_slots_kernel(
         req_ids_ptr,
         old_sorted_ptr,
@@ -632,6 +687,7 @@ def get_cache_miss_topk_kernel(
         out_ptr,
         num_reqs,
         topk: tl.constexpr,
+        TOKEN_LIMIT: tl.constexpr,
         BLOCK: tl.constexpr,
         SUB_BLOCK: tl.constexpr,
 ):
@@ -639,14 +695,14 @@ def get_cache_miss_topk_kernel(
     if pid >= num_reqs:
         return
 
-    req_id = tl.load(req_ids_ptr + pid).to(tl.int32)
-    req_offset = req_id * 65536
+    req_id = tl.load(req_ids_ptr + pid).to(tl.int64)
+    req_offset = req_id * TOKEN_LIMIT
     row_off = pid * topk
     cols = tl.arange(0, BLOCK)
     mask = cols < topk
 
-    old = tl.load(old_ptr + row_off + cols, mask=mask, other=-1).to(tl.int32)
-    new = tl.load(new_ptr + row_off + cols, mask=mask, other=-1).to(tl.int32)
+    old = tl.load(old_ptr + row_off + cols, mask=mask, other=-1).to(tl.int64)
+    new = tl.load(new_ptr + row_off + cols, mask=mask, other=-1).to(tl.int64)
     new_with_offset = tl.where(new >= 0, new + req_offset, -1)
     # ---- sub-blocked miss_mask: new not in old ----
     miss_count = tl.zeros((BLOCK,), tl.int32)
@@ -655,7 +711,7 @@ def get_cache_miss_topk_kernel(
         sb_mask = sb_cols < topk
         old_chunk = tl.load(
             old_ptr + row_off + sb_cols, mask=sb_mask, other=-1
-        ).to(tl.int32)
+        ).to(tl.int64)
         old_b = tl.broadcast_to(old_chunk[None, :], (BLOCK, SUB_BLOCK))
         new_b = tl.broadcast_to(new_with_offset[:, None], (BLOCK, SUB_BLOCK))
         cmp = new_b == old_b
@@ -669,7 +725,7 @@ def get_cache_miss_topk_kernel(
         sb_mask = sb_cols < topk
         new_chunk = tl.load(
             new_ptr + row_off + sb_cols, mask=sb_mask, other=-1
-        ).to(tl.int32)
+        ).to(tl.int64)
         new_chunk_off = tl.where(new_chunk >= 0, new_chunk + req_offset, -1)
         old_b = tl.broadcast_to(old[:, None], (BLOCK, SUB_BLOCK))
         new_b = tl.broadcast_to(new_chunk_off[None, :], (BLOCK, SUB_BLOCK))
@@ -698,7 +754,7 @@ def get_cache_miss_topk_kernel(
     #            find miss_vals where miss_rank == r
     # Phase 2 (scatter): for each available slot where avail_rank == r,
     #            write the gathered value
-    out_with_offset = tl.full((BLOCK,), -1, tl.int32)
+    out_with_offset = tl.full((BLOCK,), -1, tl.int64)
     for sb_start in range(0, BLOCK, SUB_BLOCK):
         target_ranks = sb_start + tl.arange(0, SUB_BLOCK)
 
@@ -710,7 +766,7 @@ def get_cache_miss_topk_kernel(
 
         miss_match = (mr_b == tr_b) & mm_b
         gathered = tl.sum(
-            tl.where(miss_match, mv_b, tl.zeros((BLOCK, SUB_BLOCK), tl.int32)),
+            tl.where(miss_match, mv_b, tl.zeros((BLOCK, SUB_BLOCK), tl.int64)),
             axis=0,
         )
 
@@ -724,7 +780,7 @@ def get_cache_miss_topk_kernel(
             tl.where(
                 slot_match,
                 gathered[None, :],
-                tl.zeros((BLOCK, SUB_BLOCK), tl.int32),
+                tl.zeros((BLOCK, SUB_BLOCK), tl.int64),
             ),
             axis=1,
         )
@@ -736,7 +792,7 @@ def get_cache_miss_topk_kernel(
     tl.store(old_ptr + row_off + cols, updated_old, mask=mask)
 
     # ---- remove req offset and store ----
-    out = tl.where(out_with_offset >= 0, out_with_offset - req_offset, tl.full((BLOCK,), -1, tl.int32))
+    out = tl.where(out_with_offset >= 0, out_with_offset - req_offset, tl.full((BLOCK,), -1, tl.int64))
     tl.store(out_ptr + row_off + cols, out.to(tl.int32), mask=mask)
 
 
@@ -853,16 +909,20 @@ def get_cache_miss_topk_indices_triton_exact(
     req_ids_tensor: torch.Tensor,
     topk_indices_old: torch.Tensor,
     topk_indices_new: torch.Tensor,
+    token_limit: int = 65536,
+    out: torch.Tensor | None = None,
     sub_block: int = 4,
+    **_: object,
 ):
     num_reqs, topk = topk_indices_new.shape
     assert topk == topk_indices_old.shape[1]
 
-    out = torch.empty(
-        topk_indices_new.shape,
-        dtype=torch.int32,
-        device=topk_indices_new.device,
-    )
+    if out is None:
+        out = torch.empty(
+            topk_indices_new.shape,
+            dtype=torch.int32,
+            device=topk_indices_new.device,
+        )
 
     grid = (num_reqs,)
     BLOCK = triton.next_power_of_2(topk)
@@ -874,6 +934,7 @@ def get_cache_miss_topk_indices_triton_exact(
         out,
         num_reqs,
         topk=topk,
+        TOKEN_LIMIT=token_limit,
         BLOCK=BLOCK,
         SUB_BLOCK=sub_block,
     )
@@ -886,12 +947,60 @@ def get_cache_miss_topk_indices_triton(
     topk_indices_new: torch.Tensor,
     **kwargs,
 ):
-    return get_cache_miss_topk_indices_triton_bitmap(
+    return get_cache_miss_topk_indices_triton_exact(
         req_ids_tensor,
         topk_indices_old,
         topk_indices_new,
         **kwargs,
     )
+
+
+def get_cache_miss_topk_indices_triton_sorted_merge_dense(
+    req_ids_tensor: torch.Tensor,
+    topk_indices_old: torch.Tensor,
+    topk_indices_new: torch.Tensor,
+    token_limit: int = 65536,
+    out: torch.Tensor | None = None,
+    miss_count: torch.Tensor | None = None,
+    **_: object,
+):
+    """Return cache misses as a dense prefix after sorted set comparison.
+
+    Unlike the slot-preserving helpers, this function treats
+    ``topk_indices_old`` as historical set state. It updates that state to the
+    sorted, request-offset current set and writes cache-miss token ids densely
+    at the start of ``out``. Remaining entries are filled with -1.
+    """
+    num_reqs, topk = topk_indices_new.shape
+    assert topk == topk_indices_old.shape[1]
+
+    device = topk_indices_new.device
+    if out is None:
+        out = torch.empty((num_reqs, topk), dtype=torch.int32, device=device)
+    if miss_count is None:
+        miss_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
+
+    old_sorted, _ = torch.sort(topk_indices_old, dim=1)
+    new_sorted, _ = torch.sort(topk_indices_new, dim=1)
+
+    grid = (num_reqs,)
+    BLOCK = triton.next_power_of_2(topk)
+    LOGK = topk.bit_length()
+
+    sorted_dense_cache_miss_kernel[grid](
+        req_ids_tensor,
+        old_sorted,
+        new_sorted,
+        topk_indices_old,
+        out,
+        miss_count,
+        num_reqs,
+        topk=topk,
+        TOKEN_LIMIT=token_limit,
+        BLOCK=BLOCK,
+        LOGK=LOGK,
+    )
+    return out
 
 
 def get_cache_miss_topk_indices_triton_sorted(
@@ -1076,49 +1185,44 @@ class CacheMissTopKScratch:
         token_limit: int = 65536,
         history_dtype: torch.dtype = torch.int64,
     ):
-        marker_shape = (num_reqs, token_limit)
         scratch_shape = (num_reqs, topk)
         needs_alloc = (
             self.token_limit != token_limit
             or self.device != device
             or self.history_dtype != history_dtype
-            or self.marker_shape[0] < num_reqs
             or self.scratch_shape[0] < num_reqs
             or self.scratch_shape[1] != topk
         )
 
         if needs_alloc:
-            self.old_marker = torch.zeros(marker_shape, dtype=torch.int32, device=device)
-            self.new_marker = torch.zeros(marker_shape, dtype=torch.int32, device=device)
-            self.slot_scratch = torch.empty(scratch_shape, dtype=torch.int32, device=device)
-            self.miss_scratch = torch.empty(scratch_shape, dtype=history_dtype, device=device)
-            self.miss_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
-            self.slot_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
-            self.stamp_tensor = torch.empty((1,), dtype=torch.int32, device=device)
+            self.old_marker = None
+            self.new_marker = None
+            self.slot_scratch = None
+            self.miss_scratch = None
+            self.miss_count = None
+            self.slot_count = None
+            self.stamp_tensor = None
             self.out = torch.empty(scratch_shape, dtype=torch.int32, device=device)
             self.token_limit = token_limit
             self.device = device
             self.history_dtype = history_dtype
-            self.marker_shape = marker_shape
+            self.marker_shape = (0, 0)
             self.scratch_shape = scratch_shape
             self.stamp = 0
 
         self.stamp += 1
         if self.stamp >= 2_000_000_000:
-            self.old_marker.zero_()
-            self.new_marker.zero_()
             self.stamp = 1
-        self.stamp_tensor.fill_(self.stamp)
 
         return {
             "token_limit": token_limit,
-            "stamp_tensor": self.stamp_tensor,
-            "old_marker": self.old_marker[:num_reqs],
-            "new_marker": self.new_marker[:num_reqs],
-            "slot_scratch": self.slot_scratch[:num_reqs, :topk],
-            "miss_scratch": self.miss_scratch[:num_reqs, :topk],
-            "miss_count": self.miss_count[:num_reqs],
-            "slot_count": self.slot_count[:num_reqs],
+            "stamp_tensor": None,
+            "old_marker": None,
+            "new_marker": None,
+            "slot_scratch": None,
+            "miss_scratch": None,
+            "miss_count": None,
+            "slot_count": None,
             "out": self.out[:num_reqs, :topk],
         }
 
