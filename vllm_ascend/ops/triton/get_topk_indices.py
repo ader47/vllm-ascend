@@ -21,13 +21,13 @@ def sorted_dense_cache_miss_kernel(
     if pid >= num_reqs:
         return
 
-    req_id = tl.load(req_ids_ptr + pid).to(tl.int64)
+    req_id = tl.load(req_ids_ptr + pid).to(tl.int32)
     req_offset = req_id * TOKEN_LIMIT
     row_off = pid * topk
     cols = tl.arange(0, BLOCK)
     mask = cols < topk
 
-    new_token = tl.load(new_sorted_ptr + row_off + cols, mask=mask, other=-1).to(tl.int64)
+    new_token = tl.load(new_sorted_ptr + row_off + cols, mask=mask, other=-1).to(tl.int32)
     new_valid = mask & (new_token >= 0) & (new_token < TOKEN_LIMIT)
     new_with_offset = new_token + req_offset
 
@@ -37,13 +37,13 @@ def sorted_dense_cache_miss_kernel(
         mid = (lo + hi) // 2
         mid_valid = new_valid & (mid < topk)
         mid_safe = tl.where(mid_valid, mid, 0)
-        old_mid = tl.load(old_sorted_ptr + row_off + mid_safe, mask=mid_valid, other=-1).to(tl.int64)
+        old_mid = tl.load(old_sorted_ptr + row_off + mid_safe, mask=mid_valid, other=-1).to(tl.int32)
         go_right = old_mid < new_with_offset
         lo = tl.where(new_valid & go_right, mid + 1, lo)
         hi = tl.where(new_valid & ~go_right, mid, hi)
 
     lo_safe = tl.where(lo < topk, lo, 0)
-    old_found = tl.load(old_sorted_ptr + row_off + lo_safe, mask=new_valid & (lo < topk), other=-1).to(tl.int64)
+    old_found = tl.load(old_sorted_ptr + row_off + lo_safe, mask=new_valid & (lo < topk), other=-1).to(tl.int32)
     miss_mask = new_valid & (old_found != new_with_offset)
 
     miss_rank = tl.cumsum(miss_mask.to(tl.int32), axis=0) - 1
@@ -54,7 +54,7 @@ def sorted_dense_cache_miss_kernel(
     tl.store(out_ptr + row_off + miss_rank_safe, new_token.to(tl.int32), mask=miss_mask)
     tl.store(miss_count_ptr + pid, num_miss)
 
-    history_value = tl.where(new_valid, new_with_offset, tl.full((BLOCK,), -1, tl.int64))
+    history_value = tl.where(new_valid, new_with_offset, tl.full((BLOCK,), -1, tl.int32))
     tl.store(history_out_ptr + row_off + cols, history_value, mask=mask)
 
 
@@ -78,13 +78,13 @@ def sorted_compact_cache_miss_slots_kernel(
     if pid >= num_reqs:
         return
 
-    req_id = tl.load(req_ids_ptr + pid).to(tl.int64)
+    req_id = tl.load(req_ids_ptr + pid).to(tl.int32)
     req_offset = req_id * TOKEN_LIMIT
     row_off = pid * topk
     cols = tl.arange(0, BLOCK)
     mask = cols < topk
 
-    new_token = tl.load(new_sorted_ptr + row_off + cols, mask=mask, other=-1).to(tl.int64)
+    new_token = tl.load(new_sorted_ptr + row_off + cols, mask=mask, other=-1).to(tl.int32)
     new_valid = mask & (new_token >= 0) & (new_token < TOKEN_LIMIT)
     new_with_offset = new_token + req_offset
 
@@ -95,15 +95,15 @@ def sorted_compact_cache_miss_slots_kernel(
         mid = (lo + hi) // 2
         mid_valid = new_valid & (mid < topk)
         mid_safe = tl.where(mid_valid, mid, 0)
-        old_mid = tl.load(old_sorted_ptr + row_off + mid_safe, mask=mid_valid, other=-1).to(tl.int64)
+        old_mid = tl.load(old_sorted_ptr + row_off + mid_safe, mask=mid_valid, other=-1).to(tl.int32)
         go_right = old_mid < new_with_offset
         lo = tl.where(new_valid & go_right, mid + 1, lo)
         hi = tl.where(new_valid & ~go_right, mid, hi)
     lo_safe = tl.where(lo < topk, lo, 0)
-    old_found = tl.load(old_sorted_ptr + row_off + lo_safe, mask=new_valid & (lo < topk), other=-1).to(tl.int64)
+    old_found = tl.load(old_sorted_ptr + row_off + lo_safe, mask=new_valid & (lo < topk), other=-1).to(tl.int32)
     miss_mask = new_valid & (old_found != new_with_offset)
 
-    old_with_offset = tl.load(old_sorted_ptr + row_off + cols, mask=mask, other=-1).to(tl.int64)
+    old_with_offset = tl.load(old_sorted_ptr + row_off + cols, mask=mask, other=-1).to(tl.int32)
     old_token = old_with_offset - req_offset
     old_valid = mask & (old_with_offset >= 0) & (old_token >= 0) & (old_token < TOKEN_LIMIT)
 
@@ -114,12 +114,12 @@ def sorted_compact_cache_miss_slots_kernel(
         mid = (old_lo + old_hi) // 2
         mid_valid = old_valid & (mid < topk)
         mid_safe = tl.where(mid_valid, mid, 0)
-        new_mid = tl.load(new_sorted_ptr + row_off + mid_safe, mask=mid_valid, other=-1).to(tl.int64)
+        new_mid = tl.load(new_sorted_ptr + row_off + mid_safe, mask=mid_valid, other=-1).to(tl.int32)
         go_right = new_mid < old_token
         old_lo = tl.where(old_valid & go_right, mid + 1, old_lo)
         old_hi = tl.where(old_valid & ~go_right, mid, old_hi)
     old_lo_safe = tl.where(old_lo < topk, old_lo, 0)
-    new_found = tl.load(new_sorted_ptr + row_off + old_lo_safe, mask=old_valid & (old_lo < topk), other=-1).to(tl.int64)
+    new_found = tl.load(new_sorted_ptr + row_off + old_lo_safe, mask=old_valid & (old_lo < topk), other=-1).to(tl.int32)
     avail_mask = old_valid & (new_found != old_token)
 
     num_miss = tl.sum(miss_mask.to(tl.int32), axis=0)
