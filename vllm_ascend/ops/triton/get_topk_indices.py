@@ -38,13 +38,13 @@ def sorted_dense_cache_miss_kernel(
         mid_valid = new_valid & (mid < topk)
         mid_safe = tl.where(mid_valid, mid, 0)
         old_mid = tl.load(old_sorted_ptr + row_off + mid_safe, mask=mid_valid, other=-1).to(tl.int32)
-        go_right = old_mid < new_with_offset
+        go_right = old_mid < new_token
         lo = tl.where(new_valid & go_right, mid + 1, lo)
         hi = tl.where(new_valid & ~go_right, mid, hi)
 
     lo_safe = tl.where(lo < topk, lo, 0)
     old_found = tl.load(old_sorted_ptr + row_off + lo_safe, mask=new_valid & (lo < topk), other=-1).to(tl.int32)
-    miss_mask = new_valid & (old_found != new_with_offset)
+    miss_mask = new_valid & (old_found != new_token)
 
     miss_rank = tl.cumsum(miss_mask.to(tl.int32), axis=0) - 1
     miss_rank_safe = tl.where(miss_mask, miss_rank, 0)
@@ -92,12 +92,12 @@ def sorted_collect_cache_miss_kernel(
         mid_valid = new_valid & (mid < topk)
         mid_safe = tl.where(mid_valid, mid, 0)
         old_mid = tl.load(old_sorted_ptr + row_off + mid_safe, mask=mid_valid, other=-1).to(tl.int32)
-        go_right = old_mid < new_with_offset
+        go_right = old_mid < new_token
         lo = tl.where(new_valid & go_right, mid + 1, lo)
         hi = tl.where(new_valid & ~go_right, mid, hi)
     lo_safe = tl.where(lo < topk, lo, 0)
     old_found = tl.load(old_sorted_ptr + row_off + lo_safe, mask=new_valid & (lo < topk), other=-1).to(tl.int32)
-    miss_mask = new_valid & (old_found != new_with_offset)
+    miss_mask = new_valid & (old_found != new_token)
 
     miss_rank = tl.cumsum(miss_mask.to(tl.int32), axis=0) - 1
     miss_rank_safe = tl.where(miss_mask, miss_rank, 0)
@@ -126,15 +126,12 @@ def sorted_collect_cache_slots_kernel(
     if pid >= num_reqs:
         return
 
-    req_id = tl.load(req_ids_ptr + pid).to(tl.int32)
-    req_offset = req_id * TOKEN_LIMIT
     row_off = pid * topk
     cols = tl.arange(0, BLOCK)
     mask = cols < topk
 
-    old_with_offset = tl.load(old_sorted_ptr + row_off + cols, mask=mask, other=-1).to(tl.int32)
-    old_token = old_with_offset - req_offset
-    old_valid = mask & (old_with_offset >= 0) & (old_token >= 0) & (old_token < TOKEN_LIMIT)
+    old_token = tl.load(old_sorted_ptr + row_off + cols, mask=mask, other=-1).to(tl.int32)
+    old_valid = mask & (old_token >= 0) & (old_token < TOKEN_LIMIT)
 
     old_lo = tl.full((BLOCK,), 0, tl.int32)
     old_hi = tl.full((BLOCK,), topk, tl.int32)
@@ -154,7 +151,7 @@ def sorted_collect_cache_slots_kernel(
     num_avail = tl.sum(avail_mask.to(tl.int32), axis=0)
     num_shortage = num_miss - num_avail
 
-    empty_mask = mask & (old_with_offset == -1)
+    empty_mask = mask & (old_token == -1)
     empty_cumsum = tl.cumsum(empty_mask.to(tl.int32), axis=0)
     selected_empty = (empty_cumsum <= num_shortage) & empty_mask
     avail_mask = avail_mask | selected_empty
@@ -1057,9 +1054,14 @@ def get_cache_miss_topk_indices_triton(
     topk_indices_new: torch.Tensor,
     **kwargs,
 ):
-    topk_indices_new_sorted, _ = torch.sort(topk_indices_new, dim=1)
-    topk_indices_old_slots = torch.argsort(topk_indices_old, dim=1)
-    topk_indices_old_sorted = torch.gather(topk_indices_old, 1, topk_indices_old_slots)
+    token_limit = kwargs.get("token_limit", 65536)
+    req_ids_offset = (req_ids_tensor.to(topk_indices_old.dtype) * token_limit).unsqueeze(1)
+    old_token_keys = torch.where(topk_indices_old >= 0, topk_indices_old - req_ids_offset, topk_indices_old)
+    old_token_keys = old_token_keys.to(torch.float32)
+    new_token_keys = topk_indices_new.to(torch.float32)
+    topk_indices_new_sorted, _ = torch.sort(new_token_keys, dim=1)
+    topk_indices_old_slots = torch.argsort(old_token_keys, dim=1)
+    topk_indices_old_sorted = torch.gather(old_token_keys, 1, topk_indices_old_slots)
     return get_cache_miss_topk_indices_triton_sorted(
         req_ids_tensor,
         topk_indices_old,
@@ -1095,8 +1097,10 @@ def get_cache_miss_topk_indices_triton_sorted_merge_dense(
     if miss_count is None:
         miss_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
 
-    old_sorted, _ = torch.sort(topk_indices_old, dim=1)
-    new_sorted, _ = torch.sort(topk_indices_new, dim=1)
+    req_ids_offset = (req_ids_tensor.to(topk_indices_old.dtype) * token_limit).unsqueeze(1)
+    old_token_keys = torch.where(topk_indices_old >= 0, topk_indices_old - req_ids_offset, topk_indices_old)
+    old_sorted, _ = torch.sort(old_token_keys.to(torch.float32), dim=1)
+    new_sorted, _ = torch.sort(topk_indices_new.to(torch.float32), dim=1)
 
     grid = (num_reqs,)
     BLOCK = triton.next_power_of_2(topk)
