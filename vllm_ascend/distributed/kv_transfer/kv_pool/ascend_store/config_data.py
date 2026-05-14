@@ -570,6 +570,8 @@ class ReqMeta:
     req_id: str
     # Number of tokens in this chunk
     token_len_chunk: int
+    # Current logical token length of this request.
+    current_token_len: int
 
     block_ids_by_group: list[list[int]]
 
@@ -705,7 +707,10 @@ class ReqMeta:
             return None
 
         if not skip_save:
-            tracker.num_saved_tokens = num_tokens_to_save
+            tracker.num_saved_tokens = max(
+                tracker.num_saved_tokens,
+                num_tokens_to_save,
+            )
 
         token_ids = None
         if tracker.token_ids:
@@ -723,6 +728,7 @@ class ReqMeta:
         return ReqMeta(
             req_id=tracker.req_id,
             token_len_chunk=num_tokens_to_save,
+            current_token_len=current_token_len,
             save_start_token=previous_saved_tokens,
             block_ids=tracker.allocated_block_ids,
             can_save=not skip_save,
