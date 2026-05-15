@@ -672,7 +672,7 @@ class NPUWorker(WorkerBase):
                 "profiling. Example: "
                 "'--profiler-config.profiler=torch --profiler-config.torch_profiler_dir"
                 "=YOUR_DIR_PATH_TO_DUMP_TRACE'"
-            )
+        )
 
         if is_start:
             from vllm.distributed.utils import get_worker_rank_suffix
@@ -688,11 +688,20 @@ class NPUWorker(WorkerBase):
                 # Profiler already initialized. Restart profiling but keep
                 # the original trace name from the first initialization.
                 self.profiler.start()
+            from vllm.profiler.memcache import start_memcache_profile
+            start_memcache_profile(
+                self.profiler_config.torch_profiler_dir,
+                trace_name,
+            )
         else:
             if self.profiler is None:
                 logger.warning("Profiler was not started, nothing to stop.")
                 return
-            self.profiler.stop()
+            try:
+                self.profiler.stop()
+            finally:
+                from vllm.profiler.memcache import stop_memcache_profile
+                stop_memcache_profile()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
