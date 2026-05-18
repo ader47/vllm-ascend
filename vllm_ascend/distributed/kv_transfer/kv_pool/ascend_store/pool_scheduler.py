@@ -100,6 +100,7 @@ class KVPoolScheduler:
         self._discard_partial_chunks = True
         self._unfinished_requests: dict[str, tuple[Request, list[int]]] = {}
         self._unfinished_request_ids: set[str] = set()
+        self._delayed_free_req_ids: set[str] = set()
 
         self.page_size_bytes = page_size_bytes
         logger.info(f"==============> page_size_bytes {page_size_bytes}")
@@ -421,8 +422,13 @@ class KVPoolScheduler:
             self._preempted_req_ids.update(scheduler_output.preempted_req_ids)
             self._request_trackers.pop(req_id, None)
             self._unfinished_requests.pop(req_id, None)
+            self._delayed_free_req_ids.discard(req_id)
 
-        meta = AscendConnectorMetadata(self._unfinished_request_ids, scheduler_output.preempted_req_ids)
+        meta = AscendConnectorMetadata(
+            self._unfinished_request_ids,
+            scheduler_output.preempted_req_ids,
+            self._delayed_free_req_ids.copy(),
+        )
 
         for request in scheduler_output.scheduled_new_reqs:
             # Right now, we only load KV for new requests
@@ -750,42 +756,26 @@ class KVPoolScheduler:
         should be freed now or will be sent asynchronously and freed later.
         """
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
+            self._delayed_free_req_ids.discard(request.request_id)
             return False, None
         if self.use_layerwise:
+            self._delayed_free_req_ids.discard(request.request_id)
             return False, None
         tracker = self._request_trackers.get(request.request_id)
-        if tracker is not None and tracker.num_saved_tokens <= 0:
+        if tracker is None or tracker.num_saved_tokens <= 0:
+            self._delayed_free_req_ids.discard(request.request_id)
             return False, None
         delay_free_blocks = len(block_ids) > 0
         if delay_free_blocks:
-            if logger.isEnabledFor(10):
-                logger.debug("Delaying free of %d blocks for request %s", len(block_ids), request.request_id)
+            self._delayed_free_req_ids.add(request.request_id)
+            logger.debug("Delaying free of %d blocks for request %s", len(block_ids), request.request_id)
+        else:
+            self._delayed_free_req_ids.discard(request.request_id)
         return delay_free_blocks, None
 
-    def request_finished_all_groups(
-        self,
-        request: "Request",
-        block_ids: tuple[list[int], ...],
-    ) -> tuple[bool, dict[str, Any] | None]:
-        """HMA path for hybrid KV cache groups."""
-        if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
-            return False, None
-        tracker = self._request_trackers.get(request.request_id)
-        if tracker is not None and tracker.num_saved_tokens <= 0:
-            return False, None
-        block_ids = cast(tuple[list[int], ...], self.get_sw_clipped_blocks(block_ids))
-        valid_group_block_ids = [group_block_ids for group_block_ids in block_ids if group_block_ids]
-        delay_free_blocks = bool(valid_group_block_ids)
-        if delay_free_blocks:
-            logger.debug(
-                "Delaying free of %d KV cache groups for request %s",
-                len(valid_group_block_ids),
-                request.request_id,
-            )
-        return delay_free_blocks, None
-
-    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
-        self._block_pool = gpu_block_pool
+    def update_finished_sending(self, finished_sending: set[str] | None) -> None:
+        if finished_sending:
+            self._delayed_free_req_ids.difference_update(finished_sending)
 
 
 def get_zmq_rpc_path_lookup(vllm_config: "VllmConfig") -> str:
