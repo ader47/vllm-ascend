@@ -540,7 +540,6 @@ class NPUWorker(WorkerBase):
                 + self.non_torch_memory
                 + npugraph_memory_bytes
             )
-            self.npugraph_memory_bytes = npugraph_memory_bytes
             suggested_to_requested = int(self.requested_memory) - non_kv_memory - redundancy_buffer
             suggested_to_gpu_limit = int(self.init_snapshot.free_memory) - non_kv_memory - redundancy_buffer
             msg = (
@@ -573,8 +572,12 @@ class NPUWorker(WorkerBase):
         if get_ascend_config().enable_cpu_binding:
             try:
                 bind_cpus(self.local_rank)
+                if has_kv_transfer_group():
+                    connector = get_kv_transfer_group()
+                    if hasattr(connector, "rebind_kv_transfer_threads"):
+                        connector.rebind_kv_transfer_threads()
             except Exception as e:
-                logger.warning("Bind cpus failed in rank%s: %s Skip binding cpu.", self.local_rank, e)
+                logger.warning(f"Bind cpus failed in rank{self.local_rank}: {e} Skip binding cpu.")
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
@@ -651,13 +654,12 @@ class NPUWorker(WorkerBase):
 
         # Log for debugging in PP mode
         if not is_first_pp_rank:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "[ProfilingChunk] PP rank %d: profiled %d tokens, latency=%.2f ms (not used)",
-                    get_pp_group().rank_in_group,
-                    num_tokens,
-                    latency_ms,
-                )
+            logger.debug(
+                "[ProfilingChunk] PP rank %d: profiled %d tokens, latency=%.2f ms (not used)",
+                get_pp_group().rank_in_group,
+                num_tokens,
+                latency_ms,
+            )
 
         return latency_ms
 
