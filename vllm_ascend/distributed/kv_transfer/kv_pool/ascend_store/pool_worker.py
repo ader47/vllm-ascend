@@ -78,15 +78,6 @@ class KVPoolWorker:
     ):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
-        self.kv_cache_config = kv_cache_config
-        hf_text_config = getattr(model_config, "hf_text_config", None)
-        hf_config = getattr(model_config, "hf_config", hf_text_config)
-        self.hf_config = hf_text_config or hf_config
-        self.compress_ratios = getattr(hf_text_config, "compress_ratios", None)
-        if self.compress_ratios is None:
-            self.compress_ratios = getattr(hf_config, "compress_ratios", None)
-        self.use_compress = self.compress_ratios is not None
-        self.dp_rank = parallel_config.data_parallel_rank
         self.local_rank = envs.LOCAL_RANK
         self.use_mla = False
         if hasattr(model_config, "use_mla") and isinstance(model_config.use_mla, bool) and model_config.use_mla:
@@ -121,7 +112,6 @@ class KVPoolWorker:
             extra_config.get("layerwise_max_transfer_blocks", 0))
         self.layerwise_max_transfer_bytes = int(
             extra_config.get("layerwise_max_transfer_bytes", 0))
-        self.original_block_size = vllm_config.cache_config.block_size
         self.block_size = vllm_config.cache_config.block_size
 
         logger.info(
@@ -241,7 +231,6 @@ class KVPoolWorker:
         self.next_layer_to_submit = 0
         layerwise_config = get_layerwise_config(self.num_layers)
         self.layerwise_offload = layerwise_config.has_layer_reuse
-        self.NUM_SHARED_BUFFERS = layerwise_config.num_shared_buffers
         self.NUM_PREFETCH_LAYERS = layerwise_config.num_prefetch_layers
         self.independent_layers = layerwise_config.independent_layers
         self.prefetch_layer_map = layerwise_config.prefetch_layer_map
@@ -307,7 +296,6 @@ class KVPoolWorker:
             first_kv_cache.shape,
         )
 
-        self.kv_caches = kv_caches
         self.kv_caches_base_addr = []
         ptrs = []
         lengths = []
