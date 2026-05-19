@@ -5,6 +5,7 @@ import math
 import threading
 
 import torch
+
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -16,7 +17,6 @@ from vllm.distributed import (
 )
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
-
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.cpu_binding import (
     bind_thread_to_cpus,
@@ -47,14 +47,14 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config i
     get_layerwise_config,
 )
 
+
 class KVPoolWorker:
     # The main class for the cache engine.
 
     def __init__(
         self,
         vllm_config: VllmConfig,
-        use_layerwize: bool,
-        kv_cache_config: KVCacheConfig | None = None,
+        use_layerwise: bool,
     ):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
@@ -63,7 +63,7 @@ class KVPoolWorker:
         if hasattr(model_config, "use_mla") and isinstance(model_config.use_mla, bool) and model_config.use_mla:
             self.use_mla = True
         self.use_sparse = hasattr(model_config.hf_text_config, "index_topk")
-        self.use_layerwise = use_layerwize
+        self.use_layerwise = use_layerwise
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.pp_size = parallel_config.pipeline_parallel_size
