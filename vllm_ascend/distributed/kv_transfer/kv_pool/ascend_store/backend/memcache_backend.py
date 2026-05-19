@@ -103,6 +103,12 @@ class MemcacheBackend(Backend):
         assert self.store is not None
         return self.store.batch_is_exist(keys)
 
+    def batch_get_key_info(self, keys: list[str]):
+        return self.store.batch_get_key_info(keys)
+
+    def batch_alloc(self, keys: list[str], sizes: list[int]) -> list[int]:
+        return self.store.batch_alloc(keys, sizes)
+
     def get(self, key: list[str], addr: list[list[int]], size: list[list[int]]):
         if self._lazy_init and not self._store_initialized:
             logger.error("MemcacheBackend.get called before store initialization, keys=%s", key)
