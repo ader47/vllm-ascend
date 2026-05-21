@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    get_layerwise_config,
     get_layerwise_kv_cache_reuse_layers,
 )
 
@@ -38,6 +39,26 @@ def get_kv_cache_reuse_layers(max_layers: int | None = None) -> int | None:
             f"of KV cache layers, got {reuse_layers} > {max_layers}."
         )
     return reuse_layers
+
+
+def get_layerwise_storage_slots(layer_names: list[str]) -> list[list[str]]:
+    layerwise_config = get_layerwise_config(len(layer_names))
+    if not layerwise_config.has_layer_reuse:
+        return [[layer_name] for layer_name in layer_names]
+
+    independent_layers = set(layerwise_config.independent_layers)
+    storage_slots: list[list[str]] = [
+        [] for _ in range(layerwise_config.num_shared_buffers)
+    ]
+    reused_layer_idx = 0
+    for layer_idx, layer_name in enumerate(layer_names):
+        if layer_idx in independent_layers:
+            storage_slots.append([layer_name])
+            continue
+        storage_slots[reused_layer_idx %
+                      layerwise_config.num_shared_buffers].append(layer_name)
+        reused_layer_idx += 1
+    return [slot for slot in storage_slots if slot]
 
 
 def get_num_blocks(
@@ -107,9 +128,7 @@ def get_kv_cache_config_from_groups(
         if reuse_layers is None:
             storage_slots = [[layer_name] for layer_name in group.layer_names]
         else:
-            storage_slots = [[] for _ in range(reuse_layers)]
-            for i, layer_name in enumerate(group.layer_names):
-                storage_slots[i % reuse_layers].append(layer_name)
+            storage_slots = get_layerwise_storage_slots(group.layer_names)
 
         page_size = sum(
             max(per_layer_specs[layer_name].page_size_bytes for layer_name in slot) for slot in storage_slots

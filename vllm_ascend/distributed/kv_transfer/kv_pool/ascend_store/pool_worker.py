@@ -15,6 +15,7 @@ from vllm.distributed import (
 )
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.cpu_binding import (
     bind_thread_to_cpus,
@@ -255,7 +256,11 @@ class KVPoolWorker:
         ptrs = []
         lengths = []
         length = len(self.block_len)
-        for cache_or_caches in kv_caches.values():
+        ordered_kv_caches = sorted(
+            kv_caches.items(),
+            key=lambda item: extract_layer_index(item[0]),
+        )
+        for _, cache_or_caches in ordered_kv_caches:
             for i, cache in enumerate(cache_or_caches, 0):
                 base_addr = cache.data_ptr()
                 if base_addr not in self.kv_caches_base_addr:
