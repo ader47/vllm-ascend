@@ -4,10 +4,10 @@ from enum import Enum
 from typing import Any
 
 import torch
+
 from vllm.config import ParallelConfig
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import logger
-
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
@@ -20,34 +20,12 @@ class MmcDirect(Enum):
 
 
 class MemcacheBackend(Backend):
-    def __init__(self, parallel_config: ParallelConfig, lazy_init: bool = False):
-        self.local_rank = get_world_group().local_rank
-        self.store: Any | None = None
-        self._is_a2 = get_ascend_device_type() in {AscendDeviceType.A2}
-        self._lazy_init = lazy_init and not self._is_a2
-        self._store_initialized = False
-        self._store_init_lock = threading.Lock()
-        self._registered_buffers: tuple[list[int], list[int]] | None = None
-        self._buffers_registered = False
-
-        if not self._lazy_init:
-            self.store = self._setup_store()
-            self._store_initialized = True
-
-    def _ensure_initialized(self):
-        if self._store_initialized:
-            return
-
-        with self._store_init_lock:
-            if self._store_initialized:
-                return
-
-            logger.info("Initializing Memcache store on first put.")
-            self.store = self._setup_store()
-            self._store_initialized = True
-            self._register_buffers_if_needed()
-
-    def _setup_store(self):
+    def __init__(
+        self,
+        parallel_config: ParallelConfig,
+        local_rank: int | None = None,
+        init_bm: bool = True,
+    ):
         try:
             from memcache_hybrid import DistributedObjectStore  # type: ignore
         except ImportError as e:
@@ -57,20 +35,28 @@ class MemcacheBackend(Backend):
                 "to run vLLM with MemcacheConnector."
             ) from e
         try:
-            if self._is_a2:
+            soc_version = get_ascend_device_type()
+            if init_bm and soc_version in {AscendDeviceType.A2}:
                 tmp_tensor = torch.zeros(1, device="npu")
                 output_tensor_list = [torch.empty_like(tmp_tensor) for _ in range(torch.distributed.get_world_size())]
                 torch.distributed.all_gather(output_tensor_list, tmp_tensor, group=get_world_group().device_group)
-            store = DistributedObjectStore()
-            res = store.init(self.local_rank)
+            self.local_rank = local_rank if local_rank is not None else get_world_group().local_rank
+            self.store = DistributedObjectStore()
+            res = self.store.init(self.local_rank, init_bm=init_bm)
             assert res == 0
-            return store
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
             raise
         except Exception as exc:
             logger.error("An error occurred while loading the configuration: %s", exc)
             raise
+
+    @classmethod
+    def create_scheduler_client(cls, parallel_config: ParallelConfig):
+        # The scheduler is a single metadata client. It is initialized before
+        # the world group exists and must not initialize memcache storage, so
+        # keep the old device_id=0/init_bm=False behavior here.
+        return cls(parallel_config, local_rank=0, init_bm=False)
 
     def set_device(self):
         device = torch.device(f"npu:{self.local_rank}")
