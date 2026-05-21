@@ -1,12 +1,13 @@
 from typing import Any
+
 from memcache_hybrid import DistributedObjectStore  # type: ignore
+
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request
-
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
     LoadSpec,
@@ -15,6 +16,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
     get_layerwise_config,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.memcache_utils import (
+    set_memcache_client_cpu_affinity,
 )
 
 
@@ -53,6 +57,7 @@ class KVPoolScheduler:
         self.page_size_bytes = page_size_bytes
         logger.info(f"==============> page_size_bytes {page_size_bytes}")
         self.store_scheduler = DistributedObjectStore()
+        set_memcache_client_cpu_affinity(self.store_scheduler, 0)
         self.store_scheduler.init(device_id=0, init_bm=False)
 
         model_config = vllm_config.model_config
