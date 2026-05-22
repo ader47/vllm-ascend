@@ -328,13 +328,20 @@ class KVPoolScheduler:
             need_to_allocate,
         )
 
-        if need_to_allocate <= 0:
+        # With layer reuse, HBM prefix cache only keeps independent layers
+        # usable. Reused layers still need to be restored from the KV pool even
+        # when vLLM reports the same number of local cached tokens.
+        force_layerwise_load = (
+            self.layerwise_offload
+            and num_external_hit_tokens > 0
+        )
+        if need_to_allocate <= 0 and not force_layerwise_load:
             return 0, False
 
         self.load_specs[request.request_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
             kvpool_cached_tokens=num_external_hit_tokens,
-            can_load=False,
+            can_load=force_layerwise_load,
         )
         logger.info(
             "KV pool load spec created req=%s vllm_cached=%d kvpool_cached=%d "
@@ -373,12 +380,9 @@ class KVPoolScheduler:
 
         if num_external_tokens == 0:
             # No need to load anything
-            self.load_specs[request.request_id].can_load = False
-            logger.debug(
-                "KV pool load spec disabled req=%s because num_external_tokens=0 vllm_cached=%d kvpool_cached=%d",
-                request.request_id,
-                self.load_specs[request.request_id].vllm_cached_tokens,
-                self.load_specs[request.request_id].kvpool_cached_tokens,
+            self.load_specs[request.request_id].can_load = (
+                self.layerwise_offload
+                and self.load_specs[request.request_id].kvpool_cached_tokens > 0
             )
             return
 
