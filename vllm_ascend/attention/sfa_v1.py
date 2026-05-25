@@ -44,7 +44,9 @@ from vllm_ascend.ops.layer_shard_linear import (
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.ops.triton.get_topk_indices import (
     CacheMissTopKScratch,
+    CacheMissTopKState,
     get_cache_miss_topk_indices_triton,
+    get_cache_miss_topk_indices_triton_state,
 )
 from vllm_ascend.ops.triton.rope import rope_forward_triton
 from vllm_ascend.quantization.methods import AscendW8A8LinearMethod
@@ -64,6 +66,11 @@ if TYPE_CHECKING:
 
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+
+# Experiment flag: switch to stateful token_to_slot cache-miss path.
+# When True, uses CacheMissTopKState + get_cache_miss_topk_indices_triton_state
+# instead of the default hash-based path. Default False keeps current behavior.
+USE_STATEFUL_TOPK_CACHE_MISS = False
 
 
 class AscendSFABackend(AttentionBackend):
@@ -478,6 +485,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.sparse_topk_indices = torch.arange(2048, dtype=torch.int32, device="npu").view(1, -1).repeat(max_num_reqs, 1)
         self.last_step_topk_indices = torch.full([max_num_reqs, 2048], -1, dtype=torch.int64, device='npu') # 32 bits for req_id, 11 bits for token_id, other redundent
         self.cache_miss_scratch = CacheMissTopKScratch()
+        self.cache_miss_state = CacheMissTopKState()
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # NOTE: We currently do not support quant kv_b_proj.
@@ -1204,24 +1212,43 @@ class AscendSFAImpl(MLAAttentionImpl):
         # )
 
         req_ids_tensor = attn_metadata.req_ids_tensor[:num_reqs].contiguous()
-        topk_indices_old = self.last_step_topk_indices[:num_reqs]
-        cache_miss_scratch = self.cache_miss_scratch.prepare(
-            num_reqs,
-            topk_indices.shape[1],
-            topk_indices.device,
-            history_dtype=topk_indices_old.dtype,
-        )
-        torch.npu.synchronize()
-        t1 = time.time()
-        topk_indices = get_cache_miss_topk_indices_triton(
-            req_ids_tensor,
-            topk_indices_old,
-            topk_indices,
-            **cache_miss_scratch,
-        )
-        torch.npu.synchronize()
-        t2 = time.time()
-        print(f">>>>>>>>>>> get_cache_miss_topk_indices_triton {(t2-t1)*1000:.2f}ms")
+
+        if USE_STATEFUL_TOPK_CACHE_MISS:
+            state_kwargs = self.cache_miss_state.prepare(
+                num_reqs,
+                topk_indices.shape[1],
+                topk_indices.device,
+                req_dtype=req_ids_tensor.dtype,
+            )
+            torch.npu.synchronize()
+            t1 = time.time()
+            topk_indices = get_cache_miss_topk_indices_triton_state(
+                req_ids_tensor,
+                topk_indices,
+                **state_kwargs,
+            )
+            torch.npu.synchronize()
+            t2 = time.time()
+            print(f">>>>>>>>>>> get_cache_miss_topk_indices_triton_state {(t2-t1)*1000:.2f}ms")
+        else:
+            topk_indices_old = self.last_step_topk_indices[:num_reqs]
+            cache_miss_scratch = self.cache_miss_scratch.prepare(
+                num_reqs,
+                topk_indices.shape[1],
+                topk_indices.device,
+                history_dtype=topk_indices_old.dtype,
+            )
+            torch.npu.synchronize()
+            t1 = time.time()
+            topk_indices = get_cache_miss_topk_indices_triton(
+                req_ids_tensor,
+                topk_indices_old,
+                topk_indices,
+                **cache_miss_scratch,
+            )
+            torch.npu.synchronize()
+            t2 = time.time()
+            print(f">>>>>>>>>>> get_cache_miss_topk_indices_triton {(t2-t1)*1000:.2f}ms")
 
         # common
         t1 = time.time()

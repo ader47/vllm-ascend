@@ -1254,6 +1254,7 @@ def get_cache_miss_topk_indices_triton_state(
     req_ids_tensor: torch.Tensor,
     topk_indices_new: torch.Tensor,
     token_limit: int = 65536,
+    use_atomic: bool = False,
     req_state: torch.Tensor | None = None,
     token_to_slot: torch.Tensor | None = None,
     slot_to_token: torch.Tensor | None = None,
@@ -1276,12 +1277,8 @@ def get_cache_miss_topk_indices_triton_state(
         slot_to_token = torch.full((num_reqs, topk), -1, dtype=torch.int64, device=device)
     if slot_stamp is None:
         slot_stamp = torch.zeros((num_reqs, topk), dtype=torch.int32, device=device)
-    if free_scratch is None:
-        free_scratch = torch.empty((num_reqs, topk), dtype=torch.int32, device=device)
     if miss_scratch is None:
         miss_scratch = torch.empty((num_reqs, topk), dtype=torch.int64, device=device)
-    if free_count is None:
-        free_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
     if miss_count is None:
         miss_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
     if stamp_tensor is None:
@@ -1289,52 +1286,100 @@ def get_cache_miss_topk_indices_triton_state(
     if out is None:
         out = torch.empty((num_reqs, topk), dtype=torch.int32, device=device)
 
-    BLOCK = 128
-    grid = (num_reqs, triton.cdiv(topk, BLOCK))
+    if use_atomic:
+        # Legacy 3-kernel atomic path
+        if free_scratch is None:
+            free_scratch = torch.empty((num_reqs, topk), dtype=torch.int32, device=device)
+        if free_count is None:
+            free_count = torch.empty((num_reqs,), dtype=torch.int32, device=device)
 
-    init_cache_miss_state_step_kernel[grid](
-        req_ids_tensor,
-        req_state,
-        token_to_slot,
-        slot_to_token,
-        slot_stamp,
-        miss_count,
-        free_count,
-        out,
-        num_reqs,
-        topk=topk,
-        TOKEN_LIMIT=token_limit,
-        BLOCK=BLOCK,
-    )
+        BLOCK = 128
+        grid = (num_reqs, triton.cdiv(topk, BLOCK))
 
-    collect_cache_miss_state_kernel[grid](
-        topk_indices_new,
-        token_to_slot,
-        slot_to_token,
-        slot_stamp,
-        miss_scratch,
-        miss_count,
-        num_reqs,
-        stamp_tensor,
-        topk=topk,
-        TOKEN_LIMIT=token_limit,
-        BLOCK=BLOCK,
-    )
+        init_cache_miss_state_step_kernel[grid](
+            req_ids_tensor,
+            req_state,
+            token_to_slot,
+            slot_to_token,
+            slot_stamp,
+            miss_count,
+            free_count,
+            out,
+            num_reqs,
+            topk=topk,
+            TOKEN_LIMIT=token_limit,
+            BLOCK=BLOCK,
+        )
 
-    apply_cache_miss_state_atomic_kernel[grid](
-        out,
-        token_to_slot,
-        slot_to_token,
-        slot_stamp,
-        miss_scratch,
-        miss_count,
-        free_count,
-        num_reqs,
-        stamp_tensor,
-        topk=topk,
-        TOKEN_LIMIT=token_limit,
-        BLOCK=BLOCK,
-    )
+        collect_cache_miss_state_kernel[grid](
+            topk_indices_new,
+            token_to_slot,
+            slot_to_token,
+            slot_stamp,
+            miss_scratch,
+            miss_count,
+            num_reqs,
+            stamp_tensor,
+            topk=topk,
+            TOKEN_LIMIT=token_limit,
+            BLOCK=BLOCK,
+        )
+
+        apply_cache_miss_state_atomic_kernel[grid](
+            out,
+            token_to_slot,
+            slot_to_token,
+            slot_stamp,
+            miss_scratch,
+            miss_count,
+            free_count,
+            num_reqs,
+            stamp_tensor,
+            topk=topk,
+            TOKEN_LIMIT=token_limit,
+            BLOCK=BLOCK,
+        )
+    else:
+        # Non-atomic 2-kernel path: compact + apply
+        # One program per request processes all topk slots at once.
+        # compact handles req_id change detection, old state cleanup,
+        # token_to_slot lookup, hit/miss classification, and miss compaction
+        # using tl.cumsum (no atomics).
+        # apply finds free slots (empty + stale), pairs them with misses,
+        # updates all state arrays, and produces the slot-aligned output.
+        BLOCK = triton.next_power_of_2(topk)
+        grid = (num_reqs,)
+
+        compact_cache_miss_state_kernel[grid](
+            req_ids_tensor,
+            topk_indices_new,
+            req_state,
+            token_to_slot,
+            slot_to_token,
+            slot_stamp,
+            miss_scratch,
+            miss_count,
+            num_reqs,
+            stamp_tensor,
+            topk=topk,
+            TOKEN_LIMIT=token_limit,
+            BLOCK=BLOCK,
+        )
+
+        apply_cache_miss_state_kernel[grid](
+            req_ids_tensor,
+            out,
+            token_to_slot,
+            slot_to_token,
+            slot_stamp,
+            miss_scratch,
+            miss_count,
+            num_reqs,
+            stamp_tensor,
+            topk=topk,
+            TOKEN_LIMIT=token_limit,
+            BLOCK=BLOCK,
+        )
 
     return out
 
