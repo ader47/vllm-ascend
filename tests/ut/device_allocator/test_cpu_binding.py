@@ -346,6 +346,17 @@ class TestCpuAlloc(unittest.TestCase):
         self.cpu_alloc.build_global_slice_cpu_pool()
         self.assertEqual(self.cpu_alloc.npu_cpu_pool, {})
 
+    def test_build_global_slice_cpu_pool_excludes_configured_memcache_cpus(self):
+        self.cpu_alloc.device_info.running_npu_list = [0, 1]
+        self.cpu_alloc.device_info.allowed_cpus = list(range(20))
+        self.cpu_alloc.device_info.total_logic_npus = 2
+
+        with patch.object(CpuAlloc, "memcache_cpu_list", return_value="0-7"):
+            self.cpu_alloc.build_global_slice_cpu_pool()
+
+        self.assertEqual(self.cpu_alloc.npu_cpu_pool[0], [8, 9, 10, 11, 12, 13])
+        self.assertEqual(self.cpu_alloc.npu_cpu_pool[1], [14, 15, 16, 17, 18, 19])
+
     @patch("vllm_ascend.cpu_binding.execute_command")
     def test_allocate(self, _mock_execute_command):
         self.cpu_alloc.device_info.running_npu_list = [0]
@@ -364,6 +375,63 @@ class TestCpuAlloc(unittest.TestCase):
         self.cpu_alloc.npu_cpu_pool = {0: [0, 1]}
         with self.assertRaises(RuntimeError):
             self.cpu_alloc.allocate()
+
+    def test_allocate_uses_configured_memcache_cpu_list(self):
+        self.cpu_alloc.device_info.running_npu_list = [0, 1]
+        self.cpu_alloc.device_info.total_logic_npus = 2
+        self.cpu_alloc.device_info.allowed_cpus = list(range(200))
+        self.cpu_alloc.npu_cpu_pool = {
+            0: list(range(24)),
+            1: list(range(24, 48)),
+        }
+
+        with patch.object(CpuAlloc, "memcache_cpu_list", return_value="100-115"):
+            self.cpu_alloc.allocate()
+
+        self.assertEqual(self.cpu_alloc.assign_main[0], list(range(2, 14)))
+        self.assertEqual(self.cpu_alloc.assign_memcache[0], list(range(100, 108)))
+        self.assertEqual(self.cpu_alloc.assign_main[1], list(range(26, 38)))
+        self.assertEqual(self.cpu_alloc.assign_memcache[1], list(range(108, 116)))
+
+    def test_configured_memcache_cpu_list_rejects_cpus_outside_cpuset(self):
+        self.cpu_alloc.device_info.running_npu_list = [0]
+        self.cpu_alloc.device_info.total_logic_npus = 1
+        self.cpu_alloc.device_info.allowed_cpus = list(range(24))
+        self.cpu_alloc.npu_cpu_pool = {0: list(range(24))}
+
+        with patch.object(CpuAlloc, "memcache_cpu_list", return_value="20-30"):
+            with self.assertRaises(RuntimeError):
+                self.cpu_alloc.allocate()
+
+    @patch("vllm_ascend.cpu_binding.logger.warning")
+    def test_configured_memcache_cpu_list_warns_when_slice_is_short(self, mock_warning):
+        self.cpu_alloc.device_info.running_npu_list = [0, 1]
+        self.cpu_alloc.device_info.total_logic_npus = 2
+        self.cpu_alloc.device_info.allowed_cpus = list(range(100))
+        self.cpu_alloc.npu_cpu_pool = {
+            0: list(range(24)),
+            1: list(range(24, 48)),
+        }
+
+        with patch.object(CpuAlloc, "memcache_cpu_list", return_value="80-87"):
+            self.cpu_alloc.allocate()
+
+        self.assertEqual(self.cpu_alloc.assign_memcache[0], [80, 81, 82, 83])
+        self.assertEqual(self.cpu_alloc.assign_memcache[1], [84, 85, 86, 87])
+        mock_warning.assert_called()
+
+    @patch("vllm_ascend.cpu_binding.logger.warning")
+    def test_configured_memcache_cpu_list_warns_on_reserved_cpu_overlap(self, mock_warning):
+        self.cpu_alloc.device_info.running_npu_list = [0]
+        self.cpu_alloc.device_info.total_logic_npus = 1
+        self.cpu_alloc.device_info.allowed_cpus = list(range(24))
+        self.cpu_alloc.npu_cpu_pool = {0: list(range(24))}
+
+        with patch.object(CpuAlloc, "memcache_cpu_list", return_value="0-7"):
+            self.cpu_alloc.allocate()
+
+        self.assertEqual(self.cpu_alloc.assign_memcache[0], list(range(8)))
+        mock_warning.assert_called()
 
     @patch("vllm_ascend.cpu_binding.execute_command")
     def test_bind_threads(self, mock_execute_command):

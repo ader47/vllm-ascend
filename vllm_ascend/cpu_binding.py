@@ -203,6 +203,26 @@ class CpuAlloc:
         )
 
     @staticmethod
+    def memcache_cpu_list() -> str | None:
+        return getattr(envs, "VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_LIST", None)
+
+    def configured_memcache_cpu_pool(self) -> list[int]:
+        cpu_list_config = self.memcache_cpu_list()
+        if not cpu_list_config:
+            return []
+
+        configured_cpus = sorted(set(DeviceInfo.expand_cpu_list(cpu_list_config)))
+        allowed_cpus = set(self.device_info.allowed_cpus)
+        if allowed_cpus:
+            invalid_cpus = sorted(set(configured_cpus) - allowed_cpus)
+            if invalid_cpus:
+                raise RuntimeError(
+                    "VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_LIST contains CPUs outside "
+                    f"the current cpuset: {invalid_cpus}."
+                )
+        return configured_cpus
+
+    @staticmethod
     def worker_cpu_count() -> int:
         value = CpuAlloc._get_non_negative_env(
             "VLLM_ASCEND_CPU_BIND_WORKER_CPU_COUNT",
@@ -277,6 +297,63 @@ class CpuAlloc:
                 result[npu] = cpu_list[start_index:end_index]
         return result
 
+    def _global_slice_npu_count(self) -> int:
+        total_npus = self.device_info.total_logic_npus
+        if total_npus <= 0:
+            total_npus = len(self.device_info.npu_affinity)
+        if total_npus <= 0:
+            total_npus = len(self.device_info.running_npu_list)
+        return total_npus
+
+    def _slice_global_cpu_list(self, cpus: list[int], npu: int) -> list[int]:
+        total_npus = self._global_slice_npu_count()
+        if total_npus <= 0:
+            return []
+        if npu < 0 or npu >= total_npus:
+            raise RuntimeError(f"Invalid NPU id {npu}, total_npus={total_npus}.")
+
+        base = len(cpus) // total_npus
+        extra = len(cpus) % total_npus
+        start = npu * base + (npu if npu < extra else extra)
+        take = base + (1 if npu < extra else 0)
+        return cpus[start : start + take]
+
+    def _configured_memcache_cpus(
+        self,
+        npu: int,
+        memcache_cpu_count: int,
+        reserved_cpus: list[int],
+    ) -> list[int] | None:
+        cpu_list_config = self.memcache_cpu_list()
+        if not cpu_list_config:
+            return None
+
+        configured_cpus = self.configured_memcache_cpu_pool()
+        sliced_cpus = self._slice_global_cpu_list(configured_cpus, npu)
+        memcache_cpus = sliced_cpus[:memcache_cpu_count]
+        if not memcache_cpus and memcache_cpu_count > 0:
+            raise RuntimeError(
+                "VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_LIST does not provide any CPU "
+                f"for NPU{npu}."
+            )
+        overlapped_cpus = sorted(set(memcache_cpus) & set(reserved_cpus))
+        if overlapped_cpus:
+            logger.warning(
+                "NPU%d MemCache CPUs from VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_LIST "
+                "overlap with worker/IRQ/ACL/release CPUs: %s.",
+                npu,
+                overlapped_cpus,
+            )
+        if len(memcache_cpus) < memcache_cpu_count:
+            logger.warning(
+                "NPU%d MemCache CPU count from VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_LIST "
+                "is %d, less than requested %d.",
+                npu,
+                len(memcache_cpus),
+                memcache_cpu_count,
+            )
+        return memcache_cpus
+
     def extend_numa(self, cpu_list: list[int]) -> list[int]:
         if not cpu_list:
             return []
@@ -329,7 +406,8 @@ class CpuAlloc:
         if not running:
             return
 
-        allowed = sorted(set(self.device_info.allowed_cpus))
+        configured_memcache_cpus = set(self.configured_memcache_cpu_pool())
+        allowed = sorted(set(self.device_info.allowed_cpus) - configured_memcache_cpus)
         total_cpu = len(allowed)
         if total_cpu == 0:
             return
@@ -349,6 +427,7 @@ class CpuAlloc:
         logger.debug(
             f"[cpu_global_slice] rank:{self.rank_id} ASCEND_RT_VISIBLE_DEVICES={ASCEND_RT_VISIBLE_DEVICES} "
             f"running_npu_list:{running} total_npus:{total_npus} allowed_cpus:{total_cpu} "
+            f"reserved_memcache_cpus:{len(configured_memcache_cpus)} "
             f"base:{base} extra:{extra} allowed_cpus_head:{allowed[:16]} allowed_cpus_tail:{allowed[-16:]}"
         )
 
@@ -427,6 +506,10 @@ class CpuAlloc:
             rel = remaining[:RELEASE_CPUS_PER_NPU]
             remaining = remaining[len(rel):]
             memcache = remaining[:memcache_cpu_count]
+            reserved_cpus = pool[:irq_end] + main + acl + rel
+            configured_memcache = self._configured_memcache_cpus(npu, memcache_cpu_count, reserved_cpus)
+            if configured_memcache is not None:
+                memcache = configured_memcache
 
             if len(main) < worker_cpu_count:
                 logger.warning(

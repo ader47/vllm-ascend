@@ -131,6 +131,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_COUNT": lambda: int(
         os.getenv("VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_COUNT", "8")
     ),
+    # Explicit CPU list used for MemCache client threads and KV transfer helper
+    # threads. When set, this list is globally sliced by logical NPU ID and then
+    # limited by VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_COUNT.
+    # Example: "0-79" or "0,2,4-7". Default: None. Not sensitive.
+    "VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_LIST": lambda: os.getenv(
+        "VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_LIST", None
+    ),
     # Number of CPUs to reserve per rank for worker/main threads.
     # Default: 12. Valid range: integer >= 1. This variable is not sensitive.
     "VLLM_ASCEND_CPU_BIND_WORKER_CPU_COUNT": lambda: int(
