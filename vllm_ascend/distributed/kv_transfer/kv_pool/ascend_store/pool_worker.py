@@ -15,6 +15,7 @@ from vllm.distributed import (
 )
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.cpu_binding import (
     bind_thread_to_cpus,
@@ -94,6 +95,32 @@ class KVPoolWorker:
             extra_config.get("h2d_stagger_dynamic_addrs_per_us", 0))
         self.h2d_stagger_max_us = int(
             extra_config.get("h2d_stagger_max_us", 0))
+        self.h2d_concurrent_ranks = int(
+            extra_config.get(
+                "h2d_concurrent_ranks",
+                ascend_envs.VLLM_ASCEND_KV_POOL_H2D_CONCURRENT_RANKS,
+            )
+        )
+        self.h2d_batch_window_us = int(
+            extra_config.get(
+                "h2d_batch_window_us",
+                ascend_envs.VLLM_ASCEND_KV_POOL_H2D_BATCH_WINDOW_US,
+            )
+        )
+        self.h2d_runtime_config_path = extra_config.get(
+            "h2d_runtime_config",
+            ascend_envs.VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG,
+        )
+        self.h2d_runtime_config_check_interval = float(
+            extra_config.get(
+                "h2d_runtime_config_check_interval",
+                ascend_envs.VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG_CHECK_INTERVAL,
+            )
+        )
+        self.h2d_global_rank = int(getattr(parallel_config, "rank", self.local_rank))
+        self.h2d_global_world_size = int(
+            getattr(parallel_config, "world_size", self.tp_size)
+        )
         self.layerwise_max_transfer_blocks = int(
             extra_config.get("layerwise_max_transfer_blocks", 0))
         self.layerwise_max_transfer_bytes = int(
@@ -335,6 +362,12 @@ class KVPoolWorker:
                 self.h2d_stagger_group_size,
                 self.h2d_stagger_dynamic_addrs_per_us,
                 self.h2d_stagger_max_us,
+                self.h2d_concurrent_ranks,
+                self.h2d_batch_window_us,
+                self.h2d_runtime_config_path,
+                self.h2d_runtime_config_check_interval,
+                self.h2d_global_rank,
+                self.h2d_global_world_size,
                 self.layerwise_max_transfer_blocks,
                 self.layerwise_max_transfer_bytes,
             )

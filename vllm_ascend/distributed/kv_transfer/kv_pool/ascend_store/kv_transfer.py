@@ -1,4 +1,6 @@
 import ctypes
+import json
+import os
 import queue
 import threading
 import time
@@ -764,6 +766,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         h2d_stagger_group_size: int = 0,
         h2d_stagger_dynamic_addrs_per_us: int = 0,
         h2d_stagger_max_us: int = 0,
+        h2d_concurrent_ranks: int = 0,
+        h2d_batch_window_us: int = 0,
+        h2d_runtime_config_path: str | None = None,
+        h2d_runtime_config_check_interval: float = 1.0,
+        h2d_global_rank: int = 0,
+        h2d_global_world_size: int = 1,
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
     ):
@@ -785,6 +793,17 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.h2d_stagger_group_size = h2d_stagger_group_size
         self.h2d_stagger_dynamic_addrs_per_us = h2d_stagger_dynamic_addrs_per_us
         self.h2d_stagger_max_us = h2d_stagger_max_us
+        self.h2d_concurrent_ranks = h2d_concurrent_ranks
+        self.h2d_batch_window_us = h2d_batch_window_us
+        self.h2d_runtime_config_path = h2d_runtime_config_path
+        self.h2d_runtime_config_check_interval = max(
+            0.0,
+            h2d_runtime_config_check_interval,
+        )
+        self._h2d_runtime_config_last_check = 0.0
+        self._h2d_runtime_config_mtime: float | None = None
+        self.h2d_global_rank = h2d_global_rank
+        self.h2d_global_world_size = max(1, h2d_global_world_size)
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
         self.layer_batch_builder = LayerBatchBuilder(
@@ -794,14 +813,105 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             page_size_bytes,
         )
 
+    def _maybe_update_h2d_runtime_config(self) -> None:
+        if not self.h2d_runtime_config_path:
+            return
+        now = time.monotonic()
+        if (
+            now - self._h2d_runtime_config_last_check
+            < self.h2d_runtime_config_check_interval
+        ):
+            return
+        self._h2d_runtime_config_last_check = now
+
+        try:
+            stat_result = os.stat(self.h2d_runtime_config_path)
+        except FileNotFoundError:
+            return
+        except OSError as err:
+            logger.warning(
+                "Failed to stat H2D runtime config file %s: %s",
+                self.h2d_runtime_config_path,
+                err,
+            )
+            return
+
+        config_mtime = stat_result.st_mtime
+        if self._h2d_runtime_config_mtime == config_mtime:
+            return
+
+        try:
+            with open(self.h2d_runtime_config_path) as f:
+                config = json.load(f)
+        except (OSError, json.JSONDecodeError) as err:
+            logger.warning(
+                "Failed to load H2D runtime config file %s: %s",
+                self.h2d_runtime_config_path,
+                err,
+            )
+            return
+
+        old_concurrent_ranks = self.h2d_concurrent_ranks
+        old_batch_window_us = self.h2d_batch_window_us
+        try:
+            if "concurrent_ranks" in config:
+                self.h2d_concurrent_ranks = max(
+                    0,
+                    int(config["concurrent_ranks"]),
+                )
+            if "batch_window_us" in config:
+                self.h2d_batch_window_us = max(
+                    0,
+                    int(config["batch_window_us"]),
+                )
+        except (TypeError, ValueError) as err:
+            logger.warning(
+                "Invalid H2D runtime config values in %s: %s",
+                self.h2d_runtime_config_path,
+                err,
+            )
+            return
+
+        self._h2d_runtime_config_mtime = config_mtime
+        if (
+            self.h2d_concurrent_ranks != old_concurrent_ranks
+            or self.h2d_batch_window_us != old_batch_window_us
+        ):
+            logger.info(
+                "Updated H2D runtime config from %s: "
+                "concurrent_ranks %d -> %d, batch_window_us %d -> %d",
+                self.h2d_runtime_config_path,
+                old_concurrent_ranks,
+                self.h2d_concurrent_ranks,
+                old_batch_window_us,
+                self.h2d_batch_window_us,
+            )
+
     def add_request(  # type: ignore[override]
         self, req_meta: LayerLoadTask
     ) -> torch.Tensor:
         self.request_queue.put(req_meta)
 
     def _get_h2d_stagger_delay_us(self, layer_id: int, num_addrs: int) -> int:
+        self._maybe_update_h2d_runtime_config()
+        delay_us = 0
+        if self.h2d_concurrent_ranks > 0 and self.h2d_batch_window_us > 0:
+            concurrent_ranks = min(
+                self.h2d_concurrent_ranks,
+                self.h2d_global_world_size,
+            )
+            num_batches = (
+                self.h2d_global_world_size + concurrent_ranks - 1
+            ) // concurrent_ranks
+            if num_batches > 1:
+                batch_index = self.h2d_global_rank // concurrent_ranks
+                # Rotate batch order by layer so the same ranks do not always
+                # submit first.
+                batch_slot = (batch_index + layer_id) % num_batches
+                delay_us += batch_slot * self.h2d_batch_window_us
+
         if self.h2d_stagger_us <= 0:
-            return 0
+            return delay_us
         group_size = self.h2d_stagger_group_size or self.tp_size
         group_size = max(1, group_size)
         slot = (self.tp_rank + layer_id) % group_size
@@ -811,7 +921,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             stagger_us += num_addrs // self.h2d_stagger_dynamic_addrs_per_us
         if self.h2d_stagger_max_us > 0:
             stagger_us = min(stagger_us, self.h2d_stagger_max_us)
-        return slot * stagger_us
+        delay_us += slot * stagger_us
+        return delay_us
 
     def _stagger_h2d_submit(self, layer_id: int, num_addrs: int) -> None:
         delay_us = self._get_h2d_stagger_delay_us(layer_id, num_addrs)

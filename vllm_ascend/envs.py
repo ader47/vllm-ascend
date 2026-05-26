@@ -157,6 +157,28 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_KV_POOL_LAYERWISE_INDEPENDENT_LAYERS": lambda: os.getenv(
         "VLLM_ASCEND_KV_POOL_LAYERWISE_INDEPENDENT_LAYERS", None
     ),
+    # Maximum number of ranks that submit layerwise KV H2D in one batch.
+    # 0 disables batch staggering. Default: 0. Valid range: integer >= 0.
+    # Not sensitive.
+    "VLLM_ASCEND_KV_POOL_H2D_CONCURRENT_RANKS": lambda: int(
+        os.getenv("VLLM_ASCEND_KV_POOL_H2D_CONCURRENT_RANKS", "0")
+    ),
+    # Delay between layerwise KV H2D submit batches.
+    # Default: 0. Valid range: integer >= 0. Not sensitive.
+    "VLLM_ASCEND_KV_POOL_H2D_BATCH_WINDOW_US": lambda: int(
+        os.getenv("VLLM_ASCEND_KV_POOL_H2D_BATCH_WINDOW_US", "0")
+    ),
+    # Optional JSON file for runtime updates to layerwise KV H2D submit
+    # staggering. Supported keys: concurrent_ranks, batch_window_us.
+    # Default: None. Not sensitive.
+    "VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG": lambda: os.getenv(
+        "VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG", None
+    ),
+    # Minimum interval in seconds between runtime H2D config file checks.
+    # Default: 1.0. Valid range: float >= 0. Not sensitive.
+    "VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG_CHECK_INTERVAL": lambda: float(
+        os.getenv("VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG_CHECK_INTERVAL", "1.0")
+    ),
 }
 
 # end-env-vars-definition
