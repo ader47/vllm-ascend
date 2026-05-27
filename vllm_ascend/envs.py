@@ -179,6 +179,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG_CHECK_INTERVAL": lambda: float(
         os.getenv("VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG_CHECK_INTERVAL", "1.0")
     ),
+    # Maximum number of ranks allowed to run synchronous layerwise KV H2D
+    # batch_copy at the same time on one node. 0 disables the token limiter.
+    # Default: 0. Valid range: integer >= 0. Not sensitive.
+    "VLLM_ASCEND_KV_POOL_H2D_MAX_INFLIGHT_RANKS": lambda: int(
+        os.getenv("VLLM_ASCEND_KV_POOL_H2D_MAX_INFLIGHT_RANKS", "0")
+    ),
+    # Directory used to store H2D token lock files.
+    # Default: /dev/shm/vllm_ascend_h2d_tokens. Not sensitive.
+    "VLLM_ASCEND_KV_POOL_H2D_TOKEN_DIR": lambda: os.getenv(
+        "VLLM_ASCEND_KV_POOL_H2D_TOKEN_DIR",
+        "/dev/shm/vllm_ascend_h2d_tokens",
+    ),
 }
 
 # end-env-vars-definition

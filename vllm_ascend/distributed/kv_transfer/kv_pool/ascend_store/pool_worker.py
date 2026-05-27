@@ -117,6 +117,16 @@ class KVPoolWorker:
                 ascend_envs.VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG_CHECK_INTERVAL,
             )
         )
+        self.h2d_max_inflight_ranks = int(
+            extra_config.get(
+                "h2d_max_inflight_ranks",
+                ascend_envs.VLLM_ASCEND_KV_POOL_H2D_MAX_INFLIGHT_RANKS,
+            )
+        )
+        self.h2d_token_dir = extra_config.get(
+            "h2d_token_dir",
+            ascend_envs.VLLM_ASCEND_KV_POOL_H2D_TOKEN_DIR,
+        )
         self.h2d_global_rank = int(getattr(parallel_config, "rank", self.local_rank))
         self.h2d_global_world_size = int(
             getattr(parallel_config, "world_size", self.tp_size)
@@ -366,6 +376,8 @@ class KVPoolWorker:
                 self.h2d_batch_window_us,
                 self.h2d_runtime_config_path,
                 self.h2d_runtime_config_check_interval,
+                self.h2d_max_inflight_ranks,
+                self.h2d_token_dir,
                 self.h2d_global_rank,
                 self.h2d_global_world_size,
                 self.layerwise_max_transfer_blocks,
