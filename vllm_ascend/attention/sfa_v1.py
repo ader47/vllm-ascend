@@ -66,6 +66,8 @@ if TYPE_CHECKING:
 
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+SFA_INDEXER_SPARSE_COUNT = 2048
+SFA_INDEXER_SPARSE_MODE = 3
 
 
 class AscendSFABackend(AttentionBackend):
@@ -141,6 +143,7 @@ class AscendSFAMetadata:
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     cum_query_lens: torch.Tensor
+    cum_query_lens_cpu: torch.Tensor
     block_table: torch.Tensor
     sin: torch.Tensor
     cos: torch.Tensor
@@ -242,6 +245,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
+        cum_query_lens_cpu = common_attn_metadata.query_start_loc_cpu[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
 
         # Prefer _seq_lens_cpu (always available, updated during draft
@@ -347,6 +351,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             block_table=block_table,
             sin=sin[:num_input_tokens],
             cos=cos[:num_input_tokens],
+            cum_query_lens_cpu=cum_query_lens_cpu,
             dsa_cp_context=dsa_cp_context,
         )
 
@@ -453,6 +458,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # dsa c8
         self.use_sparse_c8_indexer = ascend_config.is_sparse_c8_layer(self.layer_name)
+        self.sfa_indexer_chunk_size = envs.VLLM_ASCEND_SFA_INDEXER_CHUNK_SIZE
         if self.use_sparse_c8_indexer:
             self.c8_k_cache_dtype = torch.int8
             self.c8_k_scale_cache_dtype = torch.float16
@@ -987,21 +993,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.use_sparse_c8_indexer:
             assert len(kv_cache) == 4
             weights = weights.to(torch.float16)
-            topk_indices = torch.ops._C_ascend.npu_lightning_indexer_quant(
-                query=q_li.view(q_li_shape_ori),
+            query = q_li.view(q_li_shape_ori)
+            query_dequant_scale = q_li_scale.view(q_li_shape_ori[:-1])
+            topk_indices = self._execute_sparse_c8_indexer(
+                query=query,
                 key=kv_cache[2],
                 weights=weights,
-                query_dequant_scale=q_li_scale.view(q_li_shape_ori[:-1]),
+                query_dequant_scale=query_dequant_scale,
                 key_dequant_scale=kv_cache[3].squeeze(2),  # B S N D -> B S D
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
                 block_table=attn_metadata.block_table,
-                query_quant_mode=0,
-                key_quant_mode=0,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=2048,
-                sparse_mode=3,
+                cum_query_lens_cpu=attn_metadata.cum_query_lens_cpu,
+                num_actual_tokens=attn_metadata.num_actual_tokens,
             )
         elif self.use_torch_npu_lightning_indexer:
             topk_indices, _ = torch_npu.npu_lightning_indexer(
@@ -1013,8 +1017,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 block_table=attn_metadata.block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=2048,
-                sparse_mode=3,
+                sparse_count=SFA_INDEXER_SPARSE_COUNT,
+                sparse_mode=SFA_INDEXER_SPARSE_MODE,
             )
         else:
             topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
@@ -1026,10 +1030,112 @@ class AscendSFAImpl(MLAAttentionImpl):
                 block_table=attn_metadata.block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=2048,
-                sparse_mode=3,
+                sparse_count=SFA_INDEXER_SPARSE_COUNT,
+                sparse_mode=SFA_INDEXER_SPARSE_MODE,
             )
         return topk_indices
+
+    def _execute_sparse_c8_indexer(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        weights: torch.Tensor,
+        query_dequant_scale: torch.Tensor,
+        key_dequant_scale: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        block_table: torch.Tensor,
+        cum_query_lens_cpu: torch.Tensor,
+        num_actual_tokens: int,
+    ) -> torch.Tensor:
+        chunk_size = self.sfa_indexer_chunk_size
+        num_tokens = query.shape[0]
+        if (
+            chunk_size <= 0
+            or num_tokens <= chunk_size
+            or num_tokens != num_actual_tokens
+            or self.enable_dsa_cp
+            or _EXTRA_CTX.capturing
+        ):
+            return self._call_sparse_c8_indexer(
+                query=query,
+                key=key,
+                weights=weights,
+                query_dequant_scale=query_dequant_scale,
+                key_dequant_scale=key_dequant_scale,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                block_table=block_table,
+            )
+
+        chunks = []
+        req_start = 0
+        num_reqs = cum_query_lens_cpu.shape[0]
+        while req_start < num_reqs:
+            token_start = 0 if req_start == 0 else int(cum_query_lens_cpu[req_start - 1])
+            if token_start >= num_actual_tokens:
+                break
+            req_end = req_start + 1
+            token_end = int(cum_query_lens_cpu[req_end - 1])
+            if token_end - token_start > chunk_size:
+                logger.warning_once(
+                    "A single SFA indexer request has %s query tokens, exceeding "
+                    "VLLM_ASCEND_SFA_INDEXER_CHUNK_SIZE=%s. It will be submitted as one chunk.",
+                    token_end - token_start,
+                    chunk_size,
+                )
+            else:
+                while req_end < num_reqs:
+                    next_token_end = int(cum_query_lens_cpu[req_end])
+                    if next_token_end - token_start > chunk_size:
+                        break
+                    req_end += 1
+                    token_end = next_token_end
+
+            chunk_actual_seq_lengths_query = actual_seq_lengths_query[req_start:req_end] - token_start
+            chunks.append(
+                self._call_sparse_c8_indexer(
+                    query=query[token_start:token_end],
+                    key=key,
+                    weights=weights[token_start:token_end],
+                    query_dequant_scale=query_dequant_scale[token_start:token_end],
+                    key_dequant_scale=key_dequant_scale,
+                    actual_seq_lengths_query=chunk_actual_seq_lengths_query,
+                    actual_seq_lengths_key=actual_seq_lengths_key[req_start:req_end],
+                    block_table=block_table[req_start:req_end],
+                )
+            )
+            req_start = req_end
+
+        return torch.cat(chunks, dim=0)
+
+    @staticmethod
+    def _call_sparse_c8_indexer(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        weights: torch.Tensor,
+        query_dequant_scale: torch.Tensor,
+        key_dequant_scale: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.ops._C_ascend.npu_lightning_indexer_quant(
+            query=query,
+            key=key,
+            weights=weights,
+            query_dequant_scale=query_dequant_scale,
+            key_dequant_scale=key_dequant_scale,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            block_table=block_table,
+            query_quant_mode=0,
+            key_quant_mode=0,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=SFA_INDEXER_SPARSE_COUNT,
+            sparse_mode=SFA_INDEXER_SPARSE_MODE,
+        )
 
     def _execute_sparse_flash_attention_process(
         self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key

@@ -1,11 +1,13 @@
+import os
 import sys
 from unittest.mock import MagicMock, patch
 
 import torch
-from vllm.distributed.parallel_state import GroupCoordinator
 
 from tests.ut.attention.utils import patch_distributed_groups
 from tests.ut.base import TestBase
+from vllm.distributed.parallel_state import GroupCoordinator
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
 if "torch_npu._inductor" not in sys.modules:
@@ -55,6 +57,7 @@ class TestAscendSFAMetadata(TestBase):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
             cum_query_lens=cum_query_lens,
+            cum_query_lens_cpu=cum_query_lens,
             block_table=block_table,
             sin=sin,
             cos=cos,
@@ -188,8 +191,8 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common_attn_metadata = MagicMock()
         common_attn_metadata.num_reqs = 10
         common_attn_metadata.num_actual_tokens = 100
-        common_attn_metadata.query_start_loc = torch.tensor([0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
-        common_attn_metadata.query_start_loc_cpu = torch.tensor([0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
+        common_attn_metadata.query_start_loc = torch.tensor([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
+        common_attn_metadata.query_start_loc_cpu = torch.tensor([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
         common_attn_metadata.slot_mapping = torch.randn(100, 4, 1024)
         common_attn_metadata.seq_lens_cpu = torch.tensor([2] * 10)
         common_attn_metadata.positions = torch.randn(100)
@@ -210,6 +213,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert isinstance(metadata, AscendSFAMetadata)
         assert metadata.num_actual_tokens == common_attn_metadata.num_actual_tokens
         assert metadata.slot_mapping.shape == (100, 4, 1024)
+        assert torch.equal(metadata.cum_query_lens_cpu, common_attn_metadata.query_start_loc_cpu[1:11])
 
     @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
     @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
@@ -243,8 +247,8 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common_attn_metadata = MagicMock()
         common_attn_metadata.num_reqs = 10
         common_attn_metadata.num_actual_tokens = 100
-        common_attn_metadata.query_start_loc = torch.tensor([0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
-        common_attn_metadata.query_start_loc_cpu = torch.tensor([0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
+        common_attn_metadata.query_start_loc = torch.tensor([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
+        common_attn_metadata.query_start_loc_cpu = torch.tensor([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
         common_attn_metadata.slot_mapping = torch.randn(100, 4, 1024)
         common_attn_metadata.seq_lens_cpu = torch.tensor([2] * 10)
         common_attn_metadata.positions = torch.randn(100)
@@ -264,3 +268,166 @@ class TestAscendSFAMetadataBuilder(TestBase):
 
         assert isinstance(attn_metadata, AscendSFAMetadata)
         assert attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+
+
+class TestAscendSFAIndexerChunking(TestBase):
+    def setUp(self):
+        super().setUp()
+        self.original_chunk_size = os.environ.get("VLLM_ASCEND_SFA_INDEXER_CHUNK_SIZE")
+
+    def tearDown(self):
+        if self.original_chunk_size is None:
+            os.environ.pop("VLLM_ASCEND_SFA_INDEXER_CHUNK_SIZE", None)
+        else:
+            os.environ["VLLM_ASCEND_SFA_INDEXER_CHUNK_SIZE"] = self.original_chunk_size
+        _EXTRA_CTX.capturing = False
+
+    def test_sparse_c8_indexer_chunks_by_request_boundary(self):
+        os.environ["VLLM_ASCEND_SFA_INDEXER_CHUNK_SIZE"] = "7"
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.enable_dsa_cp = False
+        impl.sfa_indexer_chunk_size = 7
+
+        calls = []
+
+        def fake_indexer(**kwargs):
+            calls.append(kwargs)
+            return torch.full((kwargs["query"].shape[0], 2), len(calls), dtype=torch.int32)
+
+        impl._call_sparse_c8_indexer = fake_indexer
+
+        result = impl._execute_sparse_c8_indexer(
+            query=torch.arange(10, dtype=torch.int8).view(10, 1, 1),
+            key=torch.empty(1),
+            weights=torch.arange(30, dtype=torch.float16).view(10, 3),
+            query_dequant_scale=torch.ones(10, 1),
+            key_dequant_scale=torch.ones(1),
+            actual_seq_lengths_query=torch.tensor([3, 7, 10], dtype=torch.int32),
+            actual_seq_lengths_key=torch.tensor([30, 70, 100], dtype=torch.int32),
+            block_table=torch.arange(12).view(3, 4),
+            cum_query_lens_cpu=torch.tensor([3, 7, 10], dtype=torch.int32),
+            num_actual_tokens=10,
+        )
+
+        assert result.shape == (10, 2)
+        assert len(calls) == 2
+        assert calls[0]["query"].shape[0] == 7
+        assert calls[1]["query"].shape[0] == 3
+        assert torch.equal(calls[0]["actual_seq_lengths_query"], torch.tensor([3, 7], dtype=torch.int32))
+        assert torch.equal(calls[1]["actual_seq_lengths_query"], torch.tensor([3], dtype=torch.int32))
+        assert torch.equal(calls[1]["actual_seq_lengths_key"], torch.tensor([100], dtype=torch.int32))
+        assert torch.equal(calls[1]["block_table"], torch.arange(8, 12).view(1, 4))
+
+    def test_sparse_c8_indexer_chunking_can_be_disabled(self):
+        os.environ["VLLM_ASCEND_SFA_INDEXER_CHUNK_SIZE"] = "0"
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.enable_dsa_cp = False
+        impl.sfa_indexer_chunk_size = 0
+
+        calls = []
+
+        def fake_indexer(**kwargs):
+            calls.append(kwargs)
+            return torch.empty(kwargs["query"].shape[0], 2)
+
+        impl._call_sparse_c8_indexer = fake_indexer
+        impl._execute_sparse_c8_indexer(
+            query=torch.empty(10, 1, 1),
+            key=torch.empty(1),
+            weights=torch.empty(10, 3),
+            query_dequant_scale=torch.empty(10, 1),
+            key_dequant_scale=torch.empty(1),
+            actual_seq_lengths_query=torch.tensor([10], dtype=torch.int32),
+            actual_seq_lengths_key=torch.tensor([10], dtype=torch.int32),
+            block_table=torch.empty(1, 4),
+            cum_query_lens_cpu=torch.tensor([10], dtype=torch.int32),
+            num_actual_tokens=10,
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["query"].shape[0] == 10
+
+    def test_sparse_c8_indexer_keeps_original_call_for_padded_query(self):
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.enable_dsa_cp = False
+        impl.sfa_indexer_chunk_size = 7
+
+        calls = []
+
+        def fake_indexer(**kwargs):
+            calls.append(kwargs)
+            return torch.empty(kwargs["query"].shape[0], 2)
+
+        impl._call_sparse_c8_indexer = fake_indexer
+        impl._execute_sparse_c8_indexer(
+            query=torch.empty(12, 1, 1),
+            key=torch.empty(1),
+            weights=torch.empty(12, 3),
+            query_dequant_scale=torch.empty(12, 1),
+            key_dequant_scale=torch.empty(1),
+            actual_seq_lengths_query=torch.tensor([3, 7, 10, 10], dtype=torch.int32),
+            actual_seq_lengths_key=torch.tensor([30, 70, 100, 0], dtype=torch.int32),
+            block_table=torch.empty(4, 4),
+            cum_query_lens_cpu=torch.tensor([3, 7, 10, 10], dtype=torch.int32),
+            num_actual_tokens=10,
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["query"].shape[0] == 12
+
+    def test_sparse_c8_indexer_keeps_original_call_when_capturing(self):
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.enable_dsa_cp = False
+        impl.sfa_indexer_chunk_size = 7
+        _EXTRA_CTX.capturing = True
+
+        calls = []
+
+        def fake_indexer(**kwargs):
+            calls.append(kwargs)
+            return torch.empty(kwargs["query"].shape[0], 2)
+
+        impl._call_sparse_c8_indexer = fake_indexer
+        impl._execute_sparse_c8_indexer(
+            query=torch.empty(10, 1, 1),
+            key=torch.empty(1),
+            weights=torch.empty(10, 3),
+            query_dequant_scale=torch.empty(10, 1),
+            key_dequant_scale=torch.empty(1),
+            actual_seq_lengths_query=torch.tensor([3, 7, 10], dtype=torch.int32),
+            actual_seq_lengths_key=torch.tensor([30, 70, 100], dtype=torch.int32),
+            block_table=torch.empty(3, 4),
+            cum_query_lens_cpu=torch.tensor([3, 7, 10], dtype=torch.int32),
+            num_actual_tokens=10,
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["query"].shape[0] == 10
+
+    def test_sparse_c8_indexer_keeps_original_call_for_fia_padded_query(self):
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.enable_dsa_cp = False
+        impl.sfa_indexer_chunk_size = 7
+
+        calls = []
+
+        def fake_indexer(**kwargs):
+            calls.append(kwargs)
+            return torch.empty(kwargs["query"].shape[0], 2)
+
+        impl._call_sparse_c8_indexer = fake_indexer
+        impl._execute_sparse_c8_indexer(
+            query=torch.empty(12, 1, 1),
+            key=torch.empty(1),
+            weights=torch.empty(12, 3),
+            query_dequant_scale=torch.empty(12, 1),
+            key_dequant_scale=torch.empty(1),
+            actual_seq_lengths_query=torch.tensor([3, 7, 10, 12], dtype=torch.int32),
+            actual_seq_lengths_key=torch.tensor([30, 70, 100, 0], dtype=torch.int32),
+            block_table=torch.empty(4, 4),
+            cum_query_lens_cpu=torch.tensor([3, 7, 10, 12], dtype=torch.int32),
+            num_actual_tokens=10,
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["query"].shape[0] == 12

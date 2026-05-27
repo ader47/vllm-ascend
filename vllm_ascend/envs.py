@@ -84,6 +84,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # it will consume more NPU memory. If reducing NPU memory usage is a higher priority
     # for your DeepSeek W8A8 scene, then disable it.
     "VLLM_ASCEND_ENABLE_MLAPO": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MLAPO", "1"))),
+    # Maximum query tokens submitted to each SFA lightning indexer call.
+    # Default: 4096, which avoids the observed performance regression for larger
+    # npu_lightning_indexer_quant inputs. Valid range: integer >= 0. Set to 0
+    # to disable indexer chunking. Not sensitive.
+    "VLLM_ASCEND_SFA_INDEXER_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_ASCEND_SFA_INDEXER_CHUNK_SIZE", "4096")
+    ),
     # Whether to enable weight cast format to FRACTAL_NZ.
     # 0: close nz;
     # 1: only quant case enable nz;
