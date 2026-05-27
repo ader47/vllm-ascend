@@ -91,7 +91,11 @@ class AscendStoreConnector(KVConnectorBase_V1):
         if role == KVConnectorRole.SCHEDULER and self.use_layerwise:
             num_layers = vllm_config.model_config.get_num_layers(
                 vllm_config.parallel_config)
-            if (get_layerwise_config(num_layers).has_layer_reuse
+            tp_rank = (
+                vllm_config.parallel_config.rank
+                % vllm_config.parallel_config.tensor_parallel_size
+            )
+            if (get_layerwise_config(num_layers, tp_rank).has_layer_reuse
                     and self.kv_role != "kv_producer"):
                 logger.warning(
                     "[KV POOL PERFORMANCE WARNING] Layerwise KV cache reuse "

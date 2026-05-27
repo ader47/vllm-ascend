@@ -157,6 +157,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_KV_POOL_LAYERWISE_INDEPENDENT_LAYERS": lambda: os.getenv(
         "VLLM_ASCEND_KV_POOL_LAYERWISE_INDEPENDENT_LAYERS", None
     ),
+    # Use TP rank parity to choose independent layerwise KV pool layers.
+    # When enabled, even TP ranks use even independent layers and odd TP ranks
+    # use odd independent layers. This overrides
+    # VLLM_ASCEND_KV_POOL_LAYERWISE_INDEPENDENT_LAYERS.
+    # Default: 0. Valid values: 0 or 1. Not sensitive.
+    "VLLM_ASCEND_KV_POOL_LAYERWISE_TP_PARITY_INDEPENDENT_LAYERS": lambda: int(
+        os.getenv("VLLM_ASCEND_KV_POOL_LAYERWISE_TP_PARITY_INDEPENDENT_LAYERS", "0")
+    ),
     # Maximum number of ranks that submit layerwise KV H2D in one batch.
     # 0 disables batch staggering. Default: 0. Valid range: integer >= 0.
     # Not sensitive.

@@ -86,7 +86,8 @@ class KVPoolScheduler:
 
         # Keep this in sync with pool_worker.py because it affects allocation size.
         if self.use_layerwise:
-            layerwise_config = get_layerwise_config(self.num_layers)
+            tp_rank = vllm_config.parallel_config.rank % self.tp_size
+            layerwise_config = get_layerwise_config(self.num_layers, tp_rank)
             num_layer_keys = self.num_layers
             self.layerwise_offload = layerwise_config.has_layer_reuse
         else:

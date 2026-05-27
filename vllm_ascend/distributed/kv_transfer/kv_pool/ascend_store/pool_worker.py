@@ -263,7 +263,7 @@ class KVPoolWorker:
                     err,
                 )
         self.next_layer_to_submit = 0
-        layerwise_config = get_layerwise_config(self.num_layers)
+        layerwise_config = get_layerwise_config(self.num_layers, self.tp_rank)
         self.layerwise_offload = layerwise_config.has_layer_reuse
         self.NUM_PREFETCH_LAYERS = layerwise_config.num_prefetch_layers
         self.independent_layers = layerwise_config.independent_layers

@@ -2993,8 +2993,11 @@ class NPUModelRunner(GPUModelRunner):
         # the same tensor format must be maintained even if some layers
         # have only linear or attention layers, for example, the mtp layer.
         self.hybrid_with_attn_and_mamba = False
+        tp_rank = self.parallel_config.rank % self.parallel_config.tensor_parallel_size
         reuse_layers = get_layerwise_kv_cache_reuse_layers(
-            self.model_config.get_num_layers(self.parallel_config))
+            self.model_config.get_num_layers(self.parallel_config),
+            tp_rank,
+        )
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             use_mamba, use_attn = False, False
             for layer_name in kv_cache_tensor.shared_by:
