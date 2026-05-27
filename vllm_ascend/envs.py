@@ -185,7 +185,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_KV_POOL_H2D_MAX_INFLIGHT_RANKS": lambda: int(
         os.getenv("VLLM_ASCEND_KV_POOL_H2D_MAX_INFLIGHT_RANKS", "0")
     ),
-    # Directory used to store H2D token lock files.
+    # Base directory used to store H2D token lock files. When DP is enabled,
+    # each DP rank uses a dp_<rank> subdirectory under this path.
     # Default: /dev/shm/vllm_ascend_h2d_tokens. Not sensitive.
     "VLLM_ASCEND_KV_POOL_H2D_TOKEN_DIR": lambda: os.getenv(
         "VLLM_ASCEND_KV_POOL_H2D_TOKEN_DIR",

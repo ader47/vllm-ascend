@@ -1,5 +1,6 @@
 import importlib
 import math
+import os
 import threading
 
 import torch
@@ -126,7 +127,14 @@ class KVPoolWorker:
         self.h2d_token_dir = extra_config.get(
             "h2d_token_dir",
             ascend_envs.VLLM_ASCEND_KV_POOL_H2D_TOKEN_DIR,
-        )
+        ) or ascend_envs.VLLM_ASCEND_KV_POOL_H2D_TOKEN_DIR
+        h2d_dp_rank = int(getattr(parallel_config, "data_parallel_rank", 0))
+        h2d_dp_size = int(getattr(parallel_config, "data_parallel_size", 1))
+        if h2d_dp_size > 1:
+            self.h2d_token_dir = os.path.join(
+                self.h2d_token_dir,
+                f"dp_{h2d_dp_rank}",
+            )
         self.h2d_global_rank = int(getattr(parallel_config, "rank", self.local_rank))
         self.h2d_global_world_size = int(
             getattr(parallel_config, "world_size", self.tp_size)
