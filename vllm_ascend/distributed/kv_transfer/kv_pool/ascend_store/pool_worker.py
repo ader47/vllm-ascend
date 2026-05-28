@@ -730,7 +730,7 @@ class KVPoolWorker:
             )
             return True
 
-        submit_count = self.NUM_PREFETCH_LAYERS if self.current_layer == 0 else 1
+        submit_count = 1
         submitted_layers = 0
         while submitted_layers < submit_count and self.next_layer_to_submit < self.num_layers:
             layer_id = self.next_layer_to_submit
