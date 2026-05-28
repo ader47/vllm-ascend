@@ -202,11 +202,6 @@ class AscendStoreConnector(KVConnectorBase_V1):
             return
         self.connector_worker.wait_for_layer_load()
 
-    def start_pending_layer_load_comm(self) -> None:
-        if not self.use_layerwise:
-            return
-        self.connector_worker.start_pending_layer_load_comm()
-
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
     ) -> None:

@@ -289,15 +289,6 @@ def wait_for_kv_layer_from_connector(layer_name: str):
     connector.wait_for_layer_load(layer_name)
 
 
-def start_pending_kv_layer_comm_from_connector() -> None:
-    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
-        return
-
-    connector = get_kv_transfer_group()
-    if hasattr(connector, "start_pending_layer_load_comm"):
-        connector.start_pending_layer_load_comm()
-
-
 def maybe_save_kv_layer_to_connector(
     layer_name: str,
     kv_cache_layer: list[torch.Tensor],

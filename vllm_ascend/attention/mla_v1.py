@@ -30,7 +30,6 @@ from vllm_ascend.attention.utils import (
     enabling_mlapo,
     maybe_save_kv_layer_to_connector,
     split_decodes_and_prefills,
-    start_pending_kv_layer_comm_from_connector,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
@@ -42,7 +41,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_graph_params_workspaces,
 )
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.memcache_comm_fence import record_attention_compute_start, wait_for_kv_d2d_comm
+from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
     post_process_after_loading_for_shard_weight_series,
@@ -1263,14 +1262,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             "actual_seq_lengths_kv": actual_seq_lengths_kv,
         }
         record_attention_compute_start()
-        start_pending_kv_layer_comm_from_connector()
-        wait_for_kv_d2d_comm()
         attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(q_nope, k_nope, value, **common_kwargs)
 
         attn_output, attn_lse = self._compute_prefill_context(
             q_nope, q_pe, kv_c_and_k_pe_cache, self.qk_rope_head_dim, attn_metadata, attn_output, attn_lse
         )
-        wait_for_kv_d2d_comm()
 
         attn_output = attn_output.reshape([num_tokens, self.num_heads * self.v_head_dim])
 
@@ -1688,8 +1684,6 @@ class AscendMLAImpl(MLAAttentionImpl):
             # MLA Preprocess for decoding
             # TODO prefill kv offload need to remove
             record_attention_compute_start()
-            start_pending_kv_layer_comm_from_connector()
-            wait_for_kv_d2d_comm()
             output_decode = self._forward_decode(
                 decode_preprocess_res.ql_nope,
                 decode_preprocess_res.q_pe,
@@ -1699,7 +1693,6 @@ class AscendMLAImpl(MLAAttentionImpl):
                 attn_metadata,
                 decode_preprocess_res.dequant_scale_q_nope,
             )
-            wait_for_kv_d2d_comm()
 
             o_proj_input[:num_decode_tokens] = output_decode
 

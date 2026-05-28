@@ -51,7 +51,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config i
     get_layerwise_config,
 )
 from vllm_ascend.memcache_comm_fence import (
-    get_attention_compute_start_gate,
     reset_attention_compute_start_gate,
 )
 
@@ -721,15 +720,12 @@ class KVPoolWorker:
             if not self.layer_load_tasks[layer_id]:
                 return False
             wait_for_save_layer = self.prefetch_layer_map.get(layer_id)
-            attention_start_gate = None
-            if layer_id != self.current_layer:
-                attention_start_gate = get_attention_compute_start_gate()
             self.kv_recv_thread.add_request(
                 LayerLoadTask(
                     wait_for_save_layer=wait_for_save_layer,
                     transfer_tasks=self.layer_load_tasks[layer_id],
                     layer_id=layer_id,
-                    attention_start_gate=attention_start_gate,
+                    attention_start_gate=None,
                 )
             )
             return True
@@ -753,14 +749,7 @@ class KVPoolWorker:
             logger.info("Layerwise %d load wait timed out, keep waiting", self.current_layer)
         logger.debug(f">>>>>>>>>>>>>>>>>>>> clear load layer {self.current_layer}")
         self.layer_load_finished_events[self.current_layer].clear()
-        self.kv_recv_thread.commit_pending_cooperative_loads(
-            self.current_layer,
-            wait=True,
-        )
-
-    def start_pending_layer_load_comm(self) -> None:
-        if self.kv_recv_thread is not None:
-            self.kv_recv_thread.commit_pending_cooperative_loads(wait=False)
+        self.kv_recv_thread.finish_pending_cooperative_load(self.current_layer)
 
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
         # Wait for KV cache saving to complete on the final layer that requires offloading.

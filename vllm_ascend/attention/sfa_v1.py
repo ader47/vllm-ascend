@@ -31,17 +31,13 @@ from vllm_ascend.attention.utils import (
     ascend_chunked_prefill_workspace_size,
     enable_cp,
     maybe_save_kv_layer_to_connector,
-    start_pending_kv_layer_comm_from_connector,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
-from vllm_ascend.memcache_comm_fence import (
-    record_attention_compute_start,
-    wait_for_kv_d2d_comm,
-)
+from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
     post_process_after_loading_for_shard_weight_series,
@@ -1101,6 +1097,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.SpecDecoding,
         }
 
+        wait_for_kv_layer_from_connector(layer_name)
+
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
             hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
@@ -1140,7 +1138,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert k_nope is not None
                 assert k_li is not None
                 async_op = self.enable_dsa_cp_with_layer_shard or full_gather_o_proj_enabled
-                wait_for_kv_d2d_comm()
                 # support all_gather kv async for communication calculation overlap
                 if not self.use_sparse_c8_indexer:
                     fused_kv_no_split, kv_ag_handle = all_gather_async(
@@ -1192,7 +1189,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                         if is_hidden_layer(layer):
                             reach_layer_for_shard_weight_series(layer)
                 elif full_gather_o_proj_enabled:
-                    wait_for_kv_d2d_comm()
                     _, o_proj_full_handle = all_gather_async(
                         self.o_proj_tp_weight, get_tp_group(), output=AscendSFAImpl.o_proj_full_pool
                     )
@@ -1234,10 +1230,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
 
-        wait_for_kv_layer_from_connector(layer_name)
         record_attention_compute_start()
-        start_pending_kv_layer_comm_from_connector()
-        wait_for_kv_d2d_comm()
         topk_indices = self.indexer_select_post_process(
             x=hidden_states,
             q_c=q_c,
@@ -1252,7 +1245,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
         )
-        wait_for_kv_d2d_comm()
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
