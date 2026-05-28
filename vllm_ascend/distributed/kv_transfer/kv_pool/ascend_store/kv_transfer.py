@@ -1,7 +1,4 @@
 import ctypes
-import fcntl
-import json
-import os
 import queue
 import threading
 import time
@@ -769,14 +766,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         h2d_stagger_group_size: int = 0,
         h2d_stagger_dynamic_addrs_per_us: int = 0,
         h2d_stagger_max_us: int = 0,
-        h2d_concurrent_ranks: int = 0,
-        h2d_batch_window_us: int = 0,
-        h2d_runtime_config_path: str | None = None,
-        h2d_runtime_config_check_interval: float = 1.0,
-        h2d_max_inflight_ranks: int = 0,
-        h2d_token_dir: str | None = None,
-        h2d_global_rank: int = 0,
-        h2d_global_world_size: int = 1,
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
         layer_kv_caches: list[tuple[torch.Tensor, ...]] | None = None,
@@ -805,21 +794,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.h2d_stagger_group_size = h2d_stagger_group_size
         self.h2d_stagger_dynamic_addrs_per_us = h2d_stagger_dynamic_addrs_per_us
         self.h2d_stagger_max_us = h2d_stagger_max_us
-        self.h2d_concurrent_ranks = h2d_concurrent_ranks
-        self.h2d_batch_window_us = h2d_batch_window_us
-        self.h2d_runtime_config_path = h2d_runtime_config_path
-        self.h2d_runtime_config_check_interval = max(
-            0.0,
-            h2d_runtime_config_check_interval,
-        )
-        self._h2d_runtime_config_last_check = 0.0
-        self._h2d_runtime_config_mtime: float | None = None
-        self.h2d_max_inflight_ranks = max(0, h2d_max_inflight_ranks)
-        self.h2d_token_dir = h2d_token_dir
-        self._h2d_token_dir_warning_logged = False
-        self._h2d_token_file_warning_logged = False
-        self.h2d_global_rank = h2d_global_rank
-        self.h2d_global_world_size = max(1, h2d_global_world_size)
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
         self.layer_kv_caches = layer_kv_caches or []
@@ -863,110 +837,14 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             page_size_bytes,
         )
 
-    def _maybe_update_h2d_runtime_config(self) -> None:
-        if not self.h2d_runtime_config_path:
-            return
-        now = time.monotonic()
-        if now - self._h2d_runtime_config_last_check < self.h2d_runtime_config_check_interval:
-            return
-        self._h2d_runtime_config_last_check = now
-
-        try:
-            stat_result = os.stat(self.h2d_runtime_config_path)
-        except FileNotFoundError:
-            return
-        except OSError as err:
-            logger.warning(
-                "Failed to stat H2D runtime config file %s: %s",
-                self.h2d_runtime_config_path,
-                err,
-            )
-            return
-
-        config_mtime = stat_result.st_mtime
-        if self._h2d_runtime_config_mtime == config_mtime:
-            return
-
-        try:
-            with open(self.h2d_runtime_config_path) as f:
-                config = json.load(f)
-        except (OSError, json.JSONDecodeError) as err:
-            logger.warning(
-                "Failed to load H2D runtime config file %s: %s",
-                self.h2d_runtime_config_path,
-                err,
-            )
-            return
-
-        old_concurrent_ranks = self.h2d_concurrent_ranks
-        old_batch_window_us = self.h2d_batch_window_us
-        old_max_inflight_ranks = self.h2d_max_inflight_ranks
-        try:
-            if "concurrent_ranks" in config:
-                self.h2d_concurrent_ranks = max(
-                    0,
-                    int(config["concurrent_ranks"]),
-                )
-            if "batch_window_us" in config:
-                self.h2d_batch_window_us = max(
-                    0,
-                    int(config["batch_window_us"]),
-                )
-            if "max_inflight_ranks" in config:
-                self.h2d_max_inflight_ranks = max(
-                    0,
-                    int(config["max_inflight_ranks"]),
-                )
-        except (TypeError, ValueError) as err:
-            logger.warning(
-                "Invalid H2D runtime config values in %s: %s",
-                self.h2d_runtime_config_path,
-                err,
-            )
-            return
-
-        self._h2d_runtime_config_mtime = config_mtime
-        if (
-            self.h2d_concurrent_ranks != old_concurrent_ranks
-            or self.h2d_batch_window_us != old_batch_window_us
-            or self.h2d_max_inflight_ranks != old_max_inflight_ranks
-        ):
-            logger.info(
-                "Updated H2D runtime config from %s: "
-                "concurrent_ranks %d -> %d, batch_window_us %d -> %d, "
-                "max_inflight_ranks %d -> %d",
-                self.h2d_runtime_config_path,
-                old_concurrent_ranks,
-                self.h2d_concurrent_ranks,
-                old_batch_window_us,
-                self.h2d_batch_window_us,
-                old_max_inflight_ranks,
-                self.h2d_max_inflight_ranks,
-            )
-
     def add_request(  # type: ignore[override]
         self, req_meta: LayerLoadTask
     ) -> torch.Tensor:
         self.request_queue.put(req_meta)
 
     def _get_h2d_stagger_delay_us(self, layer_id: int, num_addrs: int) -> int:
-        self._maybe_update_h2d_runtime_config()
-        delay_us = 0
-        if self.h2d_concurrent_ranks > 0 and self.h2d_batch_window_us > 0:
-            concurrent_ranks = min(
-                self.h2d_concurrent_ranks,
-                self.h2d_global_world_size,
-            )
-            num_batches = (self.h2d_global_world_size + concurrent_ranks - 1) // concurrent_ranks
-            if num_batches > 1:
-                batch_index = self.h2d_global_rank // concurrent_ranks
-                # Rotate batch order by layer so the same ranks do not always
-                # submit first.
-                batch_slot = (batch_index + layer_id) % num_batches
-                delay_us += batch_slot * self.h2d_batch_window_us
-
         if self.h2d_stagger_us <= 0:
-            return delay_us
+            return 0
         group_size = self.h2d_stagger_group_size or self.tp_size
         group_size = max(1, group_size)
         slot = (self.tp_rank + layer_id) % group_size
@@ -976,90 +854,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             stagger_us += num_addrs // self.h2d_stagger_dynamic_addrs_per_us
         if self.h2d_stagger_max_us > 0:
             stagger_us = min(stagger_us, self.h2d_stagger_max_us)
-        delay_us += slot * stagger_us
-        return delay_us
+        return slot * stagger_us
 
     def _stagger_h2d_submit(self, layer_id: int, num_addrs: int) -> None:
         delay_us = self._get_h2d_stagger_delay_us(layer_id, num_addrs)
         if delay_us > 0:
             time.sleep(delay_us / 1_000_000)
-
-    def _acquire_h2d_token(self) -> tuple[int, str] | None:
-        if self.h2d_max_inflight_ranks <= 0:
-            return None
-
-        token_dir = self.h2d_token_dir or "/dev/shm/vllm_ascend_h2d_tokens"
-        try:
-            os.makedirs(token_dir, exist_ok=True)
-        except OSError as err:
-            if not self._h2d_token_dir_warning_logged:
-                logger.warning(
-                    "Failed to create H2D token directory %s: %s. Continue without H2D in-flight limit.",
-                    token_dir,
-                    err,
-                )
-                self._h2d_token_dir_warning_logged = True
-            return None
-
-        while True:
-            self._maybe_update_h2d_runtime_config()
-            if self.h2d_max_inflight_ranks <= 0:
-                return None
-
-            for token_id in range(self.h2d_max_inflight_ranks):
-                token_path = os.path.join(token_dir, f"token_{token_id}")
-                try:
-                    token_fd = os.open(token_path, os.O_CREAT | os.O_RDWR, 0o666)
-                except OSError as err:
-                    if not self._h2d_token_file_warning_logged:
-                        logger.warning("Failed to open H2D token file %s: %s", token_path, err)
-                        self._h2d_token_file_warning_logged = True
-                    continue
-
-                try:
-                    fcntl.flock(token_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    return token_fd, token_path
-                except BlockingIOError:
-                    os.close(token_fd)
-                except OSError as err:
-                    if not self._h2d_token_file_warning_logged:
-                        logger.warning("Failed to lock H2D token file %s: %s", token_path, err)
-                        self._h2d_token_file_warning_logged = True
-                    os.close(token_fd)
-
-            time.sleep(0.0001)
-
-    @staticmethod
-    def _release_h2d_token(token: tuple[int, str] | None) -> None:
-        if token is None:
-            return
-        token_fd, token_path = token
-        try:
-            fcntl.flock(token_fd, fcntl.LOCK_UN)
-        except OSError as err:
-            logger.warning("Failed to unlock H2D token file %s: %s", token_path, err)
-        finally:
-            os.close(token_fd)
-
-    def _batch_copy_h2d_with_token(
-        self,
-        gvas_array: np.ndarray,
-        addr_array: np.ndarray,
-        size_array: np.ndarray,
-    ) -> int:
-        self._maybe_update_h2d_runtime_config()
-        token = self._acquire_h2d_token()
-        try:
-            return self._batch_copy_with_limits(
-                gvas_array,
-                addr_array,
-                size_array,
-                1,
-                self.max_transfer_blocks,
-                self.max_transfer_bytes,
-            )
-        finally:
-            self._release_h2d_token(token)
 
     def _ensure_h2d_scratch_array(
         self,
@@ -1488,10 +1288,13 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 (self.tp_rank * len(req_meta.size_array)) // self.tp_size,
             )
             self._stagger_h2d_submit(layer_id, len(gvas_array))
-            res = self._batch_copy_h2d_with_token(
+            res = self._batch_copy_with_limits(
                 gvas_array,
                 addr_array,
                 size_array,
+                1,
+                self.max_transfer_blocks,
+                self.max_transfer_bytes,
             )
         if res != 0:
             logger.error("Layerwise %d load batch_copy failed with return code %d", layer_id, res)

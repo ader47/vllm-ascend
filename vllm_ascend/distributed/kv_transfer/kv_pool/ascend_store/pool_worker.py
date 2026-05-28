@@ -1,6 +1,5 @@
 import importlib
 import math
-import os
 import threading
 
 import torch
@@ -94,18 +93,6 @@ class KVPoolWorker:
         self.h2d_stagger_group_size = int(extra_config.get("h2d_stagger_group_size", 0))
         self.h2d_stagger_dynamic_addrs_per_us = int(extra_config.get("h2d_stagger_dynamic_addrs_per_us", 0))
         self.h2d_stagger_max_us = int(extra_config.get("h2d_stagger_max_us", 0))
-        self.h2d_concurrent_ranks = int(
-            extra_config.get(
-                "h2d_concurrent_ranks",
-                ascend_envs.VLLM_ASCEND_KV_POOL_H2D_CONCURRENT_RANKS,
-            )
-        )
-        self.h2d_batch_window_us = int(
-            extra_config.get(
-                "h2d_batch_window_us",
-                ascend_envs.VLLM_ASCEND_KV_POOL_H2D_BATCH_WINDOW_US,
-            )
-        )
         self.h2d_reader_count = int(
             extra_config.get(
                 "h2d_reader_count",
@@ -119,38 +106,6 @@ class KVPoolWorker:
             )
         )
         self.h2d_reader_collective_blocks = max(1, self.h2d_reader_collective_blocks)
-        self.h2d_runtime_config_path = extra_config.get(
-            "h2d_runtime_config",
-            ascend_envs.VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG,
-        )
-        self.h2d_runtime_config_check_interval = float(
-            extra_config.get(
-                "h2d_runtime_config_check_interval",
-                ascend_envs.VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG_CHECK_INTERVAL,
-            )
-        )
-        self.h2d_max_inflight_ranks = int(
-            extra_config.get(
-                "h2d_max_inflight_ranks",
-                ascend_envs.VLLM_ASCEND_KV_POOL_H2D_MAX_INFLIGHT_RANKS,
-            )
-        )
-        self.h2d_token_dir = (
-            extra_config.get(
-                "h2d_token_dir",
-                ascend_envs.VLLM_ASCEND_KV_POOL_H2D_TOKEN_DIR,
-            )
-            or ascend_envs.VLLM_ASCEND_KV_POOL_H2D_TOKEN_DIR
-        )
-        h2d_dp_rank = int(getattr(parallel_config, "data_parallel_rank", 0))
-        h2d_dp_size = int(getattr(parallel_config, "data_parallel_size", 1))
-        if h2d_dp_size > 1:
-            self.h2d_token_dir = os.path.join(
-                self.h2d_token_dir,
-                f"dp_{h2d_dp_rank}",
-            )
-        self.h2d_global_rank = int(getattr(parallel_config, "rank", self.local_rank))
-        self.h2d_global_world_size = int(getattr(parallel_config, "world_size", self.tp_size))
         self.layerwise_max_transfer_blocks = int(extra_config.get("layerwise_max_transfer_blocks", 0))
         self.layerwise_max_transfer_bytes = int(extra_config.get("layerwise_max_transfer_bytes", 0))
         self.block_size = vllm_config.cache_config.block_size
@@ -275,7 +230,7 @@ class KVPoolWorker:
                     err,
                 )
         self.next_layer_to_submit = 0
-        layerwise_config = get_layerwise_config(self.num_layers, self.tp_rank)
+        layerwise_config = get_layerwise_config(self.num_layers)
         self.layerwise_offload = layerwise_config.has_layer_reuse
         self.NUM_PREFETCH_LAYERS = layerwise_config.num_prefetch_layers
         self.independent_layers = layerwise_config.independent_layers
@@ -288,14 +243,6 @@ class KVPoolWorker:
             return
         if not self.use_layerwise:
             logger.warning("Cooperative H2D readers require layerwise KV transfer")
-            self.h2d_reader_count = 0
-            return
-        if ascend_envs.VLLM_ASCEND_KV_POOL_LAYERWISE_TP_PARITY_INDEPENDENT_LAYERS:
-            logger.warning(
-                "Cooperative H2D broadcast readers require all ranks in a group "
-                "to load the same layers. Disable because TP parity independent "
-                "layers are enabled."
-            )
             self.h2d_reader_count = 0
             return
         if self.pp_size != 1 or self.pcp_size != 1 or self.dcp_size != 1:
@@ -480,14 +427,6 @@ class KVPoolWorker:
                 self.h2d_stagger_group_size,
                 self.h2d_stagger_dynamic_addrs_per_us,
                 self.h2d_stagger_max_us,
-                self.h2d_concurrent_ranks,
-                self.h2d_batch_window_us,
-                self.h2d_runtime_config_path,
-                self.h2d_runtime_config_check_interval,
-                self.h2d_max_inflight_ranks,
-                self.h2d_token_dir,
-                self.h2d_global_rank,
-                self.h2d_global_world_size,
                 self.layerwise_max_transfer_blocks,
                 self.layerwise_max_transfer_bytes,
                 self.layer_kv_caches,

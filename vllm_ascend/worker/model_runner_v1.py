@@ -31,6 +31,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
@@ -150,6 +151,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedE
 
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
+
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
@@ -2993,11 +2995,8 @@ class NPUModelRunner(GPUModelRunner):
         # the same tensor format must be maintained even if some layers
         # have only linear or attention layers, for example, the mtp layer.
         self.hybrid_with_attn_and_mamba = False
-        tp_rank = self.parallel_config.rank % self.parallel_config.tensor_parallel_size
         reuse_layers = get_layerwise_kv_cache_reuse_layers(
-            self.model_config.get_num_layers(self.parallel_config),
-            tp_rank,
-        )
+            self.model_config.get_num_layers(self.parallel_config))
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             use_mamba, use_attn = False, False
             for layer_name in kv_cache_tensor.shared_by:

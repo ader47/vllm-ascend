@@ -58,27 +58,13 @@ def _parse_layer_indices(value: Any) -> list[int]:
     if isinstance(value, int) and not isinstance(value, bool):
         return [value]
     if isinstance(value, Iterable):
-        return [
-            _parse_int_config(index, "VLLM_ASCEND_KV_POOL_LAYERWISE_INDEPENDENT_LAYERS")
-            for index in value
-        ]
+        return [_parse_int_config(index, "VLLM_ASCEND_KV_POOL_LAYERWISE_INDEPENDENT_LAYERS") for index in value]
     raise TypeError(
-        "VLLM_ASCEND_KV_POOL_LAYERWISE_INDEPENDENT_LAYERS must be a comma-separated string "
-        "or an iterable of integers")
+        "VLLM_ASCEND_KV_POOL_LAYERWISE_INDEPENDENT_LAYERS must be a comma-separated string or an iterable of integers"
+    )
 
 
-def get_layerwise_independent_layers(
-    num_layers: int,
-    tp_rank: int | None = None,
-) -> list[int]:
-    if envs_ascend.VLLM_ASCEND_KV_POOL_LAYERWISE_TP_PARITY_INDEPENDENT_LAYERS:
-        if tp_rank is None:
-            tp_rank = 0
-        return [
-            layer_index for layer_index in range(num_layers)
-            if layer_index % 2 == tp_rank % 2
-        ]
-
+def get_layerwise_independent_layers(num_layers: int) -> list[int]:
     value = envs_ascend.VLLM_ASCEND_KV_POOL_LAYERWISE_INDEPENDENT_LAYERS
     if value is None:
         layer_indices = [0, num_layers - 1]
@@ -101,25 +87,18 @@ def get_layerwise_independent_layers(
     return sorted(normalized_indices)
 
 
-def get_layerwise_config(
-    num_layers: int,
-    tp_rank: int | None = None,
-) -> LayerwiseConfig:
+def get_layerwise_config(num_layers: int) -> LayerwiseConfig:
     num_shared_buffers = get_layerwise_num_shared_buffers(num_layers)
     num_prefetch_layers = get_layerwise_num_prefetch_layers()
-    independent_layers = get_layerwise_independent_layers(num_layers, tp_rank)
+    independent_layers = get_layerwise_independent_layers(num_layers)
     independent_layer_indices = set(independent_layers)
-    reused_layers = [
-        i for i in range(num_layers)
-        if i not in independent_layer_indices
-    ]
+    reused_layers = [i for i in range(num_layers) if i not in independent_layer_indices]
     has_layer_reuse = len(reused_layers) > num_shared_buffers
 
     prefetch_layer_map: dict[int, int | None] = {}
     if has_layer_reuse:
         for next_index in range(num_shared_buffers, len(reused_layers)):
-            prefetch_layer_map[reused_layers[next_index]] = reused_layers[
-                next_index - num_shared_buffers]
+            prefetch_layer_map[reused_layers[next_index]] = reused_layers[next_index - num_shared_buffers]
 
     return LayerwiseConfig(
         num_shared_buffers=num_shared_buffers,
@@ -130,11 +109,8 @@ def get_layerwise_config(
     )
 
 
-def get_layerwise_kv_cache_reuse_layers(
-    num_layers: int,
-    tp_rank: int | None = None,
-) -> int | None:
-    layerwise_config = get_layerwise_config(num_layers, tp_rank)
+def get_layerwise_kv_cache_reuse_layers(num_layers: int) -> int | None:
+    layerwise_config = get_layerwise_config(num_layers)
     if not layerwise_config.has_layer_reuse:
         return None
     return layerwise_config.num_shared_buffers

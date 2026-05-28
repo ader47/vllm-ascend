@@ -151,21 +151,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_KV_POOL_LAYERWISE_INDEPENDENT_LAYERS": lambda: os.getenv(
         "VLLM_ASCEND_KV_POOL_LAYERWISE_INDEPENDENT_LAYERS", None
     ),
-    # Use TP rank parity to choose independent layerwise KV pool layers.
-    # When enabled, even TP ranks use even independent layers and odd TP ranks
-    # use odd independent layers. This overrides
-    # VLLM_ASCEND_KV_POOL_LAYERWISE_INDEPENDENT_LAYERS.
-    # Default: 0. Valid values: 0 or 1. Not sensitive.
-    "VLLM_ASCEND_KV_POOL_LAYERWISE_TP_PARITY_INDEPENDENT_LAYERS": lambda: int(
-        os.getenv("VLLM_ASCEND_KV_POOL_LAYERWISE_TP_PARITY_INDEPENDENT_LAYERS", "0")
-    ),
-    # Maximum number of ranks that submit layerwise KV H2D in one batch.
-    # 0 disables batch staggering. Default: 0. Valid range: integer >= 0.
-    # Not sensitive.
-    "VLLM_ASCEND_KV_POOL_H2D_CONCURRENT_RANKS": lambda: int(os.getenv("VLLM_ASCEND_KV_POOL_H2D_CONCURRENT_RANKS", "0")),
-    # Delay between layerwise KV H2D submit batches.
-    # Default: 0. Valid range: integer >= 0. Not sensitive.
-    "VLLM_ASCEND_KV_POOL_H2D_BATCH_WINDOW_US": lambda: int(os.getenv("VLLM_ASCEND_KV_POOL_H2D_BATCH_WINDOW_US", "0")),
     # Number of ranks that read layerwise KV blocks from host/DRAM via H2D.
     # When DP is enabled, this total is split evenly across DP groups. Readers
     # broadcast loaded blocks to their assigned TP subgroup with device
@@ -178,28 +163,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # buffers. Default: 16. Valid range: integer >= 1. Not sensitive.
     "VLLM_ASCEND_KV_POOL_H2D_READER_COLLECTIVE_BLOCKS": lambda: int(
         os.getenv("VLLM_ASCEND_KV_POOL_H2D_READER_COLLECTIVE_BLOCKS", "16")
-    ),
-    # Optional JSON file for runtime updates to layerwise KV H2D submit
-    # staggering. Supported keys: concurrent_ranks, batch_window_us.
-    # Default: None. Not sensitive.
-    "VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG": lambda: os.getenv("VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG", None),
-    # Minimum interval in seconds between runtime H2D config file checks.
-    # Default: 1.0. Valid range: float >= 0. Not sensitive.
-    "VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG_CHECK_INTERVAL": lambda: float(
-        os.getenv("VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG_CHECK_INTERVAL", "1.0")
-    ),
-    # Maximum number of ranks allowed to run synchronous layerwise KV H2D
-    # batch_copy at the same time on one node. 0 disables the token limiter.
-    # Default: 0. Valid range: integer >= 0. Not sensitive.
-    "VLLM_ASCEND_KV_POOL_H2D_MAX_INFLIGHT_RANKS": lambda: int(
-        os.getenv("VLLM_ASCEND_KV_POOL_H2D_MAX_INFLIGHT_RANKS", "0")
-    ),
-    # Base directory used to store H2D token lock files. When DP is enabled,
-    # each DP rank uses a dp_<rank> subdirectory under this path.
-    # Default: /dev/shm/vllm_ascend_h2d_tokens. Not sensitive.
-    "VLLM_ASCEND_KV_POOL_H2D_TOKEN_DIR": lambda: os.getenv(
-        "VLLM_ASCEND_KV_POOL_H2D_TOKEN_DIR",
-        "/dev/shm/vllm_ascend_h2d_tokens",
     ),
 }
 
