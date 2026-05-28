@@ -1237,6 +1237,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         wait_for_kv_layer_from_connector(layer_name)
         record_attention_compute_start()
         start_pending_kv_layer_comm_from_connector()
+        wait_for_kv_d2d_comm()
         topk_indices = self.indexer_select_post_process(
             x=hidden_states,
             q_c=q_c,

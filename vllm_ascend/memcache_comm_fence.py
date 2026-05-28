@@ -102,4 +102,4 @@ def kv_d2d_comm_stream() -> torch.npu.Stream:
 def wait_for_kv_d2d_comm() -> None:
     stream = _kv_d2d_comm_stream
     if stream is not None:
-        torch.npu.current_stream().wait_stream(stream)
+        stream.synchronize()

@@ -1347,26 +1347,17 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     block_start,
                     block_end,
                 )
-            transfer_stream = self._get_transfer_stream()
-            transfer_stream.wait_stream(comm_stream)
-            with torch.npu.stream(transfer_stream):
                 self._write_typed_parts_to_kv_cache(
                     kv_cache,
                     staging_buffers,
                     block_ids_array,
                 )
-            logger.debug(
-                "Submitting H2D writeback layer=%d chunk=[%d,%d)",
-                layer_id,
-                block_start,
-                block_end,
-            )
-            logger.debug(
-                "Submitted H2D writeback layer=%d chunk=[%d,%d)",
-                layer_id,
-                block_start,
-                block_end,
-            )
+                logger.debug(
+                    "Submitted H2D writeback layer=%d chunk=[%d,%d)",
+                    layer_id,
+                    block_start,
+                    block_end,
+                )
 
     def _wait_for_inflight_cooperative_loads(self, layer_id: int | None = None) -> None:
         with self._pending_cooperative_lock:
@@ -1374,7 +1365,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 return
             if layer_id is None and not self._inflight_cooperative_layers:
                 return
-        self._get_transfer_stream().synchronize()
+        torch.npu.current_stream().wait_stream(kv_d2d_comm_stream())
         with self._pending_cooperative_lock:
             if layer_id is None:
                 self._inflight_cooperative_layers.clear()

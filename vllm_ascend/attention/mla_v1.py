@@ -1264,6 +1264,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         }
         record_attention_compute_start()
         start_pending_kv_layer_comm_from_connector()
+        wait_for_kv_d2d_comm()
         attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(q_nope, k_nope, value, **common_kwargs)
 
         attn_output, attn_lse = self._compute_prefill_context(
@@ -1688,6 +1689,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             # TODO prefill kv offload need to remove
             record_attention_compute_start()
             start_pending_kv_layer_comm_from_connector()
+            wait_for_kv_d2d_comm()
             output_decode = self._forward_decode(
                 decode_preprocess_res.ql_nope,
                 decode_preprocess_res.q_pe,
