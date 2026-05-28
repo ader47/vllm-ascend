@@ -1319,29 +1319,53 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             res = self._broadcast_h2d_status(res)
             if res != 0:
                 return res
+            logger.debug(
+                "Starting H2D broadcast layer=%d chunk=[%d,%d)",
+                req_meta.layer_id,
+                block_start,
+                block_end,
+            )
+            for cache_index, staging in enumerate(staging_buffers):
+                logger.debug(
+                    "Before H2D broadcast layer=%d chunk=[%d,%d) cache=%d "
+                    "rank=%d rank_in_group=%d group=%s shape=%s dtype=%s",
+                    req_meta.layer_id,
+                    block_start,
+                    block_end,
+                    cache_index,
+                    self.h2d_reader_group.rank,
+                    self.h2d_reader_group.rank_in_group,
+                    self.h2d_reader_group.ranks,
+                    tuple(staging.shape),
+                    staging.dtype,
+                )
+                group.broadcast(staging, src=0)
+            logger.debug(
+                "Finished H2D broadcast layer=%d chunk=[%d,%d)",
+                req_meta.layer_id,
+                block_start,
+                block_end,
+            )
             transfer_stream = self._get_transfer_stream()
             with torch.npu.stream(transfer_stream):
-                for cache_index, staging in enumerate(staging_buffers):
-                    logger.debug(
-                        "Before H2D broadcast layer=%d chunk=[%d,%d) cache=%d "
-                        "rank=%d rank_in_group=%d group=%s shape=%s dtype=%s",
-                        req_meta.layer_id,
-                        block_start,
-                        block_end,
-                        cache_index,
-                        self.h2d_reader_group.rank,
-                        self.h2d_reader_group.rank_in_group,
-                        self.h2d_reader_group.ranks,
-                        tuple(staging.shape),
-                        staging.dtype,
-                    )
-                    group.broadcast(staging, src=0)
                 self._write_typed_parts_to_kv_cache(
                     kv_cache,
                     staging_buffers,
                     req_meta.block_ids_array[block_start:block_end],
                 )
+            logger.debug(
+                "Synchronizing H2D writeback layer=%d chunk=[%d,%d)",
+                req_meta.layer_id,
+                block_start,
+                block_end,
+            )
             transfer_stream.synchronize()
+            logger.debug(
+                "Finished H2D writeback layer=%d chunk=[%d,%d)",
+                req_meta.layer_id,
+                block_start,
+                block_end,
+            )
         return 0
 
     def _handle_request(  # type: ignore[override]

@@ -290,6 +290,14 @@ class KVPoolWorker:
             logger.warning("Cooperative H2D readers require layerwise KV transfer")
             self.h2d_reader_count = 0
             return
+        if ascend_envs.VLLM_ASCEND_KV_POOL_LAYERWISE_TP_PARITY_INDEPENDENT_LAYERS:
+            logger.warning(
+                "Cooperative H2D broadcast readers require all ranks in a group "
+                "to load the same layers. Disable because TP parity independent "
+                "layers are enabled."
+            )
+            self.h2d_reader_count = 0
+            return
         if self.pp_size != 1 or self.pcp_size != 1 or self.dcp_size != 1:
             logger.warning(
                 "Cooperative H2D readers currently support DP/TP only. Disable because pp=%d, pcp=%d, dcp=%d.",
