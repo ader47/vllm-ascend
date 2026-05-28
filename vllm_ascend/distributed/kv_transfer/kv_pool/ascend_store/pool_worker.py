@@ -518,10 +518,9 @@ class KVPoolWorker:
 
         self.num_blocks = first_kv_cache.shape[0]
         logger.info("num_blocks: %s", self.num_blocks)
-        block_rank = 3
         self.block_len = []
         for i in range(len(first_kv_cache_tuple)):
-            block_shape = first_kv_cache_tuple[i].shape[-block_rank:]
+            block_shape = first_kv_cache_tuple[i].shape[1:]
             logger.info("block_shape: %s", block_shape)
             self.block_len.append(first_kv_cache_tuple[i].element_size() * math.prod(block_shape))
 

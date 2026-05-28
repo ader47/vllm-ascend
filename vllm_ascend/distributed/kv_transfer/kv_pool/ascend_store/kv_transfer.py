@@ -1075,19 +1075,20 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         assert self.h2d_reader_group is not None
         buffers = []
         for cache_index, cache in enumerate(kv_cache):
+            block_shape = tuple(cache.shape[1:])
             key = (
                 num_blocks,
                 cache_index,
                 cache.dtype,
                 cache.device,
-                tuple(cache.shape[-3:]),
+                block_shape,
             )
             buffer = self._typed_staging_buffers.get(key)
             if buffer is None:
                 buffer = torch.empty(
                     (
                         num_blocks,
-                        *cache.shape[-3:],
+                        *block_shape,
                     ),
                     dtype=cache.dtype,
                     device=cache.device,
@@ -1105,6 +1106,21 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         block_count = len(block_gvas_array)
         block_lens = self._block_lens_np
         cache_count = len(staging_buffers)
+        if cache_count > len(block_lens):
+            raise RuntimeError(
+                "KV cache block length metadata is shorter than staging buffers: "
+                f"cache_count={cache_count}, block_lens={len(block_lens)}"
+            )
+        staging_block_bytes = np.asarray(
+            [staging.element_size() * int(np.prod(staging.shape[1:])) for staging in staging_buffers],
+            dtype=np.int64,
+        )
+        if not np.array_equal(staging_block_bytes, block_lens[:cache_count]):
+            raise RuntimeError(
+                "KV cache staging block bytes mismatch: "
+                f"staging={staging_block_bytes.tolist()}, "
+                f"metadata={block_lens[:cache_count].tolist()}"
+            )
         total_addrs = block_count * cache_count
         rank_layer_offset = layer_id * self.num_ranks_per_layer * self.page_size_bytes
         gvas_array = self._ensure_h2d_scratch_array(
@@ -1198,14 +1214,14 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             assert self._slot_mapping_cache_value is not None
             return self._slot_mapping_cache_value
 
-        block_ids = torch.from_numpy(block_ids_array.astype(np.int64, copy=False)).to(device=device, non_blocking=True)
+        block_ids = torch.from_numpy(block_ids_array.astype(np.int32, copy=False)).to(device=device, non_blocking=True)
         offsets_key = (device, tokens_per_block)
         offsets = self._slot_mapping_buffers.get(offsets_key)
         if offsets is None:
             offsets = torch.arange(
                 tokens_per_block,
                 device=device,
-                dtype=torch.long,
+                dtype=torch.int32,
             )
             self._slot_mapping_buffers[offsets_key] = offsets
         slot_mapping = (block_ids[:, None] * tokens_per_block + offsets[None, :]).reshape(-1)
@@ -1220,6 +1236,15 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         block_ids_array: np.ndarray,
     ) -> None:
         tokens_per_block = local_parts[0].shape[1]
+        if block_ids_array.size > 0:
+            min_block_id = int(block_ids_array.min())
+            max_block_id = int(block_ids_array.max())
+            if min_block_id < 0 or max_block_id >= kv_cache[0].shape[0]:
+                raise RuntimeError(
+                    "KV cache write block id out of range: "
+                    f"min={min_block_id}, max={max_block_id}, "
+                    f"num_blocks={kv_cache[0].shape[0]}"
+                )
         slot_mapping = self._make_slot_mapping(
             block_ids_array,
             tokens_per_block,
@@ -1227,6 +1252,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         )
         key = local_parts[0].reshape(-1, *local_parts[0].shape[2:])
         value = local_parts[1].reshape(-1, *local_parts[1].shape[2:])
+        if key.shape[0] != slot_mapping.numel() or value.shape[0] != slot_mapping.numel():
+            raise RuntimeError(
+                "KV cache write shape mismatch: "
+                f"key_rows={key.shape[0]}, value_rows={value.shape[0]}, "
+                f"slot_mapping={slot_mapping.numel()}"
+            )
         DeviceOperator.reshape_and_cache(
             key=key,
             value=value,
@@ -1240,6 +1271,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 -1,
                 local_parts[cache_index].shape[-1],
             )
+            if source.shape[0] != slot_mapping.numel():
+                raise RuntimeError(
+                    "KV cache scatter shape mismatch: "
+                    f"cache_index={cache_index}, source_rows={source.shape[0]}, "
+                    f"slot_mapping={slot_mapping.numel()}"
+                )
             torch_npu.npu_scatter_nd_update_(
                 kv_cache[cache_index].view(-1, source.shape[-1]),
                 slot_mapping.view(-1, 1),
