@@ -22,6 +22,7 @@ import torch
 
 _lock = threading.RLock()
 _attention_compute_start_gate: AttentionComputeStartGate | None = None
+_kv_d2d_comm_stream: torch.npu.Stream | None = None
 
 
 class AttentionComputeStartGate:
@@ -89,3 +90,16 @@ def record_attention_compute_start() -> None:
         gate = _attention_compute_start_gate
     if gate is not None:
         gate.record()
+
+
+def kv_d2d_comm_stream() -> torch.npu.Stream:
+    global _kv_d2d_comm_stream
+    if _kv_d2d_comm_stream is None:
+        _kv_d2d_comm_stream = torch.npu.Stream()
+    return _kv_d2d_comm_stream
+
+
+def wait_for_kv_d2d_comm() -> None:
+    stream = _kv_d2d_comm_stream
+    if stream is not None:
+        torch.npu.current_stream().wait_stream(stream)

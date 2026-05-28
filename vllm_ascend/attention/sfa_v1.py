@@ -39,6 +39,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.memcache_comm_fence import (
     record_attention_compute_start,
+    wait_for_kv_d2d_comm,
 )
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
@@ -980,7 +981,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)
 
-        record_attention_compute_start()
         # DSV3.2 currently has graph compilation issues when using torch_npu.npu.lightning_indexer.
         # So two branches are maintained temporarily.
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
@@ -1139,6 +1139,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert k_nope is not None
                 assert k_li is not None
                 async_op = self.enable_dsa_cp_with_layer_shard or full_gather_o_proj_enabled
+                wait_for_kv_d2d_comm()
                 # support all_gather kv async for communication calculation overlap
                 if not self.use_sparse_c8_indexer:
                     fused_kv_no_split, kv_ag_handle = all_gather_async(
@@ -1190,6 +1191,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         if is_hidden_layer(layer):
                             reach_layer_for_shard_weight_series(layer)
                 elif full_gather_o_proj_enabled:
+                    wait_for_kv_d2d_comm()
                     _, o_proj_full_handle = all_gather_async(
                         self.o_proj_tp_weight, get_tp_group(), output=AscendSFAImpl.o_proj_full_pool
                     )
@@ -1232,6 +1234,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata.reshape_cache_event.record()
 
         wait_for_kv_layer_from_connector(layer_name)
+        record_attention_compute_start()
         topk_indices = self.indexer_select_post_process(
             x=hidden_states,
             q_c=q_c,
@@ -1246,6 +1249,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
         )
+        wait_for_kv_d2d_comm()
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()

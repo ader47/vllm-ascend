@@ -13,6 +13,7 @@ from vllm.distributed import (
     get_pcp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     get_world_group,
     init_model_parallel_group,
 )
@@ -337,21 +338,36 @@ class KVPoolWorker:
                     group_start = rank_start + (reader_index * self.tp_size) // readers_per_dp
                     group_end = rank_start + ((reader_index + 1) * self.tp_size) // readers_per_dp
                     group_ranks.append(list(range(group_start, group_end)))
-        backend = torch.distributed.get_backend(get_world_group().device_group)
-        self.h2d_reader_group = init_model_parallel_group(
-            group_ranks,
-            get_world_group().local_rank,
-            backend,
-            group_name="kv_pool_h2d_reader",
-        )
+        local_rank = get_world_group().local_rank
+        local_group_ranks = next(ranks for ranks in group_ranks if local_rank in ranks)
+        tp_group = get_tp_group()
+        if list(tp_group.ranks) == local_group_ranks:
+            self.h2d_reader_group = tp_group
+            group_name = "tp"
+        else:
+            backend = torch.distributed.get_backend(get_world_group().device_group)
+            self.h2d_reader_group = init_model_parallel_group(
+                group_ranks,
+                local_rank,
+                backend,
+                group_name="kv_pool_h2d_reader",
+            )
+            group_name = "kv_pool_h2d_reader"
+            logger.warning(
+                "Cooperative H2D D2D group %s does not match TP group %s. "
+                "D2D broadcast cannot reuse the TP communication stream.",
+                local_group_ranks,
+                list(tp_group.ranks),
+            )
         logger.info(
             "Enabled cooperative H2D broadcast readers: dp_rank=%d group_ranks=%s "
-            "rank_in_group=%d readers_per_dp=%d collective_blocks=%d",
+            "rank_in_group=%d readers_per_dp=%d collective_blocks=%d group_name=%s",
             dp_rank,
             self.h2d_reader_group.ranks,
             self.h2d_reader_group.rank_in_group,
             self.h2d_reader_count,
             self.h2d_reader_collective_blocks,
+            group_name,
         )
 
     def _bind_kv_transfer_thread(
@@ -733,9 +749,8 @@ class KVPoolWorker:
         if not should_wait:
             self.layer_load_finished_events[self.current_layer].clear()
             return
-        is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=10)
-        if not is_finish:
-            logger.info("Layerwise %d load wait timed out", self.current_layer)
+        while not self.layer_load_finished_events[self.current_layer].wait(timeout=10):
+            logger.info("Layerwise %d load wait timed out, keep waiting", self.current_layer)
         logger.debug(f">>>>>>>>>>>>>>>>>>>> clear load layer {self.current_layer}")
         self.layer_load_finished_events[self.current_layer].clear()
 
