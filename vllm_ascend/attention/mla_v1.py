@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypeVar
 import numpy as np
 import torch
 import torch_npu
+
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.logger import logger
@@ -17,7 +18,6 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
-
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -30,6 +30,7 @@ from vllm_ascend.attention.utils import (
     enabling_mlapo,
     maybe_save_kv_layer_to_connector,
     split_decodes_and_prefills,
+    start_pending_kv_layer_comm_from_connector,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
@@ -41,7 +42,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_graph_params_workspaces,
 )
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.memcache_comm_fence import record_attention_compute_start
+from vllm_ascend.memcache_comm_fence import record_attention_compute_start, wait_for_kv_d2d_comm
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
     post_process_after_loading_for_shard_weight_series,
@@ -1220,10 +1221,11 @@ class AscendMLAImpl(MLAAttentionImpl):
         value: torch.Tensor,
         kv_c_and_k_pe_cache: tuple[torch.Tensor],
         attn_metadata: AscendMLAMetadata,
-        layer_name
+        layer_name,
     ) -> torch.Tensor:
         assert attn_metadata.prefill is not None
         assert len(kv_c_and_k_pe_cache) > 1
+
         num_tokens = q_nope.size(0)
         prefill_meta = attn_metadata.prefill
 
@@ -1260,13 +1262,14 @@ class AscendMLAImpl(MLAAttentionImpl):
             "actual_seq_lengths": actual_seq_lengths_q,
             "actual_seq_lengths_kv": actual_seq_lengths_kv,
         }
-        wait_for_kv_layer_from_connector(layer_name)
         record_attention_compute_start()
+        start_pending_kv_layer_comm_from_connector()
         attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(q_nope, k_nope, value, **common_kwargs)
 
         attn_output, attn_lse = self._compute_prefill_context(
             q_nope, q_pe, kv_c_and_k_pe_cache, self.qk_rope_head_dim, attn_metadata, attn_output, attn_lse
         )
+        wait_for_kv_d2d_comm()
 
         attn_output = attn_output.reshape([num_tokens, self.num_heads * self.v_head_dim])
 
@@ -1666,6 +1669,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         o_proj_input_shape = (_EXTRA_CTX.num_tokens, self.num_heads * self.v_head_dim)
         o_proj_input = torch.empty(o_proj_input_shape, dtype=hidden_states.dtype, device=hidden_states.device)
 
+        wait_for_kv_layer_from_connector(layer_name)
+
         # MLA Preprocess
         if self.fa_quant_layer or (self.enable_mlapo and attn_metadata.num_decode_tokens <= MLAPO_MAX_SUPPORTED_TOKENS):
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
@@ -1681,8 +1686,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
             # TODO prefill kv offload need to remove
-            wait_for_kv_layer_from_connector(layer_name)
             record_attention_compute_start()
+            start_pending_kv_layer_comm_from_connector()
             output_decode = self._forward_decode(
                 decode_preprocess_res.ql_nope,
                 decode_preprocess_res.q_pe,
@@ -1692,6 +1697,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 attn_metadata,
                 decode_preprocess_res.dequant_scale_q_nope,
             )
+            wait_for_kv_d2d_comm()
 
             o_proj_input[:num_decode_tokens] = output_decode
 
@@ -1707,7 +1713,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 prefill_preprocess_res.value,
                 kv_cache,
                 attn_metadata,
-                layer_name
+                layer_name,
             )
 
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill

@@ -1356,7 +1356,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     block_ids_array,
                 )
             logger.debug(
-                "Synchronizing H2D writeback layer=%d chunk=[%d,%d)",
+                "Submitting H2D writeback layer=%d chunk=[%d,%d)",
                 layer_id,
                 block_start,
                 block_end,
