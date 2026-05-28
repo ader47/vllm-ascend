@@ -1301,6 +1301,16 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         assert self.h2d_reader_group is not None
         group = self.h2d_reader_group
         for kv_cache, staging_buffers, block_ids_array, block_start, block_end in chunks:
+            logger.info(
+                "D2D broadcast layer=%d chunk=[%d,%d) rank=%d group=%s shape=%s dtype=%s",
+                layer_id,
+                block_start,
+                block_end,
+                self.h2d_reader_group.rank_in_group,
+                self.h2d_reader_group.ranks,
+                tuple(staging_buffers[0].shape),
+                staging_buffers[0].dtype,
+            )
             logger.debug(
                 "Starting H2D broadcast layer=%d chunk=[%d,%d)",
                 layer_id,
