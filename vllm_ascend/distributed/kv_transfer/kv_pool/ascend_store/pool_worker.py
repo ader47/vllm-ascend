@@ -729,13 +729,7 @@ class KVPoolWorker:
             )
             return True
 
-        submit_count = 1
-        submitted_layers = 0
-        while submitted_layers < submit_count and self.next_layer_to_submit < self.num_layers:
-            layer_id = self.next_layer_to_submit
-            self.next_layer_to_submit += 1
-            if submit_layer_load(layer_id):
-                submitted_layers += 1
+        submit_layer_load(self.current_layer)
 
     def wait_for_layer_load(self) -> None:
         reset_attention_compute_start_gate()
