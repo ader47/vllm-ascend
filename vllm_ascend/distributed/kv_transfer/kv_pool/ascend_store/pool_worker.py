@@ -13,8 +13,11 @@ from vllm.distributed import (
     get_pcp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_world_group,
+    init_model_parallel_group,
 )
 from vllm.distributed.kv_events import BlockStored
+from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.logger import logger
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
@@ -85,17 +88,12 @@ class KVPoolWorker:
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.load_async = extra_config.get("load_async", False)
-        self.consumer_is_to_put = extra_config.get(
-            "consumer_is_to_put", False
-        )
+        self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
         self.backend = extra_config.get("backend", "mooncake")
         self.h2d_stagger_us = int(extra_config.get("h2d_stagger_us", 0))
-        self.h2d_stagger_group_size = int(
-            extra_config.get("h2d_stagger_group_size", 0))
-        self.h2d_stagger_dynamic_addrs_per_us = int(
-            extra_config.get("h2d_stagger_dynamic_addrs_per_us", 0))
-        self.h2d_stagger_max_us = int(
-            extra_config.get("h2d_stagger_max_us", 0))
+        self.h2d_stagger_group_size = int(extra_config.get("h2d_stagger_group_size", 0))
+        self.h2d_stagger_dynamic_addrs_per_us = int(extra_config.get("h2d_stagger_dynamic_addrs_per_us", 0))
+        self.h2d_stagger_max_us = int(extra_config.get("h2d_stagger_max_us", 0))
         self.h2d_concurrent_ranks = int(
             extra_config.get(
                 "h2d_concurrent_ranks",
@@ -108,6 +106,19 @@ class KVPoolWorker:
                 ascend_envs.VLLM_ASCEND_KV_POOL_H2D_BATCH_WINDOW_US,
             )
         )
+        self.h2d_reader_count = int(
+            extra_config.get(
+                "h2d_reader_count",
+                ascend_envs.VLLM_ASCEND_KV_POOL_H2D_READER_COUNT,
+            )
+        )
+        self.h2d_reader_collective_blocks = int(
+            extra_config.get(
+                "h2d_reader_collective_blocks",
+                ascend_envs.VLLM_ASCEND_KV_POOL_H2D_READER_COLLECTIVE_BLOCKS,
+            )
+        )
+        self.h2d_reader_collective_blocks = max(1, self.h2d_reader_collective_blocks)
         self.h2d_runtime_config_path = extra_config.get(
             "h2d_runtime_config",
             ascend_envs.VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG,
@@ -124,10 +135,13 @@ class KVPoolWorker:
                 ascend_envs.VLLM_ASCEND_KV_POOL_H2D_MAX_INFLIGHT_RANKS,
             )
         )
-        self.h2d_token_dir = extra_config.get(
-            "h2d_token_dir",
-            ascend_envs.VLLM_ASCEND_KV_POOL_H2D_TOKEN_DIR,
-        ) or ascend_envs.VLLM_ASCEND_KV_POOL_H2D_TOKEN_DIR
+        self.h2d_token_dir = (
+            extra_config.get(
+                "h2d_token_dir",
+                ascend_envs.VLLM_ASCEND_KV_POOL_H2D_TOKEN_DIR,
+            )
+            or ascend_envs.VLLM_ASCEND_KV_POOL_H2D_TOKEN_DIR
+        )
         h2d_dp_rank = int(getattr(parallel_config, "data_parallel_rank", 0))
         h2d_dp_size = int(getattr(parallel_config, "data_parallel_size", 1))
         if h2d_dp_size > 1:
@@ -136,13 +150,9 @@ class KVPoolWorker:
                 f"dp_{h2d_dp_rank}",
             )
         self.h2d_global_rank = int(getattr(parallel_config, "rank", self.local_rank))
-        self.h2d_global_world_size = int(
-            getattr(parallel_config, "world_size", self.tp_size)
-        )
-        self.layerwise_max_transfer_blocks = int(
-            extra_config.get("layerwise_max_transfer_blocks", 0))
-        self.layerwise_max_transfer_bytes = int(
-            extra_config.get("layerwise_max_transfer_bytes", 0))
+        self.h2d_global_world_size = int(getattr(parallel_config, "world_size", self.tp_size))
+        self.layerwise_max_transfer_blocks = int(extra_config.get("layerwise_max_transfer_blocks", 0))
+        self.layerwise_max_transfer_bytes = int(extra_config.get("layerwise_max_transfer_bytes", 0))
         self.block_size = vllm_config.cache_config.block_size
 
         if self.pcp_size > 1:
@@ -163,9 +173,11 @@ class KVPoolWorker:
         else:
             self.head_or_tp_rank = self.tp_rank
             self.put_step = 1
-        self.my_key_index = (self.pcp_rank * self.dcp_size * (self.tp_size // self.put_step) +
-                             self.dcp_rank * (self.tp_size // self.put_step) +
-                             self.head_or_tp_rank)
+        self.my_key_index = (
+            self.pcp_rank * self.dcp_size * (self.tp_size // self.put_step)
+            + self.dcp_rank * (self.tp_size // self.put_step)
+            + self.head_or_tp_rank
+        )
         self.num_ranks_per_layer = self.pcp_size * self.dcp_size * (self.tp_size // self.put_step)
 
         self.metadata = KeyMetadata(
@@ -215,8 +227,7 @@ class KVPoolWorker:
             memcache_client_cpus = extra_config.get("memcache_client_cpus")
             if memcache_client_cpus is None:
                 try:
-                    memcache_client_cpus = get_memcache_client_cpus(
-                        self.cpu_binding_rank)
+                    memcache_client_cpus = get_memcache_client_cpus(self.cpu_binding_rank)
                 except Exception as err:
                     logger.warning(
                         "Failed to get MemCache client CPUs for rank%d: %s",
@@ -241,6 +252,8 @@ class KVPoolWorker:
         self.kv_recv_thread: KVTransferThread | None = None
         self._registered_buffer_ptrs: list[int] = []
         self._registered_buffer_lengths: list[int] = []
+        self.layer_kv_caches: list[tuple[torch.Tensor, ...]] = []
+        self.h2d_reader_group: GroupCoordinator | None = None
         self._kv_caches_registered = False
         self._backend_initialized = False
         self._buffers_registered = False
@@ -254,8 +267,7 @@ class KVPoolWorker:
         self.kv_transfer_thread_cpus: list[int] = []
         if get_ascend_config().enable_cpu_binding:
             try:
-                self.kv_transfer_thread_cpus = get_memcache_client_cpus(
-                    self.cpu_binding_rank)
+                self.kv_transfer_thread_cpus = get_memcache_client_cpus(self.cpu_binding_rank)
             except Exception as err:
                 logger.warning(
                     "Failed to get MemCache CPUs for KV transfer threads in rank%d: %s",
@@ -269,6 +281,70 @@ class KVPoolWorker:
         self.independent_layers = layerwise_config.independent_layers
         self.prefetch_layer_map = layerwise_config.prefetch_layer_map
         self.sync_save_events = None
+        self._init_h2d_reader_group(parallel_config)
+
+    def _init_h2d_reader_group(self, parallel_config) -> None:
+        if self.h2d_reader_count <= 0:
+            return
+        if not self.use_layerwise:
+            logger.warning("Cooperative H2D readers require layerwise KV transfer")
+            self.h2d_reader_count = 0
+            return
+        if self.pp_size != 1 or self.pcp_size != 1 or self.dcp_size != 1:
+            logger.warning(
+                "Cooperative H2D readers currently support DP/TP only. Disable because pp=%d, pcp=%d, dcp=%d.",
+                self.pp_size,
+                self.pcp_size,
+                self.dcp_size,
+            )
+            self.h2d_reader_count = 0
+            return
+        if self.num_ranks_per_layer != 1:
+            logger.warning(
+                "Cooperative H2D broadcast readers require TP-replicated KV. Disable because num_ranks_per_layer=%d.",
+                self.num_ranks_per_layer,
+            )
+            self.h2d_reader_count = 0
+            return
+
+        dp_size = int(getattr(parallel_config, "data_parallel_size", 1))
+        dp_rank = int(getattr(parallel_config, "data_parallel_rank", 0))
+        if self.h2d_reader_count < dp_size:
+            logger.warning(
+                "Cooperative H2D reader count %d is smaller than DP size %d. Use one reader per DP group.",
+                self.h2d_reader_count,
+                dp_size,
+            )
+        readers_per_dp = max(1, self.h2d_reader_count // max(1, dp_size))
+        readers_per_dp = min(readers_per_dp, self.tp_size)
+        self.h2d_reader_count = readers_per_dp
+
+        world_size = get_world_group().world_size
+        ranks_per_external_dp = dp_size * self.tp_size
+        group_ranks = []
+        for base_rank in range(0, world_size, ranks_per_external_dp):
+            for group_dp_rank in range(dp_size):
+                rank_start = base_rank + group_dp_rank * self.tp_size
+                for reader_index in range(readers_per_dp):
+                    group_start = rank_start + (reader_index * self.tp_size) // readers_per_dp
+                    group_end = rank_start + ((reader_index + 1) * self.tp_size) // readers_per_dp
+                    group_ranks.append(list(range(group_start, group_end)))
+        backend = torch.distributed.get_backend(get_world_group().device_group)
+        self.h2d_reader_group = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="kv_pool_h2d_reader",
+        )
+        logger.info(
+            "Enabled cooperative H2D broadcast readers: dp_rank=%d group_ranks=%s "
+            "rank_in_group=%d readers_per_dp=%d collective_blocks=%d",
+            dp_rank,
+            self.h2d_reader_group.ranks,
+            self.h2d_reader_group.rank_in_group,
+            self.h2d_reader_count,
+            self.h2d_reader_collective_blocks,
+        )
 
     def _bind_kv_transfer_thread(
         self,
@@ -368,6 +444,7 @@ class KVPoolWorker:
                 self.tp_rank,
                 self.tp_size,
                 self.dcp_size,
+                self.put_step,
                 self.my_key_index,
                 self.num_ranks_per_layer,
                 self.page_size_bytes,
@@ -390,6 +467,10 @@ class KVPoolWorker:
                 self.h2d_global_world_size,
                 self.layerwise_max_transfer_blocks,
                 self.layerwise_max_transfer_bytes,
+                self.layer_kv_caches,
+                self.h2d_reader_group,
+                self.h2d_reader_count,
+                self.h2d_reader_collective_blocks,
             )
             self.kv_recv_thread.start()
             ready_event.wait()
@@ -433,6 +514,7 @@ class KVPoolWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
         first_kv_cache = first_kv_cache_tuple[0]
+        self.layer_kv_caches = [tuple(cache_or_caches) for cache_or_caches in kv_caches.values()]
 
         self.num_blocks = first_kv_cache.shape[0]
         logger.info("num_blocks: %s", self.num_blocks)
@@ -504,9 +586,7 @@ class KVPoolWorker:
                 size_list = []
                 key_list = []
                 mask_num = request.load_spec.vllm_cached_tokens // self.block_size * self.block_size
-                for start, end, key in self.token_database.process_tokens(
-                    token_len, request.block_hashes, mask_num
-                ):
+                for start, end, key in self.token_database.process_tokens(token_len, request.block_hashes, mask_num):
                     addr, size, _ = self.token_database.prepare_value(start, end, request.block_ids)
                     key_list.append(key.to_string())
                     addr_list.append(addr)
@@ -573,23 +653,17 @@ class KVPoolWorker:
             if load_previous_last_block:
                 full_blocks = max(0, cached_full_blocks - 1)
             needs_last_block_at_boundary = (
-                cached_tokens > 0
-                and cached_tokens % self.block_size == 0
-                and full_blocks < cached_full_blocks
+                cached_tokens > 0 and cached_tokens % self.block_size == 0 and full_blocks < cached_full_blocks
             )
             if request.last_block_gva is not None and (
-                cached_tokens % self.block_size != 0
-                or needs_last_block_at_boundary
+                cached_tokens % self.block_size != 0 or needs_last_block_at_boundary
             ):
                 partial_block_index = (
-                    cached_full_blocks
-                    if cached_tokens % self.block_size != 0
-                    else cached_full_blocks - 1
+                    cached_full_blocks if cached_tokens % self.block_size != 0 else cached_full_blocks - 1
                 )
             else:
                 partial_block_index = None
-            if (partial_block_index is not None
-                    and partial_block_index < load_start_block):
+            if partial_block_index is not None and partial_block_index < load_start_block:
                 partial_block_index = None
             if load_start_block >= full_blocks and partial_block_index is None:
                 continue
@@ -639,8 +713,7 @@ class KVPoolWorker:
 
         submit_count = self.NUM_PREFETCH_LAYERS if self.current_layer == 0 else 1
         submitted_layers = 0
-        while (submitted_layers < submit_count
-               and self.next_layer_to_submit < self.num_layers):
+        while submitted_layers < submit_count and self.next_layer_to_submit < self.num_layers:
             layer_id = self.next_layer_to_submit
             self.next_layer_to_submit += 1
             if submit_layer_load(layer_id):
@@ -664,8 +737,7 @@ class KVPoolWorker:
         self.sync_save_events[self.current_layer].record()
         if self.layer_save_tasks[self.current_layer]:
             for block_range in self.layer_save_tasks[self.current_layer][0].block_ranges:
-                self.kv_send_thread.add_stored_request(
-                    block_range.request.req_id)
+                self.kv_send_thread.add_stored_request(block_range.request.req_id)
             self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
         else:
             self.layer_save_finished_events[self.current_layer].set()
@@ -712,23 +784,17 @@ class KVPoolWorker:
                 self.kv_send_thread.get_and_clear_finished_requests()
                 done_sending = set()
             else:
-                stale_finished_req_ids = (
-                    finished_req_ids - meta.delayed_free_req_ids)
-                self.kv_send_thread.discard_finished_requests(
-                    stale_finished_req_ids)
-                done_sending = self.kv_send_thread.get_and_clear_finished_requests(
-                    meta.delayed_free_req_ids
-                )
+                stale_finished_req_ids = finished_req_ids - meta.delayed_free_req_ids
+                self.kv_send_thread.discard_finished_requests(stale_finished_req_ids)
+                done_sending = self.kv_send_thread.get_and_clear_finished_requests(meta.delayed_free_req_ids)
         else:
             done_sending = set()
 
         done_recving = set()
         if self.kv_recv_thread is not None:
-            self.kv_recv_thread.discard_finished_requests(
-                meta.preempted_req_ids)
+            self.kv_recv_thread.discard_finished_requests(meta.preempted_req_ids)
             if self.load_async:
-                done_recving = self.kv_recv_thread.get_and_clear_finished_requests(
-                    meta.loading_req_ids)
+                done_recving = self.kv_recv_thread.get_and_clear_finished_requests(meta.loading_req_ids)
 
         logger.debug(
             "Number of completed KV cache send requests: %d, receive requests: %d, tp_rank:%d",

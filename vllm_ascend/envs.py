@@ -128,21 +128,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Number of CPUs to reserve per rank for MemCache client threads.
     # KV transfer helper threads use the same CPU set.
     # Default: 8. Valid range: integer >= 0. This variable is not sensitive.
-    "VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_COUNT": lambda: int(
-        os.getenv("VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_COUNT", "8")
-    ),
+    "VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_COUNT": lambda: int(os.getenv("VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_COUNT", "8")),
     # Explicit CPU list used for MemCache client threads and KV transfer helper
     # threads. When set, this list is globally sliced by logical NPU ID and then
     # limited by VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_COUNT.
     # Example: "0-79" or "0,2,4-7". Default: None. Not sensitive.
-    "VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_LIST": lambda: os.getenv(
-        "VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_LIST", None
-    ),
+    "VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_LIST": lambda: os.getenv("VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_LIST", None),
     # Number of CPUs to reserve per rank for worker/main threads.
     # Default: 12. Valid range: integer >= 1. This variable is not sensitive.
-    "VLLM_ASCEND_CPU_BIND_WORKER_CPU_COUNT": lambda: int(
-        os.getenv("VLLM_ASCEND_CPU_BIND_WORKER_CPU_COUNT", "12")
-    ),
+    "VLLM_ASCEND_CPU_BIND_WORKER_CPU_COUNT": lambda: int(os.getenv("VLLM_ASCEND_CPU_BIND_WORKER_CPU_COUNT", "12")),
     # Number of layerwise KV pool load layers to prefetch.
     # Default: 2. Valid range: integer >= 1. Not sensitive.
     "VLLM_ASCEND_KV_POOL_LAYERWISE_PREFETCH_LAYERS": lambda: int(
@@ -168,20 +162,27 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Maximum number of ranks that submit layerwise KV H2D in one batch.
     # 0 disables batch staggering. Default: 0. Valid range: integer >= 0.
     # Not sensitive.
-    "VLLM_ASCEND_KV_POOL_H2D_CONCURRENT_RANKS": lambda: int(
-        os.getenv("VLLM_ASCEND_KV_POOL_H2D_CONCURRENT_RANKS", "0")
-    ),
+    "VLLM_ASCEND_KV_POOL_H2D_CONCURRENT_RANKS": lambda: int(os.getenv("VLLM_ASCEND_KV_POOL_H2D_CONCURRENT_RANKS", "0")),
     # Delay between layerwise KV H2D submit batches.
     # Default: 0. Valid range: integer >= 0. Not sensitive.
-    "VLLM_ASCEND_KV_POOL_H2D_BATCH_WINDOW_US": lambda: int(
-        os.getenv("VLLM_ASCEND_KV_POOL_H2D_BATCH_WINDOW_US", "0")
+    "VLLM_ASCEND_KV_POOL_H2D_BATCH_WINDOW_US": lambda: int(os.getenv("VLLM_ASCEND_KV_POOL_H2D_BATCH_WINDOW_US", "0")),
+    # Number of ranks that read layerwise KV blocks from host/DRAM via H2D.
+    # When DP is enabled, this total is split evenly across DP groups. Readers
+    # broadcast loaded blocks to their assigned TP subgroup with device
+    # collectives.
+    # 0 disables cooperative H2D readers. Default: 0. Valid range: integer >= 0.
+    # Not sensitive.
+    "VLLM_ASCEND_KV_POOL_H2D_READER_COUNT": lambda: int(os.getenv("VLLM_ASCEND_KV_POOL_H2D_READER_COUNT", "0")),
+    # Number of blocks handled by one cooperative H2D collective chunk. Larger
+    # values reduce collective launch overhead but require larger staging
+    # buffers. Default: 16. Valid range: integer >= 1. Not sensitive.
+    "VLLM_ASCEND_KV_POOL_H2D_READER_COLLECTIVE_BLOCKS": lambda: int(
+        os.getenv("VLLM_ASCEND_KV_POOL_H2D_READER_COLLECTIVE_BLOCKS", "16")
     ),
     # Optional JSON file for runtime updates to layerwise KV H2D submit
     # staggering. Supported keys: concurrent_ranks, batch_window_us.
     # Default: None. Not sensitive.
-    "VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG": lambda: os.getenv(
-        "VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG", None
-    ),
+    "VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG": lambda: os.getenv("VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG", None),
     # Minimum interval in seconds between runtime H2D config file checks.
     # Default: 1.0. Valid range: float >= 0. Not sensitive.
     "VLLM_ASCEND_KV_POOL_H2D_RUNTIME_CONFIG_CHECK_INTERVAL": lambda: float(

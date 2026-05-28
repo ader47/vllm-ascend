@@ -11,10 +11,13 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch_npu
 
 from vllm.distributed.kv_events import BlockStored
+from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
+from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
 
 # isort: off
@@ -46,7 +49,6 @@ def _circular_shift_array(value: np.ndarray, offset: int) -> np.ndarray:
 
 
 class LayerBatchBuilder:
-
     def __init__(
         self,
         token_database: ChunkedTokenDatabase,
@@ -62,10 +64,12 @@ class LayerBatchBuilder:
             token_database.kv_caches_base_addr,
             dtype=np.int64,
         )
-        self._full_block_inner_offsets_np = np.concatenate((
-            np.zeros(1, dtype=np.int64),
-            np.cumsum(self._block_len_np[:-1], dtype=np.int64),
-        ))
+        self._full_block_inner_offsets_np = np.concatenate(
+            (
+                np.zeros(1, dtype=np.int64),
+                np.cumsum(self._block_len_np[:-1], dtype=np.int64),
+            )
+        )
         self._block_ids_scratch_np: np.ndarray | None = None
         self._block_gvas_scratch_np: np.ndarray | None = None
         self._last_block_ids_scratch_np: np.ndarray | None = None
@@ -132,21 +136,12 @@ class LayerBatchBuilder:
         block_len_np = self._block_len_np
         length = block_len_np.shape[0]
         base_offset = layer_id * length
-        layer_base_addrs = self._kv_caches_base_addr_np[base_offset:base_offset + length]
-        rank_layer_offset = (
-            layer_id * self.num_ranks_per_layer + self.my_key_index
-        ) * self.page_size_bytes
+        layer_base_addrs = self._kv_caches_base_addr_np[base_offset : base_offset + length]
+        rank_layer_offset = (layer_id * self.num_ranks_per_layer + self.my_key_index) * self.page_size_bytes
 
-        addr_arr = (
-            layer_base_addrs[None, :]
-            + block_ids_arr[:, None] * block_len_np[None, :]
-        )
+        addr_arr = layer_base_addrs[None, :] + block_ids_arr[:, None] * block_len_np[None, :]
         size_arr = np.broadcast_to(block_len_np, addr_arr.shape)
-        gvas_arr = (
-            base_gvas_arr[:, None]
-            + rank_layer_offset
-            + self._full_block_inner_offsets_np[None, :]
-        )
+        gvas_arr = base_gvas_arr[:, None] + rank_layer_offset + self._full_block_inner_offsets_np[None, :]
 
         return (
             addr_arr.ravel(),
@@ -200,7 +195,7 @@ class LayerBatchBuilder:
                         f"range [{block_range.start_block}, {block_range.end_block}) "
                         f"with offset {request.gva_block_offset}"
                     )
-                block_ids_arr[offset:end] = block_ids_np[block_range.start_block:block_range.end_block]
+                block_ids_arr[offset:end] = block_ids_np[block_range.start_block : block_range.end_block]
                 block_gvas_arr[offset:end] = block_gvas_np[gva_start:gva_end]
                 offset = end
 
@@ -222,8 +217,7 @@ class LayerBatchBuilder:
             block_ids_arr,
             block_gvas_arr,
         )
-        addr_array, size_array, gvas_array = self._build_transfer_arrays(
-            block_ids_arr, block_gvas_arr, task.layer_id)
+        addr_array, size_array, gvas_array = self._build_transfer_arrays(block_ids_arr, block_gvas_arr, task.layer_id)
 
         return LayerBatchReqMeta(
             req_ids=req_ids,
@@ -232,6 +226,8 @@ class LayerBatchBuilder:
             addr_array=addr_array,
             size_array=size_array,
             gvas_array=gvas_array,
+            block_ids_array=block_ids_arr.copy(),
+            block_gvas_array=block_gvas_arr.copy(),
         )
 
 
@@ -374,10 +370,14 @@ class KVTransferThread(threading.Thread):
         except Exception:
             pass
 
+    def _after_set_device(self) -> None:
+        pass
+
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
         self._set_os_thread_name()
         self.m_store.set_device()
+        self._after_set_device()
         self.ready_event.set()
         while True:
             request_data = self.request_queue.get()
@@ -638,7 +638,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         layer_save_finished_events: list[threading.Event],
         sync_save_events: list[torch.npu.Event],
         enable_kv_event: bool = False,
-        layer_transfer_finished_events = None,
+        layer_transfer_finished_events=None,
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
     ):
@@ -712,9 +712,9 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             return
         layer_id = req_meta.layer_id
         rank_start = self.tp_rank % self.put_step
-        addr_array = req_meta.addr_array[rank_start::self.put_step]
-        size_array = req_meta.size_array[rank_start::self.put_step]
-        gvas_array = req_meta.gvas_array[rank_start::self.put_step]
+        addr_array = req_meta.addr_array[rank_start :: self.put_step]
+        size_array = req_meta.size_array[rank_start :: self.put_step]
+        gvas_array = req_meta.gvas_array[rank_start :: self.put_step]
         for req_id in req_meta.req_ids:
             self.dec_stored_request(req_id)
         self.sync_save_events[layer_id].synchronize()
@@ -755,6 +755,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         tp_rank: int,
         tp_size: int,
         dcp_size: int,
+        put_step: int,
         my_key_index: int,
         num_ranks_per_layer: int,
         page_size_bytes: int,
@@ -777,6 +778,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         h2d_global_world_size: int = 1,
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
+        layer_kv_caches: list[tuple[torch.Tensor, ...]] | None = None,
+        h2d_reader_group: GroupCoordinator | None = None,
+        h2d_reader_count: int = 0,
+        h2d_reader_collective_blocks: int = 16,
     ):
         super().__init__(
             m_store,
@@ -792,6 +797,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.layer_load_finished_events = layer_load_finished_events
         self.layer_save_finished_events = layer_save_finished_events
         self.final_layer_id = num_layers - 1
+        self.put_step = put_step
+        self.num_ranks_per_layer = num_ranks_per_layer
+        self.page_size_bytes = page_size_bytes
         self.h2d_stagger_us = h2d_stagger_us
         self.h2d_stagger_group_size = h2d_stagger_group_size
         self.h2d_stagger_dynamic_addrs_per_us = h2d_stagger_dynamic_addrs_per_us
@@ -813,6 +821,28 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.h2d_global_world_size = max(1, h2d_global_world_size)
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
+        self.layer_kv_caches = layer_kv_caches or []
+        self.h2d_reader_group = h2d_reader_group
+        self.h2d_reader_count = max(0, h2d_reader_count)
+        self.h2d_reader_collective_blocks = max(1, h2d_reader_collective_blocks)
+        self._block_lens_np = np.asarray(token_database.block_len, dtype=np.int64)
+        self._block_inner_offsets_np = np.concatenate(
+            (
+                np.zeros(1, dtype=np.int64),
+                np.cumsum(self._block_lens_np[:-1], dtype=np.int64),
+            )
+        )
+        self._typed_staging_buffers: dict[tuple[Any, ...], torch.Tensor] = {}
+        self._slot_mapping_buffers: dict[tuple[torch.device, int], torch.Tensor] = {}
+        self._slot_mapping_cache_key: tuple[torch.device, int, bytes] | None = None
+        self._slot_mapping_cache_value: torch.Tensor | None = None
+        self._h2d_status_tensor = torch.empty(1, dtype=torch.int32, device="cpu")
+        self._h2d_gvas_scratch_np: np.ndarray | None = None
+        self._h2d_addr_scratch_np: np.ndarray | None = None
+        self._h2d_size_scratch_np: np.ndarray | None = None
+        self._h2d_block_offsets_scratch_np: np.ndarray | None = None
+        self._h2d_base_addrs_scratch_np: np.ndarray | None = None
+        self._transfer_stream: Any | None = None
         self.layer_batch_builder = LayerBatchBuilder(
             token_database,
             my_key_index,
@@ -820,14 +850,19 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             page_size_bytes,
         )
 
+    def _after_set_device(self) -> None:
+        self._transfer_stream = torch.npu.Stream()
+
+    def _get_transfer_stream(self) -> Any:
+        if self._transfer_stream is None:
+            self._transfer_stream = torch.npu.Stream()
+        return self._transfer_stream
+
     def _maybe_update_h2d_runtime_config(self) -> None:
         if not self.h2d_runtime_config_path:
             return
         now = time.monotonic()
-        if (
-            now - self._h2d_runtime_config_last_check
-            < self.h2d_runtime_config_check_interval
-        ):
+        if now - self._h2d_runtime_config_last_check < self.h2d_runtime_config_check_interval:
             return
         self._h2d_runtime_config_last_check = now
 
@@ -917,9 +952,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self.h2d_concurrent_ranks,
                 self.h2d_global_world_size,
             )
-            num_batches = (
-                self.h2d_global_world_size + concurrent_ranks - 1
-            ) // concurrent_ranks
+            num_batches = (self.h2d_global_world_size + concurrent_ranks - 1) // concurrent_ranks
             if num_batches > 1:
                 batch_index = self.h2d_global_rank // concurrent_ranks
                 # Rotate batch order by layer so the same ranks do not always
@@ -956,8 +989,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         except OSError as err:
             if not self._h2d_token_dir_warning_logged:
                 logger.warning(
-                    "Failed to create H2D token directory %s: %s. "
-                    "Continue without H2D in-flight limit.",
+                    "Failed to create H2D token directory %s: %s. Continue without H2D in-flight limit.",
                     token_dir,
                     err,
                 )
@@ -1024,6 +1056,257 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         finally:
             self._release_h2d_token(token)
 
+    def _ensure_h2d_scratch_array(
+        self,
+        attr_name: str,
+        capacity: int,
+    ) -> np.ndarray:
+        array = getattr(self, attr_name)
+        if array is None or array.shape[0] < capacity:
+            array = np.empty(capacity, dtype=np.int64)
+            setattr(self, attr_name, array)
+        return array[:capacity]
+
+    def _get_typed_staging_buffers(
+        self,
+        kv_cache: tuple[torch.Tensor, ...],
+        num_blocks: int,
+    ) -> list[torch.Tensor]:
+        assert self.h2d_reader_group is not None
+        buffers = []
+        for cache_index, cache in enumerate(kv_cache):
+            key = (
+                num_blocks,
+                cache_index,
+                cache.dtype,
+                cache.device,
+                tuple(cache.shape[-3:]),
+            )
+            buffer = self._typed_staging_buffers.get(key)
+            if buffer is None:
+                buffer = torch.empty(
+                    (
+                        num_blocks,
+                        *cache.shape[-3:],
+                    ),
+                    dtype=cache.dtype,
+                    device=cache.device,
+                )
+                self._typed_staging_buffers[key] = buffer
+            buffers.append(buffer)
+        return buffers
+
+    def _build_typed_staging_copy_arrays(
+        self,
+        staging_buffers: list[torch.Tensor],
+        layer_id: int,
+        block_gvas_array: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        block_count = len(block_gvas_array)
+        block_lens = self._block_lens_np
+        cache_count = len(staging_buffers)
+        total_addrs = block_count * cache_count
+        rank_layer_offset = layer_id * self.num_ranks_per_layer * self.page_size_bytes
+        gvas_array = self._ensure_h2d_scratch_array(
+            "_h2d_gvas_scratch_np",
+            total_addrs,
+        ).reshape(block_count, cache_count)
+        addr_array = self._ensure_h2d_scratch_array(
+            "_h2d_addr_scratch_np",
+            total_addrs,
+        ).reshape(block_count, cache_count)
+        size_array = self._ensure_h2d_scratch_array(
+            "_h2d_size_scratch_np",
+            total_addrs,
+        ).reshape(block_count, cache_count)
+        block_offsets = self._ensure_h2d_scratch_array(
+            "_h2d_block_offsets_scratch_np",
+            block_count,
+        ).reshape(block_count, 1)
+        base_addrs = self._ensure_h2d_scratch_array(
+            "_h2d_base_addrs_scratch_np",
+            cache_count,
+        )
+
+        base_addrs[:] = [staging.data_ptr() for staging in staging_buffers]
+        block_offsets[:, 0] = np.arange(block_count, dtype=np.int64)
+        np.add(
+            block_gvas_array[:, None],
+            rank_layer_offset + self._block_inner_offsets_np[None, :cache_count],
+            out=gvas_array,
+        )
+        np.multiply(
+            block_offsets,
+            block_lens[None, :cache_count],
+            out=addr_array,
+        )
+        np.add(addr_array, base_addrs[None, :], out=addr_array)
+        size_array[:] = block_lens[None, :cache_count]
+        return (
+            gvas_array.ravel(),
+            addr_array.ravel(),
+            size_array.ravel(),
+        )
+
+    def _copy_remote_blocks_to_typed_staging(
+        self,
+        staging_buffers: list[torch.Tensor],
+        req_meta: LayerBatchReqMeta,
+        block_start: int,
+        block_end: int,
+    ) -> int:
+        assert self.h2d_reader_group is not None
+        if self.h2d_reader_group.rank_in_group != 0:
+            return 0
+        block_gvas = req_meta.block_gvas_array[block_start:block_end]
+
+        gvas_array, addr_array, size_array = self._build_typed_staging_copy_arrays(
+            staging_buffers,
+            req_meta.layer_id,
+            block_gvas,
+        )
+        self._stagger_h2d_submit(req_meta.layer_id, len(gvas_array))
+        return self._batch_copy_h2d_with_token(
+            gvas_array,
+            addr_array,
+            size_array,
+        )
+
+    def _broadcast_h2d_status(self, res: int) -> int:
+        assert self.h2d_reader_group is not None
+        status = self._h2d_status_tensor
+        status[0] = res
+        torch.distributed.broadcast(
+            status,
+            src=self.h2d_reader_group.ranks[0],
+            group=self.h2d_reader_group.cpu_group,
+        )
+        return int(status.item())
+
+    def _make_slot_mapping(
+        self,
+        block_ids_array: np.ndarray,
+        tokens_per_block: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        cache_key = (
+            device,
+            tokens_per_block,
+            block_ids_array.tobytes(),
+        )
+        if self._slot_mapping_cache_key == cache_key:
+            assert self._slot_mapping_cache_value is not None
+            return self._slot_mapping_cache_value
+
+        block_ids = torch.from_numpy(block_ids_array.astype(np.int64, copy=False)).to(device=device, non_blocking=True)
+        offsets_key = (device, tokens_per_block)
+        offsets = self._slot_mapping_buffers.get(offsets_key)
+        if offsets is None:
+            offsets = torch.arange(
+                tokens_per_block,
+                device=device,
+                dtype=torch.long,
+            )
+            self._slot_mapping_buffers[offsets_key] = offsets
+        slot_mapping = (block_ids[:, None] * tokens_per_block + offsets[None, :]).reshape(-1)
+        self._slot_mapping_cache_key = cache_key
+        self._slot_mapping_cache_value = slot_mapping
+        return slot_mapping
+
+    def _write_typed_parts_to_kv_cache(
+        self,
+        kv_cache: tuple[torch.Tensor, ...],
+        local_parts: list[torch.Tensor],
+        block_ids_array: np.ndarray,
+    ) -> None:
+        tokens_per_block = local_parts[0].shape[1]
+        slot_mapping = self._make_slot_mapping(
+            block_ids_array,
+            tokens_per_block,
+            local_parts[0].device,
+        )
+        key = local_parts[0].reshape(-1, *local_parts[0].shape[2:])
+        value = local_parts[1].reshape(-1, *local_parts[1].shape[2:])
+        DeviceOperator.reshape_and_cache(
+            key=key,
+            value=value,
+            key_cache=kv_cache[0],
+            value_cache=kv_cache[1],
+            slot_mapping=slot_mapping,
+        )
+
+        for cache_index in range(2, len(kv_cache)):
+            source = local_parts[cache_index].reshape(
+                -1,
+                local_parts[cache_index].shape[-1],
+            )
+            torch_npu.npu_scatter_nd_update_(
+                kv_cache[cache_index].view(-1, source.shape[-1]),
+                slot_mapping.view(-1, 1),
+                source,
+            )
+
+    def _cooperative_h2d_load(self, req_meta: LayerBatchReqMeta) -> int | None:
+        group = self.h2d_reader_group
+        if group is None or self.h2d_reader_count <= 0 or group.world_size <= 1 or not self.layer_kv_caches:
+            return None
+        if req_meta.layer_id >= len(self.layer_kv_caches):
+            return None
+        if len(req_meta.block_ids_array) == 0:
+            return 0
+
+        kv_cache = self.layer_kv_caches[req_meta.layer_id]
+        if len(kv_cache) < 2:
+            return None
+        if self.num_ranks_per_layer != 1:
+            return None
+
+        block_count = len(req_meta.block_ids_array)
+        blocks_per_collective = min(
+            self.h2d_reader_collective_blocks,
+            block_count,
+        )
+        for block_start in range(0, block_count, blocks_per_collective):
+            block_end = min(block_start + blocks_per_collective, block_count)
+            current_blocks = block_end - block_start
+            staging_buffers = self._get_typed_staging_buffers(
+                kv_cache,
+                current_blocks,
+            )
+            res = self._copy_remote_blocks_to_typed_staging(
+                staging_buffers,
+                req_meta,
+                block_start,
+                block_end,
+            )
+            res = self._broadcast_h2d_status(res)
+            if res != 0:
+                return res
+            transfer_stream = self._get_transfer_stream()
+            with torch.npu.stream(transfer_stream):
+                for cache_index, staging in enumerate(staging_buffers):
+                    logger.debug(
+                        "Before H2D broadcast layer=%d chunk=[%d,%d) cache=%d "
+                        "rank=%d rank_in_group=%d group=%s shape=%s dtype=%s",
+                        req_meta.layer_id,
+                        block_start,
+                        block_end,
+                        cache_index,
+                        self.h2d_reader_group.rank,
+                        self.h2d_reader_group.rank_in_group,
+                        self.h2d_reader_group.ranks,
+                        tuple(staging.shape),
+                        staging.dtype,
+                    )
+                    group.broadcast(staging, src=0)
+                self._write_typed_parts_to_kv_cache(
+                    kv_cache,
+                    staging_buffers,
+                    req_meta.block_ids_array[block_start:block_end],
+                )
+            transfer_stream.synchronize()
+        return 0
+
     def _handle_request(  # type: ignore[override]
         self, data: LayerLoadTask
     ):
@@ -1065,29 +1348,30 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             while not attention_start_gate.wait(timeout=10):
                 logger.info("Layerwise %d load waits for attention compute start", layer_id)
 
-        gvas_array = _circular_shift_array(
-            req_meta.gvas_array,
-            (self.tp_rank * len(req_meta.gvas_array)) // self.tp_size,
-        )
-        addr_array = _circular_shift_array(
-            req_meta.addr_array,
-            (self.tp_rank * len(req_meta.addr_array)) // self.tp_size,
-        )
-        size_array = _circular_shift_array(
-            req_meta.size_array,
-            (self.tp_rank * len(req_meta.size_array)) // self.tp_size,
-        )
-        self._stagger_h2d_submit(layer_id, len(gvas_array))
-        res = self._batch_copy_h2d_with_token(
-            gvas_array,
-            addr_array,
-            size_array,
-        )
+        res = self._cooperative_h2d_load(req_meta)
+        if res is None:
+            gvas_array = _circular_shift_array(
+                req_meta.gvas_array,
+                (self.tp_rank * len(req_meta.gvas_array)) // self.tp_size,
+            )
+            addr_array = _circular_shift_array(
+                req_meta.addr_array,
+                (self.tp_rank * len(req_meta.addr_array)) // self.tp_size,
+            )
+            size_array = _circular_shift_array(
+                req_meta.size_array,
+                (self.tp_rank * len(req_meta.size_array)) // self.tp_size,
+            )
+            self._stagger_h2d_submit(layer_id, len(gvas_array))
+            res = self._batch_copy_h2d_with_token(
+                gvas_array,
+                addr_array,
+                size_array,
+            )
         if res != 0:
             logger.error("Layerwise %d load batch_copy failed with return code %d", layer_id, res)
         elif layer_id == self.final_layer_id:
-            for req_id, is_last_chunk in zip(req_meta.req_ids,
-                                             req_meta.is_last_chunks):
+            for req_id, is_last_chunk in zip(req_meta.req_ids, req_meta.is_last_chunks):
                 if is_last_chunk:
                     self.set_finished_request(req_id)
         assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "

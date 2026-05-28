@@ -4,6 +4,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -137,10 +138,7 @@ class ChunkedTokenDatabase:
     def prepare_addr_from_block_id(self, block_id: int, layer_id: int) -> list[int]:
         length = len(self.block_len)
         base_offset = layer_id * length
-        return [
-            self.kv_caches_base_addr[base_offset + i] + block_id * self.block_len[i]
-            for i in range(length)
-        ]
+        return [self.kv_caches_base_addr[base_offset + i] + block_id * self.block_len[i] for i in range(length)]
 
     def prepare_addrs_from_block_ids(self, block_ids: list[int], layer_id: int) -> list[int]:
         length = len(self.block_len)
@@ -156,14 +154,8 @@ class ChunkedTokenDatabase:
         length = len(self.block_len)
         base_offset = layer_id * length
         token_count = end - start
-        addr_list = [
-            self.kv_caches_base_addr[base_offset + i] + block_id * self.block_len[i]
-            for i in range(length)
-        ]
-        size_list = [
-            int(self.block_len[i] / self.block_size * token_count)
-            for i in range(length)
-        ]
+        addr_list = [self.kv_caches_base_addr[base_offset + i] + block_id * self.block_len[i] for i in range(length)]
+        size_list = [int(self.block_len[i] / self.block_size * token_count) for i in range(length)]
         return addr_list, size_list
 
     def process_tokens(
@@ -171,7 +163,7 @@ class ChunkedTokenDatabase:
         token_len: int,
         block_hashes: list[BlockHash] | list[str],
         mask_num: int = 0,
-        req_id = 'no_need',
+        req_id="no_need",
     ) -> Iterable[tuple[int, int, PoolKey]]:
         """Process the tokens and return the corresponding cache engine keys.
 
@@ -193,13 +185,13 @@ class ChunkedTokenDatabase:
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
-        if req_id != 'no_need' and token_len % self.block_size != 0:
-            block_hashes.append(f'{req_id}_lastblock')
+        if req_id != "no_need" and token_len % self.block_size != 0:
+            block_hashes.append(f"{req_id}_lastblock")
         if not block_hashes:
             return
         if not isinstance(block_hashes[0], str):
             block_hashes = [
-                h.hex() if not isinstance(h, str) else h   # type: ignore[union-attr]
+                h.hex() if not isinstance(h, str) else h  # type: ignore[union-attr]
                 for h in block_hashes
             ]
         start_idx = 0
@@ -409,24 +401,16 @@ class ReqMeta:
         # Calculate number of tokens to save based on discard_partial_chunks
         # setting
         num_tokens_to_save = (
-            target_token_len // block_size * block_size
-        ) if discard_partial_chunks else target_token_len
+            (target_token_len // block_size * block_size) if discard_partial_chunks else target_token_len
+        )
         full_block_count = target_token_len // block_size
         boundary_without_hash = (
-            target_token_len > 0
-            and target_token_len % block_size == 0
-            and full_block_count > len(block_hashes)
+            target_token_len > 0 and target_token_len % block_size == 0 and full_block_count > len(block_hashes)
         )
         if boundary_without_hash:
             num_tokens_to_save = len(block_hashes) * block_size
-        if tracker.last_block_gva is not None and (
-            target_token_len % block_size != 0 or boundary_without_hash
-        ):
-            partial_block_index = (
-                full_block_count
-                if target_token_len % block_size != 0
-                else full_block_count - 1
-            )
+        if tracker.last_block_gva is not None and (target_token_len % block_size != 0 or boundary_without_hash):
+            partial_block_index = full_block_count if target_token_len % block_size != 0 else full_block_count - 1
         else:
             partial_block_index = None
 
@@ -505,12 +489,11 @@ class LayerBatchReqMeta:
     req_ids: list[str]
     layer_id: int
     is_last_chunks: list[bool | None] = field(default_factory=list)
-    addr_array: np.ndarray = field(
-        default_factory=lambda: np.empty(0, dtype=np.int64))
-    size_array: np.ndarray = field(
-        default_factory=lambda: np.empty(0, dtype=np.int64))
-    gvas_array: np.ndarray = field(
-        default_factory=lambda: np.empty(0, dtype=np.int64))
+    addr_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    size_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    gvas_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    block_ids_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    block_gvas_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
 
 
 @dataclass
