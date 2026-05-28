@@ -753,6 +753,14 @@ class KVPoolWorker:
             logger.info("Layerwise %d load wait timed out, keep waiting", self.current_layer)
         logger.debug(f">>>>>>>>>>>>>>>>>>>> clear load layer {self.current_layer}")
         self.layer_load_finished_events[self.current_layer].clear()
+        self.kv_recv_thread.commit_pending_cooperative_loads(
+            self.current_layer,
+            wait=True,
+        )
+
+    def start_pending_layer_load_comm(self) -> None:
+        if self.kv_recv_thread is not None:
+            self.kv_recv_thread.commit_pending_cooperative_loads(wait=False)
 
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
         # Wait for KV cache saving to complete on the final layer that requires offloading.

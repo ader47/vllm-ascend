@@ -31,6 +31,7 @@ from vllm_ascend.attention.utils import (
     ascend_chunked_prefill_workspace_size,
     enable_cp,
     maybe_save_kv_layer_to_connector,
+    start_pending_kv_layer_comm_from_connector,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
@@ -1235,6 +1236,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         wait_for_kv_layer_from_connector(layer_name)
         record_attention_compute_start()
+        start_pending_kv_layer_comm_from_connector()
         topk_indices = self.indexer_select_post_process(
             x=hidden_states,
             q_c=q_c,

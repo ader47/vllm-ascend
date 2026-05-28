@@ -845,6 +845,20 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self._h2d_block_offsets_scratch_np: np.ndarray | None = None
         self._h2d_base_addrs_scratch_np: np.ndarray | None = None
         self._transfer_stream: Any | None = None
+        self._pending_cooperative_loads: dict[
+            int,
+            list[
+                tuple[
+                    tuple[torch.Tensor, ...],
+                    list[torch.Tensor],
+                    np.ndarray,
+                    int,
+                    int,
+                ]
+            ],
+        ] = {}
+        self._inflight_cooperative_layers: set[int] = set()
+        self._pending_cooperative_lock = threading.Lock()
         self.layer_batch_builder = LayerBatchBuilder(
             token_database,
             my_key_index,
@@ -1073,12 +1087,14 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self,
         kv_cache: tuple[torch.Tensor, ...],
         num_blocks: int,
+        cache_key_prefix: tuple[Any, ...] = (),
     ) -> list[torch.Tensor]:
         assert self.h2d_reader_group is not None
         buffers = []
         for cache_index, cache in enumerate(kv_cache):
             block_shape = tuple(cache.shape[1:])
             key = (
+                *cache_key_prefix,
                 num_blocks,
                 cache_index,
                 cache.dtype,
@@ -1285,21 +1301,119 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 source,
             )
 
-    @staticmethod
-    def _wait_for_attention_start(
-        attention_start_gate: Any,
-        layer_id: int,
-    ) -> None:
-        if attention_start_gate is None:
-            return
-        while not attention_start_gate.wait(timeout=10):
-            logger.info("Layerwise %d load waits for attention compute start", layer_id)
-
-    def _cooperative_h2d_load(
+    def _submit_cooperative_d2d_and_writeback(
         self,
-        req_meta: LayerBatchReqMeta,
-        attention_start_gate: Any,
-    ) -> int | None:
+        layer_id: int,
+        chunks: list[
+            tuple[
+                tuple[torch.Tensor, ...],
+                list[torch.Tensor],
+                np.ndarray,
+                int,
+                int,
+            ]
+        ],
+    ) -> None:
+        assert self.h2d_reader_group is not None
+        group = self.h2d_reader_group
+        for kv_cache, staging_buffers, block_ids_array, block_start, block_end in chunks:
+            comm_stream = kv_d2d_comm_stream()
+            comm_stream.wait_stream(torch.npu.current_stream())
+            with torch.npu.stream(comm_stream):
+                logger.debug(
+                    "Starting H2D broadcast layer=%d chunk=[%d,%d)",
+                    layer_id,
+                    block_start,
+                    block_end,
+                )
+                for cache_index, staging in enumerate(staging_buffers):
+                    logger.debug(
+                        "Before H2D broadcast layer=%d chunk=[%d,%d) cache=%d "
+                        "rank=%d rank_in_group=%d group=%s shape=%s dtype=%s",
+                        layer_id,
+                        block_start,
+                        block_end,
+                        cache_index,
+                        self.h2d_reader_group.rank,
+                        self.h2d_reader_group.rank_in_group,
+                        self.h2d_reader_group.ranks,
+                        tuple(staging.shape),
+                        staging.dtype,
+                    )
+                    group.broadcast(staging, src=0)
+                logger.debug(
+                    "Finished H2D broadcast layer=%d chunk=[%d,%d)",
+                    layer_id,
+                    block_start,
+                    block_end,
+                )
+            transfer_stream = self._get_transfer_stream()
+            transfer_stream.wait_stream(comm_stream)
+            with torch.npu.stream(transfer_stream):
+                self._write_typed_parts_to_kv_cache(
+                    kv_cache,
+                    staging_buffers,
+                    block_ids_array,
+                )
+            logger.debug(
+                "Synchronizing H2D writeback layer=%d chunk=[%d,%d)",
+                layer_id,
+                block_start,
+                block_end,
+            )
+            logger.debug(
+                "Submitted H2D writeback layer=%d chunk=[%d,%d)",
+                layer_id,
+                block_start,
+                block_end,
+            )
+
+    def _wait_for_inflight_cooperative_loads(self, layer_id: int | None = None) -> None:
+        with self._pending_cooperative_lock:
+            if layer_id is not None and layer_id not in self._inflight_cooperative_layers:
+                return
+            if layer_id is None and not self._inflight_cooperative_layers:
+                return
+        self._get_transfer_stream().synchronize()
+        with self._pending_cooperative_lock:
+            if layer_id is None:
+                self._inflight_cooperative_layers.clear()
+            else:
+                self._inflight_cooperative_layers.discard(layer_id)
+
+    def commit_pending_cooperative_loads(
+        self,
+        layer_id: int | None = None,
+        wait: bool = False,
+    ) -> None:
+        with self._pending_cooperative_lock:
+            if layer_id is None:
+                layer_ids = sorted(self._pending_cooperative_loads)
+            elif layer_id in self._pending_cooperative_loads:
+                layer_ids = [layer_id]
+            else:
+                layer_ids = []
+            pending_loads = [
+                (
+                    pending_layer_id,
+                    self._pending_cooperative_loads.pop(pending_layer_id),
+                )
+                for pending_layer_id in layer_ids
+            ]
+        for pending_layer_id, chunks in pending_loads:
+            self._submit_cooperative_d2d_and_writeback(pending_layer_id, chunks)
+            with self._pending_cooperative_lock:
+                self._inflight_cooperative_layers.add(pending_layer_id)
+        if wait:
+            if layer_id is None or pending_loads:
+                self._wait_for_inflight_cooperative_loads(layer_id)
+            else:
+                with self._pending_cooperative_lock:
+                    is_inflight = layer_id in self._inflight_cooperative_layers
+                if is_inflight:
+                    self._wait_for_inflight_cooperative_loads(layer_id)
+
+    def _cooperative_h2d_load(self, req_meta: LayerBatchReqMeta) -> int | None:
         group = self.h2d_reader_group
         if group is None or self.h2d_reader_count <= 0 or group.world_size <= 1 or not self.layer_kv_caches:
             return None
@@ -1319,13 +1433,14 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self.h2d_reader_collective_blocks,
             block_count,
         )
-        d2d_start_gate = attention_start_gate
+        chunks = []
         for block_start in range(0, block_count, blocks_per_collective):
             block_end = min(block_start + blocks_per_collective, block_count)
             current_blocks = block_end - block_start
             staging_buffers = self._get_typed_staging_buffers(
                 kv_cache,
                 current_blocks,
+                cache_key_prefix=(req_meta.layer_id, block_start),
             )
             res = self._copy_remote_blocks_to_typed_staging(
                 staging_buffers,
@@ -1336,59 +1451,17 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             res = self._broadcast_h2d_status(res)
             if res != 0:
                 return res
-            self._wait_for_attention_start(d2d_start_gate, req_meta.layer_id)
-            d2d_start_gate = None
-            comm_stream = kv_d2d_comm_stream()
-            comm_stream.wait_stream(torch.npu.current_stream())
-            with torch.npu.stream(comm_stream):
-                logger.debug(
-                    "Starting H2D broadcast layer=%d chunk=[%d,%d)",
-                    req_meta.layer_id,
-                    block_start,
-                    block_end,
-                )
-                for cache_index, staging in enumerate(staging_buffers):
-                    logger.debug(
-                        "Before H2D broadcast layer=%d chunk=[%d,%d) cache=%d "
-                        "rank=%d rank_in_group=%d group=%s shape=%s dtype=%s",
-                        req_meta.layer_id,
-                        block_start,
-                        block_end,
-                        cache_index,
-                        self.h2d_reader_group.rank,
-                        self.h2d_reader_group.rank_in_group,
-                        self.h2d_reader_group.ranks,
-                        tuple(staging.shape),
-                        staging.dtype,
-                    )
-                    group.broadcast(staging, src=0)
-                logger.debug(
-                    "Finished H2D broadcast layer=%d chunk=[%d,%d)",
-                    req_meta.layer_id,
-                    block_start,
-                    block_end,
-                )
-            transfer_stream = self._get_transfer_stream()
-            transfer_stream.wait_stream(comm_stream)
-            with torch.npu.stream(transfer_stream):
-                self._write_typed_parts_to_kv_cache(
+            chunks.append(
+                (
                     kv_cache,
                     staging_buffers,
-                    req_meta.block_ids_array[block_start:block_end],
+                    req_meta.block_ids_array[block_start:block_end].copy(),
+                    block_start,
+                    block_end,
                 )
-            logger.debug(
-                "Synchronizing H2D writeback layer=%d chunk=[%d,%d)",
-                req_meta.layer_id,
-                block_start,
-                block_end,
             )
-            transfer_stream.synchronize()
-            logger.debug(
-                "Finished H2D writeback layer=%d chunk=[%d,%d)",
-                req_meta.layer_id,
-                block_start,
-                block_end,
-            )
+        with self._pending_cooperative_lock:
+            self._pending_cooperative_loads[req_meta.layer_id] = chunks
         return 0
 
     def _handle_request(  # type: ignore[override]
@@ -1428,15 +1501,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             logger.debug(f">>>>>>>>>>>>>>>>>>>> clear save layer {wait_for_save}")
             self.layer_save_finished_events[wait_for_save].clear()
 
-        res = self._cooperative_h2d_load(
-            req_meta,
-            attention_start_gate,
-        )
+        res = self._cooperative_h2d_load(req_meta)
         if res is None:
-            self._wait_for_attention_start(
-                attention_start_gate,
-                layer_id,
-            )
+            if attention_start_gate is not None:
+                while not attention_start_gate.wait(timeout=10):
+                    logger.info("Layerwise %d load waits for attention compute start", layer_id)
             gvas_array = _circular_shift_array(
                 req_meta.gvas_array,
                 (self.tp_rank * len(req_meta.gvas_array)) // self.tp_size,

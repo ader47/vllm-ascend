@@ -89,20 +89,16 @@ class AscendStoreConnector(KVConnectorBase_V1):
             )
 
         if role == KVConnectorRole.SCHEDULER and self.use_layerwise:
-            num_layers = vllm_config.model_config.get_num_layers(
-                vllm_config.parallel_config)
-            tp_rank = (
-                vllm_config.parallel_config.rank
-                % vllm_config.parallel_config.tensor_parallel_size
-            )
-            if (get_layerwise_config(num_layers, tp_rank).has_layer_reuse
-                    and self.kv_role != "kv_producer"):
+            num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+            tp_rank = vllm_config.parallel_config.rank % vllm_config.parallel_config.tensor_parallel_size
+            if get_layerwise_config(num_layers, tp_rank).has_layer_reuse and self.kv_role != "kv_producer":
                 logger.warning(
                     "[KV POOL PERFORMANCE WARNING] Layerwise KV cache reuse "
                     "is only expected to perform well on the prefill "
                     "producer node in PD disaggregation. Current kv_role is "
                     "%s, so this mode can have very poor performance.",
-                    self.kv_role)
+                    self.kv_role,
+                )
 
         self.kv_caches: dict[str, torch.Tensor] = {}
         self._kv_cache_events: AscendStoreKVEvents | None = None
@@ -153,10 +149,8 @@ class AscendStoreConnector(KVConnectorBase_V1):
             connector_output (KVConnectorOutput): the worker-side connectors output.
         """
         assert self.connector_scheduler is not None
-        self.connector_scheduler.update_finished_recving(
-            connector_output.finished_recving)
-        self.connector_scheduler.update_finished_sending(
-            connector_output.finished_sending)
+        self.connector_scheduler.update_finished_recving(connector_output.finished_recving)
+        self.connector_scheduler.update_finished_sending(connector_output.finished_sending)
 
         # Get the KV events
         kv_cache_events = connector_output.kv_cache_events
@@ -207,6 +201,11 @@ class AscendStoreConnector(KVConnectorBase_V1):
         if not self.use_layerwise:
             return
         self.connector_worker.wait_for_layer_load()
+
+    def start_pending_layer_load_comm(self) -> None:
+        if not self.use_layerwise:
+            return
+        self.connector_worker.start_pending_layer_load_comm()
 
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
