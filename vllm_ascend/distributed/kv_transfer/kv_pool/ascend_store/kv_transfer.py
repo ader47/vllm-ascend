@@ -1297,6 +1297,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         with self._pending_cooperative_lock:
             chunks = self._pending_cooperative_loads.pop(layer_id, [])
         if not chunks:
+            logger.info("Layerwise %d has no pending cooperative D2D chunks", layer_id)
             return
         assert self.h2d_reader_group is not None
         group = self.h2d_reader_group
@@ -1354,16 +1355,40 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     def _cooperative_h2d_load(self, req_meta: LayerBatchReqMeta) -> int | None:
         group = self.h2d_reader_group
         if group is None or self.h2d_reader_count <= 0 or group.world_size <= 1 or not self.layer_kv_caches:
+            logger.info(
+                "Skip cooperative H2D layer=%d: group=%s reader_count=%d world_size=%s registered_kv_layers=%d",
+                req_meta.layer_id,
+                group.ranks if group is not None else None,
+                self.h2d_reader_count,
+                group.world_size if group is not None else None,
+                len(self.layer_kv_caches),
+            )
             return None
         if req_meta.layer_id >= len(self.layer_kv_caches):
+            logger.info(
+                "Skip cooperative H2D layer=%d: only %d kv cache layers registered",
+                req_meta.layer_id,
+                len(self.layer_kv_caches),
+            )
             return None
         if len(req_meta.block_ids_array) == 0:
+            logger.info("Skip cooperative H2D layer=%d: empty block ids", req_meta.layer_id)
             return 0
 
         kv_cache = self.layer_kv_caches[req_meta.layer_id]
         if len(kv_cache) < 2:
+            logger.info(
+                "Skip cooperative H2D layer=%d: kv cache parts=%d",
+                req_meta.layer_id,
+                len(kv_cache),
+            )
             return None
         if self.num_ranks_per_layer != 1:
+            logger.info(
+                "Skip cooperative H2D layer=%d: num_ranks_per_layer=%d",
+                req_meta.layer_id,
+                self.num_ranks_per_layer,
+            )
             return None
 
         block_count = len(req_meta.block_ids_array)
@@ -1400,6 +1425,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             )
         with self._pending_cooperative_lock:
             self._pending_cooperative_loads[req_meta.layer_id] = chunks
+        logger.info(
+            "Prepared cooperative H2D layer=%d chunks=%d blocks=%d",
+            req_meta.layer_id,
+            len(chunks),
+            block_count,
+        )
         return 0
 
     def _handle_request(  # type: ignore[override]

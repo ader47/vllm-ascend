@@ -742,6 +742,7 @@ class KVPoolWorker:
         self._submit_ready_layer_loads()
         should_wait = bool(self.layer_load_tasks[self.current_layer])
         if not should_wait:
+            logger.info("Layerwise %d has no load task, skip H2D/D2D load", self.current_layer)
             self.layer_load_finished_events[self.current_layer].clear()
             return
         while not self.layer_load_finished_events[self.current_layer].wait(timeout=10):
