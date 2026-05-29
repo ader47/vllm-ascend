@@ -558,7 +558,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 keys, addrs, sizes = self.token_database.decode_adaptor_prefill_pp(keys, addrs, sizes)
 
             if current_event is not None:
-                logger.info("Skip KV save event synchronization for profiling")
+                torch.npu.current_stream().wait_event(current_event)
             self.m_store.put(keys, addrs, sizes)
 
             # TODO Query specific replica info to update the event
@@ -715,7 +715,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         gvas_array = req_meta.gvas_array[rank_start :: self.put_step]
         for req_id in req_meta.req_ids:
             self.dec_stored_request(req_id)
-        logger.info("Skip layerwise save event synchronization for profiling, layer=%d", layer_id)
+        torch.npu.current_stream().wait_event(self.sync_save_events[layer_id])
         res = self._batch_copy_with_limits(
             gvas_array,
             addr_array,
@@ -1157,7 +1157,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self.layer_load_finished_events[layer_id].set()
             return False
         assert self.h2d_reader_group is not None
-        group = self.h2d_reader_group
         with torch.npu.stream(self._cooperative_load_stream):
             for kv_cache, staging_buffers, block_ids_array, block_start, block_end in chunks:
                 logger.info(
@@ -1190,7 +1189,14 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                         tuple(staging.shape),
                         staging.dtype,
                     )
-                    group.broadcast(staging, src=0)
+                    logger.info(
+                        "Simulate D2D broadcast layer=%d chunk=[%d,%d) cache=%d",
+                        layer_id,
+                        block_start,
+                        block_end,
+                        cache_index,
+                    )
+                    staging.add_(0)
                 logger.debug(
                     "Finished H2D broadcast layer=%d chunk=[%d,%d)",
                     layer_id,
