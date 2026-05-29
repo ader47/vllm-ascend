@@ -760,6 +760,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         ready_event: threading.Event,
         get_event: threading.Event,
         layer_h2d_finished_events: list[threading.Event],
+        layer_d2d_allowed_events: list[threading.Event],
         layer_load_finished_events: list[threading.Event],
         layer_save_finished_events: list[threading.Event],
         num_layers: int,
@@ -786,6 +787,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         )
         self.get_event = get_event
         self.layer_h2d_finished_events = layer_h2d_finished_events
+        self.layer_d2d_allowed_events = layer_d2d_allowed_events
         self.layer_load_finished_events = layer_load_finished_events
         self.layer_save_finished_events = layer_save_finished_events
         self.final_layer_id = num_layers - 1
@@ -834,12 +836,31 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self._cooperative_load_stream = torch.npu.Stream()
         self._cooperative_load_events: dict[int, torch.npu.Event] = {}
         self._pending_cooperative_lock = threading.Lock()
+        self._d2d_queue: queue.Queue[int] = queue.Queue()
+        self._d2d_thread = threading.Thread(
+            target=self._run_d2d_worker,
+            daemon=True,
+            name="KVStoreD2DWorker",
+        )
         self.layer_batch_builder = LayerBatchBuilder(
             token_database,
             my_key_index,
             num_ranks_per_layer,
             page_size_bytes,
         )
+
+    def _after_set_device(self) -> None:
+        self._d2d_thread.start()
+
+    def _run_d2d_worker(self) -> None:
+        self.m_store.set_device()
+        while True:
+            layer_id = self._d2d_queue.get()
+            while not self.layer_d2d_allowed_events[layer_id].wait(timeout=10):
+                logger.info("Layerwise %d D2D waits for gate", layer_id)
+            self.layer_d2d_allowed_events[layer_id].clear()
+            self.start_pending_cooperative_load(layer_id)
+            self._d2d_queue.task_done()
 
     def add_request(  # type: ignore[override]
         self, req_meta: LayerLoadTask
@@ -1328,6 +1349,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             assert not self.layer_h2d_finished_events[layer_id].is_set(), f"thread: {layer_id} H2D failed "
             logger.debug(f">>>>>>>>>>>>>>>>>>>> set H2D layer {layer_id}")
             self.layer_h2d_finished_events[layer_id].set()
+            self._d2d_queue.put(layer_id)
         if res != 0:
             logger.error("Layerwise %d load batch_copy failed with return code %d", layer_id, res)
         elif layer_id == self.final_layer_id:
