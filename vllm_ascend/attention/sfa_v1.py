@@ -31,6 +31,7 @@ from vllm_ascend.attention.utils import (
     ascend_chunked_prefill_workspace_size,
     enable_cp,
     maybe_save_kv_layer_to_connector,
+    start_kv_layer_h2d_prefetch_from_connector,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
@@ -1083,6 +1084,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             actual_seq_lengths_query = attn_metadata.cum_query_lens
             actual_seq_lengths_key = attn_metadata.seq_lens
+
+        start_kv_layer_h2d_prefetch_from_connector(layer_name)
 
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = attn_metadata.num_input_tokens

@@ -30,6 +30,7 @@ from vllm_ascend.attention.utils import (
     enabling_mlapo,
     maybe_save_kv_layer_to_connector,
     split_decodes_and_prefills,
+    start_kv_layer_h2d_prefetch_from_connector,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
@@ -1652,6 +1653,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                 if is_hidden_layer(layer):
                     reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
+
+        start_kv_layer_h2d_prefetch_from_connector(layer_name)
 
         num_actual_tokens = self.get_num_actual_tokens(attn_metadata)
         assert (

@@ -289,6 +289,19 @@ def wait_for_kv_layer_from_connector(layer_name: str):
     connector.wait_for_layer_load(layer_name)
 
 
+def start_kv_layer_h2d_prefetch_from_connector(layer_name: str):
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+
+    connector = get_kv_transfer_group()
+
+    forward_context: ForwardContext = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return
+    connector.start_layer_h2d_prefetch(layer_name)
+
+
 def maybe_save_kv_layer_to_connector(
     layer_name: str,
     kv_cache_layer: list[torch.Tensor],

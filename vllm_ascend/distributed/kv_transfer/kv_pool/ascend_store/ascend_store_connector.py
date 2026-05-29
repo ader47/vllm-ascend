@@ -201,6 +201,11 @@ class AscendStoreConnector(KVConnectorBase_V1):
             return
         self.connector_worker.wait_for_layer_load()
 
+    def start_layer_h2d_prefetch(self, layer_name: str) -> None:
+        if not self.use_layerwise:
+            return
+        self.connector_worker.start_layer_h2d_prefetch()
+
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
     ) -> None:

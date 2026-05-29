@@ -759,6 +759,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         page_size_bytes: int,
         ready_event: threading.Event,
         get_event: threading.Event,
+        layer_h2d_finished_events: list[threading.Event],
         layer_load_finished_events: list[threading.Event],
         layer_save_finished_events: list[threading.Event],
         num_layers: int,
@@ -784,6 +785,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             name="KVCacheStoreLayerRecvingThread",
         )
         self.get_event = get_event
+        self.layer_h2d_finished_events = layer_h2d_finished_events
         self.layer_load_finished_events = layer_load_finished_events
         self.layer_save_finished_events = layer_save_finished_events
         self.final_layer_id = num_layers - 1
@@ -1099,12 +1101,13 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self,
         layer_id: int,
     ) -> bool:
-        if layer_id in self._cooperative_load_events:
-            return True
         with self._pending_cooperative_lock:
             chunks = self._pending_cooperative_loads.pop(layer_id, [])
         if not chunks:
             logger.info("Layerwise %d has no pending cooperative D2D chunks", layer_id)
+            if not self.layer_load_finished_events[layer_id].is_set():
+                logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
+                self.layer_load_finished_events[layer_id].set()
             return False
         assert self.h2d_reader_group is not None
         group = self.h2d_reader_group
@@ -1161,6 +1164,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             event = torch.npu.Event()
             event.record(self._cooperative_load_stream)
         self._cooperative_load_events[layer_id] = event
+        assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "
+        logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
+        self.layer_load_finished_events[layer_id].set()
         return True
 
     def wait_pending_cooperative_load(
@@ -1259,7 +1265,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         wait_for_save = data.wait_for_save_layer
         transfer_tasks = data.transfer_tasks
         layer_id = data.layer_id
-        attention_start_gate = data.attention_start_gate
 
         if len(transfer_tasks) == 0:
             if wait_for_save is not None:
@@ -1267,6 +1272,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
                 logger.debug(f">>>>>>>>>>>>>>>>>>>> clear save layer {wait_for_save}")
                 self.layer_save_finished_events[wait_for_save].clear()
+            assert not self.layer_h2d_finished_events[layer_id].is_set(), f"thread: {layer_id} H2D failed "
+            logger.debug(f">>>>>>>>>>>>>>>>>>>> set H2D layer {layer_id}")
+            self.layer_h2d_finished_events[layer_id].set()
             assert not self.layer_load_finished_events[layer_id].is_set()
             logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
             self.layer_load_finished_events[layer_id].set()
@@ -1277,6 +1285,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             raise ValueError(f"Expected at most one layer transfer task, got {len(transfer_tasks)}")
         req_meta = self.layer_batch_builder.build(transfer_tasks[0])
         if req_meta is None:
+            assert not self.layer_h2d_finished_events[layer_id].is_set(), f"thread: {layer_id} H2D failed "
+            logger.debug(f">>>>>>>>>>>>>>>>>>>> set H2D layer {layer_id}")
+            self.layer_h2d_finished_events[layer_id].set()
             assert not self.layer_load_finished_events[layer_id].is_set()
             logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
             self.layer_load_finished_events[layer_id].set()
@@ -1292,9 +1303,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
         res = self._cooperative_h2d_load(req_meta)
         if res is None:
-            if attention_start_gate is not None:
-                while not attention_start_gate.wait(timeout=10):
-                    logger.info("Layerwise %d load waits for attention compute start", layer_id)
             gvas_array = _circular_shift_array(
                 req_meta.gvas_array,
                 (self.tp_rank * len(req_meta.gvas_array)) // self.tp_size,
@@ -1316,15 +1324,23 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self.max_transfer_blocks,
                 self.max_transfer_bytes,
             )
+        elif res == 0:
+            assert not self.layer_h2d_finished_events[layer_id].is_set(), f"thread: {layer_id} H2D failed "
+            logger.debug(f">>>>>>>>>>>>>>>>>>>> set H2D layer {layer_id}")
+            self.layer_h2d_finished_events[layer_id].set()
         if res != 0:
             logger.error("Layerwise %d load batch_copy failed with return code %d", layer_id, res)
         elif layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_meta.req_ids, req_meta.is_last_chunks):
                 if is_last_chunk:
                     self.set_finished_request(req_id)
-        assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "
-        logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
-        self.layer_load_finished_events[layer_id].set()
+        if res is None:
+            assert not self.layer_h2d_finished_events[layer_id].is_set(), f"thread: {layer_id} H2D failed "
+            logger.debug(f">>>>>>>>>>>>>>>>>>>> set H2D layer {layer_id}")
+            self.layer_h2d_finished_events[layer_id].set()
+            assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "
+            logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
+            self.layer_load_finished_events[layer_id].set()
         transfer_tasks.clear()
         self.request_queue.task_done()
         self.get_event.set()

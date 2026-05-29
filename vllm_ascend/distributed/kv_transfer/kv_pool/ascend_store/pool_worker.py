@@ -49,9 +49,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
     get_layerwise_config,
 )
-from vllm_ascend.memcache_comm_fence import (
-    reset_attention_compute_start_gate,
-)
+from vllm_ascend.memcache_comm_fence import reset_attention_compute_start_gate
 
 
 class KVPoolWorker:
@@ -216,6 +214,7 @@ class KVPoolWorker:
 
         self.layer_load_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
         self.layer_save_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
+        self.layer_h2d_finished_events = None
         self.layer_load_finished_events = None
         self.layer_save_finished_events = None
         self.layer_transfer_finished_events = None
@@ -231,7 +230,6 @@ class KVPoolWorker:
                 )
         self.next_layer_to_submit = 0
         self.submitted_layer_loads: set[int] = set()
-        self.finished_layer_h2d_loads: set[int] = set()
         layerwise_config = get_layerwise_config(self.num_layers)
         self.layerwise_offload = layerwise_config.has_layer_reuse
         self.NUM_PREFETCH_LAYERS = layerwise_config.num_prefetch_layers
@@ -376,6 +374,7 @@ class KVPoolWorker:
 
         if self.use_layerwise:
             self.get_event = threading.Event()
+            self.layer_h2d_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.layer_load_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.layer_save_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
@@ -422,6 +421,7 @@ class KVPoolWorker:
                 self.page_size_bytes,
                 ready_event,
                 self.get_event,
+                self.layer_h2d_finished_events,
                 self.layer_load_finished_events,
                 self.layer_save_finished_events,
                 self.num_layers,
@@ -522,7 +522,6 @@ class KVPoolWorker:
         if self.use_layerwise:
             self.next_layer_to_submit = 0
             self.submitted_layer_loads.clear()
-            self.finished_layer_h2d_loads.clear()
             reset_attention_compute_start_gate()
         if len(metadata.requests) == 0:
             return
@@ -666,6 +665,8 @@ class KVPoolWorker:
         def submit_layer_load(layer_id: int) -> bool:
             if not self.layer_load_tasks[layer_id]:
                 return False
+            self.layer_h2d_finished_events[layer_id].clear()
+            self.layer_load_finished_events[layer_id].clear()
             self.kv_recv_thread.add_request(
                 LayerLoadTask(
                     wait_for_save_layer=None,
@@ -684,38 +685,32 @@ class KVPoolWorker:
             submit_layer_load(self.next_layer_to_submit)
             self.next_layer_to_submit += 1
 
-    def _wait_for_layer_h2d(self, layer_id: int) -> bool:
-        if layer_id not in self.submitted_layer_loads:
-            return False
-        if layer_id in self.finished_layer_h2d_loads:
-            return True
-        while not self.layer_load_finished_events[layer_id].wait(timeout=10):
-            logger.info("Layerwise %d load wait timed out, keep waiting", layer_id)
-        logger.debug(f">>>>>>>>>>>>>>>>>>>> clear load layer {layer_id}")
-        self.layer_load_finished_events[layer_id].clear()
-        self.finished_layer_h2d_loads.add(layer_id)
-        return True
-
-    def _start_ready_cooperative_loads(self) -> None:
-        target_layer = min(self.num_layers, self.current_layer + self.NUM_PREFETCH_LAYERS)
-        for layer_id in range(self.current_layer, target_layer):
-            if self._wait_for_layer_h2d(layer_id):
-                self.kv_recv_thread.start_pending_cooperative_load(layer_id)
-
-    def wait_for_layer_load(self) -> None:
+    def start_layer_h2d_prefetch(self) -> None:
         reset_attention_compute_start_gate()
         self._submit_ready_layer_loads()
-        self._start_ready_cooperative_loads()
-        should_wait = self.current_layer in self.submitted_layer_loads or bool(
+
+    def wait_for_layer_load(self) -> None:
+        if self.current_layer not in self.submitted_layer_loads and self.layer_load_tasks[self.current_layer]:
+            self.start_layer_h2d_prefetch()
+        has_load = self.current_layer in self.submitted_layer_loads or bool(
             self.layer_load_tasks[self.current_layer]
         )
-        if not should_wait:
+        if not has_load:
             logger.info("Layerwise %d has no load task, skip H2D/D2D load", self.current_layer)
+            self.layer_h2d_finished_events[self.current_layer].clear()
             self.layer_load_finished_events[self.current_layer].clear()
             return
+        while not self.layer_h2d_finished_events[self.current_layer].wait(timeout=10):
+            logger.info("Layerwise %d H2D wait timed out, keep waiting", self.current_layer)
+        logger.debug(f">>>>>>>>>>>>>>>>>>>> clear H2D layer {self.current_layer}")
+        self.layer_h2d_finished_events[self.current_layer].clear()
+        self.kv_recv_thread.start_pending_cooperative_load(self.current_layer)
+        while not self.layer_load_finished_events[self.current_layer].wait(timeout=10):
+            logger.info("Layerwise %d load wait timed out, keep waiting", self.current_layer)
+        logger.debug(f">>>>>>>>>>>>>>>>>>>> clear load layer {self.current_layer}")
+        self.layer_load_finished_events[self.current_layer].clear()
         self.kv_recv_thread.wait_pending_cooperative_load(self.current_layer)
         self.submitted_layer_loads.discard(self.current_layer)
-        self.finished_layer_h2d_loads.discard(self.current_layer)
 
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
         layer_id = self.current_layer
