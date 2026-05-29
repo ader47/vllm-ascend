@@ -821,6 +821,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self._h2d_size_scratch_np: np.ndarray | None = None
         self._h2d_block_offsets_scratch_np: np.ndarray | None = None
         self._h2d_base_addrs_scratch_np: np.ndarray | None = None
+        self._small_broadcast_tensor: torch.Tensor | None = None
         self._pending_cooperative_loads: dict[
             int,
             list[
@@ -1157,6 +1158,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self.layer_load_finished_events[layer_id].set()
             return False
         assert self.h2d_reader_group is not None
+        group = self.h2d_reader_group
         with torch.npu.stream(self._cooperative_load_stream):
             for kv_cache, staging_buffers, block_ids_array, block_start, block_end in chunks:
                 logger.info(
@@ -1190,13 +1192,17 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                         staging.dtype,
                     )
                     logger.info(
-                        "Simulate D2D broadcast layer=%d chunk=[%d,%d) cache=%d",
+                        "Broadcast small placeholder layer=%d chunk=[%d,%d) cache=%d",
                         layer_id,
                         block_start,
                         block_end,
                         cache_index,
                     )
-                    staging.add_(0)
+                    if (self._small_broadcast_tensor is None
+                            or self._small_broadcast_tensor.device != staging.device):
+                        self._small_broadcast_tensor = torch.empty(
+                            1, dtype=torch.int32, device=staging.device)
+                    group.broadcast(self._small_broadcast_tensor, src=0)
                 logger.debug(
                     "Finished H2D broadcast layer=%d chunk=[%d,%d)",
                     layer_id,
