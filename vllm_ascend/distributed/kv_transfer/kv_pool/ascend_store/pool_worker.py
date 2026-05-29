@@ -231,6 +231,7 @@ class KVPoolWorker:
                 )
         self.next_layer_to_submit = 0
         self.submitted_layer_loads: set[int] = set()
+        self.last_save_layer_to_wait: int | None = None
         layerwise_config = get_layerwise_config(self.num_layers)
         self.layerwise_offload = layerwise_config.has_layer_reuse
         self.NUM_PREFETCH_LAYERS = layerwise_config.num_prefetch_layers
@@ -525,11 +526,20 @@ class KVPoolWorker:
         if self.use_layerwise:
             self.next_layer_to_submit = 0
             self.submitted_layer_loads.clear()
+            self.last_save_layer_to_wait = None
             reset_attention_compute_start_gate()
         if len(metadata.requests) == 0:
             return
         if self.use_layerwise:
             self.process_layer_data(metadata.requests)
+            self.last_save_layer_to_wait = next(
+                (
+                    layer_id
+                    for layer_id in range(self.num_layers - 1, -1, -1)
+                    if self.layer_save_tasks[layer_id]
+                ),
+                None,
+            )
             return
 
         for request in metadata.requests:
@@ -673,7 +683,7 @@ class KVPoolWorker:
             self.layer_load_finished_events[layer_id].clear()
             self.kv_recv_thread.add_request(
                 LayerLoadTask(
-                    wait_for_save_layer=None,
+                    wait_for_save_layer=self.prefetch_layer_map.get(layer_id),
                     transfer_tasks=self.layer_load_tasks[layer_id],
                     layer_id=layer_id,
                     attention_start_gate=None,
@@ -722,14 +732,15 @@ class KVPoolWorker:
         if self.layer_save_tasks[layer_id]:
             for block_range in self.layer_save_tasks[layer_id][0].block_ranges:
                 self.kv_send_thread.add_stored_request(block_range.request.req_id)
+            self.layer_save_finished_events[layer_id].clear()
             self.kv_send_thread.add_request(self.layer_save_tasks[layer_id])
         else:
             self.layer_save_finished_events[layer_id].set()
 
-        while not self.layer_save_finished_events[layer_id].wait(timeout=10):
-            logger.info("Layerwise %d save wait timed out, keep waiting", layer_id)
-        logger.debug(f">>>>>>>>>>>>>>>>>>>> clear save layer {layer_id}")
-        self.layer_save_finished_events[layer_id].clear()
+        if layer_id == self.last_save_layer_to_wait:
+            while not self.layer_save_finished_events[layer_id].wait(timeout=10):
+                logger.info("Layerwise %d save wait timed out, keep waiting", layer_id)
+            logger.debug(f">>>>>>>>>>>>>>>>>>>> save layer {layer_id} is done")
         self.current_layer += 1
 
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata):

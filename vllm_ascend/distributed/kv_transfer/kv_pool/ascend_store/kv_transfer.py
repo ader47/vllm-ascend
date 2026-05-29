@@ -837,7 +837,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self._cooperative_load_events: dict[int, torch.npu.Event] = {}
         self._pending_cooperative_lock = threading.Lock()
         self._last_cooperative_h2d_layer_id: int | None = None
-        self._d2d_queue: queue.Queue[int] = queue.Queue()
+        self._d2d_queue: queue.Queue[tuple[int, int | None]] = queue.Queue()
         self._d2d_thread = threading.Thread(
             target=self._run_d2d_worker,
             daemon=True,
@@ -870,10 +870,17 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     def _run_d2d_worker(self) -> None:
         self.m_store.set_device()
         while True:
-            layer_id = self._d2d_queue.get()
+            layer_id, wait_for_save = self._d2d_queue.get()
             while not self.layer_d2d_allowed_events[layer_id].wait(timeout=10):
                 logger.info("Layerwise %d D2D waits for gate", layer_id)
             self.layer_d2d_allowed_events[layer_id].clear()
+            if wait_for_save is not None:
+                while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
+                    logger.info(
+                        "Layerwise %d D2D waits for layer %d save before writeback",
+                        layer_id,
+                        wait_for_save,
+                    )
             self.start_pending_cooperative_load(layer_id)
             self._d2d_queue.task_done()
 
@@ -1305,11 +1312,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         layer_id = data.layer_id
 
         if len(transfer_tasks) == 0:
-            if wait_for_save is not None:
-                while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
-                    logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
-                logger.debug(f">>>>>>>>>>>>>>>>>>>> clear save layer {wait_for_save}")
-                self.layer_save_finished_events[wait_for_save].clear()
             assert not self.layer_h2d_finished_events[layer_id].is_set(), f"thread: {layer_id} H2D failed "
             logger.debug(f">>>>>>>>>>>>>>>>>>>> set H2D layer {layer_id}")
             self.layer_h2d_finished_events[layer_id].set()
@@ -1333,14 +1335,15 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             return
         layer_id = req_meta.layer_id
 
-        if wait_for_save is not None:
-            while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
-                logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
-            logger.debug(f">>>>>>>>>>>>>>>>>>>> clear save layer {wait_for_save}")
-            self.layer_save_finished_events[wait_for_save].clear()
-
         res = self._cooperative_h2d_load(req_meta)
         if res is None:
+            if wait_for_save is not None:
+                while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
+                    logger.info(
+                        "Layerwise %d direct H2D waits for layer %d save before writeback",
+                        layer_id,
+                        wait_for_save,
+                    )
             gvas_array = _circular_shift_array(
                 req_meta.gvas_array,
                 (self.tp_rank * len(req_meta.gvas_array)) // self.tp_size,
@@ -1366,7 +1369,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             assert not self.layer_h2d_finished_events[layer_id].is_set(), f"thread: {layer_id} H2D failed "
             logger.debug(f">>>>>>>>>>>>>>>>>>>> set H2D layer {layer_id}")
             self.layer_h2d_finished_events[layer_id].set()
-            self._d2d_queue.put(layer_id)
+            self._d2d_queue.put((layer_id, wait_for_save))
         if res != 0:
             logger.error("Layerwise %d load batch_copy failed with return code %d", layer_id, res)
         elif layer_id == self.final_layer_id:
