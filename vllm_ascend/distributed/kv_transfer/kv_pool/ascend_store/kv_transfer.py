@@ -836,6 +836,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self._cooperative_load_stream = torch.npu.Stream()
         self._cooperative_load_events: dict[int, torch.npu.Event] = {}
         self._pending_cooperative_lock = threading.Lock()
+        self._last_cooperative_h2d_layer_id: int | None = None
         self._d2d_queue: queue.Queue[int] = queue.Queue()
         self._d2d_thread = threading.Thread(
             target=self._run_d2d_worker,
@@ -848,6 +849,20 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             num_ranks_per_layer,
             page_size_bytes,
         )
+
+    def _wait_for_staging_reuse(self, layer_id: int) -> None:
+        previous_layer = self._last_cooperative_h2d_layer_id
+        if previous_layer is None or previous_layer == layer_id:
+            return
+        while not self.layer_load_finished_events[previous_layer].wait(timeout=10):
+            logger.info(
+                "Layerwise %d H2D waits for layer %d writeback before reusing staging buffers",
+                layer_id,
+                previous_layer,
+            )
+        previous_event = self._cooperative_load_events.pop(previous_layer, None)
+        if previous_event is not None:
+            previous_event.synchronize()
 
     def _after_set_device(self) -> None:
         self._d2d_thread.start()
@@ -1194,7 +1209,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self,
         layer_id: int,
     ) -> None:
-        event = self._cooperative_load_events.pop(layer_id, None)
+        event = self._cooperative_load_events.get(layer_id)
         if event is None:
             return
         torch.npu.current_stream().wait_event(event)
@@ -1238,6 +1253,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             )
             return None
 
+        self._wait_for_staging_reuse(req_meta.layer_id)
         block_count = len(req_meta.block_ids_array)
         blocks_per_collective = min(
             self.h2d_reader_collective_blocks,
@@ -1250,7 +1266,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             staging_buffers = self._get_typed_staging_buffers(
                 kv_cache,
                 current_blocks,
-                cache_key_prefix=(req_meta.layer_id, block_start),
+                cache_key_prefix=(block_start,),
             )
             res = self._copy_remote_blocks_to_typed_staging(
                 staging_buffers,
@@ -1278,6 +1294,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             len(chunks),
             block_count,
         )
+        self._last_cooperative_h2d_layer_id = req_meta.layer_id
         return 0
 
     def _handle_request(  # type: ignore[override]

@@ -705,14 +705,14 @@ class KVPoolWorker:
             self.layer_d2d_allowed_events[self.current_layer].clear()
             self.layer_load_finished_events[self.current_layer].clear()
             return
-        self.layer_d2d_allowed_events[self.current_layer].set()
+        target_layer = min(self.num_layers, self.current_layer + self.NUM_PREFETCH_LAYERS)
+        for layer_id in range(self.current_layer, target_layer):
+            self.layer_d2d_allowed_events[layer_id].set()
         if not self.layer_load_finished_events[self.current_layer].is_set():
             logger.info("Layerwise %d KV is not ready, skip non-blocking load wait", self.current_layer)
             return
         logger.debug(f">>>>>>>>>>>>>>>>>>>> clear H2D layer {self.current_layer}")
         self.layer_h2d_finished_events[self.current_layer].clear()
-        logger.debug(f">>>>>>>>>>>>>>>>>>>> clear load layer {self.current_layer}")
-        self.layer_load_finished_events[self.current_layer].clear()
         self.kv_recv_thread.wait_pending_cooperative_load(self.current_layer)
         self.submitted_layer_loads.discard(self.current_layer)
 
