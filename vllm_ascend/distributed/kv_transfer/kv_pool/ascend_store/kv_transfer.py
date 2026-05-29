@@ -834,16 +834,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 ]
             ],
         ] = {}
+        self._pending_cooperative_wait_for_save: dict[int, int | None] = {}
         self._cooperative_load_stream = torch.npu.Stream()
         self._cooperative_load_events: dict[int, torch.npu.Event] = {}
         self._pending_cooperative_lock = threading.Lock()
         self._last_cooperative_h2d_layer_id: int | None = None
-        self._d2d_queue: queue.Queue[tuple[int, int | None]] = queue.Queue()
-        self._d2d_thread = threading.Thread(
-            target=self._run_d2d_worker,
-            daemon=True,
-            name="KVStoreD2DWorker",
-        )
         self.layer_batch_builder = LayerBatchBuilder(
             token_database,
             my_key_index,
@@ -863,31 +858,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             )
         previous_event = self._cooperative_load_events.pop(previous_layer, None)
         if previous_event is not None:
-            logger.info(
-                "Layerwise %d drops layer %d writeback event without synchronizing for profiling",
-                layer_id,
-                previous_layer,
-            )
-
-    def _after_set_device(self) -> None:
-        self._d2d_thread.start()
-
-    def _run_d2d_worker(self) -> None:
-        self.m_store.set_device()
-        while True:
-            layer_id, wait_for_save = self._d2d_queue.get()
-            if not self.layer_d2d_allowed_events[layer_id].wait(timeout=2):
-                logger.info("Layerwise %d D2D gate wait timed out; continue for profiling", layer_id)
-            self.layer_d2d_allowed_events[layer_id].clear()
-            if wait_for_save is not None:
-                if not self.layer_save_finished_events[wait_for_save].wait(timeout=2):
-                    logger.info(
-                        "Layerwise %d D2D timed out waiting for layer %d save; continue for profiling",
-                        layer_id,
-                        wait_for_save,
-                    )
-            self.start_pending_cooperative_load(layer_id)
-            self._d2d_queue.task_done()
+            previous_event.synchronize()
 
     def add_request(  # type: ignore[override]
         self, req_meta: LayerLoadTask
@@ -1151,12 +1122,20 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     ) -> bool:
         with self._pending_cooperative_lock:
             chunks = self._pending_cooperative_loads.pop(layer_id, [])
+            wait_for_save = self._pending_cooperative_wait_for_save.pop(layer_id, None)
         if not chunks:
             logger.info("Layerwise %d has no pending cooperative D2D chunks", layer_id)
             if not self.layer_load_finished_events[layer_id].is_set():
                 logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
                 self.layer_load_finished_events[layer_id].set()
             return False
+        if wait_for_save is not None:
+            if not self.layer_save_finished_events[wait_for_save].wait(timeout=2):
+                logger.info(
+                    "Layerwise %d D2D timed out waiting for layer %d save; continue for profiling",
+                    layer_id,
+                    wait_for_save,
+                )
         assert self.h2d_reader_group is not None
         group = self.h2d_reader_group
         with torch.npu.stream(self._cooperative_load_stream):
@@ -1382,10 +1361,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self.max_transfer_bytes,
             )
         elif res == 0:
+            with self._pending_cooperative_lock:
+                self._pending_cooperative_wait_for_save[layer_id] = wait_for_save
             assert not self.layer_h2d_finished_events[layer_id].is_set(), f"thread: {layer_id} H2D failed "
             logger.debug(f">>>>>>>>>>>>>>>>>>>> set H2D layer {layer_id}")
             self.layer_h2d_finished_events[layer_id].set()
-            self._d2d_queue.put((layer_id, wait_for_save))
         if res != 0:
             logger.error("Layerwise %d load batch_copy failed with return code %d", layer_id, res)
         elif layer_id == self.final_layer_id:
