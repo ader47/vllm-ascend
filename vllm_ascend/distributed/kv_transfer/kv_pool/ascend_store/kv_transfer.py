@@ -989,10 +989,13 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             block_gvas,
         )
         self._stagger_h2d_submit(req_meta.layer_id, len(gvas_array))
-        return self._batch_copy_h2d_with_token(
+        return self._batch_copy_with_limits(
             gvas_array,
             addr_array,
             size_array,
+            1,
+            self.max_transfer_blocks,
+            self.max_transfer_bytes,
         )
 
     def _broadcast_h2d_status(self, res: int) -> int:
