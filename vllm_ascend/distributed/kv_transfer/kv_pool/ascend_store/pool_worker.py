@@ -738,9 +738,10 @@ class KVPoolWorker:
             self.layer_save_finished_events[layer_id].set()
 
         if layer_id == self.last_save_layer_to_wait:
-            while not self.layer_save_finished_events[layer_id].wait(timeout=10):
-                logger.info("Layerwise %d save wait timed out, keep waiting", layer_id)
+            if not self.layer_save_finished_events[layer_id].wait(timeout=2):
+                logger.info("Layerwise %d save wait timed out; continue for profiling", layer_id)
             logger.debug(f">>>>>>>>>>>>>>>>>>>> save layer {layer_id} is done")
+            self.layer_save_finished_events[layer_id].clear()
         self.current_layer += 1
 
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata):
@@ -773,7 +774,7 @@ class KVPoolWorker:
             self.kv_send_thread.discard_finished_requests(meta.preempted_req_ids)
             if self.use_layerwise:
                 self.kv_send_thread.get_and_clear_finished_requests()
-                done_sending = set()
+                done_sending = set(meta.delayed_free_req_ids)
             else:
                 stale_finished_req_ids = finished_req_ids - meta.delayed_free_req_ids
                 self.kv_send_thread.discard_finished_requests(stale_finished_req_ids)
@@ -786,6 +787,7 @@ class KVPoolWorker:
             self.kv_recv_thread.discard_finished_requests(meta.preempted_req_ids)
             if self.load_async:
                 done_recving = self.kv_recv_thread.get_and_clear_finished_requests(meta.loading_req_ids)
+                done_recving |= set(meta.loading_req_ids)
 
         logger.debug(
             "Number of completed KV cache send requests: %d, receive requests: %d, tp_rank:%d",

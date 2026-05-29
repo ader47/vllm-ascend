@@ -558,7 +558,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 keys, addrs, sizes = self.token_database.decode_adaptor_prefill_pp(keys, addrs, sizes)
 
             if current_event is not None:
-                current_event.synchronize()
+                logger.info("Skip KV save event synchronization for profiling")
             self.m_store.put(keys, addrs, sizes)
 
             # TODO Query specific replica info to update the event
@@ -715,7 +715,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         gvas_array = req_meta.gvas_array[rank_start :: self.put_step]
         for req_id in req_meta.req_ids:
             self.dec_stored_request(req_id)
-        self.sync_save_events[layer_id].synchronize()
+        logger.info("Skip layerwise save event synchronization for profiling, layer=%d", layer_id)
         res = self._batch_copy_with_limits(
             gvas_array,
             addr_array,
@@ -854,15 +854,19 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         previous_layer = self._last_cooperative_h2d_layer_id
         if previous_layer is None or previous_layer == layer_id:
             return
-        while not self.layer_load_finished_events[previous_layer].wait(timeout=10):
+        if not self.layer_load_finished_events[previous_layer].wait(timeout=2):
             logger.info(
-                "Layerwise %d H2D waits for layer %d writeback before reusing staging buffers",
+                "Layerwise %d H2D timed out waiting for layer %d writeback; continue for profiling",
                 layer_id,
                 previous_layer,
             )
         previous_event = self._cooperative_load_events.pop(previous_layer, None)
         if previous_event is not None:
-            previous_event.synchronize()
+            logger.info(
+                "Layerwise %d drops layer %d writeback event without synchronizing for profiling",
+                layer_id,
+                previous_layer,
+            )
 
     def _after_set_device(self) -> None:
         self._d2d_thread.start()
@@ -871,13 +875,13 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.m_store.set_device()
         while True:
             layer_id, wait_for_save = self._d2d_queue.get()
-            while not self.layer_d2d_allowed_events[layer_id].wait(timeout=10):
-                logger.info("Layerwise %d D2D waits for gate", layer_id)
+            if not self.layer_d2d_allowed_events[layer_id].wait(timeout=2):
+                logger.info("Layerwise %d D2D gate wait timed out; continue for profiling", layer_id)
             self.layer_d2d_allowed_events[layer_id].clear()
             if wait_for_save is not None:
-                while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
+                if not self.layer_save_finished_events[wait_for_save].wait(timeout=2):
                     logger.info(
-                        "Layerwise %d D2D waits for layer %d save before writeback",
+                        "Layerwise %d D2D timed out waiting for layer %d save; continue for profiling",
                         layer_id,
                         wait_for_save,
                     )
@@ -1338,9 +1342,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         res = self._cooperative_h2d_load(req_meta)
         if res is None:
             if wait_for_save is not None:
-                while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
+                if not self.layer_save_finished_events[wait_for_save].wait(timeout=2):
                     logger.info(
-                        "Layerwise %d direct H2D waits for layer %d save before writeback",
+                        "Layerwise %d direct H2D timed out waiting for layer %d save; continue for profiling",
                         layer_id,
                         wait_for_save,
                     )
