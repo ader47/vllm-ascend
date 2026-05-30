@@ -688,11 +688,6 @@ class KVPoolWorker:
                     layer_id, self.tp_rank
                 )
                 return False
-            # ... 原有逻辑
-            logger.info(
-                "Layerwise %d SUBMITTED to recv thread, tp_rank=%d, wait_for_save=%s",
-                layer_id, self.tp_rank, self.prefetch_layer_map.get(layer_id)
-            )
             self.layer_h2d_finished_events[layer_id].clear()
             self.layer_d2d_allowed_events[layer_id].clear()
             self.layer_load_finished_events[layer_id].clear()
@@ -743,8 +738,7 @@ class KVPoolWorker:
             return
 
         if not self.layer_load_finished_events[self.current_layer].is_set():
-            while not self.layer_load_finished_events[self.current_layer].wait(timeout=2):
-                logger.info("Layerwise %d D2D pending", self.current_layer)
+            self.layer_load_finished_events[self.current_layer].wait()
         self.kv_recv_thread.wait_pending_cooperative_load(self.current_layer)
         self.submitted_layer_loads.discard(self.current_layer)
 

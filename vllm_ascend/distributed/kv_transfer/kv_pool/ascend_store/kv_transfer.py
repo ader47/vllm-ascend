@@ -855,10 +855,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
     def _wait_for_staging_reuse(self, layer_id: int) -> None:
         previous_layer = self._last_cooperative_h2d_layer_id
-        logger.info(
-            "Layerwise %d _wait_for_staging_reuse: previous_layer=%s, tp_rank=%d",
-            layer_id, previous_layer, self.tp_rank,
-        )
         if previous_layer is None or previous_layer == layer_id:
             return
         while not self.layer_load_finished_events[previous_layer].wait(timeout=2):
@@ -867,26 +863,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 layer_id,
                 previous_layer,
             )
-        logger.info(
-            "Layerwise %d _wait_for_staging_reuse: layer_load_finished_events[%d] is set, tp_rank=%d",
-            layer_id, previous_layer, self.tp_rank,
-        )
         while True:
             previous_event = self._cooperative_load_events.get(previous_layer, None)
-            logger.info(
-                "Layerwise %d _wait_for_staging_reuse: previous_event=%s for layer %d, tp_rank=%d",
-                layer_id, previous_event, previous_layer, self.tp_rank,
-            )
             if previous_event is not None:
-                logger.info(
-                    "Layerwise %d _wait_for_staging_reuse: BEFORE synchronize for layer %d, tp_rank=%d",
-                    layer_id, previous_layer, self.tp_rank,
-                )
-                self._cooperative_load_stream.synchronize()
-                logger.info(
-                    "Layerwise %d _wait_for_staging_reuse: AFTER synchronize for layer %d, tp_rank=%d",
-                    layer_id, previous_layer, self.tp_rank,
-                )
+                previous_event.synchronize()
                 return
             logger.info(
                 "Layerwise %d H2D waits for layer %d writeback event before reusing staging buffer",
@@ -1138,31 +1118,23 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             return False
         assert self.d2d_broadcast_group is not None
         group = self.d2d_broadcast_group
+        default_stream = torch.npu.current_stream()
+        for kv_cache, staging_buffers, slot_mapping, block_start, block_end in chunks:
+            logger.info(
+                "Layerwise %d BROADCAST START, chunks=%d, tp_rank=%d, rank_in_group=%d, group_ranks=%s",
+                layer_id, len(chunks), self.tp_rank,
+                self.h2d_reader_group.rank_in_group if self.h2d_reader_group else -1,
+                self.d2d_broadcast_group.ranks if self.d2d_broadcast_group else "N/A"
+            )
+            for staging in staging_buffers:
+                group.broadcast(staging, src=0)
+            logger.info(
+                "Layerwise %d BROADCAST DONE, tp_rank=%d",
+                layer_id, self.tp_rank
+            )
         with torch.npu.stream(self._cooperative_load_stream):
+            self._cooperative_load_stream.wait_stream(default_stream)
             for kv_cache, staging_buffers, slot_mapping, block_start, block_end in chunks:
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "D2D broadcast layer=%d chunk=[%d,%d) rank=%d group=%s shape=%s dtype=%s",
-                        layer_id,
-                        block_start,
-                        block_end,
-                        self.h2d_reader_group.rank_in_group,
-                        self.h2d_reader_group.ranks,
-                        tuple(staging_buffers[0].shape),
-                        staging_buffers[0].dtype,
-                    )
-                logger.info(
-                    "Layerwise %d BROADCAST START, chunks=%d, tp_rank=%d, rank_in_group=%d, group_ranks=%s",
-                    layer_id, len(chunks), self.tp_rank,
-                    self.h2d_reader_group.rank_in_group if self.h2d_reader_group else -1,
-                    self.d2d_broadcast_group.ranks if self.d2d_broadcast_group else "N/A"
-                )
-                for staging in staging_buffers:
-                    group.broadcast(staging, src=0)
-                logger.info(
-                    "Layerwise %d BROADCAST DONE, tp_rank=%d",
-                    layer_id, self.tp_rank
-                )
                 self._write_typed_parts_to_kv_cache(
                     kv_cache,
                     staging_buffers,
