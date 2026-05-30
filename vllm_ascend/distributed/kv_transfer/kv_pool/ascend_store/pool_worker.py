@@ -207,6 +207,7 @@ class KVPoolWorker:
         self._registered_buffer_lengths: list[int] = []
         self.layer_kv_caches: list[tuple[torch.Tensor, ...]] = []
         self.h2d_reader_group: GroupCoordinator | None = None
+        self.d2d_broadcast_group: GroupCoordinator | None = None
         self._kv_caches_registered = False
         self._backend_initialized = False
         self._buffers_registered = False
@@ -289,11 +290,11 @@ class KVPoolWorker:
         local_rank = get_world_group().local_rank
         local_group_ranks = next(ranks for ranks in group_ranks if local_rank in ranks)
         tp_group = get_tp_group()
+        backend = torch.distributed.get_backend(get_world_group().device_group)
         if list(tp_group.ranks) == local_group_ranks:
             self.h2d_reader_group = tp_group
             group_name = "tp"
         else:
-            backend = torch.distributed.get_backend(get_world_group().device_group)
             self.h2d_reader_group = init_model_parallel_group(
                 group_ranks,
                 local_rank,
@@ -307,6 +308,10 @@ class KVPoolWorker:
                 local_group_ranks,
                 list(tp_group.ranks),
             )
+        self.d2d_broadcast_group = init_model_parallel_group(
+            group_ranks, local_rank, backend,
+            group_name="kv_pool_d2d_broadcast",
+        )
         logger.info(
             "Enabled cooperative H2D broadcast readers: dp_rank=%d group_ranks=%s "
             "rank_in_group=%d readers_per_dp=%d collective_blocks=%d group_name=%s",
@@ -439,6 +444,7 @@ class KVPoolWorker:
                 self.h2d_reader_group,
                 self.h2d_reader_count,
                 self.h2d_reader_collective_blocks,
+                self.d2d_broadcast_group,
             )
             self.kv_recv_thread.start()
             ready_event.wait()
@@ -706,14 +712,12 @@ class KVPoolWorker:
     def _start_layer_d2d_load(self, layer_id: int, wait_for_h2d: bool) -> bool:
         if self.layer_load_finished_events[layer_id].is_set():
             return True
-        if wait_for_h2d:
+        if not self.layer_h2d_finished_events[layer_id].is_set():
+            if not wait_for_h2d:
+                return False
             while not self.layer_h2d_finished_events[layer_id].wait(timeout=2):
-                logger.info("Layerwise %d H2D wait timed out, keep waiting before D2D", layer_id)
-        elif not self.layer_h2d_finished_events[layer_id].is_set():
-            return False
-        logger.debug(f">>>>>>>>>>>>>>>>>>>> clear H2D layer {layer_id}")
+                logger.info("Layerwise %d H2D not ready", layer_id)
         self.layer_h2d_finished_events[layer_id].clear()
-        self.kv_recv_thread.start_pending_cooperative_load(layer_id)
         return True
 
     def wait_for_layer_load(self) -> None:
@@ -728,13 +732,16 @@ class KVPoolWorker:
             self.layer_load_finished_events[self.current_layer].clear()
             return
         self._start_layer_d2d_load(self.current_layer, wait_for_h2d=True)
+        if not self.layer_load_finished_events[self.current_layer].is_set():
+            while not self.layer_load_finished_events[self.current_layer].wait(timeout=2):
+                logger.info("Layerwise %d D2D pending", self.current_layer)
         self.kv_recv_thread.wait_pending_cooperative_load(self.current_layer)
         self.submitted_layer_loads.discard(self.current_layer)
         target_layer = min(self.num_layers, self.current_layer + self.NUM_PREFETCH_LAYERS)
         for layer_id in range(self.current_layer + 1, target_layer):
             if layer_id not in self.submitted_layer_loads:
                 continue
-            self._start_layer_d2d_load(layer_id, wait_for_h2d=True)
+            self._start_layer_d2d_load(layer_id, wait_for_h2d=False)
 
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
         layer_id = self.current_layer
