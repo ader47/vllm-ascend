@@ -859,6 +859,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             page_size_bytes,
         )
 
+    def reset_cooperative_state(self) -> None:
+        self._last_cooperative_h2d_layer_id = None
+
     def _wait_for_staging_reuse(self, layer_id: int) -> None:
         previous_layer = self._last_cooperative_h2d_layer_id
         if previous_layer is None or previous_layer == layer_id:

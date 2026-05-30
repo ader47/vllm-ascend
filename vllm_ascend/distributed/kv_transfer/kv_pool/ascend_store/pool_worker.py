@@ -527,6 +527,7 @@ class KVPoolWorker:
             self.next_layer_to_submit = 0
             self.submitted_layer_loads.clear()
             self.last_save_layer_to_wait = None
+            self.kv_recv_thread.reset_cooperative_state()
             reset_attention_compute_start_gate()
         if len(metadata.requests) == 0:
             return
