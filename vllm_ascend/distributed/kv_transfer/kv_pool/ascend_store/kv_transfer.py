@@ -843,7 +843,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self._pending_cooperative_wait_for_save: dict[int, int | None] = {}
         self._cooperative_load_stream = torch.npu.Stream()
         self._cooperative_load_events: dict[int, torch.npu.Event] = {}
-        self._h2d_done_npu_events: dict[int, torch.npu.Event] = {}
         self._pending_cooperative_lock = threading.Lock()
         self._last_cooperative_h2d_layer_id: int | None = None
         self.d2d_broadcast_group = d2d_broadcast_group
@@ -1127,10 +1126,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 )
         assert self.d2d_broadcast_group is not None
         group = self.d2d_broadcast_group
-        h2d_done_event = self._h2d_done_npu_events.pop(layer_id, None)
         with torch.npu.stream(self._cooperative_load_stream):
-            if h2d_done_event is not None:
-                self._cooperative_load_stream.wait_event(h2d_done_event)
             for kv_cache, staging_buffers, slot_mapping, block_start, block_end in chunks:
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
@@ -1252,11 +1248,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     block_end,
                 )
             )
-        h2d_done_event = torch.npu.Event()
-        h2d_done_event.record()
         with self._pending_cooperative_lock:
             self._pending_cooperative_loads[req_meta.layer_id] = chunks
-            self._h2d_done_npu_events[req_meta.layer_id] = h2d_done_event
         logger.info(
             "Prepared cooperative H2D layer=%d chunks=%d blocks=%d",
             req_meta.layer_id,
@@ -1334,18 +1327,31 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "
                 logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
                 self.layer_load_finished_events[layer_id].set()
+            else:
+                logger.error("Layerwise %d direct H2D batch_copy failed with return code %d", layer_id, res)
+                self.layer_h2d_finished_events[layer_id].set()
+                self.layer_load_finished_events[layer_id].set()
         elif res == 0:
             with self._pending_cooperative_lock:
                 self._pending_cooperative_wait_for_save[layer_id] = wait_for_save
             assert not self.layer_h2d_finished_events[layer_id].is_set(), f"thread: {layer_id} H2D failed "
             logger.debug(f">>>>>>>>>>>>>>>>>>>> set H2D layer {layer_id}")
             self.layer_h2d_finished_events[layer_id].set()
-        if res != 0:
-            logger.error("Layerwise %d load batch_copy failed with return code %d", layer_id, res)
-        elif layer_id == self.final_layer_id:
-            for req_id, is_last_chunk in zip(req_meta.req_ids, req_meta.is_last_chunks):
-                if is_last_chunk:
-                    self.set_finished_request(req_id)
+            if layer_id == self.final_layer_id:
+                for req_id, is_last_chunk in zip(req_meta.req_ids, req_meta.is_last_chunks):
+                    if is_last_chunk:
+                        self.set_finished_request(req_id)
+        else:
+            logger.error(
+                "Layerwise %d cooperative H2D failed with return code %d, cleaning up pending loads",
+                layer_id,
+                res,
+            )
+            with self._pending_cooperative_lock:
+                self._pending_cooperative_loads.pop(layer_id, None)
+                self._pending_cooperative_wait_for_save.pop(layer_id, None)
+            self.layer_h2d_finished_events[layer_id].set()
+            self.layer_load_finished_events[layer_id].set()
         transfer_tasks.clear()
         self.request_queue.task_done()
         self.get_event.set()
