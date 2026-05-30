@@ -40,6 +40,8 @@ def _resolve_reuse_domain(group_name: str) -> str:
     group_base_name = group_name.split(":")[0]
     if "eplb" in group_base_name or group_base_name == "mc2":
         return group_base_name
+    if "kv_pool_d2d" in group_base_name:
+        return group_base_name
     return "shared"
 
 

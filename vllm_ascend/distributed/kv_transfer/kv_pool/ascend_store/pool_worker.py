@@ -742,12 +742,6 @@ class KVPoolWorker:
 
             self._start_layer_d2d_load(self.current_layer)
 
-        if not self.layer_load_finished_events[self.current_layer].is_set():
-            while not self.layer_load_finished_events[self.current_layer].wait(timeout=2):
-                logger.info("Layerwise %d D2D pending", self.current_layer)
-        self.kv_recv_thread.wait_pending_cooperative_load(self.current_layer)
-        self.submitted_layer_loads.discard(self.current_layer)
-
         target_layer = min(self.num_layers, self.current_layer + self.NUM_PREFETCH_LAYERS)
         for layer_id in range(self.current_layer + 1, target_layer):
             if layer_id not in self.submitted_layer_loads:
@@ -757,6 +751,12 @@ class KVPoolWorker:
             if not self.layer_h2d_finished_events[layer_id].is_set():
                 continue
             self._start_layer_d2d_load(layer_id)
+
+        if not self.layer_load_finished_events[self.current_layer].is_set():
+            while not self.layer_load_finished_events[self.current_layer].wait(timeout=2):
+                logger.info("Layerwise %d D2D pending", self.current_layer)
+        self.kv_recv_thread.wait_pending_cooperative_load(self.current_layer)
+        self.submitted_layer_loads.discard(self.current_layer)
 
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
         layer_id = self.current_layer
