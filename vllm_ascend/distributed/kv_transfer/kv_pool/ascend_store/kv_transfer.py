@@ -1,4 +1,5 @@
 import ctypes
+import logging
 import queue
 import threading
 import time
@@ -828,7 +829,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 tuple[
                     tuple[torch.Tensor, ...],
                     list[torch.Tensor],
-                    np.ndarray,
+                    torch.Tensor,
                     int,
                     int,
                 ]
@@ -850,15 +851,23 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         previous_layer = self._last_cooperative_h2d_layer_id
         if previous_layer is None or previous_layer == layer_id:
             return
-        if not self.layer_load_finished_events[previous_layer].wait(timeout=2):
+        while not self.layer_load_finished_events[previous_layer].wait(timeout=2):
             logger.info(
-                "Layerwise %d H2D timed out waiting for layer %d writeback; continue for profiling",
+                "Layerwise %d H2D waits for layer %d writeback before reusing staging buffer",
                 layer_id,
                 previous_layer,
             )
-        previous_event = self._cooperative_load_events.pop(previous_layer, None)
-        if previous_event is not None:
-            previous_event.synchronize()
+        while True:
+            previous_event = self._cooperative_load_events.pop(previous_layer, None)
+            if previous_event is not None:
+                previous_event.synchronize()
+                return
+            logger.info(
+                "Layerwise %d H2D waits for layer %d writeback event before reusing staging buffer",
+                layer_id,
+                previous_layer,
+            )
+            time.sleep(0.002)
 
     def add_request(  # type: ignore[override]
         self, req_meta: LayerLoadTask
@@ -1066,31 +1075,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self,
         kv_cache: tuple[torch.Tensor, ...],
         local_parts: list[torch.Tensor],
-        block_ids_array: np.ndarray,
+        slot_mapping: torch.Tensor,
     ) -> None:
-        tokens_per_block = local_parts[0].shape[1]
-        if block_ids_array.size > 0:
-            min_block_id = int(block_ids_array.min())
-            max_block_id = int(block_ids_array.max())
-            if min_block_id < 0 or max_block_id >= kv_cache[0].shape[0]:
-                raise RuntimeError(
-                    "KV cache write block id out of range: "
-                    f"min={min_block_id}, max={max_block_id}, "
-                    f"num_blocks={kv_cache[0].shape[0]}"
-                )
-        slot_mapping = self._make_slot_mapping(
-            block_ids_array,
-            tokens_per_block,
-            local_parts[0].device,
-        )
         key = local_parts[0].reshape(-1, *local_parts[0].shape[2:])
         value = local_parts[1].reshape(-1, *local_parts[1].shape[2:])
-        if key.shape[0] != slot_mapping.numel() or value.shape[0] != slot_mapping.numel():
-            raise RuntimeError(
-                "KV cache write shape mismatch: "
-                f"key_rows={key.shape[0]}, value_rows={value.shape[0]}, "
-                f"slot_mapping={slot_mapping.numel()}"
-            )
         DeviceOperator.reshape_and_cache(
             key=key,
             value=value,
@@ -1104,12 +1092,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 -1,
                 local_parts[cache_index].shape[-1],
             )
-            if source.shape[0] != slot_mapping.numel():
-                raise RuntimeError(
-                    "KV cache scatter shape mismatch: "
-                    f"cache_index={cache_index}, source_rows={source.shape[0]}, "
-                    f"slot_mapping={slot_mapping.numel()}"
-                )
             torch_npu.npu_scatter_nd_update_(
                 kv_cache[cache_index].view(-1, source.shape[-1]),
                 slot_mapping.view(-1, 1),
@@ -1139,65 +1121,28 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         assert self.h2d_reader_group is not None
         group = self.h2d_reader_group
         with torch.npu.stream(self._cooperative_load_stream):
-            for kv_cache, staging_buffers, block_ids_array, block_start, block_end in chunks:
-                logger.info(
-                    "D2D broadcast layer=%d chunk=[%d,%d) rank=%d group=%s shape=%s dtype=%s",
-                    layer_id,
-                    block_start,
-                    block_end,
-                    self.h2d_reader_group.rank_in_group,
-                    self.h2d_reader_group.ranks,
-                    tuple(staging_buffers[0].shape),
-                    staging_buffers[0].dtype,
-                )
-                logger.debug(
-                    "Starting H2D broadcast layer=%d chunk=[%d,%d)",
-                    layer_id,
-                    block_start,
-                    block_end,
-                )
-                for cache_index, staging in enumerate(staging_buffers):
+            for kv_cache, staging_buffers, slot_mapping, block_start, block_end in chunks:
+                if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
-                        "Before H2D broadcast layer=%d chunk=[%d,%d) cache=%d "
-                        "rank=%d rank_in_group=%d group=%s shape=%s dtype=%s",
+                        "D2D broadcast layer=%d chunk=[%d,%d) rank=%d group=%s shape=%s dtype=%s",
                         layer_id,
                         block_start,
                         block_end,
-                        cache_index,
-                        self.h2d_reader_group.rank,
                         self.h2d_reader_group.rank_in_group,
                         self.h2d_reader_group.ranks,
-                        tuple(staging.shape),
-                        staging.dtype,
+                        tuple(staging_buffers[0].shape),
+                        staging_buffers[0].dtype,
                     )
-                    logger.info(
-                        "Broadcast small placeholder layer=%d chunk=[%d,%d) cache=%d",
-                        layer_id,
-                        block_start,
-                        block_end,
-                        cache_index,
-                    )
-                    if (self._small_broadcast_tensor is None
-                            or self._small_broadcast_tensor.device != staging.device):
-                        self._small_broadcast_tensor = torch.empty(
-                            1, dtype=torch.int32, device=staging.device)
-                    group.broadcast(self._small_broadcast_tensor, src=0)
-                logger.debug(
-                    "Finished H2D broadcast layer=%d chunk=[%d,%d)",
-                    layer_id,
-                    block_start,
-                    block_end,
-                )
+                staging_device = staging_buffers[0].device
+                if (self._small_broadcast_tensor is None
+                        or self._small_broadcast_tensor.device != staging_device):
+                    self._small_broadcast_tensor = torch.empty(
+                        1, dtype=torch.int32, device=staging_device)
+                group.broadcast(self._small_broadcast_tensor, src=0)
                 self._write_typed_parts_to_kv_cache(
                     kv_cache,
                     staging_buffers,
-                    block_ids_array,
-                )
-                logger.debug(
-                    "Finished H2D writeback layer=%d chunk=[%d,%d)",
-                    layer_id,
-                    block_start,
-                    block_end,
+                    slot_mapping,
                 )
             event = torch.npu.Event()
             event.record(self._cooperative_load_stream)
@@ -1265,6 +1210,15 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         for block_start in range(0, block_count, blocks_per_collective):
             block_end = min(block_start + blocks_per_collective, block_count)
             current_blocks = block_end - block_start
+            current_block_ids = req_meta.block_ids_array[block_start:block_end].copy()
+            min_block_id = int(current_block_ids.min())
+            max_block_id = int(current_block_ids.max())
+            if min_block_id < 0 or max_block_id >= kv_cache[0].shape[0]:
+                raise RuntimeError(
+                    "KV cache write block id out of range: "
+                    f"min={min_block_id}, max={max_block_id}, "
+                    f"num_blocks={kv_cache[0].shape[0]}"
+                )
             staging_buffers = self._get_typed_staging_buffers(
                 kv_cache,
                 current_blocks,
@@ -1283,7 +1237,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 (
                     kv_cache,
                     staging_buffers,
-                    req_meta.block_ids_array[block_start:block_end].copy(),
+                    self._make_slot_mapping(
+                        current_block_ids,
+                        staging_buffers[0].shape[1],
+                        staging_buffers[0].device,
+                    ),
                     block_start,
                     block_end,
                 )
