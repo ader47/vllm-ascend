@@ -1101,14 +1101,16 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     ) -> None:
         sm_max = slot_mapping.max().item()
         sm_min = slot_mapping.min().item()
-        cache_num_blocks = kv_cache[0].shape[0]
-        if sm_max >= cache_num_blocks or sm_min < 0:
+        cache_blocks = kv_cache[0].shape[0]
+        block_size = kv_cache[0].shape[1]
+        cache_slots = cache_blocks * block_size
+        if sm_max >= cache_slots or sm_min < 0:
             logger.error(
-                "slot_mapping out of range! min=%d max=%d cache_blocks=%d slot_mapping_shape=%s",
-                sm_min, sm_max, cache_num_blocks, slot_mapping.shape,
+                "slot_mapping out of range! min=%d max=%d cache_blocks=%d block_size=%d cache_slots=%d sm_shape=%s",
+                sm_min, sm_max, cache_blocks, block_size, cache_slots, slot_mapping.shape,
             )
             raise RuntimeError(
-                f"slot_mapping out of range: min={sm_min} max={sm_max} cache_blocks={cache_num_blocks}"
+                f"slot_mapping out of range: min={sm_min} max={sm_max} cache_blocks={cache_blocks} block_size={block_size}"
             )
         key = local_parts[0].reshape(-1, *local_parts[0].shape[2:])
         value = local_parts[1].reshape(-1, *local_parts[1].shape[2:])
