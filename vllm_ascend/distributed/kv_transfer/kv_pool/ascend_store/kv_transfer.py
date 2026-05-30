@@ -1116,22 +1116,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         assert self.d2d_broadcast_group is not None
         group = self.d2d_broadcast_group
         device_group = group.device_group
-        is_reader = self.h2d_reader_group is not None and self.h2d_reader_group.rank_in_group == 0
         with torch.npu.stream(self._cooperative_load_stream):
             for kv_cache, staging_buffers, slot_mapping, block_start, block_end in chunks:
-                if is_reader:
-                    reqs = []
-                    for dst in range(1, group.world_size):
-                        for staging in staging_buffers:
-                            reqs.append(dist.isend(staging, dst=dst, group=device_group))
-                    for req in reqs:
-                        req.wait()
-                else:
-                    reqs = []
-                    for staging in staging_buffers:
-                        reqs.append(dist.irecv(staging, src=0, group=device_group))
-                    for req in reqs:
-                        req.wait()
+                for staging in staging_buffers:
+                    dist.broadcast(staging, src=0, group=device_group)
                 self._write_typed_parts_to_kv_cache(
                     kv_cache,
                     staging_buffers,
