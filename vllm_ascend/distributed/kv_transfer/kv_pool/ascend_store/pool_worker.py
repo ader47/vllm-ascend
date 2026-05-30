@@ -783,8 +783,7 @@ class KVPoolWorker:
                 self.kv_send_thread.delete_finished_stored_request(req_id)
             self.kv_send_thread.discard_finished_requests(meta.preempted_req_ids)
             if self.use_layerwise:
-                self.kv_send_thread.get_and_clear_finished_requests()
-                done_sending = set(meta.delayed_free_req_ids)
+                done_sending = self.kv_send_thread.get_and_clear_finished_requests(meta.delayed_free_req_ids)
             else:
                 stale_finished_req_ids = finished_req_ids - meta.delayed_free_req_ids
                 self.kv_send_thread.discard_finished_requests(stale_finished_req_ids)
@@ -797,7 +796,6 @@ class KVPoolWorker:
             self.kv_recv_thread.discard_finished_requests(meta.preempted_req_ids)
             if self.load_async:
                 done_recving = self.kv_recv_thread.get_and_clear_finished_requests(meta.loading_req_ids)
-                done_recving |= set(meta.loading_req_ids)
 
         logger.debug(
             "Number of completed KV cache send requests: %d, receive requests: %d, tp_rank:%d",
