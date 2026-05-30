@@ -864,7 +864,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 previous_layer,
             )
         while True:
-            previous_event = self._cooperative_load_events.pop(previous_layer, None)
+            previous_event = self._cooperative_load_events.get(previous_layer, None)
             if previous_event is not None:
                 previous_event.synchronize()
                 return
@@ -1110,20 +1110,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     ) -> bool:
         with self._pending_cooperative_lock:
             chunks = self._pending_cooperative_loads.pop(layer_id, [])
-            wait_for_save = self._pending_cooperative_wait_for_save.pop(layer_id, None)
         if not chunks:
             logger.info("Layerwise %d has no pending cooperative D2D chunks", layer_id)
             if not self.layer_load_finished_events[layer_id].is_set():
                 logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
                 self.layer_load_finished_events[layer_id].set()
             return False
-        if wait_for_save is not None:
-            if not self.layer_save_finished_events[wait_for_save].wait(timeout=2):
-                logger.info(
-                    "Layerwise %d D2D timed out waiting for layer %d save; continue for profiling",
-                    layer_id,
-                    wait_for_save,
-                )
         assert self.d2d_broadcast_group is not None
         group = self.d2d_broadcast_group
         with torch.npu.stream(self._cooperative_load_stream):
@@ -1332,10 +1324,14 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self.layer_h2d_finished_events[layer_id].set()
                 self.layer_load_finished_events[layer_id].set()
         elif res == 0:
-            with self._pending_cooperative_lock:
-                self._pending_cooperative_wait_for_save[layer_id] = wait_for_save
-            assert not self.layer_h2d_finished_events[layer_id].is_set(), f"thread: {layer_id} H2D failed "
-            logger.debug(f">>>>>>>>>>>>>>>>>>>> set H2D layer {layer_id}")
+            if wait_for_save is not None:
+                if not self.layer_save_finished_events[wait_for_save].wait(timeout=2):
+                    logger.info(
+                        "Layerwise %d D2D timed out waiting for layer %d save; continue for profiling",
+                        layer_id,
+                        wait_for_save,
+                    )
+            self.start_pending_cooperative_load(layer_id)
             self.layer_h2d_finished_events[layer_id].set()
             if layer_id == self.final_layer_id:
                 for req_id, is_last_chunk in zip(req_meta.req_ids, req_meta.is_last_chunks):

@@ -733,25 +733,6 @@ class KVPoolWorker:
             self.submitted_layer_loads.discard(self.current_layer)
             return
 
-        d2d_already_started = self.layer_d2d_allowed_events[self.current_layer].is_set()
-        if not d2d_already_started:
-            if not self.layer_h2d_finished_events[self.current_layer].is_set():
-                while not self.layer_h2d_finished_events[self.current_layer].wait(timeout=2):
-                    logger.info("Layerwise %d H2D not ready", self.current_layer)
-            self.layer_h2d_finished_events[self.current_layer].clear()
-
-            self._start_layer_d2d_load(self.current_layer)
-
-        target_layer = min(self.num_layers, self.current_layer + self.NUM_PREFETCH_LAYERS)
-        for layer_id in range(self.current_layer + 1, target_layer):
-            if layer_id not in self.submitted_layer_loads:
-                continue
-            if self.layer_load_finished_events[layer_id].is_set():
-                continue
-            if not self.layer_h2d_finished_events[layer_id].is_set():
-                continue
-            self._start_layer_d2d_load(layer_id)
-
         if not self.layer_load_finished_events[self.current_layer].is_set():
             while not self.layer_load_finished_events[self.current_layer].wait(timeout=2):
                 logger.info("Layerwise %d D2D pending", self.current_layer)
