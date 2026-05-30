@@ -855,6 +855,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
     def _wait_for_staging_reuse(self, layer_id: int) -> None:
         previous_layer = self._last_cooperative_h2d_layer_id
+        logger.info(
+            "Layerwise %d _wait_for_staging_reuse: previous_layer=%s, tp_rank=%d",
+            layer_id, previous_layer, self.tp_rank,
+        )
         if previous_layer is None or previous_layer == layer_id:
             return
         while not self.layer_load_finished_events[previous_layer].wait(timeout=2):
@@ -863,10 +867,26 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 layer_id,
                 previous_layer,
             )
+        logger.info(
+            "Layerwise %d _wait_for_staging_reuse: layer_load_finished_events[%d] is set, tp_rank=%d",
+            layer_id, previous_layer, self.tp_rank,
+        )
         while True:
             previous_event = self._cooperative_load_events.get(previous_layer, None)
+            logger.info(
+                "Layerwise %d _wait_for_staging_reuse: previous_event=%s for layer %d, tp_rank=%d",
+                layer_id, previous_event, previous_layer, self.tp_rank,
+            )
             if previous_event is not None:
+                logger.info(
+                    "Layerwise %d _wait_for_staging_reuse: BEFORE synchronize for layer %d, tp_rank=%d",
+                    layer_id, previous_layer, self.tp_rank,
+                )
                 previous_event.synchronize()
+                logger.info(
+                    "Layerwise %d _wait_for_staging_reuse: AFTER synchronize for layer %d, tp_rank=%d",
+                    layer_id, previous_layer, self.tp_rank,
+                )
                 return
             logger.info(
                 "Layerwise %d H2D waits for layer %d writeback event before reusing staging buffer",
