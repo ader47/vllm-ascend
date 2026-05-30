@@ -667,6 +667,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             num_ranks_per_layer,
             page_size_bytes,
         )
+        self._saved_gvas: set[int] = set()
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -715,29 +716,37 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         addr_array = req_meta.addr_array[rank_start :: self.put_step]
         size_array = req_meta.size_array[rank_start :: self.put_step]
         gvas_array = req_meta.gvas_array[rank_start :: self.put_step]
+        unsaved_mask = np.array([int(g) not in self._saved_gvas for g in gvas_array], dtype=bool)
+        unsaved_count = unsaved_mask.sum()
+        total_count = len(gvas_array)
+        if unsaved_count < total_count:
+            logger.debug(
+                "Layerwise %d save: %d/%d blocks already saved, skipping",
+                layer_id, total_count - unsaved_count, total_count,
+            )
+        if unsaved_count > 0:
+            gvas_array = gvas_array[unsaved_mask]
+            addr_array = addr_array[unsaved_mask]
+            size_array = size_array[unsaved_mask]
         for req_id in req_meta.req_ids:
             self.dec_stored_request(req_id)
-        torch.npu.current_stream().wait_event(self.sync_save_events[layer_id])
-        res = self._batch_copy_with_limits(
-            gvas_array,
-            addr_array,
-            size_array,
-            0,
-            self.max_transfer_blocks,
-            self.max_transfer_bytes,
-        )
-        # wait for KV transfer (PD)
-        # if self.layer_transfer_finished_events is not None:
-        #     is_finish = self.layer_transfer_finished_events[layer_id].wait(timeout=10)  # try---cache
-        #     if not is_finish:
-        #         logger.info(f"Layerwise {layer_id} transfer failed")
-        #     self.layer_transfer_finished_events[layer_id].clear()
-        if res != 0:
-            logger.error("Layerwise %d save batch_copy failed with return code %d", layer_id, res)
-        else:
-            for req_id in req_meta.req_ids:
-                if self.try_finish_and_delete_stored_request(req_id):
-                    self.set_finished_request(req_id)
+        if unsaved_count > 0:
+            torch.npu.current_stream().wait_event(self.sync_save_events[layer_id])
+            res = self._batch_copy_with_limits(
+                gvas_array,
+                addr_array,
+                size_array,
+                0,
+                self.max_transfer_blocks,
+                self.max_transfer_bytes,
+            )
+            if res != 0:
+                logger.error("Layerwise %d save batch_copy failed with return code %d", layer_id, res)
+            else:
+                self._saved_gvas.update(int(g) for g in gvas_array)
+        for req_id in req_meta.req_ids:
+            if self.try_finish_and_delete_stored_request(req_id):
+                self.set_finished_request(req_id)
         assert not self.layer_save_finished_events[layer_id].is_set(), f"thread: {layer_id} save failed "
         logger.debug(f">>>>>>>>>>>>>>>>>>>> set save layer {layer_id}")
         self.layer_save_finished_events[layer_id].set()
@@ -1116,10 +1125,22 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         assert self.d2d_broadcast_group is not None
         group = self.d2d_broadcast_group
         device_group = group.device_group
+        is_reader = self.h2d_reader_group is not None and self.h2d_reader_group.rank_in_group == 0
         with torch.npu.stream(self._cooperative_load_stream):
             for kv_cache, staging_buffers, slot_mapping, block_start, block_end in chunks:
-                for staging in staging_buffers:
-                    dist.broadcast(staging, src=0, group=device_group)
+                if is_reader:
+                    reqs = []
+                    for dst in range(1, group.world_size):
+                        for staging in staging_buffers:
+                            reqs.append(dist.isend(staging, dst=dst, group=device_group))
+                    for req in reqs:
+                        req.wait()
+                else:
+                    reqs = []
+                    for staging in staging_buffers:
+                        reqs.append(dist.irecv(staging, src=0, group=device_group))
+                    for req in reqs:
+                        req.wait()
                 self._write_typed_parts_to_kv_cache(
                     kv_cache,
                     staging_buffers,
