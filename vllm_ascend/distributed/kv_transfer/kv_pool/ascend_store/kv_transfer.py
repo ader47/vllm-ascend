@@ -1295,15 +1295,25 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             res = self._broadcast_h2d_status(res)
             if res != 0:
                 return res
+            slot_mapping = self._make_slot_mapping(
+                        current_block_ids,
+                        staging_buffers[0].shape[1],
+                        staging_buffers[0].device,
+                    )
+            sm_fresh_min = slot_mapping.min().item()
+            sm_fresh_max = slot_mapping.max().item()
+            logger.info(
+                "Layerwise %d FRESH slot_mapping: blocks=%d block_ids[0]=%d block_ids[-1]=%d "
+                "sm=%d..%d sm_shape=%s tp_rank=%d",
+                req_meta.layer_id, current_blocks,
+                int(current_block_ids[0]), int(current_block_ids[-1]),
+                sm_fresh_min, sm_fresh_max, slot_mapping.shape, self.tp_rank,
+            )
             chunks.append(
                 (
                     kv_cache,
                     staging_buffers,
-                    self._make_slot_mapping(
-                        current_block_ids,
-                        staging_buffers[0].shape[1],
-                        staging_buffers[0].device,
-                    ),
+                    slot_mapping,
                     block_start,
                     block_end,
                 )
