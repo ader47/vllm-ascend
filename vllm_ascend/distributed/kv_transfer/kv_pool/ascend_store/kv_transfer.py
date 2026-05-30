@@ -875,6 +875,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         while True:
             previous_event = self._cooperative_load_events.get(previous_layer, None)
             if previous_event is not None:
+                logger.info(
+                    "Layerwise %d wait %d E syn, tp_rank=%d",
+                    layer_id, previous_layer, self.tp_rank,
+                )
                 previous_event.synchronize()
                 return
             logger.info(
@@ -1094,17 +1098,24 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     ) -> None:
         sm_max = slot_mapping.max().item()
         sm_min = slot_mapping.min().item()
-        cache_numel = kv_cache[0].numel()
-        if sm_max >= cache_numel or sm_min < 0:
+        cache_num_blocks = kv_cache[0].shape[0]
+        if sm_max >= cache_num_blocks or sm_min < 0:
             logger.error(
-                "slot_mapping out of range! min=%d max=%d cache_numel=%d slot_mapping_shape=%s",
-                sm_min, sm_max, cache_numel, slot_mapping.shape,
+                "slot_mapping out of range! min=%d max=%d cache_blocks=%d slot_mapping_shape=%s",
+                sm_min, sm_max, cache_num_blocks, slot_mapping.shape,
             )
             raise RuntimeError(
-                f"slot_mapping out of range: min={sm_min} max={sm_max} cache_numel={cache_numel}"
+                f"slot_mapping out of range: min={sm_min} max={sm_max} cache_blocks={cache_num_blocks}"
             )
         key = local_parts[0].reshape(-1, *local_parts[0].shape[2:])
         value = local_parts[1].reshape(-1, *local_parts[1].shape[2:])
+        logger.info(
+            "KV write: kcache=%s vcache=%s stagK=%s stagV=%s "
+            "sm=%d..%d tp_rank=%d",
+            kv_cache[0].shape, kv_cache[1].shape,
+            key.shape, value.shape,
+            sm_min, sm_max, self.tp_rank,
+        )
         DeviceOperator.reshape_and_cache(
             key=key,
             value=value,
