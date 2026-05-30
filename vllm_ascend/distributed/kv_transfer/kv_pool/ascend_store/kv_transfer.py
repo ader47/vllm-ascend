@@ -1092,6 +1092,17 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         local_parts: list[torch.Tensor],
         slot_mapping: torch.Tensor,
     ) -> None:
+        sm_max = slot_mapping.max().item()
+        sm_min = slot_mapping.min().item()
+        cache_numel = kv_cache[0].numel()
+        if sm_max >= cache_numel or sm_min < 0:
+            logger.error(
+                "slot_mapping out of range! min=%d max=%d cache_numel=%d slot_mapping_shape=%s",
+                sm_min, sm_max, cache_numel, slot_mapping.shape,
+            )
+            raise RuntimeError(
+                f"slot_mapping out of range: min={sm_min} max={sm_max} cache_numel={cache_numel}"
+            )
         key = local_parts[0].reshape(-1, *local_parts[0].shape[2:])
         value = local_parts[1].reshape(-1, *local_parts[1].shape[2:])
         DeviceOperator.reshape_and_cache(
@@ -1164,7 +1175,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         event = self._cooperative_load_events.get(layer_id)
         if event is None:
             return
-        self._cooperative_load_stream.synchronize()
+        logger.info(
+            "Layerwise %d waiting cooperative stream synchronize, tp_rank=%d",
+            layer_id, self.tp_rank,
+        )
+        event.synchronize()
 
     def _cooperative_h2d_load(self, req_meta: LayerBatchReqMeta) -> int | None:
         group = self.h2d_reader_group
