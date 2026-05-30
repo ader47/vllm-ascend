@@ -882,7 +882,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     "Layerwise %d _wait_for_staging_reuse: BEFORE synchronize for layer %d, tp_rank=%d",
                     layer_id, previous_layer, self.tp_rank,
                 )
-                previous_event.synchronize()
+                self._cooperative_load_stream.synchronize()
                 logger.info(
                     "Layerwise %d _wait_for_staging_reuse: AFTER synchronize for layer %d, tp_rank=%d",
                     layer_id, previous_layer, self.tp_rank,
