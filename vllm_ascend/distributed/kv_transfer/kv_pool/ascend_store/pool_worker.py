@@ -215,8 +215,6 @@ class KVPoolWorker:
 
         self.layer_load_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
         self.layer_save_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
-        self.layer_h2d_finished_events = None
-        self.layer_d2d_allowed_events = None
         self.layer_load_finished_events = None
         self.layer_save_finished_events = None
         self.layer_transfer_finished_events = None
@@ -381,8 +379,6 @@ class KVPoolWorker:
 
         if self.use_layerwise:
             self.get_event = threading.Event()
-            self.layer_h2d_finished_events = [threading.Event() for i in range(self.num_layers)]
-            self.layer_d2d_allowed_events = [threading.Event() for i in range(self.num_layers)]
             self.layer_load_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.layer_save_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
@@ -429,8 +425,6 @@ class KVPoolWorker:
                 self.page_size_bytes,
                 ready_event,
                 self.get_event,
-                self.layer_h2d_finished_events,
-                self.layer_d2d_allowed_events,
                 self.layer_load_finished_events,
                 self.layer_save_finished_events,
                 self.num_layers,
@@ -688,8 +682,6 @@ class KVPoolWorker:
                     layer_id, self.tp_rank
                 )
                 return False
-            self.layer_h2d_finished_events[layer_id].clear()
-            self.layer_d2d_allowed_events[layer_id].clear()
             self.layer_load_finished_events[layer_id].clear()
             self.kv_recv_thread.add_request(
                 LayerLoadTask(
@@ -713,13 +705,6 @@ class KVPoolWorker:
         reset_attention_compute_start_gate()
         self._submit_ready_layer_loads()
 
-    def _start_layer_d2d_load(self, layer_id: int) -> bool:
-        if self.layer_load_finished_events[layer_id].is_set():
-            return True
-        self.kv_recv_thread.start_pending_cooperative_load(layer_id)
-        self.layer_d2d_allowed_events[layer_id].set()
-        return True
-
     def wait_for_layer_load(self) -> None:
         self.start_layer_h2d_prefetch()
         has_load = self.current_layer in self.submitted_layer_loads or bool(
@@ -727,8 +712,6 @@ class KVPoolWorker:
         )
         if not has_load:
             logger.info("Layerwise %d has no load task, skip H2D/D2D load", self.current_layer)
-            self.layer_h2d_finished_events[self.current_layer].clear()
-            self.layer_d2d_allowed_events[self.current_layer].clear()
             self.layer_load_finished_events[self.current_layer].clear()
             return
 

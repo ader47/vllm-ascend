@@ -761,8 +761,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         page_size_bytes: int,
         ready_event: threading.Event,
         get_event: threading.Event,
-        layer_h2d_finished_events: list[threading.Event],
-        layer_d2d_allowed_events: list[threading.Event],
         layer_load_finished_events: list[threading.Event],
         layer_save_finished_events: list[threading.Event],
         num_layers: int,
@@ -789,8 +787,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             name="KVCacheStoreLayerRecvingThread",
         )
         self.get_event = get_event
-        self.layer_h2d_finished_events = layer_h2d_finished_events
-        self.layer_d2d_allowed_events = layer_d2d_allowed_events
         self.layer_load_finished_events = layer_load_finished_events
         self.layer_save_finished_events = layer_save_finished_events
         self.final_layer_id = num_layers - 1
@@ -1215,10 +1211,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     f"min={min_block_id}, max={max_block_id}, "
                     f"num_blocks={kv_cache[0].shape[0]}"
                 )
-            logger.info(
-                "Layerwise %d BEFORE wait_for_staging_reuse, tp_rank=%d",
-                req_meta.layer_id, self.tp_rank,
-            )
             self._wait_for_staging_reuse(req_meta.layer_id)
             logger.info(
                 "Layerwise %d AFTER wait_for_staging_reuse, tp_rank=%d",
@@ -1235,15 +1227,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 block_start,
                 block_end,
             )
-            logger.info(
-                "Layerwise %d BEFORE broadcast_h2d_status, res=%d, tp_rank=%d",
-                req_meta.layer_id, res, self.tp_rank,
-            )
             res = self._broadcast_h2d_status(res)
-            logger.info(
-                "Layerwise %d AFTER broadcast_h2d_status, res=%d, tp_rank=%d",
-                req_meta.layer_id, res, self.tp_rank,
-            )
             if res != 0:
                 return res
             chunks.append(
@@ -1276,14 +1260,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         wait_for_save = data.wait_for_save_layer
         transfer_tasks = data.transfer_tasks
         layer_id = data.layer_id
-        logger.info(
-            "Layerwise %d RECV_THREAD start processing, tp_rank=%d, rank_in_group=%d",
-            layer_id, self.tp_rank, self.h2d_reader_group.rank_in_group if self.h2d_reader_group else -1
-        )
         if len(transfer_tasks) == 0:
-            assert not self.layer_h2d_finished_events[layer_id].is_set(), f"thread: {layer_id} H2D failed "
-            logger.debug(f">>>>>>>>>>>>>>>>>>>> set H2D layer {layer_id}")
-            self.layer_h2d_finished_events[layer_id].set()
             assert not self.layer_load_finished_events[layer_id].is_set()
             logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
             self.layer_load_finished_events[layer_id].set()
@@ -1294,9 +1271,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             raise ValueError(f"Expected at most one layer transfer task, got {len(transfer_tasks)}")
         req_meta = self.layer_batch_builder.build(transfer_tasks[0])
         if req_meta is None:
-            assert not self.layer_h2d_finished_events[layer_id].is_set(), f"thread: {layer_id} H2D failed "
-            logger.debug(f">>>>>>>>>>>>>>>>>>>> set H2D layer {layer_id}")
-            self.layer_h2d_finished_events[layer_id].set()
             assert not self.layer_load_finished_events[layer_id].is_set()
             logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
             self.layer_load_finished_events[layer_id].set()
@@ -1305,10 +1279,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         layer_id = req_meta.layer_id
 
         res = self._cooperative_h2d_load(req_meta)
-        logger.info(
-    "Layerwise %d H2D done, res=%s, tp_rank=%d",
-    layer_id, res, self.tp_rank
-)
         if res is None:
             if wait_for_save is not None:
                 if not self.layer_save_finished_events[wait_for_save].wait(timeout=2):
@@ -1339,15 +1309,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self.max_transfer_bytes,
             )
             if res == 0:
-                assert not self.layer_h2d_finished_events[layer_id].is_set(), f"thread: {layer_id} H2D failed "
-                logger.debug(f">>>>>>>>>>>>>>>>>>>> set H2D layer {layer_id}")
-                self.layer_h2d_finished_events[layer_id].set()
                 assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "
                 logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
                 self.layer_load_finished_events[layer_id].set()
             else:
                 logger.error("Layerwise %d direct H2D batch_copy failed with return code %d", layer_id, res)
-                self.layer_h2d_finished_events[layer_id].set()
                 self.layer_load_finished_events[layer_id].set()
         elif res == 0:
             if wait_for_save is not None:
@@ -1358,7 +1324,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                         wait_for_save,
                     )
             self.start_pending_cooperative_load(layer_id)
-            self.layer_h2d_finished_events[layer_id].set()
             if layer_id == self.final_layer_id:
                 for req_id, is_last_chunk in zip(req_meta.req_ids, req_meta.is_last_chunks):
                     if is_last_chunk:
@@ -1372,7 +1337,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             with self._pending_cooperative_lock:
                 self._pending_cooperative_loads.pop(layer_id, None)
                 self._pending_cooperative_wait_for_save.pop(layer_id, None)
-            self.layer_h2d_finished_events[layer_id].set()
             self.layer_load_finished_events[layer_id].set()
         transfer_tasks.clear()
         self.request_queue.task_done()
