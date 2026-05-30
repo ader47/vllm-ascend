@@ -1172,6 +1172,13 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                         reqs.append(dist.irecv(staging, src=0, group=device_group))
                     for req in reqs:
                         req.wait()
+                p2p_done = torch.npu.Event()
+                p2p_done.record(self._cooperative_load_stream)
+                p2p_done.synchronize()
+                logger.info(
+                    "Layerwise %d D2D P2P complete OK (before KV cache write), tp_rank=%d",
+                    layer_id, self.tp_rank,
+                )
                 self._write_typed_parts_to_kv_cache(
                     kv_cache,
                     staging_buffers,
