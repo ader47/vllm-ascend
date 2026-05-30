@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch_npu
 
 from vllm.distributed.kv_events import BlockStored
@@ -1118,23 +1119,22 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             return False
         assert self.d2d_broadcast_group is not None
         group = self.d2d_broadcast_group
-        default_stream = torch.npu.current_stream()
-        for kv_cache, staging_buffers, slot_mapping, block_start, block_end in chunks:
-            logger.info(
-                "Layerwise %d BROADCAST START, chunks=%d, tp_rank=%d, rank_in_group=%d, group_ranks=%s",
-                layer_id, len(chunks), self.tp_rank,
-                self.h2d_reader_group.rank_in_group if self.h2d_reader_group else -1,
-                self.d2d_broadcast_group.ranks if self.d2d_broadcast_group else "N/A"
-            )
-            for staging in staging_buffers:
-                group.broadcast(staging, src=0)
-            logger.info(
-                "Layerwise %d BROADCAST DONE, tp_rank=%d",
-                layer_id, self.tp_rank
-            )
+        is_reader = self.h2d_reader_group is not None and self.h2d_reader_group.rank_in_group == 0
         with torch.npu.stream(self._cooperative_load_stream):
-            self._cooperative_load_stream.wait_stream(default_stream)
             for kv_cache, staging_buffers, slot_mapping, block_start, block_end in chunks:
+                if is_reader:
+                    reqs = []
+                    for dst in range(1, group.size()):
+                        for staging in staging_buffers:
+                            reqs.append(dist.isend(staging, dst=dst, group=group))
+                    for req in reqs:
+                        req.wait()
+                else:
+                    reqs = []
+                    for staging in staging_buffers:
+                        reqs.append(dist.irecv(staging, src=0, group=group))
+                    for req in reqs:
+                        req.wait()
                 self._write_typed_parts_to_kv_cache(
                     kv_cache,
                     staging_buffers,
