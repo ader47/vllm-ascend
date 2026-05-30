@@ -1222,7 +1222,15 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     f"min={min_block_id}, max={max_block_id}, "
                     f"num_blocks={kv_cache[0].shape[0]}"
                 )
+            logger.info(
+                "Layerwise %d BEFORE wait_for_staging_reuse, tp_rank=%d",
+                req_meta.layer_id, self.tp_rank,
+            )
             self._wait_for_staging_reuse(req_meta.layer_id)
+            logger.info(
+                "Layerwise %d AFTER wait_for_staging_reuse, tp_rank=%d",
+                req_meta.layer_id, self.tp_rank,
+            )
             staging_buffers = self._get_typed_staging_buffers(
                 kv_cache,
                 current_blocks,
@@ -1234,7 +1242,15 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 block_start,
                 block_end,
             )
+            logger.info(
+                "Layerwise %d BEFORE broadcast_h2d_status, res=%d, tp_rank=%d",
+                req_meta.layer_id, res, self.tp_rank,
+            )
             res = self._broadcast_h2d_status(res)
+            logger.info(
+                "Layerwise %d AFTER broadcast_h2d_status, res=%d, tp_rank=%d",
+                req_meta.layer_id, res, self.tp_rank,
+            )
             if res != 0:
                 return res
             chunks.append(
