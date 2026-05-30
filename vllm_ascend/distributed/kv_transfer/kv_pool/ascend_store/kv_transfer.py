@@ -1152,7 +1152,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         event = self._cooperative_load_events.get(layer_id)
         if event is None:
             return
-        torch.npu.current_stream().wait_event(event)
+        self._cooperative_load_stream.synchronize()
 
     def _cooperative_h2d_load(self, req_meta: LayerBatchReqMeta) -> int | None:
         group = self.h2d_reader_group
