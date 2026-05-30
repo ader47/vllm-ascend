@@ -822,7 +822,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self._h2d_size_scratch_np: np.ndarray | None = None
         self._h2d_block_offsets_scratch_np: np.ndarray | None = None
         self._h2d_base_addrs_scratch_np: np.ndarray | None = None
-        self._small_broadcast_tensor: torch.Tensor | None = None
         self._pending_cooperative_loads: dict[
             int,
             list[
@@ -1133,12 +1132,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                         tuple(staging_buffers[0].shape),
                         staging_buffers[0].dtype,
                     )
-                staging_device = staging_buffers[0].device
-                if (self._small_broadcast_tensor is None
-                        or self._small_broadcast_tensor.device != staging_device):
-                    self._small_broadcast_tensor = torch.empty(
-                        1, dtype=torch.int32, device=staging_device)
-                group.broadcast(self._small_broadcast_tensor, src=0)
+                for staging in staging_buffers:
+                    group.broadcast(staging, src=0)
                 self._write_typed_parts_to_kv_cache(
                     kv_cache,
                     staging_buffers,
