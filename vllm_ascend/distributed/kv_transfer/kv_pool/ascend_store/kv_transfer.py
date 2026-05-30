@@ -861,6 +861,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
     def reset_cooperative_state(self) -> None:
         self._last_cooperative_h2d_layer_id = None
+        self._slot_mapping_cache_key = None
+        self._slot_mapping_cache_value = None
+        self._cooperative_load_stream.synchronize()
 
     def _wait_for_staging_reuse(self, layer_id: int) -> None:
         previous_layer = self._last_cooperative_h2d_layer_id
