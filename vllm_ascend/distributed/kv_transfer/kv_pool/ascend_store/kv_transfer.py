@@ -1201,7 +1201,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             )
             return None
 
-        self._wait_for_staging_reuse(req_meta.layer_id)
         block_count = len(req_meta.block_ids_array)
         blocks_per_collective = min(
             self.h2d_reader_collective_blocks,
@@ -1220,6 +1219,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     f"min={min_block_id}, max={max_block_id}, "
                     f"num_blocks={kv_cache[0].shape[0]}"
                 )
+            self._wait_for_staging_reuse(req_meta.layer_id)
             staging_buffers = self._get_typed_staging_buffers(
                 kv_cache,
                 current_blocks,
@@ -1335,7 +1335,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             assert not self.layer_h2d_finished_events[layer_id].is_set(), f"thread: {layer_id} H2D failed "
             logger.debug(f">>>>>>>>>>>>>>>>>>>> set H2D layer {layer_id}")
             self.layer_h2d_finished_events[layer_id].set()
-            self.start_pending_cooperative_load(layer_id)
         if res != 0:
             logger.error("Layerwise %d load batch_copy failed with return code %d", layer_id, res)
         elif layer_id == self.final_layer_id:

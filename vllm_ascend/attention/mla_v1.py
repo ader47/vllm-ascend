@@ -1669,8 +1669,6 @@ class AscendMLAImpl(MLAAttentionImpl):
         o_proj_input_shape = (_EXTRA_CTX.num_tokens, self.num_heads * self.v_head_dim)
         o_proj_input = torch.empty(o_proj_input_shape, dtype=hidden_states.dtype, device=hidden_states.device)
 
-        wait_for_kv_layer_from_connector(layer_name)
-
         # MLA Preprocess
         if self.fa_quant_layer or (self.enable_mlapo and attn_metadata.num_decode_tokens <= MLAPO_MAX_SUPPORTED_TOKENS):
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
@@ -1683,6 +1681,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
                 layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv
             )
+
+        wait_for_kv_layer_from_connector(layer_name)
+
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
             # TODO prefill kv offload need to remove

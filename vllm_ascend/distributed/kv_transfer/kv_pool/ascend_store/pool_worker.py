@@ -709,15 +709,11 @@ class KVPoolWorker:
         reset_attention_compute_start_gate()
         self._submit_ready_layer_loads()
 
-    def _start_layer_d2d_load(self, layer_id: int, wait_for_h2d: bool) -> bool:
+    def _start_layer_d2d_load(self, layer_id: int) -> bool:
         if self.layer_load_finished_events[layer_id].is_set():
             return True
-        if not self.layer_h2d_finished_events[layer_id].is_set():
-            if not wait_for_h2d:
-                return False
-            while not self.layer_h2d_finished_events[layer_id].wait(timeout=2):
-                logger.info("Layerwise %d H2D not ready", layer_id)
-        self.layer_h2d_finished_events[layer_id].clear()
+        self.kv_recv_thread.start_pending_cooperative_load(layer_id)
+        self.layer_d2d_allowed_events[layer_id].set()
         return True
 
     def wait_for_layer_load(self) -> None:
@@ -731,17 +727,36 @@ class KVPoolWorker:
             self.layer_d2d_allowed_events[self.current_layer].clear()
             self.layer_load_finished_events[self.current_layer].clear()
             return
-        self._start_layer_d2d_load(self.current_layer, wait_for_h2d=True)
+
+        if self.layer_load_finished_events[self.current_layer].is_set():
+            self.kv_recv_thread.wait_pending_cooperative_load(self.current_layer)
+            self.submitted_layer_loads.discard(self.current_layer)
+            return
+
+        d2d_already_started = self.layer_d2d_allowed_events[self.current_layer].is_set()
+        if not d2d_already_started:
+            if not self.layer_h2d_finished_events[self.current_layer].is_set():
+                while not self.layer_h2d_finished_events[self.current_layer].wait(timeout=2):
+                    logger.info("Layerwise %d H2D not ready", self.current_layer)
+            self.layer_h2d_finished_events[self.current_layer].clear()
+
+            self._start_layer_d2d_load(self.current_layer)
+
         if not self.layer_load_finished_events[self.current_layer].is_set():
             while not self.layer_load_finished_events[self.current_layer].wait(timeout=2):
                 logger.info("Layerwise %d D2D pending", self.current_layer)
         self.kv_recv_thread.wait_pending_cooperative_load(self.current_layer)
         self.submitted_layer_loads.discard(self.current_layer)
+
         target_layer = min(self.num_layers, self.current_layer + self.NUM_PREFETCH_LAYERS)
         for layer_id in range(self.current_layer + 1, target_layer):
             if layer_id not in self.submitted_layer_loads:
                 continue
-            self._start_layer_d2d_load(layer_id, wait_for_h2d=False)
+            if self.layer_load_finished_events[layer_id].is_set():
+                continue
+            if not self.layer_h2d_finished_events[layer_id].is_set():
+                continue
+            self._start_layer_d2d_load(layer_id)
 
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
         layer_id = self.current_layer
