@@ -806,6 +806,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.h2d_reader_group = h2d_reader_group
         self.h2d_reader_count = max(0, h2d_reader_count)
         self.h2d_reader_collective_blocks = max(1, h2d_reader_collective_blocks)
+        self._h2d_broadcast_cpu_group = (
+            torch.distributed.new_group(h2d_reader_group.ranks, backend="gloo")
+            if h2d_reader_group is not None
+            else None
+        )
         self._block_lens_np = np.asarray(token_database.block_len, dtype=np.int64)
         self._block_inner_offsets_np = np.concatenate(
             (
@@ -1033,13 +1038,13 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         )
 
     def _broadcast_h2d_status(self, res: int) -> int:
-        assert self.h2d_reader_group is not None
+        assert self._h2d_broadcast_cpu_group is not None
         status = self._h2d_status_tensor
         status[0] = res
         torch.distributed.broadcast(
             status,
             src=self.h2d_reader_group.ranks[0],
-            group=self.h2d_reader_group.cpu_group,
+            group=self._h2d_broadcast_cpu_group,
         )
         return int(status.item())
 
