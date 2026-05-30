@@ -1131,8 +1131,18 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                         tuple(staging_buffers[0].shape),
                         staging_buffers[0].dtype,
                     )
+                logger.info(
+                    "Layerwise %d BROADCAST START, chunks=%d, tp_rank=%d, rank_in_group=%d, group_ranks=%s",
+                    layer_id, len(chunks), self.tp_rank,
+                    self.h2d_reader_group.rank_in_group if self.h2d_reader_group else -1,
+                    self.d2d_broadcast_group.ranks if self.d2d_broadcast_group else "N/A"
+                )
                 for staging in staging_buffers:
                     group.broadcast(staging, src=0)
+                logger.info(
+                    "Layerwise %d BROADCAST DONE, tp_rank=%d",
+                    layer_id, self.tp_rank
+                )
                 self._write_typed_parts_to_kv_cache(
                     kv_cache,
                     staging_buffers,
@@ -1257,7 +1267,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         wait_for_save = data.wait_for_save_layer
         transfer_tasks = data.transfer_tasks
         layer_id = data.layer_id
-
+        logger.info(
+            "Layerwise %d RECV_THREAD start processing, tp_rank=%d, rank_in_group=%d",
+            layer_id, self.tp_rank, self.h2d_reader_group.rank_in_group if self.h2d_reader_group else -1
+        )
         if len(transfer_tasks) == 0:
             assert not self.layer_h2d_finished_events[layer_id].is_set(), f"thread: {layer_id} H2D failed "
             logger.debug(f">>>>>>>>>>>>>>>>>>>> set H2D layer {layer_id}")
@@ -1283,6 +1296,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         layer_id = req_meta.layer_id
 
         res = self._cooperative_h2d_load(req_meta)
+        logger.info(
+    "Layerwise %d H2D done, res=%s, tp_rank=%d",
+    layer_id, res, self.tp_rank
+)
         if res is None:
             if wait_for_save is not None:
                 if not self.layer_save_finished_events[wait_for_save].wait(timeout=2):

@@ -683,7 +683,16 @@ class KVPoolWorker:
 
         def submit_layer_load(layer_id: int) -> bool:
             if not self.layer_load_tasks[layer_id]:
+                logger.warning(
+                    "Layerwise %d SKIP submit: layer_load_tasks is empty, tp_rank=%d",
+                    layer_id, self.tp_rank
+                )
                 return False
+            # ... 原有逻辑
+            logger.info(
+                "Layerwise %d SUBMITTED to recv thread, tp_rank=%d, wait_for_save=%s",
+                layer_id, self.tp_rank, self.prefetch_layer_map.get(layer_id)
+            )
             self.layer_h2d_finished_events[layer_id].clear()
             self.layer_d2d_allowed_events[layer_id].clear()
             self.layer_load_finished_events[layer_id].clear()
