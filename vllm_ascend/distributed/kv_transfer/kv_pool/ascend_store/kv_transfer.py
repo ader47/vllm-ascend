@@ -1140,8 +1140,25 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         group = self.d2d_broadcast_group
         device_group = group.device_group
         is_reader = self.h2d_reader_group is not None and self.h2d_reader_group.rank_in_group == 0
+        logger.info(
+            "Layerwise %d cooperative D2D start: is_reader=%s world_size=%d rank_in_group=%d "
+            "chunks=%d staging_buffers=%d tp_rank=%d",
+            layer_id, is_reader, group.world_size,
+            group.rank_in_group if group is not None else -1,
+            len(chunks),
+            len(chunks[0][1]) if chunks else 0,
+            self.tp_rank,
+        )
         with torch.npu.stream(self._cooperative_load_stream):
             for kv_cache, staging_buffers, slot_mapping, block_start, block_end in chunks:
+                for si, staging in enumerate(staging_buffers):
+                    logger.info(
+                        "Layerwise %d D2D chunk: block[%d:%d] staging[%d] "
+                        "shape=%s dtype=%s device=%s numel=%d tp_rank=%d",
+                        layer_id, block_start, block_end, si,
+                        staging.shape, staging.dtype, staging.device,
+                        staging.numel(), self.tp_rank,
+                    )
                 if is_reader:
                     reqs = []
                     for dst in range(1, group.world_size):
