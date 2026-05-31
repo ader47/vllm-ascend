@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
@@ -766,6 +767,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         h2d_stagger_max_us: int = 0,
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
+        p2p_enabled: bool = False,
+        tp_group: dist.ProcessGroup | None = None,
+        layer_kv_caches: list | None = None,
     ):
         super().__init__(
             m_store,
@@ -787,6 +791,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.h2d_stagger_max_us = h2d_stagger_max_us
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
+        self.p2p_enabled = p2p_enabled
+        self.tp_group = tp_group
+        self.layer_kv_caches = layer_kv_caches
         self.layer_batch_builder = LayerBatchBuilder(
             token_database,
             my_key_index,
@@ -817,6 +824,88 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         delay_us = self._get_h2d_stagger_delay_us(layer_id, num_addrs)
         if delay_us > 0:
             time.sleep(delay_us / 1_000_000)
+
+    def _do_p2p_load(self, req_meta: LayerBatchReqMeta, layer_id: int) -> None:
+        full_gvas = req_meta.gvas_array
+        full_addrs = req_meta.addr_array
+        full_sizes = req_meta.size_array
+
+        total_entries = len(full_sizes)
+        total_bytes = int(full_sizes.sum())
+
+        cumsum_sizes = full_sizes.cumsum(dtype=np.int64)
+        h2d_byte_starts = np.concatenate(
+            (np.zeros(1, dtype=np.int64), cumsum_sizes[:-1])
+        )
+
+        if self.tp_rank == 0:
+            h2d_buffer = torch.empty(total_bytes, dtype=torch.uint8, device="npu")
+            h2d_temp_addrs = h2d_byte_starts + h2d_buffer.data_ptr()
+
+            self._stagger_h2d_submit(layer_id, len(full_gvas))
+            res = self._batch_copy_with_limits(
+                full_gvas, h2d_temp_addrs, full_sizes, 1,
+                self.max_transfer_blocks, self.max_transfer_bytes,
+            )
+            if res != 0:
+                logger.error("Layerwise %d P2P H2D batch_copy failed with return code %d", layer_id, res)
+            else:
+                self._scatter_buffer_to_kv(h2d_buffer, full_addrs, full_sizes,
+                                           0, total_entries, layer_id)
+
+            handles = []
+            for r in range(1, self.tp_size):
+                handles.append(dist.isend(h2d_buffer, dst=r, group=self.tp_group))
+            for h in handles:
+                h.wait()
+        else:
+            recv_buffer = torch.empty(total_bytes, dtype=torch.uint8, device="npu")
+            recv_handle = dist.irecv(recv_buffer, src=0, group=self.tp_group)
+            recv_handle.wait()
+            self._scatter_buffer_to_kv(recv_buffer, full_addrs, full_sizes,
+                                       0, total_entries, layer_id)
+
+        p2p_done_event = torch.npu.Event()
+        p2p_done_event.record()
+        p2p_done_event.synchronize()
+
+        if layer_id == self.final_layer_id:
+            for req_id, is_last_chunk in zip(req_meta.req_ids,
+                                             req_meta.is_last_chunks):
+                if is_last_chunk:
+                    self.set_finished_request(req_id)
+
+    def _scatter_buffer_to_kv(self, buffer, addrs, sizes, start, end, layer_id):
+        num_sub = self.num_addrs_per_block
+        assert (end - start) % num_sub == 0, (
+            f"scatter_buffer_to_kv: entries {end - start} not divisible by "
+            f"num_addrs_per_block {num_sub}")
+        num_blocks = (end - start) // num_sub
+        if num_blocks == 0:
+            return
+
+        byte_starts = sizes.cumsum(dtype=np.int64)
+        byte_starts = np.concatenate((np.zeros(1, dtype=np.int64), byte_starts[:-1]))
+
+        addrs_2d = addrs[start:end].reshape(num_blocks, num_sub).T
+        sizes_2d = sizes[start:end].reshape(num_blocks, num_sub).T
+        offs_2d = byte_starts[start:end].reshape(num_blocks, num_sub).T
+
+        base_offset = layer_id * num_sub
+        base_2d = self.layer_batch_builder._kv_caches_base_addr_np[
+            base_offset:base_offset + num_sub, None]
+        blen_2d = self.layer_batch_builder._block_len_np[:num_sub, None]
+
+        blk_2d = (addrs_2d - base_2d) // blen_2d
+        dst_2d = base_2d + blk_2d * blen_2d
+        src_2d = buffer.data_ptr() + offs_2d
+
+        torch.ops._C_ascend.swap_blocks_batch(
+            torch.from_numpy(src_2d.ravel(order='F')),
+            torch.from_numpy(dst_2d.ravel(order='F')),
+            torch.from_numpy(sizes_2d.ravel(order='F')),
+            2,
+        )
 
     def _handle_request(  # type: ignore[override]
         self, data: LayerLoadTask
@@ -859,34 +948,37 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             while not attention_start_gate.wait(timeout=10):
                 logger.info("Layerwise %d load waits for attention compute start", layer_id)
 
-        gvas_array = _circular_shift_array(
-            req_meta.gvas_array,
-            (self.tp_rank * len(req_meta.gvas_array)) // self.tp_size,
-        )
-        addr_array = _circular_shift_array(
-            req_meta.addr_array,
-            (self.tp_rank * len(req_meta.addr_array)) // self.tp_size,
-        )
-        size_array = _circular_shift_array(
-            req_meta.size_array,
-            (self.tp_rank * len(req_meta.size_array)) // self.tp_size,
-        )
-        self._stagger_h2d_submit(layer_id, len(gvas_array))
-        res = self._batch_copy_with_limits(
-            gvas_array,
-            addr_array,
-            size_array,
-            1,
-            self.max_transfer_blocks,
-            self.max_transfer_bytes,
-        )
-        if res != 0:
-            logger.error("Layerwise %d load batch_copy failed with return code %d", layer_id, res)
-        elif layer_id == self.final_layer_id:
-            for req_id, is_last_chunk in zip(req_meta.req_ids,
-                                             req_meta.is_last_chunks):
-                if is_last_chunk:
-                    self.set_finished_request(req_id)
+        if self.p2p_enabled and self.tp_size > 1:
+            self._do_p2p_load(req_meta, layer_id)
+        else:
+            gvas_array = _circular_shift_array(
+                req_meta.gvas_array,
+                (self.tp_rank * len(req_meta.gvas_array)) // self.tp_size,
+            )
+            addr_array = _circular_shift_array(
+                req_meta.addr_array,
+                (self.tp_rank * len(req_meta.addr_array)) // self.tp_size,
+            )
+            size_array = _circular_shift_array(
+                req_meta.size_array,
+                (self.tp_rank * len(req_meta.size_array)) // self.tp_size,
+            )
+            self._stagger_h2d_submit(layer_id, len(gvas_array))
+            res = self._batch_copy_with_limits(
+                gvas_array,
+                addr_array,
+                size_array,
+                1,
+                self.max_transfer_blocks,
+                self.max_transfer_bytes,
+            )
+            if res != 0:
+                logger.error("Layerwise %d load batch_copy failed with return code %d", layer_id, res)
+            elif layer_id == self.final_layer_id:
+                for req_id, is_last_chunk in zip(req_meta.req_ids,
+                                                 req_meta.is_last_chunks):
+                    if is_last_chunk:
+                        self.set_finished_request(req_id)
         assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "
         logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
         self.layer_load_finished_events[layer_id].set()

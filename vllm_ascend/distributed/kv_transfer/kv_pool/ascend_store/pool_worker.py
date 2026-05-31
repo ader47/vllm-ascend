@@ -12,6 +12,7 @@ from vllm.distributed import (
     get_pcp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
@@ -200,6 +201,7 @@ class KVPoolWorker:
         self._backend_initialized = False
         self._buffers_registered = False
         self._transfer_threads_started = False
+        self.layer_kv_caches: list = []
 
         self.layer_load_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
         self.layer_save_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
@@ -316,6 +318,7 @@ class KVPoolWorker:
                     "layerwise send",
                 )
             ready_event = threading.Event()
+            p2p_enabled = self.tp_size > 1 and self.put_step > 1
             self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
                 self.m_store,
                 self.token_database,
@@ -337,6 +340,9 @@ class KVPoolWorker:
                 self.h2d_stagger_max_us,
                 self.layerwise_max_transfer_blocks,
                 self.layerwise_max_transfer_bytes,
+                p2p_enabled=p2p_enabled,
+                tp_group=get_tp_group().device_group if p2p_enabled else None,
+                layer_kv_caches=self.layer_kv_caches if p2p_enabled else None,
             )
             self.kv_recv_thread.start()
             ready_event.wait()
@@ -397,11 +403,13 @@ class KVPoolWorker:
             first_kv_cache.shape,
         )
 
+        self.layer_kv_caches = []
         self.kv_caches_base_addr = []
         ptrs = []
         lengths = []
         length = len(self.block_len)
         for cache_or_caches in kv_caches.values():
+            self.layer_kv_caches.append(cache_or_caches)
             for i, cache in enumerate(cache_or_caches, 0):
                 base_addr = cache.data_ptr()
                 if base_addr not in self.kv_caches_base_addr:
