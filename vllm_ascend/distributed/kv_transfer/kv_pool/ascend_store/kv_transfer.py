@@ -874,21 +874,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         if self.transfer_stream is None:
             self.transfer_stream = torch.npu.Stream()
         with torch.npu.stream(self.transfer_stream):
-            if self.tp_rank == 0:
-                if h2d_ok:
-                    self._scatter_buffer_to_kv(buffer, addrs, sizes,
-                                               start, end, meta_layer_id)
-                handles = []
-                for r in range(1, self.tp_size):
-                    handles.append(dist.isend(buffer, dst=r, group=self.tp_device_group))
-                for h in handles:
-                    h.wait()
-            else:
-                recv_handle = dist.irecv(buffer, src=0, group=self.tp_device_group)
-                recv_handle.wait()
-                if h2d_ok:
-                    self._scatter_buffer_to_kv(buffer, addrs, sizes,
-                                               start, end, meta_layer_id)
+            dist.broadcast(buffer, src=0, group=self.tp_device_group)
+            if h2d_ok:
+                self._scatter_buffer_to_kv(buffer, addrs, sizes,
+                                           start, end, meta_layer_id)
         p2p_done_event = torch.npu.Event()
         p2p_done_event.record(self.transfer_stream)
         p2p_done_event.synchronize()
