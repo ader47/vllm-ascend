@@ -909,31 +909,20 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         blen_2d = self.layer_batch_builder._block_len_np[:num_sub, None]
 
         blk_2d = (addrs_2d - base_2d) // blen_2d
-        dst_2d = base_2d + blk_2d * blen_2d
-        src_2d = buffer.data_ptr() + offs_2d
+        elem_size = self.layer_kv_caches[layer_id][0].element_size()
+        tensors = self.layer_kv_caches[layer_id]
+        buffer_flat = buffer.view(tensors[0].dtype)
 
-        try:
-            torch.ops._C_ascend.swap_blocks_batch(
-                torch.from_numpy(src_2d.ravel(order='F')),
-                torch.from_numpy(dst_2d.ravel(order='F')),
-                torch.from_numpy(sizes_2d.ravel(order='F')),
-                2,
-            )
-        except AttributeError:
-            elem_size = self.layer_kv_caches[layer_id][0].element_size()
-            tensors = self.layer_kv_caches[layer_id]
-            buffer_flat = buffer.view(tensors[0].dtype)
-
-            for j in range(num_sub):
-                for b in range(num_blocks):
-                    block_idx = int(blk_2d[j, b])
-                    off = int(offs_2d[j, b])
-                    sz = int(sizes_2d[j, b])
-                    if sz == 0:
-                        continue
-                    elems = sz // elem_size
-                    tensors[j][block_idx].view(-1)[:elems].copy_(
-                        buffer_flat[off // elem_size:off // elem_size + elems])
+        for j in range(num_sub):
+            for b in range(num_blocks):
+                block_idx = int(blk_2d[j, b])
+                off = int(offs_2d[j, b])
+                sz = int(sizes_2d[j, b])
+                if sz == 0:
+                    continue
+                elems = sz // elem_size
+                tensors[j][block_idx].view(-1)[:elems].copy_(
+                    buffer_flat[off // elem_size:off // elem_size + elems])
 
     def _handle_request(  # type: ignore[override]
         self, data: LayerLoadTask
