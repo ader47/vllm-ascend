@@ -3,7 +3,6 @@ import math
 import threading
 
 import torch
-import torch.distributed as dist
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -14,6 +13,8 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    get_world_group,
+    init_model_parallel_group,
 )
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
@@ -225,6 +226,7 @@ class KVPoolWorker:
         self.prefetch_layer_map = layerwise_config.prefetch_layer_map
         self.sync_save_events = None
         self.p2p_enabled = self.tp_size > 1 and self.put_step > 1
+        self.p2p_group = None
         self.p2p_device_group = None
 
     def _bind_kv_transfer_thread(
@@ -318,11 +320,18 @@ class KVPoolWorker:
                     "layerwise send",
                 )
             if self.p2p_enabled:
-                # Create a dedicated HCCL communicator for P2P to avoid
-                # interference with TP collectives (all-reduce) that share
-                # the same HCCL communicator across different streams.
-                tp_ranks = get_tp_group().ranks
-                self.p2p_device_group = dist.new_group(tp_ranks, backend="hccl")
+                # Keep P2P KV traffic on a dedicated HCCL communicator so it
+                # does not share the TP collective communicator across streams.
+                tp_group = get_tp_group()
+                backend = torch.distributed.get_backend(tp_group.device_group)
+                self.p2p_group = init_model_parallel_group(
+                    [tp_group.ranks],
+                    get_world_group().local_rank,
+                    backend,
+                    group_name="p2p_kv",
+                    use_device_communicator=False,
+                )
+                self.p2p_device_group = self.p2p_group.device_group
             ready_event = threading.Event()
             self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
                 self.m_store,
@@ -608,12 +617,7 @@ class KVPoolWorker:
         should_wait = self.layer_load_submitted[self.current_layer]
         if not should_wait:
             self.layer_load_finished_events[self.current_layer].clear()
-            if self.p2p_enabled:
-                self.kv_recv_thread.p2p_ready_events[self.current_layer].clear()
             return
-        if self.p2p_enabled:
-            self.kv_recv_thread.p2p_ready_events[self.current_layer].wait()
-            self.kv_recv_thread._broadcast_p2p_layer(self.current_layer)
         is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=10)
         if not is_finish:
             logger.info("Layerwise %d load wait timed out", self.current_layer)

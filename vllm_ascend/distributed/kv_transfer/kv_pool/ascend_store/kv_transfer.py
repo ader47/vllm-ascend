@@ -796,7 +796,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.tp_device_group = tp_device_group
         self.layer_kv_caches = layer_kv_caches
         self.transfer_stream: torch.npu.Stream | None = None
-        self.p2p_ready_events: list[threading.Event] = [threading.Event() for _ in range(num_layers)]
         self.p2p_pending: dict[int, tuple] = {}
         self.layer_batch_builder = LayerBatchBuilder(
             token_database,
@@ -860,12 +859,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.p2p_pending[layer_id] = (
             buffer, full_addrs, full_sizes, 0, total_entries, layer_id,
             h2d_ok, req_meta.req_ids, req_meta.is_last_chunks)
-        self.p2p_ready_events[layer_id].set()
+        self._broadcast_p2p_layer(layer_id)
 
     def _broadcast_p2p_layer(self, layer_id: int) -> None:
         pending = self.p2p_pending.pop(layer_id, None)
         if pending is None:
-            self.p2p_ready_events[layer_id].clear()
             return
         buffer, addrs, sizes, start, end, meta_layer_id, h2d_ok = pending[:7]
         req_ids, is_last_chunks = pending[7], pending[8]
@@ -881,7 +879,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         p2p_done_event = torch.npu.Event()
         p2p_done_event.record(self.transfer_stream)
         p2p_done_event.synchronize()
-        self.p2p_ready_events[layer_id].clear()
         if layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_ids, is_last_chunks):
                 if is_last_chunk:
@@ -962,7 +959,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             if len(transfer_tasks) == 0:
                 logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
                 self.layer_load_finished_events[layer_id].set()
-                self.p2p_ready_events[layer_id].set()
                 self.request_queue.task_done()
                 return
 
@@ -972,7 +968,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             if req_meta is None:
                 logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
                 self.layer_load_finished_events[layer_id].set()
-                self.p2p_ready_events[layer_id].set()
                 self.request_queue.task_done()
                 return
 
