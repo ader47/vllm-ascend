@@ -865,6 +865,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     def _broadcast_p2p_layer(self, layer_id: int) -> None:
         pending = self.p2p_pending.pop(layer_id, None)
         if pending is None:
+            self.p2p_ready_events[layer_id].clear()
             return
         buffer, addrs, sizes, start, end, meta_layer_id, h2d_ok = pending[:7]
         req_ids, is_last_chunks = pending[7], pending[8]

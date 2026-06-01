@@ -201,6 +201,7 @@ class KVPoolWorker:
         self.layer_kv_caches: list = []
 
         self.layer_load_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
+        self.layer_load_submitted = [False for i in range(self.num_layers)]
         self.layer_save_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
         self.layer_load_finished_events = None
         self.layer_save_finished_events = None
@@ -435,6 +436,7 @@ class KVPoolWorker:
         self.current_layer = 0
         if self.use_layerwise:
             self.next_layer_to_submit = 0
+            self.layer_load_submitted = [False for i in range(self.num_layers)]
         if len(metadata.requests) == 0:
             return
         if self.use_layerwise:
@@ -589,6 +591,7 @@ class KVPoolWorker:
                     layer_id=layer_id,
                 )
             )
+            self.layer_load_submitted[layer_id] = True
             return True
 
         submit_count = self.NUM_PREFETCH_LAYERS if self.current_layer == 0 else 1
@@ -602,19 +605,21 @@ class KVPoolWorker:
 
     def wait_for_layer_load(self) -> None:
         self._submit_ready_layer_loads()
+        should_wait = self.layer_load_submitted[self.current_layer]
+        if not should_wait:
+            self.layer_load_finished_events[self.current_layer].clear()
+            if self.p2p_enabled:
+                self.kv_recv_thread.p2p_ready_events[self.current_layer].clear()
+            return
         if self.p2p_enabled:
             self.kv_recv_thread.p2p_ready_events[self.current_layer].wait()
             self.kv_recv_thread._broadcast_p2p_layer(self.current_layer)
-        else:
-            should_wait = bool(self.layer_load_tasks[self.current_layer])
-            if not should_wait:
-                self.layer_load_finished_events[self.current_layer].clear()
-                return
         is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=10)
         if not is_finish:
             logger.info("Layerwise %d load wait timed out", self.current_layer)
         logger.debug(f">>>>>>>>>>>>>>>>>>>> clear load layer {self.current_layer}")
         self.layer_load_finished_events[self.current_layer].clear()
+        self.layer_load_submitted[self.current_layer] = False
 
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
         # Wait for KV cache saving to complete on the final layer that requires offloading.
