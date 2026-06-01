@@ -843,9 +843,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             (np.zeros(1, dtype=np.int64), cumsum_sizes[:-1])
         )
 
-        if self.transfer_stream is None:
-            self.transfer_stream = torch.npu.Stream()
-
         h2d_ok = True
         buffer = torch.empty(total_bytes, dtype=torch.uint8, device="npu")
 
@@ -873,12 +870,24 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         req_ids, is_last_chunks = pending[7], pending[8]
 
         torch.npu.set_device(self.tp_rank)
+        if self.transfer_stream is None:
+            self.transfer_stream = torch.npu.Stream()
         with torch.npu.stream(self.transfer_stream):
-            dist.broadcast(buffer, src=0, group=self.tp_device_group)
-            if h2d_ok:
-                self._scatter_buffer_to_kv(buffer, addrs, sizes,
-                                           start, end, meta_layer_id)
-
+            if self.tp_rank == 0:
+                if h2d_ok:
+                    self._scatter_buffer_to_kv(buffer, addrs, sizes,
+                                               start, end, meta_layer_id)
+                handles = []
+                for r in range(1, self.tp_size):
+                    handles.append(dist.isend(buffer, dst=r, group=self.tp_device_group))
+                for h in handles:
+                    h.wait()
+            else:
+                recv_handle = dist.irecv(buffer, src=0, group=self.tp_device_group)
+                recv_handle.wait()
+                if h2d_ok:
+                    self._scatter_buffer_to_kv(buffer, addrs, sizes,
+                                               start, end, meta_layer_id)
         p2p_done_event = torch.npu.Event()
         p2p_done_event.record(self.transfer_stream)
         p2p_done_event.synchronize()
@@ -952,12 +961,39 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         transfer_tasks = data.transfer_tasks
         layer_id = data.layer_id
 
+        if wait_for_save is not None:
+            logger.info("Layerwise %d load waiting for save layer %d", layer_id, wait_for_save)
+            while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
+                logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
+            logger.debug(f">>>>>>>>>>>>>>>>>>>> clear save layer {wait_for_save}")
+            self.layer_save_finished_events[wait_for_save].clear()
+
+        if self.p2p_enabled and self.tp_size > 1:
+            if len(transfer_tasks) == 0:
+                logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
+                self.layer_load_finished_events[layer_id].set()
+                self.p2p_ready_events[layer_id].set()
+                self.request_queue.task_done()
+                return
+
+            if len(transfer_tasks) > 1:
+                raise ValueError(f"Expected at most one layer transfer task, got {len(transfer_tasks)}")
+            req_meta = self.layer_batch_builder.build(transfer_tasks[0])
+            if req_meta is None:
+                logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
+                self.layer_load_finished_events[layer_id].set()
+                self.p2p_ready_events[layer_id].set()
+                self.request_queue.task_done()
+                return
+
+            layer_id = req_meta.layer_id
+            self._do_p2p_load(req_meta, layer_id)
+            transfer_tasks.clear()
+            self.request_queue.task_done()
+            self.get_event.set()
+            return
+
         if len(transfer_tasks) == 0:
-            if wait_for_save is not None:
-                while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
-                    logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
-                logger.debug(f">>>>>>>>>>>>>>>>>>>> clear save layer {wait_for_save}")
-                self.layer_save_finished_events[wait_for_save].clear()
             assert not self.layer_load_finished_events[layer_id].is_set()
             logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
             self.layer_load_finished_events[layer_id].set()
@@ -974,49 +1010,34 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self.request_queue.task_done()
             return
         layer_id = req_meta.layer_id
-
-        if wait_for_save is not None:
-            logger.info("Layerwise %d load waiting for save layer %d", layer_id, wait_for_save)
-            while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
-                logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
-            logger.debug(f">>>>>>>>>>>>>>>>>>>> clear save layer {wait_for_save}")
-            self.layer_save_finished_events[wait_for_save].clear()
-
-        if self.p2p_enabled and self.tp_size > 1:
-            self._do_p2p_load(req_meta, layer_id)
-            transfer_tasks.clear()
-            self.request_queue.task_done()
-            self.get_event.set()
-            return
-        else:
-            gvas_array = _circular_shift_array(
-                req_meta.gvas_array,
-                (self.tp_rank * len(req_meta.gvas_array)) // self.tp_size,
-            )
-            addr_array = _circular_shift_array(
-                req_meta.addr_array,
-                (self.tp_rank * len(req_meta.addr_array)) // self.tp_size,
-            )
-            size_array = _circular_shift_array(
-                req_meta.size_array,
-                (self.tp_rank * len(req_meta.size_array)) // self.tp_size,
-            )
-            self._stagger_h2d_submit(layer_id, len(gvas_array))
-            res = self._batch_copy_with_limits(
-                gvas_array,
-                addr_array,
-                size_array,
-                1,
-                self.max_transfer_blocks,
-                self.max_transfer_bytes,
-            )
-            if res != 0:
-                logger.error("Layerwise %d load batch_copy failed with return code %d", layer_id, res)
-            elif layer_id == self.final_layer_id:
-                for req_id, is_last_chunk in zip(req_meta.req_ids,
-                                                 req_meta.is_last_chunks):
-                    if is_last_chunk:
-                        self.set_finished_request(req_id)
+        gvas_array = _circular_shift_array(
+            req_meta.gvas_array,
+            (self.tp_rank * len(req_meta.gvas_array)) // self.tp_size,
+        )
+        addr_array = _circular_shift_array(
+            req_meta.addr_array,
+            (self.tp_rank * len(req_meta.addr_array)) // self.tp_size,
+        )
+        size_array = _circular_shift_array(
+            req_meta.size_array,
+            (self.tp_rank * len(req_meta.size_array)) // self.tp_size,
+        )
+        self._stagger_h2d_submit(layer_id, len(gvas_array))
+        res = self._batch_copy_with_limits(
+            gvas_array,
+            addr_array,
+            size_array,
+            1,
+            self.max_transfer_blocks,
+            self.max_transfer_bytes,
+        )
+        if res != 0:
+            logger.error("Layerwise %d load batch_copy failed with return code %d", layer_id, res)
+        elif layer_id == self.final_layer_id:
+            for req_id, is_last_chunk in zip(req_meta.req_ids,
+                                             req_meta.is_last_chunks):
+                if is_last_chunk:
+                    self.set_finished_request(req_id)
         assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "
         logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
         self.layer_load_finished_events[layer_id].set()
