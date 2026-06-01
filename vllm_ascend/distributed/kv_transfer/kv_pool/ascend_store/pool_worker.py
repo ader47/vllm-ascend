@@ -606,6 +606,9 @@ class KVPoolWorker:
         if not should_wait:
             self.layer_load_finished_events[self.current_layer].clear()
             return
+        if self.p2p_enabled:
+            self.kv_recv_thread.p2p_ready_events[self.current_layer].wait()
+            self.kv_recv_thread._broadcast_p2p_layer(self.current_layer)
         is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=10)
         if not is_finish:
             logger.info("Layerwise %d load wait timed out", self.current_layer)

@@ -796,6 +796,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.tp_device_group = tp_device_group
         self.layer_kv_caches = layer_kv_caches
         self.transfer_stream: torch.npu.Stream | None = None
+        self.p2p_ready_events: list[threading.Event] = [threading.Event() for _ in range(num_layers)]
+        self.p2p_pending: dict[int, tuple] = {}
         self.layer_batch_builder = LayerBatchBuilder(
             token_database,
             my_key_index,
@@ -858,21 +860,36 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 h2d_ok = False
                 logger.error("Layerwise %d P2P H2D batch_copy failed with return code %d", layer_id, res)
 
+        self.p2p_pending[layer_id] = (
+            buffer, full_addrs, full_sizes, 0, total_entries, layer_id,
+            h2d_ok, req_meta.req_ids, req_meta.is_last_chunks)
+        self.p2p_ready_events[layer_id].set()
+
+    def _broadcast_p2p_layer(self, layer_id: int) -> None:
+        pending = self.p2p_pending.pop(layer_id, None)
+        if pending is None:
+            return
+        buffer, addrs, sizes, start, end, meta_layer_id, h2d_ok = pending[:7]
+        req_ids, is_last_chunks = pending[7], pending[8]
+
+        torch.npu.set_device(self.tp_rank)
         with torch.npu.stream(self.transfer_stream):
             dist.broadcast(buffer, src=0, group=self.tp_device_group)
             if h2d_ok:
-                self._scatter_buffer_to_kv(buffer, full_addrs, full_sizes,
-                                           0, total_entries, layer_id)
+                self._scatter_buffer_to_kv(buffer, addrs, sizes,
+                                           start, end, meta_layer_id)
 
         p2p_done_event = torch.npu.Event()
         p2p_done_event.record(self.transfer_stream)
         p2p_done_event.synchronize()
-
+        self.p2p_ready_events[layer_id].clear()
         if layer_id == self.final_layer_id:
-            for req_id, is_last_chunk in zip(req_meta.req_ids,
-                                             req_meta.is_last_chunks):
+            for req_id, is_last_chunk in zip(req_ids, is_last_chunks):
                 if is_last_chunk:
                     self.set_finished_request(req_id)
+        assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "
+        logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
+        self.layer_load_finished_events[layer_id].set()
 
     def _scatter_buffer_to_kv(self, buffer, addrs, sizes, start, end, layer_id):
         num_sub = self.num_addrs_per_block
@@ -967,6 +984,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
         if self.p2p_enabled and self.tp_size > 1:
             self._do_p2p_load(req_meta, layer_id)
+            transfer_tasks.clear()
+            self.request_queue.task_done()
+            self.get_event.set()
+            return
         else:
             gvas_array = _circular_shift_array(
                 req_meta.gvas_array,
