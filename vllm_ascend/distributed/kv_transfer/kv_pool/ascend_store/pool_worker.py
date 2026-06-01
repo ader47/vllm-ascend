@@ -3,6 +3,7 @@ import math
 import threading
 
 import torch
+import torch.distributed as dist
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -223,6 +224,7 @@ class KVPoolWorker:
         self.prefetch_layer_map = layerwise_config.prefetch_layer_map
         self.sync_save_events = None
         self.p2p_enabled = self.tp_size > 1 and self.put_step > 1
+        self.p2p_device_group = None
 
     def _bind_kv_transfer_thread(
         self,
@@ -314,6 +316,12 @@ class KVPoolWorker:
                     0,
                     "layerwise send",
                 )
+            if self.p2p_enabled:
+                # Create a dedicated HCCL communicator for P2P to avoid
+                # interference with TP collectives (all-reduce) that share
+                # the same HCCL communicator across different streams.
+                tp_ranks = get_tp_group().ranks
+                self.p2p_device_group = dist.new_group(tp_ranks, backend="hccl")
             ready_event = threading.Event()
             self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
                 self.m_store,
@@ -337,7 +345,7 @@ class KVPoolWorker:
                 self.layerwise_max_transfer_blocks,
                 self.layerwise_max_transfer_bytes,
                 p2p_enabled=self.p2p_enabled,
-                tp_device_group=get_tp_group().device_group if self.p2p_enabled else None,
+                tp_device_group=self.p2p_device_group,
                 layer_kv_caches=self.layer_kv_caches if self.p2p_enabled else None,
             )
             self.kv_recv_thread.start()

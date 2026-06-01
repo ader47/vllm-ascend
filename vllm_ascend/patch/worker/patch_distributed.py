@@ -20,10 +20,10 @@ from functools import wraps
 from typing import Any, cast
 
 import torch
-import vllm
 from torch.distributed import Backend
-from vllm.distributed.parallel_state import GroupCoordinator, _get_unique_name, _register_group
 
+import vllm
+from vllm.distributed.parallel_state import GroupCoordinator, _get_unique_name, _register_group
 from vllm_ascend.distributed.device_communicators.npu_communicator import NPUCommunicator
 from vllm_ascend.patch.worker._hccl_pg_registry import HcclPgRegistry, make_hccl_pg_key
 from vllm_ascend.utils import create_hccl_pg_options
@@ -38,7 +38,7 @@ def _normalize_backend(backend: str | Backend) -> str:
 
 def _resolve_reuse_domain(group_name: str) -> str:
     group_base_name = group_name.split(":")[0]
-    if "eplb" in group_base_name or group_base_name == "mc2":
+    if "eplb" in group_base_name or group_base_name in ("mc2", "p2p_kv"):
         return group_base_name
     return "shared"
 
