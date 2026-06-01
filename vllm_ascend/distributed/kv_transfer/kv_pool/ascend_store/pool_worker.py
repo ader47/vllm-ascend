@@ -227,12 +227,19 @@ class KVPoolWorker:
         self.p2p_enabled = self.tp_size > 1 and self.put_step > 1
         self.p2p_comm = None
         if self.p2p_enabled:
+            logger.info("P2P: creating PyHcclCommunicator, local_rank=%d, npu_initialized=%s",
+                        self.local_rank, torch.npu.is_initialized())
+            if not torch.npu.is_initialized():
+                torch.npu.set_device(self.local_rank)
             tp_ranks = dist.get_process_group_ranks(get_tp_group().device_group)
+            logger.info("P2P: tp_ranks=%s, creating gloo cpu_group", tp_ranks)
             cpu_group = dist.new_group(ranks=tp_ranks, backend="gloo")
+            logger.info("P2P: gloo cpu_group created, initializing PyHcclCommunicator")
             self.p2p_comm = PyHcclCommunicator(
                 cpu_group,
                 device=torch.device(f"npu:{self.local_rank}"),
             )
+            logger.info("P2P: PyHcclCommunicator initialized successfully")
 
     def _bind_kv_transfer_thread(
         self,
