@@ -537,3 +537,4 @@ class LayerLoadTask:
 @dataclass
 class LayerBroadcastTask:
     layer_id: int
+    wait_event: torch.npu.Event | None = None

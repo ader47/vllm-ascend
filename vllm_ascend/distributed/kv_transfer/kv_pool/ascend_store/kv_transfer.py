@@ -813,8 +813,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     ) -> torch.Tensor:
         self.request_queue.put(req_meta)
 
-    def add_broadcast_request(self, layer_id: int) -> None:
-        self.request_queue.put(LayerBroadcastTask(layer_id))
+    def add_broadcast_request(self, layer_id: int, wait_event: torch.npu.Event | None = None) -> None:
+        self.request_queue.put(LayerBroadcastTask(layer_id, wait_event))
 
     def reset_p2p_state(self) -> None:
         self.p2p_pending.clear()
@@ -872,7 +872,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             h2d_ok, req_meta.req_ids, req_meta.is_last_chunks)
         self.h2d_finished_events[layer_id].set()
 
-    def _broadcast_p2p_layer(self, layer_id: int) -> None:
+    def _broadcast_p2p_layer(self, layer_id: int, wait_event: torch.npu.Event | None = None) -> None:
         while not self.h2d_finished_events[layer_id].wait(timeout=10):
             logger.info("Layerwise %d P2P H2D wait timed out before broadcast", layer_id)
         pending = self.p2p_pending.pop(layer_id, None)
@@ -884,6 +884,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
         if self.transfer_stream is None:
             self.transfer_stream = torch.npu.Stream()
+        if wait_event is not None:
+            self.transfer_stream.wait_event(wait_event)
         with torch.npu.stream(self.transfer_stream):
             dist.broadcast(buffer, src=self.p2p_src_rank, group=self.tp_device_group)
             if h2d_ok:
@@ -959,7 +961,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self, data: LayerLoadTask | LayerBroadcastTask
     ):
         if isinstance(data, LayerBroadcastTask):
-            self._broadcast_p2p_layer(data.layer_id)
+            self._broadcast_p2p_layer(data.layer_id, data.wait_event)
             self.request_queue.task_done()
             self.get_event.set()
             return

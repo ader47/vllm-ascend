@@ -623,7 +623,9 @@ class KVPoolWorker:
             return False
         if self.layer_broadcast_submitted[layer_id]:
             return True
-        self.kv_recv_thread.add_broadcast_request(layer_id)
+        tp_sync_event = torch.npu.Event()
+        tp_sync_event.record()
+        self.kv_recv_thread.add_broadcast_request(layer_id, tp_sync_event)
         self.layer_broadcast_submitted[layer_id] = True
         return True
 
