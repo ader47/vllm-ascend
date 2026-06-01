@@ -13,6 +13,7 @@ import torch.distributed as dist
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
+from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
 from vllm_ascend.utils import enable_custom_op
 
@@ -770,8 +771,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
         p2p_enabled: bool = False,
-        p2p_tp_ranks: list[int] | None = None,
-        p2p_backend: str | None = None,
+        p2p_gloo_group: dist.ProcessGroup | None = None,
         layer_kv_caches: list | None = None,
     ):
         super().__init__(
@@ -795,10 +795,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
         self.p2p_enabled = p2p_enabled
-        self._p2p_tp_ranks = p2p_tp_ranks
-        self._p2p_backend = p2p_backend
-        self.tp_device_group: dist.ProcessGroup | None = None
-        self.p2p_src_rank: int = 0
+        self._p2p_gloo_group = p2p_gloo_group
+        self._p2p_comm: PyHcclCommunicator | None = None
         self.layer_kv_caches = layer_kv_caches
         self.transfer_stream: torch.npu.Stream | None = None
         self.h2d_finished_events: list[threading.Event] = [threading.Event() for _ in range(num_layers)]
@@ -813,9 +811,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     def run(self):
         self._set_os_thread_name()
         self.m_store.set_device()
-        if self.p2p_enabled and self._p2p_tp_ranks is not None and self._p2p_backend is not None:
-            self.tp_device_group = dist.new_group(self._p2p_tp_ranks, backend=self._p2p_backend)
-            self.p2p_src_rank = self._p2p_tp_ranks[0]
+        if self.p2p_enabled and self._p2p_gloo_group is not None:
+            self._p2p_comm = PyHcclCommunicator(
+                group=self._p2p_gloo_group,
+                device=self.tp_rank,
+            )
         self.ready_event.set()
         while True:
             request_data = self.request_queue.get()
@@ -904,7 +904,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         if wait_event is not None:
             self.transfer_stream.wait_event(wait_event)
         with torch.npu.stream(self.transfer_stream):
-            dist.broadcast(buffer, src=self.p2p_src_rank, group=self.tp_device_group)
+            self._p2p_comm.broadcast(buffer, src=0, stream=self.transfer_stream)
             if h2d_ok:
                 self._scatter_buffer_to_kv(buffer, addrs, sizes,
                                            start, end, meta_layer_id)

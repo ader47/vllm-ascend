@@ -3,6 +3,7 @@ import math
 import threading
 
 import torch
+import torch.distributed as dist
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -319,12 +320,12 @@ class KVPoolWorker:
                 )
             if self.p2p_enabled:
                 tp_group = get_tp_group()
-                backend = torch.distributed.get_backend(tp_group.device_group)
-                self._p2p_tp_ranks = tp_group.ranks
-                self._p2p_backend = backend
+                self._p2p_gloo_group = dist.new_group(
+                    tp_group.ranks,
+                    backend="gloo",
+                )
             else:
-                self._p2p_tp_ranks = None
-                self._p2p_backend = None
+                self._p2p_gloo_group = None
             ready_event = threading.Event()
             self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
                 self.m_store,
@@ -348,8 +349,7 @@ class KVPoolWorker:
                 self.layerwise_max_transfer_blocks,
                 self.layerwise_max_transfer_bytes,
                 p2p_enabled=self.p2p_enabled,
-                p2p_tp_ranks=self._p2p_tp_ranks,
-                p2p_backend=self._p2p_backend,
+                p2p_gloo_group=self._p2p_gloo_group,
                 layer_kv_caches=self.layer_kv_caches if self.p2p_enabled else None,
             )
             self.kv_recv_thread.start()
