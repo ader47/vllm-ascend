@@ -532,3 +532,8 @@ class LayerLoadTask:
     wait_for_save_layer: int | None
     transfer_tasks: list[LayerTransferTask]
     layer_id: int
+
+
+@dataclass
+class LayerBroadcastTask:
+    layer_id: int

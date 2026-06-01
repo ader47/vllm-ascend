@@ -30,6 +30,7 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
     enable_cp,
+    finish_kv_layer_load_overlap,
     maybe_save_kv_layer_to_connector,
     trans_rope_weight,
     transdata,
@@ -1246,6 +1247,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
         )
+        finish_kv_layer_load_overlap(layer_name)
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()

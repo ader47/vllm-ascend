@@ -4,11 +4,11 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group, is_v1_kv_transfer_group
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-
 from vllm_ascend import envs
 from vllm_ascend.utils import AscendDeviceType, get_ascend_config, get_ascend_device_type
 
@@ -287,6 +287,20 @@ def wait_for_kv_layer_from_connector(layer_name: str):
         return
     # TODO: assert ascendMetadata
     connector.wait_for_layer_load(layer_name)
+
+
+def finish_kv_layer_load_overlap(layer_name: str):
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+
+    connector = get_kv_transfer_group()
+
+    forward_context: ForwardContext = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return
+    if hasattr(connector, "finish_layer_load_overlap"):
+        connector.finish_layer_load_overlap(layer_name)
 
 
 def maybe_save_kv_layer_to_connector(

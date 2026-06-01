@@ -204,6 +204,11 @@ class AscendStoreConnector(KVConnectorBase_V1):
             return
         self.connector_worker.wait_for_layer_load()
 
+    def finish_layer_load_overlap(self, layer_name: str) -> None:
+        if not self.use_layerwise:
+            return
+        self.connector_worker.finish_layer_load_overlap()
+
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
     ) -> None:

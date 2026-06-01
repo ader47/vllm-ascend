@@ -202,6 +202,8 @@ class KVPoolWorker:
 
         self.layer_load_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
         self.layer_load_submitted = [False for i in range(self.num_layers)]
+        self.layer_broadcast_submitted = [False for i in range(self.num_layers)]
+        self.layer_load_completed = [False for i in range(self.num_layers)]
         self.layer_save_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
         self.layer_load_finished_events = None
         self.layer_save_finished_events = None
@@ -227,6 +229,7 @@ class KVPoolWorker:
         self.p2p_enabled = self.tp_size > 1 and self.put_step > 1
         self.p2p_group = None
         self.p2p_device_group = None
+        self.p2p_src_rank = 0
 
     def _bind_kv_transfer_thread(
         self,
@@ -327,6 +330,7 @@ class KVPoolWorker:
                     tp_group.ranks,
                     backend=backend,
                 )
+                self.p2p_src_rank = tp_group.ranks[0]
             ready_event = threading.Event()
             self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
                 self.m_store,
@@ -351,6 +355,7 @@ class KVPoolWorker:
                 self.layerwise_max_transfer_bytes,
                 p2p_enabled=self.p2p_enabled,
                 tp_device_group=self.p2p_device_group,
+                p2p_src_rank=self.p2p_src_rank,
                 layer_kv_caches=self.layer_kv_caches if self.p2p_enabled else None,
             )
             self.kv_recv_thread.start()
@@ -441,6 +446,10 @@ class KVPoolWorker:
         if self.use_layerwise:
             self.next_layer_to_submit = 0
             self.layer_load_submitted = [False for i in range(self.num_layers)]
+            self.layer_broadcast_submitted = [False for i in range(self.num_layers)]
+            self.layer_load_completed = [False for i in range(self.num_layers)]
+            if self.p2p_enabled and self.kv_recv_thread is not None:
+                self.kv_recv_thread.reset_p2p_state()
         if len(metadata.requests) == 0:
             return
         if self.use_layerwise:
@@ -581,22 +590,62 @@ class KVPoolWorker:
         for layer_id in range(self.num_layers):
             self._process_load_for_layer_batch(requests, layer_id)
 
+    def _submit_layer_h2d(self, layer_id: int) -> bool:
+        assert self.kv_recv_thread is not None
+        if layer_id < 0 or layer_id >= self.num_layers:
+            return False
+        if self.layer_load_completed[layer_id]:
+            return False
+        if self.layer_load_submitted[layer_id]:
+            return True
+        if not self.layer_load_tasks[layer_id]:
+            self.layer_load_completed[layer_id] = True
+            return False
+        wait_for_save_layer = self.prefetch_layer_map.get(layer_id)
+        self.kv_recv_thread.add_request(
+            LayerLoadTask(
+                wait_for_save_layer=wait_for_save_layer,
+                transfer_tasks=self.layer_load_tasks[layer_id],
+                layer_id=layer_id,
+            )
+        )
+        self.layer_load_submitted[layer_id] = True
+        return True
+
+    def _submit_layer_broadcast(self, layer_id: int) -> bool:
+        assert self.kv_recv_thread is not None
+        if layer_id < 0 or layer_id >= self.num_layers:
+            return False
+        if self.layer_load_completed[layer_id]:
+            return False
+        self._submit_layer_h2d(layer_id)
+        if self.layer_load_completed[layer_id]:
+            return False
+        if self.layer_broadcast_submitted[layer_id]:
+            return True
+        self.kv_recv_thread.add_broadcast_request(layer_id)
+        self.layer_broadcast_submitted[layer_id] = True
+        return True
+
+    def _wait_layer_broadcast(self, layer_id: int) -> None:
+        if layer_id < 0 or layer_id >= self.num_layers:
+            return
+        if self.layer_load_completed[layer_id]:
+            return
+        if not self.layer_broadcast_submitted[layer_id]:
+            self._submit_layer_broadcast(layer_id)
+        if self.layer_load_completed[layer_id]:
+            return
+        while not self.layer_load_finished_events[layer_id].wait(timeout=10):
+            logger.info("Layerwise %d load wait timed out", layer_id)
+        logger.debug(f">>>>>>>>>>>>>>>>>>>> clear load layer {layer_id}")
+        self.layer_load_finished_events[layer_id].clear()
+        self.layer_load_submitted[layer_id] = False
+        self.layer_broadcast_submitted[layer_id] = False
+        self.layer_load_completed[layer_id] = True
+
     def _submit_ready_layer_loads(self) -> None:
         assert self.kv_recv_thread is not None
-
-        def submit_layer_load(layer_id: int) -> bool:
-            if not self.layer_load_tasks[layer_id]:
-                return False
-            wait_for_save_layer = self.prefetch_layer_map.get(layer_id)
-            self.kv_recv_thread.add_request(
-                LayerLoadTask(
-                    wait_for_save_layer=wait_for_save_layer,
-                    transfer_tasks=self.layer_load_tasks[layer_id],
-                    layer_id=layer_id,
-                )
-            )
-            self.layer_load_submitted[layer_id] = True
-            return True
 
         submit_count = self.NUM_PREFETCH_LAYERS if self.current_layer == 0 else 1
         submitted_layers = 0
@@ -604,10 +653,16 @@ class KVPoolWorker:
                and self.next_layer_to_submit < self.num_layers):
             layer_id = self.next_layer_to_submit
             self.next_layer_to_submit += 1
-            if submit_layer_load(layer_id):
+            if self._submit_layer_h2d(layer_id):
                 submitted_layers += 1
 
     def wait_for_layer_load(self) -> None:
+        if self.p2p_enabled:
+            self._wait_layer_broadcast(self.current_layer)
+            next_layer = self.current_layer + 1
+            self._submit_layer_broadcast(next_layer)
+            return
+
         self._submit_ready_layer_loads()
         should_wait = self.layer_load_submitted[self.current_layer]
         if not should_wait:
@@ -619,6 +674,13 @@ class KVPoolWorker:
         logger.debug(f">>>>>>>>>>>>>>>>>>>> clear load layer {self.current_layer}")
         self.layer_load_finished_events[self.current_layer].clear()
         self.layer_load_submitted[self.current_layer] = False
+
+    def finish_layer_load_overlap(self) -> None:
+        if not self.use_layerwise or not self.p2p_enabled:
+            return
+        next_layer = self.current_layer + 1
+        self._wait_layer_broadcast(next_layer)
+        self._submit_layer_h2d(next_layer + 1)
 
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
         # Wait for KV cache saving to complete on the final layer that requires offloading.

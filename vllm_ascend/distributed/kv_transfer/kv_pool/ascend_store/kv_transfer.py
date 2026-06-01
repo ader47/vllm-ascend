@@ -20,6 +20,7 @@ from vllm_ascend.utils import enable_custom_op
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     ChunkedTokenDatabase,
     LayerBatchReqMeta,
+    LayerBroadcastTask,
     LayerBlockRange,
     LayerLoadTask,
     LayerTransferTask,
@@ -770,6 +771,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         max_transfer_bytes: int = 0,
         p2p_enabled: bool = False,
         tp_device_group: dist.ProcessGroup | None = None,
+        p2p_src_rank: int = 0,
         layer_kv_caches: list | None = None,
     ):
         super().__init__(
@@ -794,8 +796,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.max_transfer_bytes = max_transfer_bytes
         self.p2p_enabled = p2p_enabled
         self.tp_device_group = tp_device_group
+        self.p2p_src_rank = p2p_src_rank
         self.layer_kv_caches = layer_kv_caches
         self.transfer_stream: torch.npu.Stream | None = None
+        self.h2d_finished_events: list[threading.Event] = [threading.Event() for _ in range(num_layers)]
         self.p2p_pending: dict[int, tuple] = {}
         self.layer_batch_builder = LayerBatchBuilder(
             token_database,
@@ -808,6 +812,14 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self, req_meta: LayerLoadTask
     ) -> torch.Tensor:
         self.request_queue.put(req_meta)
+
+    def add_broadcast_request(self, layer_id: int) -> None:
+        self.request_queue.put(LayerBroadcastTask(layer_id))
+
+    def reset_p2p_state(self) -> None:
+        self.p2p_pending.clear()
+        for event in self.h2d_finished_events:
+            event.clear()
 
     def _get_h2d_stagger_delay_us(self, layer_id: int, num_addrs: int) -> int:
         if self.h2d_stagger_us <= 0:
@@ -829,7 +841,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             time.sleep(delay_us / 1_000_000)
 
     def _do_p2p_load(self, req_meta: LayerBatchReqMeta, layer_id: int) -> None:
-        torch.npu.set_device(self.tp_rank)
         full_gvas = req_meta.gvas_array
         full_addrs = req_meta.addr_array
         full_sizes = req_meta.size_array
@@ -859,20 +870,22 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.p2p_pending[layer_id] = (
             buffer, full_addrs, full_sizes, 0, total_entries, layer_id,
             h2d_ok, req_meta.req_ids, req_meta.is_last_chunks)
-        self._broadcast_p2p_layer(layer_id)
+        self.h2d_finished_events[layer_id].set()
 
     def _broadcast_p2p_layer(self, layer_id: int) -> None:
+        while not self.h2d_finished_events[layer_id].wait(timeout=10):
+            logger.info("Layerwise %d P2P H2D wait timed out before broadcast", layer_id)
         pending = self.p2p_pending.pop(layer_id, None)
         if pending is None:
+            self.layer_load_finished_events[layer_id].set()
             return
         buffer, addrs, sizes, start, end, meta_layer_id, h2d_ok = pending[:7]
         req_ids, is_last_chunks = pending[7], pending[8]
 
-        torch.npu.set_device(self.tp_rank)
         if self.transfer_stream is None:
             self.transfer_stream = torch.npu.Stream()
         with torch.npu.stream(self.transfer_stream):
-            dist.broadcast(buffer, src=0, group=self.tp_device_group)
+            dist.broadcast(buffer, src=self.p2p_src_rank, group=self.tp_device_group)
             if h2d_ok:
                 self._scatter_buffer_to_kv(buffer, addrs, sizes,
                                            start, end, meta_layer_id)
@@ -886,6 +899,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "
         logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
         self.layer_load_finished_events[layer_id].set()
+        self.h2d_finished_events[layer_id].clear()
 
     def _scatter_buffer_to_kv(self, buffer, addrs, sizes, start, end, layer_id):
         num_sub = self.num_addrs_per_block
@@ -942,8 +956,14 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     buffer_flat[off // elem_size:off // elem_size + elems])
 
     def _handle_request(  # type: ignore[override]
-        self, data: LayerLoadTask
+        self, data: LayerLoadTask | LayerBroadcastTask
     ):
+        if isinstance(data, LayerBroadcastTask):
+            self._broadcast_p2p_layer(data.layer_id)
+            self.request_queue.task_done()
+            self.get_event.set()
+            return
+
         wait_for_save = data.wait_for_save_layer
         transfer_tasks = data.transfer_tasks
         layer_id = data.layer_id
@@ -958,6 +978,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         if self.p2p_enabled and self.tp_size > 1:
             if len(transfer_tasks) == 0:
                 logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
+                self.h2d_finished_events[layer_id].set()
                 self.layer_load_finished_events[layer_id].set()
                 self.request_queue.task_done()
                 return
@@ -967,6 +988,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             req_meta = self.layer_batch_builder.build(transfer_tasks[0])
             if req_meta is None:
                 logger.debug(f">>>>>>>>>>>>>>>>>>>> set load layer {layer_id}")
+                self.h2d_finished_events[layer_id].set()
                 self.layer_load_finished_events[layer_id].set()
                 self.request_queue.task_done()
                 return

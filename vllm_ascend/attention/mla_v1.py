@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypeVar
 import numpy as np
 import torch
 import torch_npu
+
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.logger import logger
@@ -17,7 +18,6 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
-
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -28,6 +28,7 @@ from vllm_ascend.attention.utils import (
     ascend_chunked_prefill_workspace_size,
     enable_cp,
     enabling_mlapo,
+    finish_kv_layer_load_overlap,
     maybe_save_kv_layer_to_connector,
     split_decodes_and_prefills,
     trans_rope_weight,
@@ -1711,6 +1712,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
 
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
+        finish_kv_layer_load_overlap(layer_name)
         # O proj
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
