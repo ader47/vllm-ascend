@@ -794,6 +794,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.p2p_enabled = p2p_enabled
         self.tp_group = tp_group
         self.layer_kv_caches = layer_kv_caches
+        self.transfer_stream: torch.npu.Stream | None = None
         self.layer_batch_builder = LayerBatchBuilder(
             token_database,
             my_key_index,
@@ -838,6 +839,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             (np.zeros(1, dtype=np.int64), cumsum_sizes[:-1])
         )
 
+        if self.transfer_stream is None:
+            self.transfer_stream = torch.npu.Stream()
+
         if self.tp_rank == 0:
             h2d_buffer = torch.empty(total_bytes, dtype=torch.uint8, device="npu")
             h2d_temp_addrs = h2d_byte_starts + h2d_buffer.data_ptr()
@@ -849,25 +853,33 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             )
             if res != 0:
                 logger.error("Layerwise %d P2P H2D batch_copy failed with return code %d", layer_id, res)
-            else:
-                self._scatter_buffer_to_kv(h2d_buffer, full_addrs, full_sizes,
-                                           0, total_entries, layer_id)
 
-            handles = []
-            for r in range(1, self.tp_size):
-                handles.append(dist.isend(h2d_buffer, dst=r, group=self.tp_group))
-            for h in handles:
-                h.wait()
+            with torch.npu.stream(self.transfer_stream):
+                if res == 0:
+                    self._scatter_buffer_to_kv(h2d_buffer, full_addrs, full_sizes,
+                                               0, total_entries, layer_id)
+
+                handles = []
+                for r in range(1, self.tp_size):
+                    handles.append(dist.isend(h2d_buffer, dst=r, group=self.tp_group))
+                for h in handles:
+                    h.wait()
+
+            p2p_done_event = torch.npu.Event()
+            p2p_done_event.record(self.transfer_stream)
+            p2p_done_event.synchronize()
         else:
             recv_buffer = torch.empty(total_bytes, dtype=torch.uint8, device="npu")
-            recv_handle = dist.irecv(recv_buffer, src=0, group=self.tp_group)
-            recv_handle.wait()
-            self._scatter_buffer_to_kv(recv_buffer, full_addrs, full_sizes,
-                                       0, total_entries, layer_id)
 
-        p2p_done_event = torch.npu.Event()
-        p2p_done_event.record()
-        p2p_done_event.synchronize()
+            with torch.npu.stream(self.transfer_stream):
+                recv_handle = dist.irecv(recv_buffer, src=0, group=self.tp_group)
+                recv_handle.wait()
+                self._scatter_buffer_to_kv(recv_buffer, full_addrs, full_sizes,
+                                           0, total_entries, layer_id)
+
+            p2p_done_event = torch.npu.Event()
+            p2p_done_event.record(self.transfer_stream)
+            p2p_done_event.synchronize()
 
         if layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_meta.req_ids,
@@ -900,12 +912,28 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         dst_2d = base_2d + blk_2d * blen_2d
         src_2d = buffer.data_ptr() + offs_2d
 
-        torch.ops._C_ascend.swap_blocks_batch(
-            torch.from_numpy(src_2d.ravel(order='F')),
-            torch.from_numpy(dst_2d.ravel(order='F')),
-            torch.from_numpy(sizes_2d.ravel(order='F')),
-            2,
-        )
+        try:
+            torch.ops._C_ascend.swap_blocks_batch(
+                torch.from_numpy(src_2d.ravel(order='F')),
+                torch.from_numpy(dst_2d.ravel(order='F')),
+                torch.from_numpy(sizes_2d.ravel(order='F')),
+                2,
+            )
+        except AttributeError:
+            elem_size = self.layer_kv_caches[layer_id][0].element_size()
+            tensors = self.layer_kv_caches[layer_id]
+            buffer_flat = buffer.view(tensors[0].dtype)
+
+            for j in range(num_sub):
+                for b in range(num_blocks):
+                    block_idx = int(blk_2d[j, b])
+                    off = int(offs_2d[j, b])
+                    sz = int(sizes_2d[j, b])
+                    if sz == 0:
+                        continue
+                    elems = sz // elem_size
+                    tensors[j][block_idx].view(-1)[:elems].copy_(
+                        buffer_flat[off // elem_size:off // elem_size + elems])
 
     def _handle_request(  # type: ignore[override]
         self, data: LayerLoadTask
