@@ -3,7 +3,6 @@ import math
 import threading
 
 import torch
-import torch.distributed as dist
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -23,7 +22,6 @@ from vllm_ascend.cpu_binding import (
     get_cpu_binding_rank,
     get_memcache_client_cpus,
 )
-from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
 )
@@ -225,21 +223,9 @@ class KVPoolWorker:
         self.prefetch_layer_map = layerwise_config.prefetch_layer_map
         self.sync_save_events = None
         self.p2p_enabled = self.tp_size > 1 and self.put_step > 1
-        self.p2p_comm = None
+        self.h2d_ready_events: list[threading.Event] | None = None
         if self.p2p_enabled:
-            logger.info("P2P: creating PyHcclCommunicator, local_rank=%d, npu_initialized=%s",
-                        self.local_rank, torch.npu.is_initialized())
-            if not torch.npu.is_initialized():
-                torch.npu.set_device(self.local_rank)
-            tp_ranks = dist.get_process_group_ranks(get_tp_group().device_group)
-            logger.info("P2P: tp_ranks=%s, creating gloo cpu_group", tp_ranks)
-            cpu_group = dist.new_group(ranks=tp_ranks, backend="gloo")
-            logger.info("P2P: gloo cpu_group created, initializing PyHcclCommunicator")
-            self.p2p_comm = PyHcclCommunicator(
-                cpu_group,
-                device=torch.device(f"npu:{self.local_rank}"),
-            )
-            logger.info("P2P: PyHcclCommunicator initialized successfully")
+            self.h2d_ready_events = [threading.Event() for _ in range(self.num_layers)]
 
     def _bind_kv_transfer_thread(
         self,
@@ -354,7 +340,8 @@ class KVPoolWorker:
                 self.layerwise_max_transfer_blocks,
                 self.layerwise_max_transfer_bytes,
                 p2p_enabled=self.p2p_enabled,
-                p2p_comm=self.p2p_comm,
+                tp_device_group=get_tp_group().device_group if self.p2p_enabled else None,
+                h2d_ready_events=self.h2d_ready_events,
                 layer_kv_caches=self.layer_kv_caches if self.p2p_enabled else None,
             )
             self.kv_recv_thread.start()
@@ -613,8 +600,14 @@ class KVPoolWorker:
         self._submit_ready_layer_loads()
         should_wait = bool(self.layer_load_tasks[self.current_layer])
         if not should_wait:
+            if self.p2p_enabled:
+                self.h2d_ready_events[self.current_layer].clear()
             self.layer_load_finished_events[self.current_layer].clear()
             return
+        if self.p2p_enabled:
+            self.h2d_ready_events[self.current_layer].wait()
+            self.h2d_ready_events[self.current_layer].clear()
+            self.kv_recv_thread._do_p2p_broadcast(self.current_layer)
         is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=10)
         if not is_finish:
             logger.info("Layerwise %d load wait timed out", self.current_layer)
