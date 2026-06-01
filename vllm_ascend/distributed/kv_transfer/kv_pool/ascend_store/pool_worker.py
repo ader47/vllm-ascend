@@ -3,6 +3,7 @@ import math
 import threading
 
 import torch
+import torch.distributed as dist
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -223,12 +224,13 @@ class KVPoolWorker:
         self.independent_layers = layerwise_config.independent_layers
         self.prefetch_layer_map = layerwise_config.prefetch_layer_map
         self.sync_save_events = None
-        p2p_enabled = self.tp_size > 1 and self.put_step > 1
-        self.p2p_enabled = p2p_enabled
-        self.p2p_comm: PyHcclCommunicator | None = None
-        if p2p_enabled:
+        self.p2p_enabled = self.tp_size > 1 and self.put_step > 1
+        self.p2p_comm = None
+        if self.p2p_enabled:
+            tp_ranks = dist.get_process_group_ranks(get_tp_group().device_group)
+            cpu_group = dist.new_group(ranks=tp_ranks, backend="gloo")
             self.p2p_comm = PyHcclCommunicator(
-                get_tp_group().cpu_group,
+                cpu_group,
                 device=torch.device(f"npu:{self.local_rank}"),
             )
 
