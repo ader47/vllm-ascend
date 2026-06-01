@@ -844,35 +844,24 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         if self.transfer_stream is None:
             self.transfer_stream = torch.npu.Stream()
 
-        if self.tp_rank == 0:
-            h2d_buffer = torch.empty(total_bytes, dtype=torch.uint8, device="npu")
-            h2d_temp_addrs = h2d_byte_starts + h2d_buffer.data_ptr()
+        h2d_ok = True
+        buffer = torch.empty(total_bytes, dtype=torch.uint8, device="npu")
 
+        if self.tp_rank == 0:
+            h2d_temp_addrs = h2d_byte_starts + buffer.data_ptr()
             self._stagger_h2d_submit(layer_id, len(full_gvas))
             res = self._batch_copy_with_limits(
                 full_gvas, h2d_temp_addrs, full_sizes, 1,
                 self.max_transfer_blocks, self.max_transfer_bytes,
             )
             if res != 0:
+                h2d_ok = False
                 logger.error("Layerwise %d P2P H2D batch_copy failed with return code %d", layer_id, res)
 
-            with torch.npu.stream(self.transfer_stream):
-                if res == 0:
-                    self._scatter_buffer_to_kv(h2d_buffer, full_addrs, full_sizes,
-                                               0, total_entries, layer_id)
-
-                handles = []
-                for r in range(1, self.tp_size):
-                    handles.append(dist.isend(h2d_buffer, dst=r, group=self.tp_device_group))
-                for h in handles:
-                    h.wait()
-        else:
-            recv_buffer = torch.empty(total_bytes, dtype=torch.uint8, device="npu")
-
-            with torch.npu.stream(self.transfer_stream):
-                recv_handle = dist.irecv(recv_buffer, src=0, group=self.tp_device_group)
-                recv_handle.wait()
-                self._scatter_buffer_to_kv(recv_buffer, full_addrs, full_sizes,
+        with torch.npu.stream(self.transfer_stream):
+            dist.broadcast(buffer, src=0, group=self.tp_device_group)
+            if h2d_ok:
+                self._scatter_buffer_to_kv(buffer, full_addrs, full_sizes,
                                            0, total_entries, layer_id)
 
         p2p_done_event = torch.npu.Event()
