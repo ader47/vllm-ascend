@@ -223,9 +223,6 @@ class KVPoolWorker:
         self.prefetch_layer_map = layerwise_config.prefetch_layer_map
         self.sync_save_events = None
         self.p2p_enabled = self.tp_size > 1 and self.put_step > 1
-        self.h2d_ready_events: list[threading.Event] | None = None
-        if self.p2p_enabled:
-            self.h2d_ready_events = [threading.Event() for _ in range(self.num_layers)]
 
     def _bind_kv_transfer_thread(
         self,
@@ -341,7 +338,6 @@ class KVPoolWorker:
                 self.layerwise_max_transfer_bytes,
                 p2p_enabled=self.p2p_enabled,
                 tp_device_group=get_tp_group().device_group if self.p2p_enabled else None,
-                h2d_ready_events=self.h2d_ready_events,
                 layer_kv_caches=self.layer_kv_caches if self.p2p_enabled else None,
             )
             self.kv_recv_thread.start()
@@ -600,14 +596,8 @@ class KVPoolWorker:
         self._submit_ready_layer_loads()
         should_wait = bool(self.layer_load_tasks[self.current_layer])
         if not should_wait:
-            if self.p2p_enabled:
-                self.h2d_ready_events[self.current_layer].clear()
             self.layer_load_finished_events[self.current_layer].clear()
             return
-        if self.p2p_enabled:
-            self.h2d_ready_events[self.current_layer].wait()
-            self.h2d_ready_events[self.current_layer].clear()
-            self.kv_recv_thread._do_p2p_broadcast(self.current_layer)
         is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=10)
         if not is_finish:
             logger.info("Layerwise %d load wait timed out", self.current_layer)
