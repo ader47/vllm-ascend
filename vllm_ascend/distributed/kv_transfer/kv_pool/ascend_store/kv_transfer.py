@@ -861,17 +861,17 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     self._scatter_buffer_to_kv(h2d_buffer, full_addrs, full_sizes,
                                                0, total_entries, layer_id)
 
-            handles = []
-            for r in range(1, self.tp_size):
-                handles.append(dist.isend(h2d_buffer, dst=r, group=self.tp_device_group))
-            for h in handles:
-                h.wait()
+                handles = []
+                for r in range(1, self.tp_size):
+                    handles.append(dist.isend(h2d_buffer, dst=r, group=self.tp_device_group))
+                for h in handles:
+                    h.wait()
         else:
             recv_buffer = torch.empty(total_bytes, dtype=torch.uint8, device="npu")
-            recv_handle = dist.irecv(recv_buffer, src=0, group=self.tp_device_group)
-            recv_handle.wait()
 
             with torch.npu.stream(self.transfer_stream):
+                recv_handle = dist.irecv(recv_buffer, src=0, group=self.tp_device_group)
+                recv_handle.wait()
                 self._scatter_buffer_to_kv(recv_buffer, full_addrs, full_sizes,
                                            0, total_entries, layer_id)
 
