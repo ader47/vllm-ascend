@@ -8,7 +8,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.distributed as dist
 
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
@@ -769,7 +768,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
         p2p_enabled: bool = False,
-        tp_group: dist.ProcessGroup | None = None,
+        p2p_comm = None,
         layer_kv_caches: list | None = None,
     ):
         super().__init__(
@@ -793,7 +792,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
         self.p2p_enabled = p2p_enabled
-        self.tp_group = tp_group
+        self.p2p_comm = p2p_comm
         self.layer_kv_caches = layer_kv_caches
         self.transfer_stream: torch.npu.Stream | None = None
         self.layer_batch_builder = LayerBatchBuilder(
@@ -860,27 +859,18 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     self._scatter_buffer_to_kv(h2d_buffer, full_addrs, full_sizes,
                                                0, total_entries, layer_id)
 
-            handles = []
-            for r in range(1, self.tp_size):
-                handles.append(dist.isend(h2d_buffer, dst=r, group=self.tp_group))
-            for h in handles:
-                h.wait()
-
-            p2p_done_event = torch.npu.Event()
-            p2p_done_event.record(self.transfer_stream)
-            p2p_done_event.synchronize()
+            self.p2p_comm.broadcast(h2d_buffer, src=0, stream=self.transfer_stream)
         else:
             recv_buffer = torch.empty(total_bytes, dtype=torch.uint8, device="npu")
-            recv_handle = dist.irecv(recv_buffer, src=0, group=self.tp_group)
-            recv_handle.wait()
+            self.p2p_comm.broadcast(recv_buffer, src=0, stream=self.transfer_stream)
 
             with torch.npu.stream(self.transfer_stream):
                 self._scatter_buffer_to_kv(recv_buffer, full_addrs, full_sizes,
                                            0, total_entries, layer_id)
 
-            p2p_done_event = torch.npu.Event()
-            p2p_done_event.record(self.transfer_stream)
-            p2p_done_event.synchronize()
+        p2p_done_event = torch.npu.Event()
+        p2p_done_event.record(self.transfer_stream)
+        p2p_done_event.synchronize()
 
         if layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_meta.req_ids,

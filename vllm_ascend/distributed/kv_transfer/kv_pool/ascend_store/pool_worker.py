@@ -22,6 +22,7 @@ from vllm_ascend.cpu_binding import (
     get_cpu_binding_rank,
     get_memcache_client_cpus,
 )
+from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
 )
@@ -222,6 +223,14 @@ class KVPoolWorker:
         self.independent_layers = layerwise_config.independent_layers
         self.prefetch_layer_map = layerwise_config.prefetch_layer_map
         self.sync_save_events = None
+        p2p_enabled = self.tp_size > 1 and self.put_step > 1
+        self.p2p_enabled = p2p_enabled
+        self.p2p_comm: PyHcclCommunicator | None = None
+        if p2p_enabled:
+            self.p2p_comm = PyHcclCommunicator(
+                get_tp_group().cpu_group,
+                device=torch.device(f"npu:{self.local_rank}"),
+            )
 
     def _bind_kv_transfer_thread(
         self,
@@ -314,7 +323,6 @@ class KVPoolWorker:
                     "layerwise send",
                 )
             ready_event = threading.Event()
-            p2p_enabled = self.tp_size > 1 and self.put_step > 1
             self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
                 self.m_store,
                 self.token_database,
@@ -336,9 +344,9 @@ class KVPoolWorker:
                 self.h2d_stagger_max_us,
                 self.layerwise_max_transfer_blocks,
                 self.layerwise_max_transfer_bytes,
-                p2p_enabled=p2p_enabled,
-                tp_group=get_tp_group().device_group if p2p_enabled else None,
-                layer_kv_caches=self.layer_kv_caches if p2p_enabled else None,
+                p2p_enabled=self.p2p_enabled,
+                p2p_comm=self.p2p_comm,
+                layer_kv_caches=self.layer_kv_caches if self.p2p_enabled else None,
             )
             self.kv_recv_thread.start()
             ready_event.wait()
