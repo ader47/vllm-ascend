@@ -3,6 +3,7 @@ import math
 import threading
 
 import torch
+import torch.distributed as dist
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -13,8 +14,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
-    get_world_group,
-    init_model_parallel_group,
 )
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
@@ -324,14 +323,10 @@ class KVPoolWorker:
                 # does not share the TP collective communicator across streams.
                 tp_group = get_tp_group()
                 backend = torch.distributed.get_backend(tp_group.device_group)
-                self.p2p_group = init_model_parallel_group(
-                    [tp_group.ranks],
-                    get_world_group().local_rank,
-                    backend,
-                    group_name="p2p_kv",
-                    use_device_communicator=False,
+                self.p2p_device_group = dist.new_group(
+                    tp_group.ranks,
+                    backend=backend,
                 )
-                self.p2p_device_group = self.p2p_group.device_group
             ready_event = threading.Event()
             self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
                 self.m_store,
