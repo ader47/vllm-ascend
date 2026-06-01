@@ -770,8 +770,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
         p2p_enabled: bool = False,
-        tp_device_group: dist.ProcessGroup | None = None,
-        p2p_src_rank: int = 0,
+        p2p_tp_ranks: list[int] | None = None,
+        p2p_backend: str | None = None,
         layer_kv_caches: list | None = None,
     ):
         super().__init__(
@@ -795,8 +795,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
         self.p2p_enabled = p2p_enabled
-        self.tp_device_group = tp_device_group
-        self.p2p_src_rank = p2p_src_rank
+        self._p2p_tp_ranks = p2p_tp_ranks
+        self._p2p_backend = p2p_backend
+        self.tp_device_group: dist.ProcessGroup | None = None
+        self.p2p_src_rank: int = 0
         self.layer_kv_caches = layer_kv_caches
         self.transfer_stream: torch.npu.Stream | None = None
         self.h2d_finished_events: list[threading.Event] = [threading.Event() for _ in range(num_layers)]
@@ -807,6 +809,21 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             num_ranks_per_layer,
             page_size_bytes,
         )
+
+    def run(self):
+        self._set_os_thread_name()
+        self.m_store.set_device()
+        if self.p2p_enabled and self._p2p_tp_ranks is not None and self._p2p_backend is not None:
+            self.tp_device_group = dist.new_group(self._p2p_tp_ranks, backend=self._p2p_backend)
+            self.p2p_src_rank = self._p2p_tp_ranks[0]
+        self.ready_event.set()
+        while True:
+            request_data = self.request_queue.get()
+            if request_data is None:
+                logger.warning("Received a None request!")
+                self.request_queue.task_done()
+                continue
+            self._handle_request(request_data)
 
     def add_request(  # type: ignore[override]
         self, req_meta: LayerLoadTask
