@@ -14,6 +14,7 @@ from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+from vllm_ascend.utils import enable_custom_op
 
 # isort: off
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
@@ -859,21 +860,21 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     self._scatter_buffer_to_kv(h2d_buffer, full_addrs, full_sizes,
                                                0, total_entries, layer_id)
 
-                handles = []
-                for r in range(1, self.tp_size):
-                    handles.append(dist.isend(h2d_buffer, dst=r, group=self.tp_group))
-                for h in handles:
-                    h.wait()
+            handles = []
+            for r in range(1, self.tp_size):
+                handles.append(dist.isend(h2d_buffer, dst=r, group=self.tp_group))
+            for h in handles:
+                h.wait()
 
             p2p_done_event = torch.npu.Event()
             p2p_done_event.record(self.transfer_stream)
             p2p_done_event.synchronize()
         else:
             recv_buffer = torch.empty(total_bytes, dtype=torch.uint8, device="npu")
+            recv_handle = dist.irecv(recv_buffer, src=0, group=self.tp_group)
+            recv_handle.wait()
 
             with torch.npu.stream(self.transfer_stream):
-                recv_handle = dist.irecv(recv_buffer, src=0, group=self.tp_group)
-                recv_handle.wait()
                 self._scatter_buffer_to_kv(recv_buffer, full_addrs, full_sizes,
                                            0, total_entries, layer_id)
 
@@ -909,19 +910,36 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         blen_2d = self.layer_batch_builder._block_len_np[:num_sub, None]
 
         blk_2d = (addrs_2d - base_2d) // blen_2d
-        elem_size = self.layer_kv_caches[layer_id][0].element_size()
-        tensors = self.layer_kv_caches[layer_id]
-        buffer_flat = buffer.view(tensors[0].dtype)
+        dst_2d = base_2d + blk_2d * blen_2d
+        src_2d = buffer.data_ptr() + offs_2d
 
-        for j in range(num_sub):
-            for b in range(num_blocks):
-                block_idx = int(blk_2d[j, b])
-                off = int(offs_2d[j, b])
-                sz = int(sizes_2d[j, b])
+        enable_custom_op()
+        try:
+            torch.ops._C_ascend.swap_blocks_batch(
+                torch.from_numpy(src_2d.ravel(order='F')),
+                torch.from_numpy(dst_2d.ravel(order='F')),
+                torch.from_numpy(sizes_2d.ravel(order='F')),
+                2,
+            )
+        except AttributeError:
+            elem_size = self.layer_kv_caches[layer_id][0].element_size()
+            tensors = self.layer_kv_caches[layer_id]
+            buffer_flat = buffer.view(tensors[0].dtype)
+
+            block_ids = blk_2d.ravel(order='F').astype(np.int64)
+            buf_offs = offs_2d.ravel(order='F').astype(np.int64)
+            cp_sizes = sizes_2d.ravel(order='F').astype(np.int64)
+            sub_ids = np.tile(np.arange(num_sub, dtype=np.int64), num_blocks)
+
+            for i in range(len(block_ids)):
+                sz = int(cp_sizes[i])
                 if sz == 0:
                     continue
+                j = int(sub_ids[i])
+                bid = int(block_ids[i])
+                off = int(buf_offs[i])
                 elems = sz // elem_size
-                tensors[j][block_idx].view(-1)[:elems].copy_(
+                tensors[j][bid].view(-1)[:elems].copy_(
                     buffer_flat[off // elem_size:off // elem_size + elems])
 
     def _handle_request(  # type: ignore[override]
@@ -930,7 +948,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         wait_for_save = data.wait_for_save_layer
         transfer_tasks = data.transfer_tasks
         layer_id = data.layer_id
-        attention_start_gate = data.attention_start_gate
 
         if len(transfer_tasks) == 0:
             if wait_for_save is not None:
@@ -960,10 +977,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
             logger.debug(f">>>>>>>>>>>>>>>>>>>> clear save layer {wait_for_save}")
             self.layer_save_finished_events[wait_for_save].clear()
-
-        if attention_start_gate is not None:
-            while not attention_start_gate.wait(timeout=10):
-                logger.info("Layerwise %d load waits for attention compute start", layer_id)
 
         if self.p2p_enabled and self.tp_size > 1:
             self._do_p2p_load(req_meta, layer_id)

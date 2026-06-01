@@ -4,12 +4,12 @@ from typing import Optional
 
 import numpy as np
 import torch
+
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import NewRequestData
-from vllm_ascend.memcache_comm_fence import AttentionComputeStartGate
 
 
 # Parameters related to the key
@@ -532,4 +532,3 @@ class LayerLoadTask:
     wait_for_save_layer: int | None
     transfer_tasks: list[LayerTransferTask]
     layer_id: int
-    attention_start_gate: AttentionComputeStartGate | None = None
