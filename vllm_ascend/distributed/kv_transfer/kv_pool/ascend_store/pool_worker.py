@@ -619,7 +619,6 @@ class KVPoolWorker:
         if self.layer_broadcast_submitted[layer_id]:
             return True
         wait_event = self.layer_broadcast_wait_events[layer_id]
-        wait_event.record()
         self.kv_recv_thread.add_broadcast_request(layer_id, wait_event)
         self.layer_broadcast_submitted[layer_id] = True
         return True
@@ -664,6 +663,8 @@ class KVPoolWorker:
     def wait_for_layer_load(self) -> None:
         if self.p2p_enabled:
             next_layer = self.current_layer + 1
+            if self.current_layer == 0:
+                self.layer_broadcast_wait_events[self.current_layer].record()
             if 0 <= next_layer < self.num_layers:
                 self.layer_broadcast_wait_events[next_layer].record()
             self._wait_layer_broadcast(self.current_layer)
@@ -686,6 +687,8 @@ class KVPoolWorker:
         if not self.use_layerwise or not self.p2p_enabled:
             return
         next_layer = self.current_layer + 1
+        if 0 <= next_layer < self.num_layers:
+            self.layer_broadcast_wait_events[next_layer].record()
         self._wait_layer_broadcast(next_layer)
         self._submit_layer_h2d(next_layer + 1)
 
