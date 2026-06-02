@@ -275,7 +275,7 @@ def split_decodes_and_prefills(
     return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
 
 
-def wait_for_kv_layer_from_connector(layer_name: str):
+def wait_for_kv_layer_from_connector(layer_name: str=""):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
 

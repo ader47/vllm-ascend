@@ -1531,7 +1531,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
         prefill_kv_no_split = kv_no_split[num_decode_tokens:num_actual_tokens]
         # Record event and wait for broadcast AFTER comm stream dependency is established
-        wait_for_kv_layer_from_connector(layer_name)
+        wait_for_kv_layer_from_connector()
         prefill_q_c = q_c[num_decode_tokens:num_actual_tokens]
         prefill_q = self.q_proj(prefill_q_c)[0].view(-1, self.num_heads, self.qk_head_dim)
         prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]

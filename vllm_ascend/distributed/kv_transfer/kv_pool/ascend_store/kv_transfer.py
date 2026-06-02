@@ -901,9 +901,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
         if self.transfer_stream is None:
             self.transfer_stream = torch.npu.Stream()
-        if wait_event is not None:
-            self.transfer_stream.wait_event(wait_event)
         with torch.npu.stream(self.transfer_stream):
+            self.transfer_stream.wait_event(wait_event)
             self._p2p_comm.broadcast(buffer, src=0, stream=self.transfer_stream)
             if h2d_ok:
                 self._scatter_buffer_to_kv(buffer, addrs, sizes,
