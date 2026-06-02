@@ -204,6 +204,7 @@ class KVPoolWorker:
         self.layer_load_submitted = [False for i in range(self.num_layers)]
         self.layer_broadcast_submitted = [False for i in range(self.num_layers)]
         self.layer_load_completed = [False for i in range(self.num_layers)]
+        self.layer_broadcast_wait_events = [torch.npu.Event() for i in range(self.num_layers)]
         self.layer_save_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
         self.layer_load_finished_events = None
         self.layer_save_finished_events = None
@@ -617,9 +618,9 @@ class KVPoolWorker:
             return False
         if self.layer_broadcast_submitted[layer_id]:
             return True
-        tp_sync_event = torch.npu.Event()
-        tp_sync_event.record()
-        self.kv_recv_thread.add_broadcast_request(layer_id, tp_sync_event)
+        wait_event = self.layer_broadcast_wait_events[layer_id]
+        wait_event.record()
+        self.kv_recv_thread.add_broadcast_request(layer_id, wait_event)
         self.layer_broadcast_submitted[layer_id] = True
         return True
 
@@ -654,8 +655,10 @@ class KVPoolWorker:
 
     def wait_for_layer_load(self) -> None:
         if self.p2p_enabled:
-            self._wait_layer_broadcast(self.current_layer)
             next_layer = self.current_layer + 1
+            if 0 <= next_layer < self.num_layers:
+                self.layer_broadcast_wait_events[next_layer].record()
+            self._wait_layer_broadcast(self.current_layer)
             self._submit_layer_broadcast(next_layer)
             return
 
