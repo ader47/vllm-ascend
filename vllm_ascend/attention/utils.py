@@ -303,6 +303,15 @@ def finish_kv_layer_load_overlap(layer_name: str):
         connector.finish_layer_load_overlap(layer_name)
 
 
+def submit_next_layer_h2d():
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+
+    connector = get_kv_transfer_group()
+    if hasattr(connector, "submit_next_layer_h2d"):
+        connector.submit_next_layer_h2d()
+
+
 def maybe_save_kv_layer_to_connector(
     layer_name: str,
     kv_cache_layer: list[torch.Tensor],

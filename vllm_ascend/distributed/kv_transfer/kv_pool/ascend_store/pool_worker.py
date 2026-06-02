@@ -653,6 +653,14 @@ class KVPoolWorker:
             if self._submit_layer_h2d(layer_id):
                 submitted_layers += 1
 
+    def submit_next_layer_h2d(self) -> None:
+        if not self.use_layerwise or not self.p2p_enabled:
+            return
+        next_layer = self.current_layer + 1
+        if 0 <= next_layer < self.num_layers:
+            if self.prefetch_layer_map.get(next_layer) is None:
+                self._submit_layer_h2d(next_layer)
+
     def wait_for_layer_load(self) -> None:
         if self.p2p_enabled:
             next_layer = self.current_layer + 1

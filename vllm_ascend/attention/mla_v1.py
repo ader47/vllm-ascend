@@ -31,6 +31,7 @@ from vllm_ascend.attention.utils import (
     finish_kv_layer_load_overlap,
     maybe_save_kv_layer_to_connector,
     split_decodes_and_prefills,
+    submit_next_layer_h2d,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
@@ -1261,7 +1262,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             "actual_seq_lengths": actual_seq_lengths_q,
             "actual_seq_lengths_kv": actual_seq_lengths_kv,
         }
-        wait_for_kv_layer_from_connector(layer_name)
+        # wait_for_kv_layer_from_connector(layer_name)
         record_attention_compute_start()
         attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(q_nope, k_nope, value, **common_kwargs)
 
@@ -1599,7 +1600,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         decode_preprocess_res = None
         prefill_preprocess_res = None
         # if has_prefill:
-        # wait_for_kv_layer_from_connector(layer_name)
+        wait_for_kv_layer_from_connector(layer_name)
         # Preprocess for decode tokens
         if self.is_kv_producer and not self.is_kv_both:
             attn_metadata.reshape_cache_event = torch.npu.Event()
@@ -1654,6 +1655,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                     reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
 
+        submit_next_layer_h2d()
+
         num_actual_tokens = self.get_num_actual_tokens(attn_metadata)
         assert (
             attn_metadata.num_decodes is not None
@@ -1682,7 +1685,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
             # TODO prefill kv offload need to remove
-            wait_for_kv_layer_from_connector(layer_name)
+            # wait_for_kv_layer_from_connector(layer_name)
             record_attention_compute_start()
             output_decode = self._forward_decode(
                 decode_preprocess_res.ql_nope,
