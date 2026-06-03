@@ -3,7 +3,6 @@ import queue
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -257,8 +256,7 @@ class KVTransferThread(threading.Thread):
         self.num_addrs_per_block = len(token_database.block_len)
         self.done_task_lock = threading.Lock()
         self.request_queue: queue.Queue[Any] = queue.Queue()
-        # TODO(jianzs): make this configurable
-        self.executor = ThreadPoolExecutor(max_workers=32)
+        self.stored_requests: defaultdict[str, int] = defaultdict(int)
         self.finished_requests: set[str] = set()
         self.kv_event_lock = threading.Lock()
         self.kv_events: list[BlockStored] = []
@@ -428,117 +426,6 @@ class KVTransferThread(threading.Thread):
             self.kv_events.clear()
         return events
 
-    @staticmethod
-    def _skip_null_blocks(req_meta: ReqMeta, group_id: int, cache_role: str = "kv") -> bool:
-        if cache_role != "kv":
-            return False
-        skip_flags = req_meta.skip_null_blocks_by_group
-        return group_id < len(skip_flags) and skip_flags[group_id] if skip_flags else False
-
-    def _process_tokens_with_block_ids(
-        self,
-        token_len: int,
-        block_hashes,
-        block_ids: list[int],
-        mask_num: int = 0,
-        kv_cache_group_id: int = 0,
-        skip_null_blocks: bool = False,
-        cache_role: str = "kv",
-    ):
-        process_with_block_ids = getattr(self.token_database, "process_tokens_with_block_ids", None)
-        if process_with_block_ids is not None:
-            return process_with_block_ids(
-                token_len,
-                block_hashes,
-                block_ids,
-                mask_num,
-                kv_cache_group_id=kv_cache_group_id,
-                skip_null_blocks=skip_null_blocks,
-                cache_role=cache_role,
-            )
-
-        def iter_with_legacy_process_tokens():
-            try:
-                token_iter = self.token_database.process_tokens(token_len, block_hashes, mask_num)
-            except TypeError:
-                token_iter = self.token_database.process_tokens(token_len, block_hashes)
-            group_block_size = self._get_block_size(kv_cache_group_id)
-            for start, end, key in token_iter:
-                block_idx = start // group_block_size
-                if block_idx >= len(block_ids):
-                    continue
-                block_id = block_ids[block_idx]
-                if skip_null_blocks and cache_role == "kv" and block_id <= 0:
-                    continue
-                yield start, end, key, block_id
-
-        return iter_with_legacy_process_tokens()
-
-    def _prepare_value(
-        self,
-        start: int,
-        end: int,
-        block_ids: list[int],
-        kv_cache_group_id: int = 0,
-        cache_role: str = "kv",
-    ):
-        try:
-            return self.token_database.prepare_value(
-                start,
-                end,
-                block_ids,
-                kv_cache_group_id=kv_cache_group_id,
-                cache_role=cache_role,
-            )
-        except TypeError:
-            return self.token_database.prepare_value(start, end, block_ids)
-
-    def _decode_adaptor_prefill_pp(
-        self,
-        keys: list[str],
-        addrs: list[list[int]],
-        sizes: list[list[int]],
-        kv_cache_group_id: int = 0,
-        cache_role: str = "kv",
-    ):
-        try:
-            return self.token_database.decode_adaptor_prefill_pp(
-                keys,
-                addrs,
-                sizes,
-                kv_cache_group_id=kv_cache_group_id,
-                cache_role=cache_role,
-            )
-        except TypeError:
-            return self.token_database.decode_adaptor_prefill_pp(keys, addrs, sizes)
-
-
-class KVCacheStoreSendingThread(KVTransferThread):
-    def __init__(
-        self,
-        m_store: Backend,
-        token_database: ChunkedTokenDatabase,
-        block_size: int | list[int],
-        tp_rank: int,
-        tp_size: int,
-        dcp_size: int,
-        put_step: int,
-        kv_role: str,
-        ready_event: threading.Event,
-        group_uses_align_state: list[bool],
-        enable_kv_event: bool = False,
-    ):
-        super().__init__(
-            m_store, token_database, block_size, tp_rank, tp_size, dcp_size, ready_event, name="KVCacheSendingThread"
-        )
-        self.put_step = put_step
-        self.kv_role = kv_role
-        self.stored_requests = defaultdict[str, int](int)
-        self.group_uses_align_state = group_uses_align_state
-        self.enable_kv_event = enable_kv_event
-        self.completed_events_lock = threading.Lock()
-        self.completed_events: dict[int, int] = {}
-
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
             self.stored_requests[req_id] += 1
@@ -559,6 +446,28 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 del self.stored_requests[req_id]
                 return True
             return False
+
+
+class KVCacheStoreSendingThread(KVTransferThread):
+    def __init__(
+        self,
+        m_store: Backend,
+        token_database: ChunkedTokenDatabase,
+        block_size: int,
+        tp_rank: int,
+        tp_size: int,
+        dcp_size: int,
+        put_step: int,
+        kv_role: str,
+        ready_event: threading.Event,
+        enable_kv_event: bool = False,
+    ):
+        super().__init__(
+            m_store, token_database, block_size, tp_rank, tp_size, dcp_size, ready_event, name="KVCacheSendingThread"
+        )
+        self.put_step = put_step
+        self.kv_role = kv_role
+        self.enable_kv_event = enable_kv_event
 
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.save_end_token
@@ -770,28 +679,6 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
         self.put_step = put_step
         self.layer_save_finished_events = layer_save_finished_events
         self.sync_save_events = sync_save_events
-        self.stored_requests = defaultdict[str, int](int)
-
-    def add_stored_request(self, req_id: str):
-        with self.done_task_lock:
-            self.stored_requests[req_id] += 1
-
-    def dec_stored_request(self, req_id: str):
-        with self.done_task_lock:
-            if req_id in self.stored_requests:
-                self.stored_requests[req_id] -= 1
-
-    def delete_finished_stored_request(self, req_id: str):
-        with self.done_task_lock:
-            if req_id in self.stored_requests:
-                del self.stored_requests[req_id]
-
-    def try_finish_and_delete_stored_request(self, req_id: str) -> bool:
-        with self.done_task_lock:
-            if req_id in self.stored_requests and self.stored_requests[req_id] == 0:
-                del self.stored_requests[req_id]
-                return True
-            return False
 
     def add_request(  # type: ignore[override]
         self, req_meta: list[LayerTransferTask]
@@ -1025,7 +912,6 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.enable_kv_event = enable_kv_event
         self.layer_save_finished_events = layer_save_finished_events
         self.sync_save_events = sync_save_events
-        self.stored_requests = defaultdict[str, int](int)
         self.layer_transfer_finished_events = layer_transfer_finished_events
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
@@ -1035,27 +921,6 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             num_ranks_per_layer,
             page_size_bytes,
         )
-
-    def add_stored_request(self, req_id: str):
-        with self.done_task_lock:
-            self.stored_requests[req_id] += 1
-
-    def dec_stored_request(self, req_id: str):
-        with self.done_task_lock:
-            if req_id in self.stored_requests:
-                self.stored_requests[req_id] -= 1
-
-    def delete_finished_stored_request(self, req_id: str):
-        with self.done_task_lock:
-            if req_id in self.stored_requests:
-                del self.stored_requests[req_id]
-
-    def try_finish_and_delete_stored_request(self, req_id: str) -> bool:
-        with self.done_task_lock:
-            if req_id in self.stored_requests and self.stored_requests[req_id] == 0:
-                del self.stored_requests[req_id]
-                return True
-            return False
 
     def add_request(  # type: ignore[override]
         self, req_meta: list[LayerTransferTask]
