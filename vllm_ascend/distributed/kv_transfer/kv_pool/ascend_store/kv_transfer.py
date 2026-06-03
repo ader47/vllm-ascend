@@ -987,7 +987,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         layer_id = data.layer_id
 
         if wait_for_save is not None:
-            logger.info("Layerwise %d load waiting for save layer %d", layer_id, wait_for_save)
             while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
                 logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
             logger.debug(f">>>>>>>>>>>>>>>>>>>> clear save layer {wait_for_save}")

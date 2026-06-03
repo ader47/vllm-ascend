@@ -321,10 +321,11 @@ class KVPoolWorker:
                 )
             if self.p2p_enabled:
                 tp_group = get_tp_group()
-                self._p2p_gloo_group = dist.new_group(
-                    tp_group.ranks,
-                    backend="gloo",
-                )
+                self._p2p_gloo_group = tp_group.cpu_group
+                #dist.new_group(
+                #     tp_group.ranks,
+                #     backend="gloo",
+                # )
             else:
                 self._p2p_gloo_group = None
             ready_event = threading.Event()
