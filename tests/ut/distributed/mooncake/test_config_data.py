@@ -1,16 +1,32 @@
 import sys
 import types
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 fake_engine = types.ModuleType("mooncake.engine")
 fake_engine.TransferEngine = MagicMock()  # type: ignore[attr-defined]
 sys.modules["mooncake.engine"] = fake_engine
 fake_store = types.ModuleType("mooncake.store")
 fake_store.ReplicateConfig = MagicMock()  # type: ignore[attr-defined]
+
+
+class FakeMooncakeDistributedStore:
+    instances = []
+
+    def __init__(self):
+        self.setup_calls = []
+        FakeMooncakeDistributedStore.instances.append(self)
+
+    def setup(self, *args):
+        self.setup_calls.append(args)
+        return 0
+
+
+fake_store.MooncakeDistributedStore = FakeMooncakeDistributedStore  # type: ignore[attr-defined]
 sys.modules["mooncake.store"] = fake_store
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import (  # noqa: E402
+    MooncakeBackend,
     _convert_to_bytes,
     _parse_global_segment_size,
 )
@@ -72,3 +88,67 @@ class TestConvertToBytes(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             _convert_to_bytes("1.2.3", 1024, "1.2.3KB")
+
+
+class TestMooncakeSchedulerClient(unittest.TestCase):
+
+    def setUp(self):
+        FakeMooncakeDistributedStore.instances.clear()
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.get_ip")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.global_te")
+    def test_scheduler_client_does_not_contribute_memory(self, mock_global_te, mock_get_ip):
+        mock_get_ip.return_value = "127.0.0.1"
+        transfer_engine = MagicMock()
+        transfer_engine.get_rpc_port.return_value = 12345
+        transfer_engine.get_engine.return_value = object()
+        mock_global_te.get_transfer_engine.return_value = transfer_engine
+
+        config = MagicMock()
+        config.metadata_server = "P2PHANDSHAKE"
+        config.global_segment_size = 1024
+        config.local_buffer_size = 2048
+        config.protocol = "ascend"
+        config.device_name = ""
+        config.master_server_address = "127.0.0.1:50051"
+
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend."
+            "MooncakeStoreConfig.load_from_env",
+            return_value=config,
+        ):
+            MooncakeBackend.create_scheduler_client(MagicMock())
+
+        store = FakeMooncakeDistributedStore.instances[-1]
+        setup_args = store.setup_calls[-1]
+        self.assertEqual(setup_args[2], 0)
+        self.assertEqual(setup_args[3], 0)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.get_ip")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.global_te")
+    def test_worker_client_uses_configured_memory(self, mock_global_te, mock_get_ip):
+        mock_get_ip.return_value = "127.0.0.1"
+        transfer_engine = MagicMock()
+        transfer_engine.get_rpc_port.return_value = 12345
+        transfer_engine.get_engine.return_value = object()
+        mock_global_te.get_transfer_engine.return_value = transfer_engine
+
+        config = MagicMock()
+        config.metadata_server = "P2PHANDSHAKE"
+        config.global_segment_size = 1024
+        config.local_buffer_size = 2048
+        config.protocol = "ascend"
+        config.device_name = ""
+        config.master_server_address = "127.0.0.1:50051"
+
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend."
+            "MooncakeStoreConfig.load_from_env",
+            return_value=config,
+        ):
+            MooncakeBackend(MagicMock())
+
+        store = FakeMooncakeDistributedStore.instances[-1]
+        setup_args = store.setup_calls[-1]
+        self.assertEqual(setup_args[2], 1024)
+        self.assertEqual(setup_args[3], 2048)

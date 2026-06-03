@@ -1,0 +1,179 @@
+from collections.abc import Iterable
+from typing import Any
+
+import torch
+
+from vllm.config import VllmConfig
+from vllm.distributed.kv_events import (
+    KVCacheEvent,
+    KVConnectorKVEvents,
+    KVEventAggregator,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole
+from vllm.forward_context import ForwardContext
+from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import Request
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
+    KVPoolScheduler,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.layerwise.layerwise_worker import LayerwiseWorker
+
+
+class LayerwiseStoreKVEvents(KVConnectorKVEvents):
+    def __init__(self, num_workers: int) -> None:
+        self._aggregator = KVEventAggregator(num_workers)
+
+    def add_events(self, events: list[KVCacheEvent]) -> None:
+        self._aggregator.add_events(events)
+
+    def aggregate(self) -> "LayerwiseStoreKVEvents":
+        common_events = self._aggregator.get_common_events()
+        self._aggregator.clear_events()
+        self._aggregator.add_events(common_events)
+        self._aggregator.reset_workers()
+        return self
+
+    def increment_workers(self, count: int = 1) -> None:
+        self._aggregator.increment_workers(count)
+
+    def get_all_events(self) -> list[KVCacheEvent]:
+        return self._aggregator.get_all_events()
+
+    def get_number_of_workers(self) -> int:
+        return self._aggregator.get_number_of_workers()
+
+    def clear_events(self) -> None:
+        self._aggregator.clear_events()
+        self._aggregator.reset_workers()
+
+    def __repr__(self) -> str:
+        return f"<LayerwiseStoreKVEvents events={self.get_all_events()}>"
+
+
+class LayerwiseStoreConnector(KVConnectorBase_V1):
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        return True
+
+    def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
+        super().__init__(vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config)
+        self.kv_role = vllm_config.kv_transfer_config.kv_role
+
+        self.consumer_is_to_put = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "consumer_is_to_put", False
+        )
+
+        self.kv_caches: dict[str, torch.Tensor] = {}
+        self._kv_cache_events: LayerwiseStoreKVEvents | None = None
+
+        if role == KVConnectorRole.SCHEDULER:
+            page_size_bytes = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+            self.connector_scheduler = KVPoolScheduler(vllm_config, True, page_size_bytes=page_size_bytes)
+        else:
+            self.connector_worker = LayerwiseWorker(vllm_config)
+
+    ############################################################
+    # Scheduler Side Methods
+    ############################################################
+
+    def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
+
+    def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
+
+    def build_connector_meta(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> KVConnectorMetadata:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.build_connector_meta(scheduler_output)
+
+    def request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_finished(request, block_ids)
+
+    def update_connector_output(self, connector_output: KVConnectorOutput):
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.update_finished_recving(
+            connector_output.finished_recving)
+        self.connector_scheduler.update_finished_sending(
+            connector_output.finished_sending)
+
+        kv_cache_events = connector_output.kv_cache_events
+        if not kv_cache_events or not isinstance(kv_cache_events, LayerwiseStoreKVEvents):
+            return
+
+        if self._kv_cache_events is None:
+            self._kv_cache_events = kv_cache_events
+        else:
+            self._kv_cache_events.add_events(kv_cache_events.get_all_events())
+            self._kv_cache_events.increment_workers(kv_cache_events.get_number_of_workers())
+        return
+
+    def take_events(self) -> Iterable["KVCacheEvent"]:
+        if self._kv_cache_events is not None:
+            self._kv_cache_events.aggregate()
+            kv_cache_events = self._kv_cache_events.get_all_events()
+            yield from kv_cache_events
+            self._kv_cache_events.clear_events()
+            self._kv_cache_events = None
+
+    ############################################################
+    # Worker Side Methods
+    ############################################################
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        assert self.connector_worker is not None
+        self.connector_worker.register_kv_caches(kv_caches)
+
+    def rebind_kv_transfer_threads(self) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.rebind_kv_transfer_threads()
+
+    def init_backend(self) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.init_backend()
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.start_load_kv(self._get_connector_metadata())
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        self.connector_worker.wait_for_layer_load()
+
+    def save_kv_layer(
+        self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
+    ) -> None:
+        if self.kv_role == "kv_consumer":
+            return
+        self.connector_worker.save_kv_layer(self._get_connector_metadata())
+
+    def wait_for_save(self):
+        if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
+            return
+
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+        assert self.connector_worker is not None
+        done_sending, done_recving = self.connector_worker.get_finished(
+            finished_req_ids, self._get_connector_metadata()
+        )
+        return done_sending, done_recving
+
+    def get_kv_connector_kv_cache_events(self) -> LayerwiseStoreKVEvents | None:
+        events = self.connector_worker.get_kv_events()
+        if not events:
+            return None
+
+        layerwise_store_kv_events = LayerwiseStoreKVEvents(num_workers=1)
+        layerwise_store_kv_events.add_events(events)
+        return layerwise_store_kv_events
