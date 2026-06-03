@@ -22,35 +22,11 @@ DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
 
 
 class MooncakeBackend(Backend):
-    def __init__(self, parallel_config: ParallelConfig, lazy_init: bool = False):
-        self.config = MooncakeStoreConfig.load_from_env()
-        if self.config.protocol != "ascend":
-            raise NotImplementedError(f"MooncakeBackend does not support protocol {self.config.protocol!r}.")
-
-        self.store: Any | None = None
-        self.local_seg: str | None = None
-        self._use_fabric_mem = os.getenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0") == "1"
-        self._lazy_init = lazy_init and self._use_fabric_mem
-        self._store_initialized = False
-        self._store_init_lock = threading.Lock()
-
-        if not self._lazy_init:
-            self.store = self._setup_store()
-            self._store_initialized = True
-
-    def _ensure_initialized(self):
-        if self._store_initialized:
-            return
-
-        with self._store_init_lock:
-            if self._store_initialized:
-                return
-
-            logger.info("Initializing Mooncake store on first put.")
-            self.store = self._setup_store()
-            self._store_initialized = True
-
-    def _setup_store(self):
+    def __init__(
+        self,
+        parallel_config: ParallelConfig,
+        contribute_memory: bool = True,
+    ):
         try:
             from mooncake.store import MooncakeDistributedStore  # type: ignore
         except ImportError as e:
@@ -59,42 +35,52 @@ class MooncakeBackend(Backend):
                 "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
                 "to run vLLM with MooncakeConnector."
             ) from e
-
-        store = MooncakeDistributedStore()
-        local_hostname = get_ip()
-        # ASCEND_ENABLE_USE_FABRIC_MEM: Enable unified memory address direct transmission scheme
-        # and only can be used for 800 I/T A3 series.
-        # Required supporting hardware versions are as follows:
-        if not self._use_fabric_mem:
-            transfer_engine = global_te.get_transfer_engine(local_hostname, device_name=None)
-            self.local_seg = local_hostname + ":" + str(transfer_engine.get_rpc_port())
-            ret = store.setup(
-                local_hostname=self.local_seg,
-                metadata_server=self.config.metadata_server,
-                global_segment_size=self.config.global_segment_size,
-                local_buffer_size=self.config.local_buffer_size,
-                protocol=self.config.protocol,
-                rdma_devices=self.config.device_name,
-                master_server_addr=self.config.master_server_address,
-                engine=transfer_engine.get_engine(),
-            )
-        else:
-            self.local_seg = local_hostname
-            ret = store.setup(
-                local_hostname=self.local_seg,
-                metadata_server=self.config.metadata_server,
-                global_segment_size=self.config.global_segment_size,
-                local_buffer_size=0,
-                protocol=self.config.protocol,
-                rdma_devices=self.config.device_name,
-                master_server_addr=self.config.master_server_address,
-            )
+        self.config = MooncakeStoreConfig.load_from_env()
+        self.store = MooncakeDistributedStore()
+        self.rank = parallel_config.rank
+        global_segment_size = (
+            self.config.global_segment_size if contribute_memory else 0)
+        local_buffer_size = (
+            self.config.local_buffer_size if contribute_memory else 0)
+        if self.config.protocol == "ascend":
+            local_hostname = get_ip()
+            # ASCEND_ENABLE_USE_FABRIC_MEM: Enable unified memory address direct transmission scheme
+            # and only can be used for 800 I/T A3 series.
+            # Required supporting hardware versions are as follows:
+            if os.getenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0") != "1":
+                transfer_engine = global_te.get_transfer_engine(local_hostname, device_name=None)
+                self.local_seg = local_hostname + ":" + str(transfer_engine.get_rpc_port())
+                ret = self.store.setup(
+                    self.local_seg,
+                    self.config.metadata_server,
+                    global_segment_size,
+                    local_buffer_size,
+                    self.config.protocol,
+                    self.config.device_name,
+                    self.config.master_server_address,
+                    transfer_engine.get_engine(),
+                )
+            else:
+                self.local_seg = local_hostname
+                ret = self.store.setup(
+                    self.local_seg,
+                    self.config.metadata_server,
+                    global_segment_size,
+                    0,
+                    self.config.protocol,
+                    self.config.device_name,
+                    self.config.master_server_address,
+                )
 
         if ret != 0:
             msg = "Initialize mooncake failed."
             logger.error(msg)
             raise RuntimeError(msg)
         return store
+
+    @classmethod
+    def create_scheduler_client(cls, parallel_config: ParallelConfig):
+        return cls(parallel_config, contribute_memory=False)
 
     def set_device(self):
         local_rank = get_world_group().local_rank
