@@ -9,10 +9,16 @@ from collections import defaultdict
 import psutil
 from vllm.logger import logger
 
+from vllm_ascend import envs
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 MASK_BIT = 32  # Number of bits in a CPU affinity mask group
 MIN_CPUS_PER_NPU = 5  # 2(IRQ) + 1(main, at least 1 CPU) + 1(acl) + 1(release) = 5 CPUs per NPU
+IRQ_CPUS_PER_NPU = 2
+ACL_CPUS_PER_NPU = 1
+RELEASE_CPUS_PER_NPU = 1
+DEFAULT_MEMCACHE_CPUS_PER_NPU = 8
+DEFAULT_WORKER_CPUS_PER_NPU = 12
 ALLOWED_CPUS_PATH = "/proc/self/status"
 ASCEND_RT_VISIBLE_DEVICES = os.getenv("ASCEND_RT_VISIBLE_DEVICES")
 
@@ -24,6 +30,22 @@ DEVICE_BINDING_MODE: dict["AscendDeviceType", str] = {
     AscendDeviceType.A3: GLOBAL_SLICE_MODE,
     AscendDeviceType._310P: TOPO_AFFINITY_MODE,
 }
+
+
+def get_cpu_binding_rank(local_rank: int, parallel_config: object) -> int:
+    dp_rank_local = int(getattr(parallel_config, "data_parallel_rank_local", 0) or 0)
+    dp_size_local = int(getattr(parallel_config, "data_parallel_size_local", 1) or 1)
+    if dp_size_local <= 1:
+        return local_rank
+
+    per_dp_local_world_size = int(getattr(parallel_config, "local_world_size", 0) or 0)
+    if per_dp_local_world_size <= 0:
+        per_dp_local_world_size = int(getattr(parallel_config, "world_size", 1) or 1)
+    rank = getattr(parallel_config, "rank", None)
+    total_local_world_size = dp_size_local * per_dp_local_world_size
+    if rank is not None and total_local_world_size > 0:
+        return int(rank) % total_local_world_size
+    return dp_rank_local * per_dp_local_world_size + local_rank
 
 
 def is_arm_cpu() -> bool:
@@ -158,11 +180,37 @@ class CpuAlloc:
         self.rank_id = rank_id
         self.device_info: DeviceInfo = DeviceInfo()
         self.cpu_node: dict[int, int] = {}
+        self.cpu_socket: dict[int, int] = {}
         self.numa_to_cpu_map: dict[int, list[int]] = defaultdict(list)
         self.npu_cpu_pool: dict[int, list[int]] = {}
         self.assign_main: dict[int, list[int]] = {}
         self.assign_acl: dict[int, list[int]] = {}
         self.assign_rel: dict[int, list[int]] = {}
+        self.assign_memcache: dict[int, list[int]] = {}
+
+    @staticmethod
+    def _get_non_negative_env(name: str, default: int) -> int:
+        value = getattr(envs, name, default)
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative.")
+        return value
+
+    @staticmethod
+    def memcache_cpu_count() -> int:
+        return CpuAlloc._get_non_negative_env(
+            "VLLM_ASCEND_CPU_BIND_MEMCACHE_CPU_COUNT",
+            DEFAULT_MEMCACHE_CPUS_PER_NPU,
+        )
+
+    @staticmethod
+    def worker_cpu_count() -> int:
+        value = CpuAlloc._get_non_negative_env(
+            "VLLM_ASCEND_CPU_BIND_WORKER_CPU_COUNT",
+            DEFAULT_WORKER_CPUS_PER_NPU,
+        )
+        if value < 1:
+            raise ValueError("VLLM_ASCEND_CPU_BIND_WORKER_CPU_COUNT must be at least 1.")
+        return value
 
     @staticmethod
     def cpu_to_mask(cpu: int) -> str:
@@ -204,6 +252,20 @@ class CpuAlloc:
             if return_code != 0:
                 raise RuntimeError(f"Failed to bind {pid} to CPU {cpu_list}.")
 
+    @staticmethod
+    def _get_thread_name(pid: str, thread_id: str) -> str:
+        try:
+            with open(f"/proc/{pid}/task/{thread_id}/comm") as f:
+                return f.read().strip()
+        except OSError as err:
+            logger.warning(
+                "Failed to read thread name for pid=%s tid=%s: %s",
+                pid,
+                thread_id,
+                err,
+            )
+            return ""
+
     def average_distribute(self, groups: dict[str, list[int]]) -> dict[int, list[int]]:
         result: dict[int, list[int]] = {}
         for key, npu_list in groups.items():
@@ -230,12 +292,18 @@ class CpuAlloc:
         return sorted(set(extended))
 
     def build_cpu_node_map(self) -> None:
-        cpu_numa_map, _ = execute_command(["lscpu", "-e=CPU,NODE"])
+        lscpu_fields = "CPU,NODE"
+        cpu_numa_map, return_code = execute_command(["lscpu", f"-e={lscpu_fields}"])
+        if return_code != 0:
+            raise RuntimeError(f"lscpu command failed when querying {lscpu_fields}. Please check!")
         for line in cpu_numa_map.splitlines():
             line = line.strip()
             if not line or not line[0].isdigit():
                 continue
-            cpu_str, node_str = line.split()
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            cpu_str, node_str = parts[:2]
             cpu = int(cpu_str)
             node = int(node_str)
             self.cpu_node[cpu] = node
@@ -323,28 +391,26 @@ class CpuAlloc:
 
     def build_cpu_pools(self) -> None:
         self.build_cpu_node_map()
-
         mode = self._binding_mode()
         logger.info(
-            "[cpu_bind_mode] mode=%s rank=%s visible_npus=%s", mode, self.rank_id, self.device_info.running_npu_list
+            "[cpu_bind_mode] mode=%s rank=%d visible_npus=%s",
+            mode,
+            self.rank_id,
+            self.device_info.running_npu_list,
         )
         if mode == GLOBAL_SLICE_MODE:
             self.build_global_slice_cpu_pool()
             return
 
-        # topo_affinity mode
         if not self.device_info.npu_affinity:
             logger.warning("NPU topo affinity not found, fallback to global-slice CPU binding.")
             self.build_global_slice_cpu_pool()
             return
 
         allowed_cpu_set = set(self.device_info.allowed_cpus)
-        # Consider all logical NPUs to avoid CPU distribution overlap across worker processes.
         candidate_npus = [
             npu
             for npu in self.device_info.all_logic_npus
-            # Always keep visible NPUs for strict conflict checks; include
-            # non-visible NPUs only when they overlap this process's cpuset.
             if npu in self.device_info.running_npu_list
             or any(cpu in allowed_cpu_set for cpu in self.device_info.npu_affinity.get(npu, []))
         ]
@@ -367,30 +433,79 @@ class CpuAlloc:
                 final[npu_list[0]] = self.npu_cpu_pool[npu_list[0]]
             else:
                 final.update(self.average_distribute({key: npu_list}))
-        # Keep only visible NPUs in the final binding pool. Non-visible NPUs are used only to avoid overlap.
         self.npu_cpu_pool = {npu: final[npu] for npu in self.device_info.running_npu_list}
 
+    def get_current_npu(self) -> int:
+        if 0 <= self.rank_id < len(self.device_info.running_npu_list):
+            return self.device_info.running_npu_list[self.rank_id]
+        if self.rank_id in self.npu_cpu_pool:
+            return self.rank_id
+        raise RuntimeError(
+            f"Invalid CPU binding rank {self.rank_id}. "
+            f"visible_npus={self.device_info.running_npu_list}"
+        )
+
     def allocate(self) -> None:
+        memcache_cpu_count = self.memcache_cpu_count()
+        worker_cpu_count = self.worker_cpu_count()
         for npu, pool in self.npu_cpu_pool.items():
-            if len(pool) >= MIN_CPUS_PER_NPU:
-                main = pool[2:-2]
-                acl = [pool[-2]]
-                rel = [pool[-1]]
-            else:
+            if len(pool) < MIN_CPUS_PER_NPU:
                 raise RuntimeError(
                     f"The number of CPUs is insufficient. Each NPU requires at least {MIN_CPUS_PER_NPU} CPUs."
+                )
+            irq_end = min(IRQ_CPUS_PER_NPU, len(pool))
+            remaining = pool[irq_end:]
+
+            reserved_for_acl_release = ACL_CPUS_PER_NPU + RELEASE_CPUS_PER_NPU
+            max_main_count = max(1, len(remaining) - reserved_for_acl_release)
+            main_count = min(worker_cpu_count, max_main_count)
+            main = remaining[:main_count]
+            remaining = remaining[len(main):]
+            if not main:
+                raise RuntimeError(
+                    f"The number of CPUs is insufficient. NPU{npu} requires at least one worker CPU."
+                )
+
+            acl = remaining[:ACL_CPUS_PER_NPU]
+            remaining = remaining[len(acl):]
+            rel = remaining[:RELEASE_CPUS_PER_NPU]
+            remaining = remaining[len(rel):]
+            memcache = remaining[:memcache_cpu_count]
+
+            if len(main) < worker_cpu_count:
+                logger.warning(
+                    "NPU%d worker CPU count is %d, less than requested %d.",
+                    npu,
+                    len(main),
+                    worker_cpu_count,
+                )
+            if len(memcache) < memcache_cpu_count:
+                logger.warning(
+                    "NPU%d MemCache CPU count is %d, less than requested %d.",
+                    npu,
+                    len(memcache),
+                    memcache_cpu_count,
                 )
             self.assign_main[npu] = main
             self.assign_acl[npu] = acl
             self.assign_rel[npu] = rel
+            self.assign_memcache[npu] = memcache
 
     def print_plan(self) -> None:
         logger.info("The CPU allocation plan is as follows:")
-        current_npu = self.device_info.running_npu_list[self.rank_id]
+        current_npu = self.get_current_npu()
         main = " ".join(map(str, self.assign_main[current_npu]))
+        memcache = " ".join(map(str, self.assign_memcache[current_npu]))
         acl = " ".join(map(str, self.assign_acl[current_npu]))
         rel = str(self.assign_rel[current_npu]) if self.assign_rel[current_npu] else ""
-        logger.info("NPU%s: main=[%s]  acl=[%s]  release=[%s]", current_npu, main, acl, rel)
+        logger.info(
+            "NPU%s: main=[%s]  memcache=[%s] acl=[%s]  release=[%s]",
+            current_npu,
+            main,
+            memcache,
+            acl,
+            rel,
+        )
 
     def bind_memory(self, pid: str, npu: int) -> None:
         def _get_npu_numa_node(npu_id: int) -> int | None:
@@ -426,11 +541,65 @@ class CpuAlloc:
         thread_message, _ = execute_command(["ps", "-Te"])
         threads_map = self.get_threads_map(thread_message)
         main_pid = str(psutil.Process().pid)
-        current_npu = self.device_info.running_npu_list[self.rank_id]
-        self.bind(main_pid, self.assign_main[current_npu], True)
-        for acl_thread in threads_map.get(main_pid, {}).get("acl_thread", []):
+        process_name = psutil.Process().name()
+        current_npu = self.get_current_npu()
+        acl_threads = set(threads_map.get(main_pid, {}).get("acl_thread", []))
+        release_threads = set(threads_map.get(main_pid, {}).get("release_thread", []))
+        special_threads = acl_threads | release_threads
+
+        try:
+            thread_ids = sorted(os.listdir(f"/proc/{main_pid}/task"), key=int)
+        except OSError as err:
+            logger.warning("Failed to list threads for pid=%s: %s", main_pid, err)
+            thread_ids = []
+
+        logger.info(
+            "Binding worker process threads. process_name=%s pid=%s "
+            "main_cpus=%s acl_cpus=%s release_cpus=%s thread_count=%d",
+            process_name,
+            main_pid,
+            self.assign_main[current_npu],
+            self.assign_acl[current_npu],
+            self.assign_rel[current_npu],
+            len(thread_ids),
+        )
+        for thread_id in thread_ids:
+            if thread_id in special_threads:
+                continue
+            thread_name = self._get_thread_name(main_pid, thread_id)
+            logger.info(
+                "Binding worker thread. process_name=%s pid=%s "
+                "thread_name=%s tid=%s role=main cpus=%s",
+                process_name,
+                main_pid,
+                thread_name,
+                thread_id,
+                self.assign_main[current_npu],
+            )
+            self.bind(thread_id, self.assign_main[current_npu], False)
+        for acl_thread in acl_threads:
+            thread_name = self._get_thread_name(main_pid, acl_thread)
+            logger.info(
+                "Binding worker thread. process_name=%s pid=%s "
+                "thread_name=%s tid=%s role=acl cpus=%s",
+                process_name,
+                main_pid,
+                thread_name,
+                acl_thread,
+                self.assign_acl[current_npu],
+            )
             self.bind(acl_thread, self.assign_acl[current_npu], False)
-        for release_thread in threads_map.get(main_pid, {}).get("release_thread", []):
+        for release_thread in release_threads:
+            thread_name = self._get_thread_name(main_pid, release_thread)
+            logger.info(
+                "Binding worker thread. process_name=%s pid=%s "
+                "thread_name=%s tid=%s role=release cpus=%s",
+                process_name,
+                main_pid,
+                thread_name,
+                release_thread,
+                self.assign_rel[current_npu],
+            )
             self.bind(release_thread, self.assign_rel[current_npu], False)
         # Migrate memory once for the whole process, after all threads are pinned.
         self.bind_memory(main_pid, current_npu)
@@ -440,7 +609,7 @@ class CpuAlloc:
             return
 
         # Only bind IRQ for current rank's NPU to avoid multi-process overwrite.
-        current_npu = self.device_info.running_npu_list[self.rank_id]
+        current_npu = self.get_current_npu()
         if current_npu not in self.npu_cpu_pool:
             logger.warning("[irq] rank:%s -> NPU%s has no cpu pool, skip irq binding.", self.rank_id, current_npu)
             return
@@ -535,3 +704,17 @@ def bind_cpus(rank_id: int) -> None:
         return
     binder = CpuAlloc(rank_id)
     binder.run_all()
+
+
+def get_memcache_client_cpus(rank_id: int) -> list[int]:
+    if not is_arm_cpu():
+        return []
+    binder = CpuAlloc(rank_id)
+    binder.build_cpu_pools()
+    binder.allocate()
+    current_npu = binder.get_current_npu()
+    return binder.assign_memcache[current_npu]
+
+
+def bind_thread_to_cpus(thread_id: int, cpus: list[int]) -> None:
+    CpuAlloc.bind(str(thread_id), cpus, False)
