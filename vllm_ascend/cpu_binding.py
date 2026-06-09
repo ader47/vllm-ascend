@@ -443,10 +443,7 @@ class CpuAlloc:
             return self.device_info.running_npu_list[self.rank_id]
         if self.rank_id in self.npu_cpu_pool:
             return self.rank_id
-        raise RuntimeError(
-            f"Invalid CPU binding rank {self.rank_id}. "
-            f"visible_npus={self.device_info.running_npu_list}"
-        )
+        raise RuntimeError(f"Invalid CPU binding rank {self.rank_id}. visible_npus={self.device_info.running_npu_list}")
 
     def allocate(self) -> None:
         memcache_cpu_count = self.memcache_cpu_count()
@@ -463,16 +460,14 @@ class CpuAlloc:
             max_main_count = max(1, len(remaining) - reserved_for_acl_release)
             main_count = min(worker_cpu_count, max_main_count)
             main = remaining[:main_count]
-            remaining = remaining[len(main):]
+            remaining = remaining[len(main) :]
             if not main:
-                raise RuntimeError(
-                    f"The number of CPUs is insufficient. NPU{npu} requires at least one worker CPU."
-                )
+                raise RuntimeError(f"The number of CPUs is insufficient. NPU{npu} requires at least one worker CPU.")
 
             acl = remaining[:ACL_CPUS_PER_NPU]
-            remaining = remaining[len(acl):]
+            remaining = remaining[len(acl) :]
             rel = remaining[:RELEASE_CPUS_PER_NPU]
-            remaining = remaining[len(rel):]
+            remaining = remaining[len(rel) :]
             memcache = remaining[:memcache_cpu_count]
 
             if len(main) < worker_cpu_count:
@@ -575,8 +570,7 @@ class CpuAlloc:
                 continue
             thread_name = self._get_thread_name(main_pid, thread_id)
             logger.info(
-                "Binding worker thread. process_name=%s pid=%s "
-                "thread_name=%s tid=%s role=main cpus=%s",
+                "Binding worker thread. process_name=%s pid=%s thread_name=%s tid=%s role=main cpus=%s",
                 process_name,
                 main_pid,
                 thread_name,
@@ -587,8 +581,7 @@ class CpuAlloc:
         for acl_thread in acl_threads:
             thread_name = self._get_thread_name(main_pid, acl_thread)
             logger.info(
-                "Binding worker thread. process_name=%s pid=%s "
-                "thread_name=%s tid=%s role=acl cpus=%s",
+                "Binding worker thread. process_name=%s pid=%s thread_name=%s tid=%s role=acl cpus=%s",
                 process_name,
                 main_pid,
                 thread_name,
@@ -599,8 +592,7 @@ class CpuAlloc:
         for release_thread in release_threads:
             thread_name = self._get_thread_name(main_pid, release_thread)
             logger.info(
-                "Binding worker thread. process_name=%s pid=%s "
-                "thread_name=%s tid=%s role=release cpus=%s",
+                "Binding worker thread. process_name=%s pid=%s thread_name=%s tid=%s role=release cpus=%s",
                 process_name,
                 main_pid,
                 thread_name,
