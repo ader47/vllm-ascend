@@ -2881,6 +2881,9 @@ class NPUModelRunner(GPUModelRunner):
                     self.routed_experts_slot_mapping_device[:n].copy_(
                         slot_mapping
                     )
+            logger.info("slot_mapping: %s", slot_mapping)
+            logger.info("blk_table_tensor: %s", blk_table_tensor)
+            logger.info(">>>>>>>>>>>>>%s", self.b)
             return blk_table_tensor, slot_mapping
 
         if self.use_compress and num_scheduled_tokens_compressed_list is not None:
@@ -4361,6 +4364,7 @@ class NPUModelRunner(GPUModelRunner):
                 kernel_block_sizes=self.kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
                 kv_cache_groups=kv_cache_config.kv_cache_groups,
+                cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             )
 
     def initialize_attn_backend(

@@ -4,6 +4,7 @@ import torch
 import torch.distributed as dist
 import torch_npu
 from vllm.distributed import get_dcp_group, get_decode_context_model_parallel_world_size, get_pcp_group
+from vllm.logger import logger
 
 
 @dataclass
@@ -109,6 +110,28 @@ def _process_attn_out_lse(attn_output: torch.Tensor, softmax_lse: torch.Tensor) 
     pcp_size = get_pcp_group().world_size
     dcp_size = get_decode_context_model_parallel_world_size()
     dcp_group = get_dcp_group().device_group if dcp_size > 1 else None
+
+    # [DCP_DEBUG] Log shapes before processing
+    logger.info(
+        "[DCP_DEBUG] _process_attn_out_lse BEFORE: "
+        "pcp_size=%d, dcp_size=%d, "
+        "attn_output.shape=%s, softmax_lse.shape=%s, "
+        "attn_output stats: mean=%.6f, std=%.6f, min=%.6f, max=%.6f, "
+        "softmax_lse stats: mean=%.6f, std=%.6f, min=%.6f, max=%.6f",
+        pcp_size,
+        dcp_size,
+        str(attn_output.shape),
+        str(softmax_lse.shape),
+        attn_output.float().mean().item(),
+        attn_output.float().std().item(),
+        attn_output.float().min().item(),
+        attn_output.float().max().item(),
+        softmax_lse.float().mean().item(),
+        softmax_lse.float().std().item(),
+        softmax_lse.float().min().item(),
+        softmax_lse.float().max().item(),
+    )
+
     softmax_lse = softmax_lse.to(torch.float32)
     attn_output = attn_output.to(torch.float32)
     # Concat out&lse: [bs,num_heads,v_head_dim] + [bs,num_heads,1] -> [bs,num_heads,v_head_dim+1]
@@ -119,6 +142,18 @@ def _process_attn_out_lse(attn_output: torch.Tensor, softmax_lse: torch.Tensor) 
         attn_out_lse_all2all = torch.empty_like(attn_out_lse)
         dist.all_to_all_single(attn_out_lse_all2all, attn_out_lse, group=dcp_group)
         attn_out_lse = attn_out_lse_all2all.permute([2, 0, 1])
+
+        # [DCP_DEBUG] Log shapes after all_to_all
+        logger.info(
+            "[DCP_DEBUG] _process_attn_out_lse AFTER all_to_all: "
+            "attn_out_lse.shape=%s, "
+            "attn_out_lse stats: mean=%.6f, std=%.6f, min=%.6f, max=%.6f",
+            str(attn_out_lse.shape),
+            attn_out_lse.mean().item(),
+            attn_out_lse.std().item(),
+            attn_out_lse.min().item(),
+            attn_out_lse.max().item(),
+        )
 
     if pcp_size > 1:
         # AllGather out&lse within CP group
@@ -136,6 +171,29 @@ def _npu_attention_update(head_size, attn_out_lse: torch.Tensor) -> torch.Tensor
     H = H_total // dcp_size
     D = head_size
     assert D_plus_1 == D + 1
+
+    # [DCP_DEBUG] Log reshape parameters
+    logger.info(
+        "[DCP_DEBUG] _npu_attention_update: "
+        "pcp_size=%d, dcp_size=%d, "
+        "attn_out_lse.shape=%s, "
+        "B_total=%d, H_total=%d, S=%d, H=%d, D=%d, "
+        "view shape=[%d, %d, %d, %d, %d]",
+        pcp_size,
+        dcp_size,
+        str(attn_out_lse.shape),
+        B_total,
+        H_total,
+        S,
+        H,
+        D,
+        pcp_size,
+        S,
+        dcp_size,
+        H,
+        D_plus_1,
+    )
+
     # [PCP, S, DCP, H, D+1]
     x = attn_out_lse.view(pcp_size, S, dcp_size, H, D_plus_1)
     # [PCP, DCP, S, H, D+1]
@@ -148,11 +206,44 @@ def _npu_attention_update(head_size, attn_out_lse: torch.Tensor) -> torch.Tensor
     #    lse: [N, S, H, 1] -> [N, S*H]
     out_flat = out_flat.flatten(1, 2)  # [N, S*H, D]
     lse_flat = lse_flat.flatten(1, -1)  # [N, S*H]
+
+    # [DCP_DEBUG] Log each partial result before npu_attention_update
+    N = pcp_size * dcp_size
+    for i in range(N):
+        out_i = out_flat[i]
+        lse_i = lse_flat[i]
+        logger.info(
+            "[DCP_DEBUG] _npu_attention_update partial[%d/%d]: "
+            "out.shape=%s, out stats: mean=%.6f, std=%.6f, "
+            "lse.shape=%s, lse stats: mean=%.6f, std=%.6f, min=%.6f, max=%.6f",
+            i,
+            N,
+            str(out_i.shape),
+            out_i.mean().item(),
+            out_i.std().item(),
+            str(lse_i.shape),
+            lse_i.mean().item(),
+            lse_i.std().item(),
+            lse_i.min().item(),
+            lse_i.max().item(),
+        )
+
     #  unbind to list
     out_list = out_flat.unbind(0)  # [S*H, D]
     lse_list = lse_flat.unbind(0)  # [S*H]
     attn_out, _ = torch_npu.npu_attention_update(lse_list, out_list, 0)
     attn_out = attn_out.view(-1, H, D)
+
+    # [DCP_DEBUG] Log final output
+    logger.info(
+        "[DCP_DEBUG] _npu_attention_update FINAL: attn_out.shape=%s, stats: mean=%.6f, std=%.6f, min=%.6f, max=%.6f",
+        str(attn_out.shape),
+        attn_out.mean().item(),
+        attn_out.std().item(),
+        attn_out.min().item(),
+        attn_out.max().item(),
+    )
+
     return attn_out
 
 

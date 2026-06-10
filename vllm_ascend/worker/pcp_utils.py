@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig
+from vllm.logger import logger
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.utils import CpuGpuBuffer
 
@@ -1071,6 +1072,30 @@ class PCPManager:
                 self.pcp_world_size,
                 self.dcp_world_size,
                 self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
+            )
+
+            # [DCP_DEBUG] Log context_lens and local seq lens per rank
+            logger.info(
+                "[DCP_DEBUG] generate_pcp_metadata: "
+                "pcp_world_size=%d, dcp_world_size=%d, pcp_rank=%d, dcp_rank=%d, "
+                "interleave_size=%d, "
+                "num_decode_reqs=%d, num_reqs=%d, "
+                "decode_context_lens=%s, prefill_context_lens=%s, "
+                "context_lens=%s, "
+                "num_computed_tokens_of_pcp_dcp shape=%s, "
+                "decode local_seq_lens=%s",
+                self.pcp_world_size,
+                self.dcp_world_size,
+                self.pcp_world_rank,
+                self.dcp_world_rank,
+                self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
+                self.num_decode_reqs,
+                self.num_reqs,
+                str(decode_context_lens.tolist()),
+                str(prefill_context_lens.tolist()),
+                str(context_lens.tolist()),
+                str(num_computed_tokens_of_pcp_dcp.shape),
+                str(num_computed_tokens_of_pcp_dcp[: self.num_decode_reqs].tolist()),
             )
 
             pcp_unpad_mask = self.pcp_unpad_mask_cpu[: self.pcp_padded_tokens_length]

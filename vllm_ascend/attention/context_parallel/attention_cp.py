@@ -27,6 +27,7 @@ from vllm.distributed import (
     get_decode_context_model_parallel_world_size,
     get_pcp_group,
 )
+from vllm.logger import logger
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -576,6 +577,34 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
         k_nope = self.key_cache.view(self.key_cache.shape[0], self.key_cache.shape[1], -1)
         value = self.value_cache.view(self.key_cache.shape[0], self.key_cache.shape[1], -1)
 
+        # [DCP_DEBUG] Log key decode parameters
+        actual_seq_lengths_kv = attn_metadata.decode_meta.num_computed_tokens_of_pcp_dcp[
+            : attn_metadata.num_decodes, self.pcp_rank, self.dcp_rank
+        ]
+        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q[: attn_metadata.num_decodes]
+        logger.info(
+            "[DCP_DEBUG] _forward_decode_pcp_dcp: "
+            "pcp_size=%d, dcp_size=%d, pcp_rank=%d, dcp_rank=%d, "
+            "num_decodes=%d, num_decode_tokens=%d, "
+            "query.shape=%s (after all_gather), num_heads=%d, num_kv_heads=%d, "
+            "actual_seq_lengths_q=%s, actual_seq_lengths_kv=%s, "
+            "key_cache.shape=%s, block_table.shape=%s, block_size=%d",
+            self.pcp_size,
+            self.dcp_size,
+            self.pcp_rank,
+            self.dcp_rank,
+            attn_metadata.num_decodes,
+            attn_metadata.num_decode_tokens,
+            str(query.shape),
+            num_heads,
+            self.num_kv_heads,
+            str(actual_seq_lengths_q),
+            str(actual_seq_lengths_kv),
+            str(self.key_cache.shape),
+            str(attn_metadata.decode_meta.block_tables.shape),
+            self.key_cache.shape[1],
+        )
+
         attn_mask = None
         input_layerout = "TND"
         actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q[: attn_metadata.num_decodes]
@@ -815,6 +844,22 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
 
             if has_decode:
                 slot_mapping = attn_metadata.slot_mapping[: num_decode_tokens * self.pcp_size : self.pcp_size]
+                # [DCP_DEBUG] Log decode slot_mapping
+                logger.info(
+                    "[DCP_DEBUG] reshape_and_cache decode: "
+                    "pcp_size=%d, dcp_size=%d, pcp_rank=%d, dcp_rank=%d, "
+                    "num_decode_tokens=%d, key[:dec].shape=%s, "
+                    "slot_mapping=%s, "
+                    "slot_mapping (non-negative values)=%s",
+                    self.pcp_size,
+                    self.dcp_size,
+                    self.pcp_rank,
+                    self.dcp_rank,
+                    num_decode_tokens,
+                    str(key[:num_decode_tokens].shape),
+                    str(slot_mapping.tolist()),
+                    str([s for s in slot_mapping.tolist() if s >= 0]),
+                )
                 DeviceOperator.reshape_and_cache(
                     key=key[:num_decode_tokens],
                     value=value[:num_decode_tokens],
@@ -898,6 +943,9 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
         qkv_fa_padding_workspace[decode_offset:][pcp_unpad_mask] = actual_qkv[decode_offset:]
         qkv_fa_padding_workspace[decode_offset:][~pcp_unpad_mask].fill_(0)
 
+        num_real_prefill = actual_qkv.shape[0] - decode_offset
+        qkv_fa_padding_workspace[decode_offset : decode_offset + num_real_prefill] = actual_qkv[decode_offset:]
+        qkv_fa_padding_workspace[decode_offset + num_real_prefill :].fill_(0)
         q, k, v = qkv_fa_padding_workspace.split(
             [
                 self.num_heads * self.head_size,
