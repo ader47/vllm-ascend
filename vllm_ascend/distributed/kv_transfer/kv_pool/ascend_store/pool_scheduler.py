@@ -39,6 +39,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     infer_group_cache_families,
     normalize_block_ids_by_group,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    get_layerwise_config,
+)
 
 
 class KVPoolScheduler:
@@ -167,6 +170,14 @@ class KVPoolScheduler:
             self.put_step = 1
         self.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.model_name = model_config.model.split("/")[-1]
+
+        if self.use_gva_layerwise:
+            layerwise_config = get_layerwise_config(
+                self.num_layers, vllm_config.kv_transfer_config.kv_connector_extra_config
+            )
+            self.layerwise_offload = layerwise_config.has_layer_reuse
+        else:
+            self.layerwise_offload = False
 
         # Keep this in sync with pool_worker.py because it affects GVA allocation size.
         num_layer_keys = self.num_layers if self.use_gva_layerwise else 1

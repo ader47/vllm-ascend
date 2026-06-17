@@ -52,6 +52,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     _circular_shift,
     record_failed_blocks,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    get_layer_load_start_block,
+    get_layerwise_config,
+)
 from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
@@ -261,8 +265,16 @@ class KVPoolWorker:
         self.layer_load_finished_events: list[threading.Event] | None = None
         self.layer_save_finished_events: list[threading.Event] | None = None
 
+        layerwise_config = get_layerwise_config(
+            self.num_layers,
+            self._extra_config,
+        )
+        self.layerwise_offload = layerwise_config.has_layer_reuse
+        self.num_prefetch_layers = layerwise_config.num_prefetch_layers
+        self.independent_layers = layerwise_config.independent_layers
+        self.prefetch_layer_map = layerwise_config.prefetch_layer_map
+
         self.next_layer_to_submit = 0
-        self.num_prefetch_layers = int(self._extra_config.get("layerwise_prefetch_layers", 1))
         self.sync_save_events: list[torch.npu.Event] | None = None
 
     def _start_kv_transfer_threads(self) -> None:
@@ -707,7 +719,13 @@ class KVPoolWorker:
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
             cached_tokens = request.load_spec.kvpool_cached_tokens
-            load_start_block = request.load_spec.vllm_cached_tokens // self.block_size
+            load_start_block = get_layer_load_start_block(
+                layer_id,
+                self.independent_layers,
+                request.load_spec.vllm_cached_tokens,
+                self.block_size,
+                self.layerwise_offload,
+            )
             cached_full_blocks = cached_tokens // self.block_size
             full_blocks = min(cached_full_blocks, len(request.block_hashes))
             needs_last_block_at_boundary = (
@@ -773,21 +791,24 @@ class KVPoolWorker:
                         task.cached_process_tokens = cached
 
     def _build_shared_load_data(self) -> None:
-        """Build shared block data once and attach to all layer load tasks."""
+        """Build shared block data and attach to layer load tasks.
+
+        Block ranges may differ across layers under layer reuse (independent
+        layers load only the part beyond HBM, shared layers load from block
+        0), so build one SharedBlockData per distinct block-range shape and
+        reuse it, instead of forcing every layer through a single range.
+        """
         if not isinstance(self.kv_recv_thread, KVCacheStoreLayerRecvingThread):
             return
-        first_task = None
+        shared_by_range: dict = {}
         for layer_id in range(self.num_layers):
-            if self.layer_load_tasks[layer_id]:
-                first_task = self.layer_load_tasks[layer_id][0]
-                break
-        if first_task is None:
-            return
-        shared = self.kv_recv_thread.build_shared_data(first_task)
-        if shared is not None:
-            for layer_id in range(self.num_layers):
-                for task in self.layer_load_tasks[layer_id]:
-                    task.shared_block_data = shared
+            for task in self.layer_load_tasks[layer_id]:
+                if not task.block_ranges:
+                    continue
+                key = tuple((br.start_block, br.end_block) for br in task.block_ranges)
+                if key not in shared_by_range:
+                    shared_by_range[key] = self.kv_recv_thread.build_shared_data(task)
+                task.shared_block_data = shared_by_range[key]
 
     def process_layer_data(self, requests: list[ReqMeta]) -> None:
         if not requests:
