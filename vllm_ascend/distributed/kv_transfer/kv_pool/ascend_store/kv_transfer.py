@@ -1094,6 +1094,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         sync_save_events: list[torch.npu.Event],
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
+        layer_transfer_finished_events: list[threading.Event] | None = None,
     ):
         super().__init__(
             m_store,
@@ -1111,6 +1112,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.done_task_lock = threading.Lock()
         self.layer_save_finished_events = layer_save_finished_events
         self.sync_save_events = sync_save_events
+        self.layer_transfer_finished_events = layer_transfer_finished_events
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
         self.layer_batch_builder = LayerBatchBuilder(
@@ -1156,6 +1158,11 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         shared = task.shared_block_data
         if shared is None:
             layer_id = task.layer_id
+            if self.layer_transfer_finished_events is not None:
+                is_finish = self.layer_transfer_finished_events[layer_id].wait(timeout=30)
+                if not is_finish:
+                    logger.error("Layerwise %d PD transfer wait timed out", layer_id)
+                self.layer_transfer_finished_events[layer_id].clear()
             assert not self.layer_save_finished_events[layer_id].is_set(), f"thread: {layer_id} save failed "
             logger.debug("Layer save event set: layer %d", layer_id)
             self.layer_save_finished_events[layer_id].set()
@@ -1178,6 +1185,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             self.max_transfer_blocks,
             self.max_transfer_bytes,
         )
+        # wait for KV transfer (PD)
+        if self.layer_transfer_finished_events is not None:
+            is_finish = self.layer_transfer_finished_events[layer_id].wait(timeout=30)
+            if not is_finish:
+                logger.error("Layerwise %d PD transfer wait timed out", layer_id)
+            self.layer_transfer_finished_events[layer_id].clear()
         if res != 0:
             logger.error("Layerwise %d save batch_copy failed with return code %d", layer_id, res)
         for req_id in req_meta.req_ids:
