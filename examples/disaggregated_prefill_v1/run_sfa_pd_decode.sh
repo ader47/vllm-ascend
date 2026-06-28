@@ -25,6 +25,12 @@ NET_IFACE="lo"                          # NIC for gloo/tp/hccl; multi-host -> re
 
 KV_PORT=20002                           # Mooncake side-channel base port (different from P)
 KV_RANK=1                               # D node kv_rank (P=0, D=1)
+
+# D MUST run with use_offload=true: it drives the SFA offload code path in the
+# model runner (5-tuple kv_cache, num_offloaded_blocks, indexer_block_table, the
+# LRU-resident H2D load). Without it the connector registers but the model never
+# drives it. lru_resident_cache_config.{buffer_size,topk} default to 2048.
+ADDITIONAL_CONFIG='{"use_offload": true, "lru_resident_cache_config": {"enabled": true}}'
 # ----------------------------------------------------------------------------
 
 export HCCL_IF_IP="${HCCL_IF_IP:-127.0.0.1}"
@@ -43,6 +49,7 @@ exec vllm serve "$MODEL_PATH" \
   --trust-remote-code \
   --enforce-eager \
   --gpu-memory-utilization 0.8 \
+  --additional-config "$ADDITIONAL_CONFIG" \
   --kv-transfer-config "{
     \"kv_connector\": \"SFAPDCpuOffloadConnector\",
     \"kv_buffer_device\": \"npu\",

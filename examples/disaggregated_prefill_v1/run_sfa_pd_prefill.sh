@@ -29,6 +29,12 @@ NET_IFACE="lo"                          # NIC for gloo/tp/hccl; multi-host -> re
 
 KV_PORT=20001                           # Mooncake side-channel base port
 KV_RANK=0                               # P node kv_rank (P=0, D=1)
+
+# P MUST run with use_offload=false: the producer worker inherits mooncake's
+# register_kv_caches, which expects standard paged KV tensors (not the 5-tuple
+# that only exists when use_offload=true). Default is false; set explicitly as a
+# guard against misconfiguration.
+ADDITIONAL_CONFIG='{"use_offload": false}'
 # ----------------------------------------------------------------------------
 
 export HCCL_IF_IP="${HCCL_IF_IP:-127.0.0.1}"
@@ -47,6 +53,7 @@ exec vllm serve "$MODEL_PATH" \
   --trust-remote-code \
   --enforce-eager \
   --gpu-memory-utilization 0.8 \
+  --additional-config "$ADDITIONAL_CONFIG" \
   --kv-transfer-config "{
     \"kv_connector\": \"SFAPDCpuOffloadConnector\",
     \"kv_buffer_device\": \"npu\",

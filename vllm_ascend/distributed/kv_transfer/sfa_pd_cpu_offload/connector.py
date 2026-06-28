@@ -69,6 +69,28 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self.engine_id = vllm_config.kv_transfer_config.engine_id
 
+        # Guard the asymmetric use_offload assumption (the launch scripts must
+        # set it via --additional-config). Fail fast at startup rather than
+        # producing confusing mid-run failures.
+        #   P (producer)  : use_offload=false — inherited mooncake register
+        #                    expects standard paged KV, not the offload 5-tuple.
+        #   D (consumer)  : use_offload=true  — drives the SFA offload code path
+        #                    (5-tuple kv_cache, num_offloaded_blocks, LRU load).
+        from vllm_ascend.ascend_config import get_ascend_config
+        ascend_use_offload = get_ascend_config().use_offload
+        if self.is_producer:
+            assert not ascend_use_offload, (
+                "SFAPDCpuOffloadConnector producer (P) must run with "
+                "use_offload=false (set --additional-config "
+                "'{\"use_offload\": false}')."
+            )
+        if self.is_consumer:
+            assert ascend_use_offload, (
+                "SFAPDCpuOffloadConnector consumer (D) must run with "
+                "use_offload=true (set --additional-config "
+                "'{\"use_offload\": true, ...}')."
+            )
+
         if role == KVConnectorRole.SCHEDULER:
             # Producer scheduler reuses mooncake send-setup; consumer scheduler
             # is the D-side CPU-block allocator/advertiser.
