@@ -17,6 +17,7 @@ reading it (see plan risk #3 / buffer-reuse gating).
 from __future__ import annotations
 
 import math
+import re
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -49,6 +50,17 @@ if TYPE_CHECKING:
 # group 0 = indexer (block_size 512), group 1 = main MLA (block_size 128).
 _INDEXER_GROUP_IDX = 0
 _MAIN_GROUP_IDX = 1
+# Matches the transformer-layer index in a kv-cache layer name, e.g.
+# "model.layers.5.self_attn" / "model.layers.5.self_attn.indexer" -> 5. Prefer
+# this over extract_layer_index(), which asserts the name holds exactly one
+# integer and would raise on names carrying an extra index/shard suffix.
+_LAYER_IDX_RE = re.compile(r"layers\.(\d+)")
+
+
+def _layer_idx(layer_name: str) -> int:
+    match = _LAYER_IDX_RE.search(layer_name)
+    assert match is not None, f"no transformer layer index in layer name {layer_name!r}"
+    return int(match.group(1))
 
 
 class SFAPDCpuOffloadWorker:
@@ -88,6 +100,10 @@ class SFAPDCpuOffloadWorker:
         # thread's done_recving (keyed by external id from P's DONE signal) back
         # to the vLLM-internal id that the scheduler expects.
         self.request_map: dict[str, str] = {}
+        # External req ids whose DONE/FAILED signal arrived before request_map
+        # was seeded (see get_finished). Retried every step until mapped.
+        self._pending_done: set[str] = set()
+        self._pending_failed: set[str] = set()
 
         # P-side state (Phase 2).
         self.kv_send_layer_thread = None
@@ -112,23 +128,6 @@ class SFAPDCpuOffloadWorker:
         The sfa model runner hands a 5-tuple per layer:
         ``(k_nope, v_rope, dsa_k_indexer, topk_buf_k, topk_buf_v)``.
         """
-        # PDDBG: dump the real kv_caches / group structure so the per-layer_name
-        # LayerMetadata packing (indexer->NPU, main->CPU) can be wired to the
-        # actual layer names. Remove once packing is finalized.
-        groups_dbg = (
-            []
-            if self.kv_cache_config is None
-            else [
-                (i, g.kv_cache_spec.block_size, list(g.layer_names))
-                for i, g in enumerate(self.kv_cache_config.kv_cache_groups)
-            ]
-        )
-        shapes_dbg = {
-            n: [tuple(t.shape) for t in (v if isinstance(v, (list, tuple)) else [v])]
-            for n, v in kv_caches.items()
-        }
-        logger.info("PDDBG keys=%s groups=%s shapes=%s", list(kv_caches.keys()), groups_dbg, shapes_dbg)
-
         # --- D side: compose the SFA worker for LRU load + CPU pool ---
         self.sfa_worker = SFAKVOffloadWorker(
             self.vllm_config, self.use_layerwise, self.kv_cache_config
@@ -167,6 +166,14 @@ class SFAPDCpuOffloadWorker:
         assert len(main_names) == len(indexer_names), (
             f"main layers ({len(main_names)}) != indexer layers ({len(indexer_names)})"
         )
+
+        # Pair each indexer layer with its main layer by transformer-layer index.
+        # Do NOT rely on kv_caches.items() insertion order: indexer_names comes
+        # from kv_cache_config while main_names comes from the model runner's
+        # kv_caches dict — zip()-by-position would silently mispair (and write KV
+        # to the wrong base addr) the moment the two orderings diverge.
+        main_by_layer_idx = {_layer_idx(name): name for name in main_names}
+        main_names = [main_by_layer_idx[_layer_idx(name)] for name in indexer_names]
 
         def _region(t: torch.Tensor) -> tuple[int, int, int]:
             # (data_ptr, per-block bytes, block_size_scale = rows // num_blocks)
@@ -212,12 +219,6 @@ class SFAPDCpuOffloadWorker:
         # CRITICAL: one register_buffer call — global_te.register_buffer has a
         # process-wide latch (is_register_buffer); a second call is a no-op.
         engine = self._ensure_engine()
-        # PDDBG: log each region's ptr + 2 MiB alignment + size so an
-        # aclrtPointerGetAttributes/register_memory failure pinpoints the ptr.
-        for _p, _s in zip(ptrs, lengths):
-            logger.info(
-                "PDDBG reg ptr=%#x align2M=%s size=%d", _p, _p % (2 * 1024 * 1024), _s
-            )
         global_te.register_buffer(ptrs, lengths)
 
         metadata = MooncakeAgentMetadata(
@@ -295,15 +296,33 @@ class SFAPDCpuOffloadWorker:
         # for decode once P has finished pushing their KV. The recv thread keys
         # done by the external req id (from P's DONE_SENDING); map back to the
         # internal id via request_map.
+        #
+        # P's DONE/FAILED signal can arrive before start_load_kv has seeded
+        # request_map for that req (short prompt / fast RDMA). get_and_clear_*
+        # is destructive, so an unmapped id would be dropped and the req would
+        # stall forever in "reqs num: 0". Cache unmapped ids and retry mapping
+        # every step until the map entry shows up.
         done_recving: set[str] = set()
         if self.kv_recv_layer_thread is not None:
             done = self.kv_recv_layer_thread.get_and_clear_done_requests()
-            done_recving = {self.request_map[s] for s in done if s in self.request_map}
+            still_pending: set[str] = set()
+            for ext_id in done | self._pending_done:
+                internal = self.request_map.get(ext_id)
+                if internal is not None:
+                    done_recving.add(internal)
+                else:
+                    still_pending.add(ext_id)
+            self._pending_done = still_pending
+
             failed = self.kv_recv_layer_thread.get_and_clear_failed_requests()
-            for s in failed:
-                internal = self.request_map.get(s)
+            still_pending_failed: set[str] = set()
+            for ext_id in failed | self._pending_failed:
+                internal = self.request_map.get(ext_id)
                 if internal is not None:
                     done_recving.add(internal)  # unblock the req; load will error
+                else:
+                    still_pending_failed.add(ext_id)
+            self._pending_failed = still_pending_failed
         return set(), done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
