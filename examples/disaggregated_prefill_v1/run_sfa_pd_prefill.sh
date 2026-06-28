@@ -23,12 +23,16 @@ set -euo pipefail
 MODEL_PATH="/path/to/DeepSeek-V3.2"     # MLA + sparse (SFA) model
 SERVE_HOST="0.0.0.0"                    # external HTTP listen addr (proxy connects here)
 SERVE_PORT=8100                         # external HTTP port
-TP_SIZE=1                               # tensor parallel size
-VISIBLE_DEVICES=0                       # NPU cards for the P node (e.g. "0" or "0,1")
+TP_SIZE=4                               # tensor parallel size (P and D MUST match)
+VISIBLE_DEVICES=0,1,2,3                 # NPU cards for the P node (must NOT overlap D)
 NET_IFACE="lo"                          # NIC for gloo/tp/hccl; multi-host -> real iface
 
-KV_PORT=20001                           # Mooncake side-channel base port
-KV_RANK=0                               # P node kv_rank (P=0, D=1)
+# Mooncake gives each TP rank its own ZMQ port = KV_PORT + tp_rank. So with
+# TP_SIZE=4 this node occupies KV_PORT+0..+3 (here 20001-20004). On a single
+# host D's KV_PORT must be >= this + TP_SIZE to avoid a port collision
+# (run_sfa_pd_decode.sh uses 20005). Multi-host (different IPs) can reuse ports.
+KV_PORT=20001                           # Mooncake side-channel base port (occupies +0..+3)
+KV_RANK=0                               # P node kv_rank (P=0, D=1; inert for mooncake)
 
 # P MUST run with use_offload=false: the producer worker inherits mooncake's
 # register_kv_caches, which expects standard paged KV tensors (not the 5-tuple

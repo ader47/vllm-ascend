@@ -19,12 +19,16 @@ set -euo pipefail
 MODEL_PATH="/path/to/DeepSeek-V3.2"     # MUST match the P node
 SERVE_HOST="0.0.0.0"                    # external HTTP listen addr (proxy connects here)
 SERVE_PORT=8200                         # external HTTP port
-TP_SIZE=1                               # tensor parallel size
-VISIBLE_DEVICES=1                       # NPU cards for the D node (use a different card than P)
+TP_SIZE=4                               # tensor parallel size (P and D MUST match)
+VISIBLE_DEVICES=4,5,6,7                 # NPU cards for the D node (must NOT overlap P)
 NET_IFACE="lo"                          # NIC for gloo/tp/hccl; multi-host -> real iface
 
-KV_PORT=20002                           # Mooncake side-channel base port (different from P)
-KV_RANK=1                               # D node kv_rank (P=0, D=1)
+# Mooncake gives each TP rank its own ZMQ port = KV_PORT + tp_rank. With
+# TP_SIZE=4 this node occupies KV_PORT+0..+3. Single host: D's KV_PORT must be
+# >= P's KV_PORT + TP_SIZE to avoid collision (P uses 20001 -> 20001-20004, so D
+# uses 20005 -> 20005-20008). Multi-host (different IPs) can reuse ports.
+KV_PORT=20005                           # Mooncake side-channel base port (P's 20001 + TP_SIZE)
+KV_RANK=1                               # D node kv_rank (P=0, D=1; inert for mooncake)
 
 # D MUST run with use_offload=true: it drives the SFA offload code path in the
 # model runner (5-tuple kv_cache, num_offloaded_blocks, indexer_block_table, the
