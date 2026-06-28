@@ -30,6 +30,9 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_scheduler import (
     CPUBlockManager,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
+    get_external_request_id,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -135,6 +138,7 @@ class SFAPDCpuOffloadScheduler:
         # Advertise the split destination to P via the metaserver rendezvous.
         # remote_block_ids[0] = D indexer NPU blocks, [1] = D main MLA CPU blocks.
         kv_transfer_params = dict(
+            request_id=get_external_request_id(request.request_id),
             do_remote_prefill=False,
             do_remote_decode=True,
             remote_block_ids=[list(indexer_npu_ids), list(main_cpu_ids)],
