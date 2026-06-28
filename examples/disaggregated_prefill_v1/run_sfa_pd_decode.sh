@@ -29,8 +29,16 @@ KV_RANK=1                               # D node kv_rank (P=0, D=1)
 # D MUST run with use_offload=true: it drives the SFA offload code path in the
 # model runner (5-tuple kv_cache, num_offloaded_blocks, indexer_block_table, the
 # LRU-resident H2D load). Without it the connector registers but the model never
-# drives it. lru_resident_cache_config.{buffer_size,topk} default to 2048.
-ADDITIONAL_CONFIG='{"use_offload": true, "lru_resident_cache_config": {"enabled": true}}'
+# drives it.
+#
+# lru_resident_cache_config:
+#   - enabled=true is REQUIRED whenever buffer_size != 2048: model_runner uses
+#     resident_capacity = buffer_size only when (use_offload and enabled), else
+#     falls back to 2048 and diverges from the SFA worker -> shape mismatch.
+#   - buffer_size (resident capacity, in tokens) must be >= topk and divisible by
+#     block_size (128). Larger = more KV resident on HBM, fewer H2D misses.
+#   - topk must equal the model's sparse topk (2048 for DeepSeek-V3.2).
+ADDITIONAL_CONFIG='{"use_offload": true, "lru_resident_cache_config": {"enabled": true, "buffer_size": 4096, "topk": 2048}}'
 # ----------------------------------------------------------------------------
 
 export HCCL_IF_IP="${HCCL_IF_IP:-127.0.0.1}"
