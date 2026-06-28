@@ -110,7 +110,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAtt
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention, set_connector_req_ids
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention, set_connector_req_ids, maybe_get_num_cpu_blocks
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -1215,6 +1215,17 @@ class NPUModelRunner(GPUModelRunner):
                 return zlib.adler32(req_id.encode('utf-8'))
 
             num_offloaded_blocks = np.maximum(self.input_batch.num_computed_tokens_cpu[:num_reqs] // self.block_size - 1, 0)
+            # Solution 1: for remote-prefilled requests the main-MLA KV lives in
+            # the CPU pool, so the offload threshold must equal the ACTUAL number
+            # of main-MLA CPU blocks (covering the whole prefill prefix) — never
+            # the ``-1`` heuristic, which would route prefill reads to D's empty
+            # NPU main-MLA cache. Falls back to the heuristic for non-remote
+            # connectors (maybe_get_num_cpu_blocks returns None).
+            cpu_blocks_map = maybe_get_num_cpu_blocks(self.input_batch.req_ids[:num_reqs])
+            if cpu_blocks_map is not None:
+                for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                    if req_id in cpu_blocks_map:
+                        num_offloaded_blocks[i] = cpu_blocks_map[req_id]
             is_prefill = num_scheduled_tokens > 1 # decode_threshold in spec decode case
             num_offloaded_blocks[is_prefill] = 0
 

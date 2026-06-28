@@ -380,6 +380,39 @@ def maybe_prepare_lru_resident_and_load_graph(
     )
 
 
+def maybe_wait_for_layer_send(layer_idx: int) -> None:
+    """P-side buffer-reuse gate.
+
+    Blocks until the producer connector has finished RDMA-reading layer
+    ``layer_idx``'s KV buffer, so the buffer may be safely reused by a later
+    prefill layer. No-op for connectors that don't push (e.g. the D-side
+    consumer, or non-PD connectors).
+    """
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    if not hasattr(connector, "wait_for_layer_send"):
+        return
+    connector.wait_for_layer_send(layer_idx)
+
+
+def maybe_get_num_cpu_blocks(req_ids):
+    """Return {req_id: num_main_mla_cpu_blocks} for remote-prefilled requests.
+
+    Used by the SFA decode threshold (``num_offloaded_blocks``) to mark the
+    entire prefill prefix as CPU-resident, so the NPU-hit attention path never
+    reads D's empty NPU main-MLA cache for remote-prefilled requests (solution
+    1). Returns ``None`` for connectors that don't supply it, in which case the
+    caller falls back to the ``computed // block_size - 1`` heuristic.
+    """
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return None
+    connector = get_kv_transfer_group()
+    if not hasattr(connector, "get_num_cpu_blocks"):
+        return None
+    return connector.get_num_cpu_blocks(req_ids)
+
+
 def round_up(val: int, align: int) -> int:
     if align == 0:
         return 0

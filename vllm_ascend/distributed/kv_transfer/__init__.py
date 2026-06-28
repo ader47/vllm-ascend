@@ -85,3 +85,9 @@ def register_connector():
         "vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_connector",
         "SFAKVOffloadConnector",
     )
+
+    KVConnectorFactory.register_connector(
+        "SFAPDCpuOffloadConnector",
+        "vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.connector",
+        "SFAPDCpuOffloadConnector",
+    )
