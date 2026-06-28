@@ -22,6 +22,9 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
+    get_external_request_id,
+)
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
     ReqMeta,
     RequestTracker,
@@ -29,9 +32,6 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_scheduler import (
     CPUBlockManager,
-)
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
-    get_external_request_id,
 )
 
 if TYPE_CHECKING:
@@ -81,6 +81,9 @@ class SFAPDCpuOffloadScheduler:
 
         self._request_trackers: dict[str, RequestTracker] = {}
         self._remote_prefilled: set[str] = set()
+        # req_ids awaiting their first build_connector_meta seed (so the worker
+        # can build request_map for get_finished even while async-waiting KV).
+        self._reqs_need_recv: set[str] = set()
         # req_id -> CPU block ids pending delayed free (see build_connector_meta).
         self._pending_free: dict[str, list[int]] = {}
         self.executor = ThreadPoolExecutor(32)
@@ -133,6 +136,7 @@ class SFAPDCpuOffloadScheduler:
             allocated_block_ids_cpu=list(main_cpu_ids),
         )
         self._request_trackers[request.request_id] = tracker
+        self._reqs_need_recv.add(request.request_id)
         self._remote_prefilled.add(request.request_id)
 
         # Advertise the split destination to P via the metaserver rendezvous.
@@ -178,17 +182,38 @@ class SFAPDCpuOffloadScheduler:
                 self.cpu_block_manager.free(self._pending_free.pop(req_id))
 
         meta = SFAKVOffloadConnectorMetadata(set(), scheduler_output.preempted_req_ids)
+
+        def _add_req(req_id: str) -> None:
+            tracker = self._request_trackers.get(req_id)
+            if tracker is None:
+                return
+            meta.add_request(
+                ReqMeta(
+                    req_id=tracker.req_id,
+                    block_ids_npu=tracker.allocated_block_ids_npu,
+                    block_ids_cpu=tracker.allocated_block_ids_cpu,
+                    num_new_offload_blocks=0,  # D does not save; CPU pool filled by P
+                )
+            )
+
+        # Seed every newly-allocated remote-prefill request ONCE, even while it
+        # async-waits for KV — the worker needs this to build request_map so
+        # get_finished can report done_recving (without it the req never gets
+        # scheduled -> stuck "reqs num: 0").
+        seeded: set[str] = set()
+        for req_id in list(self._reqs_need_recv):
+            _add_req(req_id)
+            seeded.add(req_id)
+        self._reqs_need_recv.clear()
+
+        # Also include currently-scheduled requests (feeds the LRU-load
+        # cpu_block_table on the composed SFA worker).
         for req_id in list(self._request_trackers):
+            if req_id in seeded:
+                continue
             if req_id not in scheduler_output.num_scheduled_tokens:
                 continue
-            tracker = self._request_trackers[req_id]
-            req_meta = ReqMeta(
-                req_id=tracker.req_id,
-                block_ids_npu=tracker.allocated_block_ids_npu,
-                block_ids_cpu=tracker.allocated_block_ids_cpu,
-                num_new_offload_blocks=0,  # D does not save; CPU pool filled by P
-            )
-            meta.add_request(req_meta)
+            _add_req(req_id)
         return meta
 
     def request_finished(

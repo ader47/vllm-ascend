@@ -76,7 +76,10 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         #                    expects standard paged KV, not the offload 5-tuple.
         #   D (consumer)  : use_offload=true  — drives the SFA offload code path
         #                    (5-tuple kv_cache, num_offloaded_blocks, LRU load).
-        from vllm_ascend.ascend_config import get_ascend_config
+        from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+        # AscendConfig may not be initialized yet at connector construction
+        # time; init_ascend_config is idempotent (no-op if already done).
+        init_ascend_config(vllm_config)
         ascend_use_offload = get_ascend_config().use_offload
         if self.is_producer:
             assert not ascend_use_offload, (

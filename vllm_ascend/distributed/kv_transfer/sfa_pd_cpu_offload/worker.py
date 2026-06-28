@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
@@ -34,6 +35,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
     LayerMetadata,
     MooncakeAgentMetadata,
     MooncakeLayerwiseConnectorWorker,
+    get_external_request_id,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker import (
     SFAKVOffloadWorker,
@@ -63,7 +65,7 @@ class SFAPDCpuOffloadWorker:
         self.use_layerwise = use_layerwise
         self.is_producer = is_producer
         self.is_consumer = is_consumer
-        self.tp_rank = vllm_config.parallel_config.rank  # refined below if needed
+        self.tp_rank = get_tensor_model_parallel_rank()  # TP-local rank for the per-rank ZMQ port
         self.side_channel_host = get_ip()
         # Handshake base port (mirrors mooncake layerwise).
         self.side_channel_port = (
@@ -82,6 +84,10 @@ class SFAPDCpuOffloadWorker:
         # per-req CPU-block count for the solution-1 threshold (Phase 3).
         self._cpu_blocks_by_req: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
+        # external_req_id -> internal_req_id, so get_finished can map the recv
+        # thread's done_recving (keyed by external id from P's DONE signal) back
+        # to the vLLM-internal id that the scheduler expects.
+        self.request_map: dict[str, str] = {}
 
         # P-side state (Phase 2).
         self.kv_send_layer_thread = None
@@ -140,61 +146,78 @@ class SFAPDCpuOffloadWorker:
         k_caches_cpu = self.sfa_worker.k_caches_cpu
         v_caches_cpu = self.sfa_worker.v_caches_cpu
 
-        # Build per-layer LayerMetadata with a SPLIT destination:
-        #   indexer (group 0) -> NPU dsa_k base
-        #   main MLA (group 1) -> CPU pool k/v bases
-        # The kv_caches dict is iterated in insertion order, matching the order
-        # the SFA worker built k_caches_cpu/v_caches_cpu (it iterates the same dict).
+        # Build per-layer LayerMetadata keyed by the REAL layer names, matching
+        # how mooncake P consumes them in get_transfer_meta: it looks up
+        # remote_layer_metadata[layer_name] and zips P's local tensor list with
+        # D's by index k (k<->k, v<->v). So:
+        #   indexer layer_name (group 0) -> [dsa_k_ptr]            (1 tensor, matches P's indexer [dsa_k])
+        #   main layer_name    (group 1) -> [main_k_cpu, main_v_cpu] (2 tensors, matches P's main [k, v])
+        # On D the kv_caches dict has only the main layer_name per transformer
+        # layer (a 5-tuple with the indexer embedded at [2]); the indexer
+        # layer_name comes from kv_cache_config group 0, paired by transformer
+        # index (both lists are in layers.0..N order).
+        num_blocks = self.kv_cache_config.num_blocks
+        indexer_names = list(
+            self.kv_cache_config.kv_cache_groups[_INDEXER_GROUP_IDX].layer_names
+        )
+        main_names = [
+            n for n, v in kv_caches.items()
+            if len(v if isinstance(v, (list, tuple)) else [v]) == 5
+        ]
+        assert len(main_names) == len(indexer_names), (
+            f"main layers ({len(main_names)}) != indexer layers ({len(indexer_names)})"
+        )
+
+        def _region(t: torch.Tensor) -> tuple[int, int, int]:
+            # (data_ptr, per-block bytes, block_size_scale = rows // num_blocks)
+            scale = t.shape[0] // num_blocks if num_blocks else 1
+            return (
+                t.data_ptr(),
+                t.element_size() * math.prod(t.shape[1:]),
+                scale,
+            )
+
         ptrs: list[int] = []
         lengths: list[int] = []
-        pool_idx = 0
-        for layer_name, kv_tuple in kv_caches.items():
-            tensors = list(kv_tuple) if isinstance(kv_tuple, (list, tuple)) else [kv_tuple]
-            if len(tensors) != 5:
-                # Skip non-main entries (e.g. a standalone indexer tensor). The
-                # main MLA entries are the 5-tuples; CPU pool aligns with them.
-                continue
-            indexer_t = tensors[2]
+        for pool_idx, (indexer_name, main_name) in enumerate(zip(indexer_names, main_names)):
+            main_tuple = list(kv_caches[main_name])
+            indexer_t = main_tuple[2]  # dsa_k_indexer, NPU device memory
             k_cpu = k_caches_cpu[pool_idx]
             v_cpu = v_caches_cpu[pool_idx]
-            k_block_len = k_cpu.element_size() * math.prod(k_cpu.shape[1:])
-            v_block_len = v_cpu.element_size() * math.prod(v_cpu.shape[1:])
-            indexer_block_len = indexer_t.element_size() * math.prod(indexer_t.shape[1:])
-            # One LayerMetadata per main layer: [indexer NPU, main CPU k, main CPU v].
-            self.layer_metadata[layer_name] = LayerMetadata(
-                tensor_group_idx=[_INDEXER_GROUP_IDX, _MAIN_GROUP_IDX, _MAIN_GROUP_IDX],
-                kv_caches_base_addr=[
-                    indexer_t.data_ptr(),
-                    k_cpu.data_ptr(),
-                    v_cpu.data_ptr(),
-                ],
-                block_len=[indexer_block_len, k_block_len, v_block_len],
-                block_size_scale=[1, 1, 1],
+
+            idx_ptr, idx_len, idx_scale = _region(indexer_t)
+            k_ptr, k_len, k_scale = _region(k_cpu)
+            v_ptr, v_len, v_scale = _region(v_cpu)
+
+            # group 0 indexer (single dsa_k tensor) under its own layer_name
+            self.layer_metadata[indexer_name] = LayerMetadata(
+                tensor_group_idx=[_INDEXER_GROUP_IDX],
+                kv_caches_base_addr=[idx_ptr],
+                block_len=[idx_len],
+                block_size_scale=[idx_scale],
             )
-            ptrs.extend(
-                [
-                    indexer_t.data_ptr(),
-                    k_cpu.data_ptr(),
-                    v_cpu.data_ptr(),
-                ]
+            # group 1 main MLA (k, v) under the main layer_name — order matches
+            # P's main [k_nope, v_rope] so get_transfer_meta pairs them correctly
+            self.layer_metadata[main_name] = LayerMetadata(
+                tensor_group_idx=[_MAIN_GROUP_IDX, _MAIN_GROUP_IDX],
+                kv_caches_base_addr=[k_ptr, v_ptr],
+                block_len=[k_len, v_len],
+                block_size_scale=[k_scale, v_scale],
             )
-            lengths.extend(
-                [
-                    indexer_t.numel() * indexer_t.element_size(),
-                    k_cpu.numel() * k_cpu.element_size(),
-                    v_cpu.numel() * v_cpu.element_size(),
-                ]
-            )
-            pool_idx += 1
-            # NOTE(bring-up): Mooncake register_memory may require 2 MiB
-            # alignment. If it asserts, the CPU pool must be allocated aligned
-            # inside SFAKVOffloadWorker.register_kv_caches (small change to
-            # sfa_kv_offload_worker.py) — aligning a copy here would break the
-            # memory identity with the LRU-load path. Validate on hardware.
+
+            for t in (indexer_t, k_cpu, v_cpu):
+                ptrs.append(t.data_ptr())
+                lengths.append(t.numel() * t.element_size())
 
         # CRITICAL: one register_buffer call — global_te.register_buffer has a
         # process-wide latch (is_register_buffer); a second call is a no-op.
         engine = self._ensure_engine()
+        # PDDBG: log each region's ptr + 2 MiB alignment + size so an
+        # aclrtPointerGetAttributes/register_memory failure pinpoints the ptr.
+        for _p, _s in zip(ptrs, lengths):
+            logger.info(
+                "PDDBG reg ptr=%#x align2M=%s size=%d", _p, _p % (2 * 1024 * 1024), _s
+            )
         global_te.register_buffer(ptrs, lengths)
 
         metadata = MooncakeAgentMetadata(
@@ -222,6 +245,13 @@ class SFAPDCpuOffloadWorker:
     # -- D-side forwards to the composed SFA worker (LRU load path) --
     def start_load_kv(self, metadata: KVConnectorMetadata):
         assert self.sfa_worker is not None
+        # Seed external->internal request id map for get_finished. The scheduler
+        # includes remote-prefill requests here (even while async-waiting) so the
+        # map exists before P's DONE signal arrives.
+        for req in getattr(metadata, "requests", []):
+            req_id = getattr(req, "req_id", None)
+            if req_id is not None:
+                self.request_map[get_external_request_id(req_id)] = req_id
         # Refresh the per-req CPU-block count (Phase 3 source of truth) and
         # forward the unchanged load kickoff to the SFA worker.
         self._refresh_cpu_blocks_by_req(metadata)
@@ -261,8 +291,20 @@ class SFAPDCpuOffloadWorker:
         return
 
     def get_finished(self) -> tuple[set[str], set[str]]:
-        # Phase 3/4: delayed CPU-pool free mirroring mooncake done_recving.
-        return set(), set()
+        # Report done_recving so vLLM schedules async-remote-prefill requests
+        # for decode once P has finished pushing their KV. The recv thread keys
+        # done by the external req id (from P's DONE_SENDING); map back to the
+        # internal id via request_map.
+        done_recving: set[str] = set()
+        if self.kv_recv_layer_thread is not None:
+            done = self.kv_recv_layer_thread.get_and_clear_done_requests()
+            done_recving = {self.request_map[s] for s in done if s in self.request_map}
+            failed = self.kv_recv_layer_thread.get_and_clear_failed_requests()
+            for s in failed:
+                internal = self.request_map.get(s)
+                if internal is not None:
+                    done_recving.add(internal)  # unblock the req; load will error
+        return set(), done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         result = self._invalid_block_ids
