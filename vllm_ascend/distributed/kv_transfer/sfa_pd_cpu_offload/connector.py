@@ -209,8 +209,12 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
     def wait_for_save(self):
-        assert self.connector_worker is not None
-        self.connector_worker.wait_for_save()
+        # No-op (matches mooncake layerwise): P pushes per-layer with completion
+        # signalled via the per-layer send events / the DONE callback, not here;
+        # D does not save locally (its CPU pool is filled remotely by P). Do NOT
+        # forward to the worker — the producer worker (mooncake subclass) has no
+        # wait_for_save method.
+        return
 
     # ------------------------------------------------------------------
     # SFA duck-typed hooks (attention/utils.py) — D side only
