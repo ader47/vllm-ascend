@@ -1166,6 +1166,13 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         per layer.
         """
         if self.gva_alloc_size <= 0 or not self.model_name:
+            logger.warning(
+                "GVA-DBG worker tp_rank=%s SKIP registration (guard): "
+                "model_name=%r gva_alloc_size=%d",
+                self.tp_rank,
+                self.model_name,
+                self.gva_alloc_size,
+            )
             return
         keys: list[str] = []
         for block_range in task.block_ranges:
@@ -1177,6 +1184,15 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 keys.append(f"{self.model_name}@{block_hash.hex()}")
             self._registered_req_steps.add(step_key)
         if not keys:
+            bh_count = sum(len(br.request.block_hashes) for br in task.block_ranges)
+            logger.warning(
+                "GVA-DBG worker tp_rank=%s SKIP registration (no new keys): "
+                "block_ranges=%d total_block_hashes=%d registered_steps=%d",
+                self.tp_rank,
+                len(task.block_ranges),
+                bh_count,
+                len(self._registered_req_steps),
+            )
             return
         try:
             self.m_store.batch_alloc(keys, [self.gva_alloc_size] * len(keys))
