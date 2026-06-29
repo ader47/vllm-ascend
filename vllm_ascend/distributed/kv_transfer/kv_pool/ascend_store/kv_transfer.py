@@ -1256,6 +1256,11 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             )
         for req_id in req_meta.req_ids:
             if self.try_finish_and_delete_stored_request(req_id):
+                # Drop this request's dedup entries so the set only tracks
+                # in-flight requests (avoids unbounded growth across a run).
+                self._registered_req_steps = {
+                    k for k in self._registered_req_steps if k[0] != req_id
+                }
                 self.set_finished_request(req_id)
         assert not self.layer_save_finished_events[layer_id].is_set(), f"thread: {layer_id} save failed "
         logger.debug("Layer save event set: layer %d", layer_id)
