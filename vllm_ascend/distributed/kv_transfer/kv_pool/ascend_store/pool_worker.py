@@ -198,6 +198,9 @@ class KVPoolWorker:
         self.num_ranks_per_layer = self.pcp_size * self.dcp_size * (self.tp_size // self.put_step)
 
     def _init_metadata(self, model_config, vllm_config, extra_config) -> None:
+        # Matches KVPoolScheduler.model_name so worker-generated block keys
+        # (model_name@block_hash) are identical to the scheduler's.
+        self.model_name = model_config.model.split("/")[-1]
         partitions = None
         if self.kv_role == "kv_consumer" and self.consumer_is_to_put:
             num_hidden_layers = model_config.hf_text_config.num_hidden_layers
@@ -304,6 +307,15 @@ class KVPoolWorker:
             self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
             if self.use_gva_layerwise and self.kv_role in ["kv_producer", "kv_both"]:
                 ready_event_sending = threading.Event()
+                # GVA blob size per block key, kept in sync with
+                # KVPoolScheduler.keys_per_block_hash / alloc_size
+                # (pool_scheduler.py:184,210). The save thread re-allocs these
+                # keys locally so the destination GVAs are registered in the
+                # writer process (fix for batch_copy -3102).
+                keys_per_block_hash = (
+                    self.pcp_size * self.dcp_size * (self.tp_size // self.put_step) * self.num_layers
+                )
+                gva_alloc_size = self.page_size_bytes * keys_per_block_hash
                 self.kv_send_thread = KVCacheStoreLayerSendingThread(
                     self.m_store,
                     self.token_database,
@@ -322,6 +334,8 @@ class KVPoolWorker:
                     self.layerwise_max_transfer_blocks,
                     self.layerwise_max_transfer_bytes,
                     layer_transfer_finished_events=get_shared_layer_transfer_events(),
+                    model_name=self.model_name,
+                    gva_alloc_size=gva_alloc_size,
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()

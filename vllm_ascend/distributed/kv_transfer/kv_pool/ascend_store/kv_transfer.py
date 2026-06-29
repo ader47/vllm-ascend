@@ -1095,6 +1095,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
         layer_transfer_finished_events: list[threading.Event] | None = None,
+        model_name: str = "",
+        gva_alloc_size: int = 0,
     ):
         super().__init__(
             m_store,
@@ -1115,6 +1117,11 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.layer_transfer_finished_events = layer_transfer_finished_events
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
+        # Worker-side GVA registration (fix for batch_copy -3102). See
+        # _ensure_worker_gva_registration.
+        self.model_name = model_name
+        self.gva_alloc_size = gva_alloc_size
+        self._registered_req_steps: set[tuple[str, int]] = set()
         self.layer_batch_builder = LayerBatchBuilder(
             token_database,
             my_key_index,
@@ -1145,6 +1152,49 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self, req_meta: list[LayerTransferTask]
     ) -> torch.Tensor:
         self.request_queue.put(req_meta)
+
+    def _ensure_worker_gva_registration(self, task: LayerTransferTask) -> None:
+        """Register destination GVAs in this worker process before batch_copy.
+
+        The scheduler allocates the GVA blobs in the EngineCore process, so they
+        are only registered in EngineCore's local GVA tracker. batch_copy runs
+        here in the worker, whose tracker is empty -> FindWritable returns
+        MMC_UNMATCHED_KEY (-3102). For GVA_MALLOC keys batch_alloc is idempotent:
+        re-allocing the same block keys here returns the existing GVA and
+        registers it locally, with no extra storage. Dedup per
+        (req_id, save_end_token) so we register once per request-step, not once
+        per layer.
+        """
+        if self.gva_alloc_size <= 0 or not self.model_name:
+            return
+        keys: list[str] = []
+        for block_range in task.block_ranges:
+            request = block_range.request
+            step_key = (request.req_id, request.save_end_token)
+            if step_key in self._registered_req_steps:
+                continue
+            for block_hash in request.block_hashes:
+                keys.append(f"{self.model_name}@{block_hash.hex()}")
+            self._registered_req_steps.add(step_key)
+        if not keys:
+            return
+        try:
+            self.m_store.batch_alloc(keys, [self.gva_alloc_size] * len(keys))
+            logger.warning(
+                "GVA-DBG worker tp_rank=%s registered %d block GVAs locally "
+                "(alloc_size=%d, model=%s)",
+                self.tp_rank,
+                len(keys),
+                self.gva_alloc_size,
+                self.model_name,
+            )
+        except Exception as err:  # noqa: BLE001 - never crash the save thread
+            logger.warning(
+                "GVA-DBG worker tp_rank=%s local batch_alloc failed (batch_copy "
+                "will likely fail with -3102): %s",
+                self.tp_rank,
+                err,
+            )
 
     def _handle_request(  # type: ignore[override]
         self, transfer_tasks: list[LayerTransferTask]
@@ -1177,6 +1227,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         for req_id in req_meta.req_ids:
             self.dec_stored_request(req_id)
         self.sync_save_events[layer_id].synchronize()
+        self._ensure_worker_gva_registration(task)
         res = self._batch_copy_with_limits(
             gvas_array,
             addr_array,
