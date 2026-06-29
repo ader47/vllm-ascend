@@ -3603,6 +3603,25 @@ class NPUModelRunner(GPUModelRunner):
         offset = (aligned_addr - data_ptr) // tensor.element_size()
         return tensor[int(offset) :]
 
+    def _alloc_aligned_storage(self, size: int, alignment: int) -> torch.Tensor:
+        # Over-allocate and retry until the storage BASE is `alignment`-aligned.
+        # torch's caching allocator does not guarantee a 2MB-aligned base, and
+        # _align_memory only aligns the data_ptr (a view offset) — not enough
+        # for memfabric, whose IPC (aclrtRtIpcSetMemoryName) rejects a
+        # non-aligned base (returns 507899). mooncake only needs data_ptr
+        # aligned, so this is a strict superset and safe for both backends.
+        for _ in range(128):
+            t = torch.zeros(size + alignment, dtype=torch.int8, device=self.device)
+            if t.storage().data_ptr() % alignment == 0:
+                return t
+            del t
+        logger.warning(
+            "Failed to allocate a %d-aligned device tensor after retries; "
+            "falling back to a single attempt.",
+            alignment,
+        )
+        return torch.zeros(size + alignment, dtype=torch.int8, device=self.device)
+
     def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
         Initialize the memory buffer for KV cache.
@@ -3820,21 +3839,19 @@ class NPUModelRunner(GPUModelRunner):
                                 dsa_k_scale_tensor_size, dtype=torch.int8, device=self.device
                             )
                     else:
-                        k_tensor = torch.zeros(k_tensor_size + alignment, dtype=torch.int8, device=self.device)
+                        k_tensor = self._alloc_aligned_storage(k_tensor_size, alignment)
                         v_tensor = None
                         if v_tensor_size is not None:
-                            v_tensor = torch.zeros(v_tensor_size + alignment, dtype=torch.int8, device=self.device)
+                            v_tensor = self._alloc_aligned_storage(v_tensor_size, alignment)
                             v_tensor = self._align_memory(v_tensor, alignment)[:v_tensor_size]
                         k_tensor = self._align_memory(k_tensor, alignment)[:k_tensor_size]
                         #### for deepseek sparse attention
                         if dsa_k_tensor_size is not None:
-                            dsa_k_tensor = torch.zeros(
-                                dsa_k_tensor_size + alignment, dtype=torch.int8, device=self.device
-                            )
+                            dsa_k_tensor = self._alloc_aligned_storage(dsa_k_tensor_size, alignment)
                             dsa_k_tensor = self._align_memory(dsa_k_tensor, alignment)[:dsa_k_tensor_size]
                         if dsa_k_scale_tensor_size is not None:
-                            dsa_k_scale_tensor = torch.zeros(
-                                dsa_k_scale_tensor_size + alignment, dtype=torch.int8, device=self.device
+                            dsa_k_scale_tensor = self._alloc_aligned_storage(
+                                dsa_k_scale_tensor_size, alignment
                             )
                             dsa_k_scale_tensor = self._align_memory(
                                 dsa_k_scale_tensor, alignment
