@@ -136,12 +136,15 @@ class SFAPDCpuOffloadWorker:
                 # D-side unique_id = "<host>:<port>"; memfabric derives its
                 # config-store address from it, and the Prefill peer reuses the
                 # same "<host>:<port>" (advertised via te_rpc_port) as dest_session.
-                mf_session_port = self.side_channel_port + self.tp_rank
+                # Offset past the ZMQ recv ports (side_channel_port + tp_rank,
+                # occupied by KVCacheRecvingLayerThread) to avoid a bind collision.
+                tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+                mf_session_port = self.side_channel_port + tp_size + self.tp_rank
                 global_te.configure(
                     backend=BACKEND_MEMFABRIC,
                     role=MEMFABRIC_ROLE_DECODE,
                     unique_id=f"{self.side_channel_host}:{mf_session_port}",
-                    device_id=self.tp_rank,
+                    device_id=torch.npu.current_device(),
                 )
             self.engine = global_te.get_transfer_engine(self.side_channel_host, None)
         return self.engine
@@ -430,7 +433,7 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
                 backend=BACKEND_MEMFABRIC,
                 role=MEMFABRIC_ROLE_PREFILL,
                 unique_id=f"{get_ip()}:{get_tensor_model_parallel_rank()}",
-                device_id=get_tensor_model_parallel_rank(),
+                device_id=torch.npu.current_device(),
             )
         super().__init__(vllm_config, kv_cache_config, engine_id)
         self.layer_send_done_events: list[threading.Event] | None = None
