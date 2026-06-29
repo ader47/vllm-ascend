@@ -1313,6 +1313,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         h2d_stagger_us: int = 0,
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
+        model_name: str = "",
     ):
         super().__init__(
             m_store,
@@ -1331,6 +1332,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.h2d_stagger_us = h2d_stagger_us
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
+        # Worker-side readable registration (fix for batch_copy read -3102). See
+        # _ensure_worker_gva_readable.
+        self.model_name = model_name
+        self._queried_req_steps: set[tuple[str, int]] = set()
         self.layer_batch_builder = LayerBatchBuilder(
             token_database,
             my_key_index,
@@ -1361,6 +1366,50 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         deadline = time.perf_counter() + delay_us / 1_000_000
         while time.perf_counter() < deadline:
             pass
+
+    def _ensure_worker_gva_readable(self, task: LayerTransferTask) -> None:
+        """Register source GVAs in this worker process as readable before read.
+
+        BatchCopyReadPath -> FindReadable requires the blob to be registered
+        locally with readStartSent=true, which is set by UpdateFromQuery (i.e.
+        batch_get_key_info). The scheduler's batch_get_key_info ran in
+        EngineCore, so the consumer worker must query again here. Dedup per
+        (req_id, save_end_token) so we query once per request-step, not per
+        layer.
+        """
+        if not self.model_name:
+            return
+        keys: list[str] = []
+        for block_range in task.block_ranges:
+            request = block_range.request
+            step_key = (request.req_id, request.save_end_token)
+            if step_key in self._queried_req_steps:
+                continue
+            for block_hash in request.block_hashes:
+                keys.append(f"{self.model_name}@{block_hash.hex()}")
+            if block_range.partial_block_index is not None:
+                keys.append(f"{self.model_name}@{request.req_id}_lastblock")
+            self._queried_req_steps.add(step_key)
+        if not keys:
+            return
+        try:
+            # MMC_QUERY_FLAG_GVA_READ_START (=1, include/mmc_def.h) triggers both
+            # server-side read-start/lease tracking and client-side
+            # UpdateFromQuery (sets readStartSent=true). Without it the query is
+            # metadata-only and FindReadable still fails with -3102.
+            self.m_store.batch_get_key_info(keys, flag=1)
+            logger.warning(
+                "GVA-DBG worker(load) tp_rank=%s queried %d keys readable (model=%r)",
+                self.tp_rank,
+                len(keys),
+                self.model_name,
+            )
+        except Exception as err:  # noqa: BLE001 - never crash the load thread
+            logger.warning(
+                "GVA-DBG worker(load) tp_rank=%s batch_get_key_info failed: %s",
+                self.tp_rank,
+                err,
+            )
 
     def _handle_request(  # type: ignore[override]
         self, data: LayerLoadTask
@@ -1420,6 +1469,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             req_meta.size_array,
             (self.tp_rank * len(req_meta.size_array)) // self.tp_size,
         )
+        self._ensure_worker_gva_readable(task)
         self._stagger_h2d_submit(layer_id)
         res = self._batch_copy_with_limits(
             gvas_array,
@@ -1434,6 +1484,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         if layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_meta.req_ids, req_meta.is_last_chunks):
                 if is_last_chunk:
+                    # Drop this request's dedup entries (bound the set size).
+                    self._queried_req_steps = {
+                        k for k in self._queried_req_steps if k[0] != req_id
+                    }
                     self.set_finished_request(req_id)
         assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "
         logger.debug("Layer load event set: layer %d", layer_id)
