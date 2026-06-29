@@ -45,6 +45,10 @@ KV_RANK=1                               # D node kv_rank (P=0, D=1; inert for mo
 ADDITIONAL_CONFIG='{"use_offload": true, "lru_resident_cache_config": {"enabled": true, "buffer_size": 4096, "topk": 2048}}'
 # ----------------------------------------------------------------------------
 
+# KV transfer backend: "mooncake" (default) or "memfabric". With memfabric D
+# runs the in-process config store at <ip>:<KV_PORT+tp_rank> — start D BEFORE P.
+export VLLM_ASCEND_KV_TRANSFER_BACKEND="${VLLM_ASCEND_KV_TRANSFER_BACKEND:-mooncake}"
+
 export HCCL_IF_IP="${HCCL_IF_IP:-127.0.0.1}"
 export GLOO_SOCKET_IFNAME="$NET_IFACE"
 export TP_SOCKET_IFNAME="$NET_IFACE"

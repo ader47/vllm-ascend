@@ -41,6 +41,11 @@ KV_RANK=0                               # P node kv_rank (P=0, D=1; inert for mo
 ADDITIONAL_CONFIG='{"use_offload": false}'
 # ----------------------------------------------------------------------------
 
+# KV transfer backend: "mooncake" (default) or "memfabric". With memfabric the
+# Decode node MUST start first — it runs the in-process config store; P then
+# connects lazily on its first RDMA write (no separate store process needed).
+export VLLM_ASCEND_KV_TRANSFER_BACKEND="${VLLM_ASCEND_KV_TRANSFER_BACKEND:-mooncake}"
+
 export HCCL_IF_IP="${HCCL_IF_IP:-127.0.0.1}"
 export GLOO_SOCKET_IFNAME="$NET_IFACE"
 export TP_SOCKET_IFNAME="$NET_IFACE"

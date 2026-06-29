@@ -29,6 +29,7 @@ from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_layerwise_connector as _mlc
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     KVCacheRecvingLayerThread,
@@ -42,6 +43,11 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker im
     SFAKVOffloadWorker,
 )
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
+from vllm_ascend.distributed.kv_transfer.utils.transfer_engine_backend import (
+    BACKEND_MEMFABRIC,
+    MEMFABRIC_ROLE_DECODE,
+    MEMFABRIC_ROLE_PREFILL,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import AttentionMetadata
@@ -61,6 +67,16 @@ def _layer_idx(layer_name: str) -> int:
     match = _LAYER_IDX_RE.search(layer_name)
     assert match is not None, f"no transformer layer index in layer name {layer_name!r}"
     return int(match.group(1))
+
+
+def _resolve_kv_transfer_backend(vllm_config: VllmConfig) -> str:
+    """Pick the KV transfer backend.
+
+    ``kv_connector_extra_config["transfer_backend"]`` overrides the
+    ``VLLM_ASCEND_KV_TRANSFER_BACKEND`` env var (default ``mooncake``).
+    """
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+    return extra.get("transfer_backend") or envs.VLLM_ASCEND_KV_TRANSFER_BACKEND
 
 
 class SFAPDCpuOffloadWorker:
@@ -115,6 +131,18 @@ class SFAPDCpuOffloadWorker:
         if self.engine is None:
             # device_name=None reuses the process-wide "ascend" engine; we
             # assume host-pinned registration is accepted (user-confirmed).
+            backend = _resolve_kv_transfer_backend(self.vllm_config)
+            if backend == BACKEND_MEMFABRIC:
+                # D-side unique_id = "<host>:<port>"; memfabric derives its
+                # config-store address from it, and the Prefill peer reuses the
+                # same "<host>:<port>" (advertised via te_rpc_port) as dest_session.
+                mf_session_port = self.side_channel_port + self.tp_rank
+                global_te.configure(
+                    backend=BACKEND_MEMFABRIC,
+                    role=MEMFABRIC_ROLE_DECODE,
+                    unique_id=f"{self.side_channel_host}:{mf_session_port}",
+                    device_id=self.tp_rank,
+                )
             self.engine = global_te.get_transfer_engine(self.side_channel_host, None)
         return self.engine
 
@@ -218,11 +246,14 @@ class SFAPDCpuOffloadWorker:
 
         # CRITICAL: one register_buffer call — global_te.register_buffer has a
         # process-wide latch (is_register_buffer); a second call is a no-op.
-        engine = self._ensure_engine()
+        self._ensure_engine()
         global_te.register_buffer(ptrs, lengths)
 
+        # Advertise the session port peers reconstruct dest_session from:
+        # mooncake -> engine rpc port; memfabric -> the unique_id port baked
+        # into the D-side unique_id (see _ensure_engine).
         metadata = MooncakeAgentMetadata(
-            te_rpc_port=engine.get_rpc_port(),
+            te_rpc_port=global_te.get_advertised_rpc_port(),
             layer_metadata=self.layer_metadata,
         )
         ready_event = threading.Event()
@@ -390,6 +421,17 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
     """
 
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, engine_id: str):
+        backend = _resolve_kv_transfer_backend(vllm_config)
+        if backend == BACKEND_MEMFABRIC:
+            # Configure BEFORE super().__init__, which builds the transport
+            # engine. Prefill never starts a config store, so its unique_id is
+            # informational only (the peer never addresses it).
+            global_te.configure(
+                backend=BACKEND_MEMFABRIC,
+                role=MEMFABRIC_ROLE_PREFILL,
+                unique_id=f"{get_ip()}:{get_tensor_model_parallel_rank()}",
+                device_id=get_tensor_model_parallel_rank(),
+            )
         super().__init__(vllm_config, kv_cache_config, engine_id)
         self.layer_send_done_events: list[threading.Event] | None = None
 
