@@ -222,6 +222,20 @@ class SFAPDCpuOffloadWorker:
             indexer_t = main_tuple[2]  # dsa_k_indexer, NPU device memory
             k_cpu = k_caches_cpu[pool_idx]
             v_cpu = v_caches_cpu[pool_idx]
+            if pool_idx == 0:
+                # Diagnose memfabric RtIpcSetMemoryName failure: it needs the
+                # whole device storage handle, so a view / shared storage /
+                # nonzero storage_offset on indexer_t would make it fail.
+                _stor = indexer_t.untyped_storage()
+                logger.info(
+                    "PDDBG register[0] indexer: device=%s dtype=%s shape=%s "
+                    "data_ptr=%#x storage_ptr=%#x storage_offset=%s contiguous=%s; "
+                    "k_cpu device=%s ptr=%#x; v_cpu device=%s ptr=%#x",
+                    indexer_t.device, indexer_t.dtype, list(indexer_t.shape),
+                    indexer_t.data_ptr(), _stor.data_ptr(), indexer_t.storage_offset(),
+                    indexer_t.is_contiguous(),
+                    k_cpu.device, k_cpu.data_ptr(), v_cpu.device, v_cpu.data_ptr(),
+                )
 
             idx_ptr, idx_len, idx_scale = _region(indexer_t)
             k_ptr, k_len, k_scale = _region(k_cpu)
