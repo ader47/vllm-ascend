@@ -1183,6 +1183,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 continue
             for block_hash in request.block_hashes:
                 keys.append(f"{self.model_name}@{block_hash.hex()}")
+            # The partial/last block is written via request.last_block_gva, which
+            # the scheduler allocs under a separate key ("<model>@<req_id>_lastblock",
+            # _generate_keys_and_alloc with has_last_block). Register it too, or
+            # writes to it fail with -3102. Matches build_shared's condition.
+            if block_range.partial_block_index is not None:
+                keys.append(f"{self.model_name}@{request.req_id}_lastblock")
             self._registered_req_steps.add(step_key)
         if not keys:
             bh_count = sum(len(br.request.block_hashes) for br in task.block_ranges)
