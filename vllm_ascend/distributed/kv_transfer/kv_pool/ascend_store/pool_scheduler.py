@@ -285,12 +285,6 @@ class KVPoolScheduler:
             len(reused_pairs),
             len(alloc_pairs),
             self.model_name,
-            self.kv_role,
-            self.pp_rank,
-            ranks_per_key,
-            len(block_keys),
-            len(reused_pairs),
-            len(alloc_pairs),
             [(k[-16:], g) for k, g in reused_pairs[:4]],
             [(k[-16:], g) for k, g in alloc_pairs[:4]],
         )
