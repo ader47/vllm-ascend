@@ -788,6 +788,13 @@ class ReqMeta:
             block_hashes = []
         target_token_len = tracker.token_len
         previous_saved_tokens = tracker.num_saved_tokens
+        # On a cache hit, the prefix [0, kvpool_cached_tokens) is already in
+        # the pool and gets loaded (not saved by this request). Skip it in the
+        # save range so the producer only writes NEW blocks; otherwise it tries
+        # to re-write already-READABLE blobs, which the lease-managed GVA path
+        # rejects with MMC_UNMATCHED_STATE (-3101).
+        if load_spec is not None and load_spec.can_load:
+            previous_saved_tokens = max(previous_saved_tokens, load_spec.kvpool_cached_tokens)
 
         # For save operation: do not save if the following condition is met
         # 1. has already been saved before (num_saved_tokens > 0)
