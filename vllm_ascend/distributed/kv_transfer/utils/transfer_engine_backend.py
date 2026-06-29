@@ -232,11 +232,18 @@ class GlobalTE:
                 "call global_te.configure(unique_id=...) first"
             )
         unique_id = self._unique_id or f"{hostname}:{self._device_id}"
-        # store_url only contributes its protocol (tcp://); the real store
-        # address is derived from unique_id.
-        store_url = self._store_url or f"tcp://{hostname}"
+        # store_url carries the protocol; memfabric derives the real store
+        # address from unique_id. Use the full tcp://<unique_id> form — memfabric
+        # examples require tcp://IP:PORT, and a bare tcp://<host> (no port) can
+        # trip the store-url parser (smem ExtractIpPortFromUrl).
+        store_url = self._store_url or f"tcp://{unique_id}"
         if self._role == MEMFABRIC_ROLE_DECODE:
             self._advertised_rpc_port = self._port_from_unique_id(unique_id)
+        logger.info(
+            "memfabric TransferEngine initialize: store_url=%s unique_id=%s "
+            "role=%s device_id=%s",
+            store_url, unique_id, self._role, self._device_id,
+        )
         try:
             from memfabric_hybrid import TransferEngine as MFTransferEngine  # type: ignore
         except ImportError as e:
@@ -248,7 +255,14 @@ class GlobalTE:
         engine = MFTransferEngine()
         ret = engine.initialize(store_url, unique_id, self._role, self._device_id)
         if ret != 0:
-            raise RuntimeError(f"memfabric TransferEngine initialize failed, ret={ret}")
+            raise RuntimeError(
+                f"memfabric TransferEngine initialize failed (ret={ret}); "
+                f"store_url={store_url!r} unique_id={unique_id!r}. memfabric "
+                f"requires the unique_id host to be a numeric IPv4 reachable by "
+                f"the peer (smem's inet_pton rejects 0.0.0.0/IPv6/hostname). "
+                f"Set VLLM_HOST_IP to the node's IPv4 if get_ip() returned a "
+                f"non-IPv4 address."
+            )
         return MemfabricBackend(engine, self._advertised_rpc_port)
 
     @staticmethod
