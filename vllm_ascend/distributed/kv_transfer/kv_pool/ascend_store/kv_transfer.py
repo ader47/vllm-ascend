@@ -1165,12 +1165,13 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         (req_id, save_end_token) so we register once per request-step, not once
         per layer.
         """
-        if self.gva_alloc_size <= 0 or not self.model_name:
+        # Note: model_name may legitimately be empty (e.g. model path ends with
+        # '/'), in which case scheduler and worker both produce "@<hash>" keys
+        # that still match. Only gva_alloc_size guards the non-GVA path.
+        if self.gva_alloc_size <= 0:
             logger.warning(
-                "GVA-DBG worker tp_rank=%s SKIP registration (guard): "
-                "model_name=%r gva_alloc_size=%d",
+                "GVA-DBG worker tp_rank=%s SKIP registration (guard): gva_alloc_size=%d",
                 self.tp_rank,
-                self.model_name,
                 self.gva_alloc_size,
             )
             return

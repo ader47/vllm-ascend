@@ -276,8 +276,15 @@ class KVPoolScheduler:
         ranks_per_key = self.tp_size // self.put_step
         logger.warning(
             "GVA-DBG req=%s role=%s pp_rank=%s ranks_per_key=%d total=%d "
-            "reused=%d alloc=%d; reused(key_tail,gva)=%s; alloc(key_tail,gva)=%s",
+            "reused=%d alloc=%d model_name=%s; reused(key_tail,gva)=%s; alloc(key_tail,gva)=%s",
             request_tracker.req_id,
+            self.kv_role,
+            self.pp_rank,
+            ranks_per_key,
+            len(block_keys),
+            len(reused_pairs),
+            len(alloc_pairs),
+            self.model_name,
             self.kv_role,
             self.pp_rank,
             ranks_per_key,
