@@ -1196,12 +1196,13 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             )
             return
         try:
-            self.m_store.batch_alloc(keys, [self.gva_alloc_size] * len(keys))
+            alloc_gvas = self.m_store.batch_alloc(keys, [self.gva_alloc_size] * len(keys))
             logger.warning(
-                "GVA-DBG worker tp_rank=%s registered %d block GVAs locally "
-                "(alloc_size=%d, model=%s)",
+                "GVA-DBG worker tp_rank=%s batch_alloc(keys=%d) returned=%s "
+                "(alloc_size=%d model=%r)",
                 self.tp_rank,
                 len(keys),
+                list(alloc_gvas)[:6],
                 self.gva_alloc_size,
                 self.model_name,
             )
