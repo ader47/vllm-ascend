@@ -1192,7 +1192,17 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 logger.error("Layerwise %d PD transfer wait timed out", layer_id)
             self.layer_transfer_finished_events[layer_id].clear()
         if res != 0:
-            logger.error("Layerwise %d save batch_copy failed with return code %d", layer_id, res)
+            # [GVA-DBG] dump the destination GVAs we tried to write so they can
+            # be matched against the GVA-DBG reused/alloc lists in pool_scheduler
+            # and the failing gva in the MMC BatchCopyWritePath log.
+            logger.error(
+                "Layerwise %d save batch_copy failed with return code %d; "
+                "dst_gvas(sample)=%s sizes(sample)=%s",
+                layer_id,
+                res,
+                gvas_array[:4].tolist(),
+                size_array[:4].tolist(),
+            )
         for req_id in req_meta.req_ids:
             if self.try_finish_and_delete_stored_request(req_id):
                 self.set_finished_request(req_id)

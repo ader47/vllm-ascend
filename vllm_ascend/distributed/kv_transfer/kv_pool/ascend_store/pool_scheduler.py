@@ -247,14 +247,18 @@ class KVPoolScheduler:
         block_gvas = [0] * len(block_keys)
         missing_keys = []
         missing_indices = []
+        reused_pairs: list[tuple[str, int]] = []
         for index, key_info in enumerate(key_infos):
             sizes = key_info.size()
             if sizes and sizes > 0:
-                block_gvas[index] = key_info.gva_list()[0]
+                reused_gva = key_info.gva_list()[0]
+                block_gvas[index] = reused_gva
+                reused_pairs.append((block_keys[index], reused_gva))
             else:
                 missing_keys.append(block_keys[index])
                 missing_indices.append(index)
 
+        alloc_pairs: list[tuple[str, int]] = []
         if missing_keys:
             alloc_size = self.page_size_bytes * self.keys_per_block_hash
             new_gvas = self.store_scheduler.batch_alloc(missing_keys, [alloc_size] * len(missing_keys))
@@ -262,6 +266,27 @@ class KVPoolScheduler:
                 raise ValueError(f"Request {request_tracker.req_id}: batch_alloc failed, gvas={new_gvas}")
             for index, gva in zip(missing_indices, new_gvas):
                 block_gvas[index] = gva
+                alloc_pairs.append((block_keys[index], gva))
+
+        # [GVA-DBG] diagnose batch_copy -3102 (MMC_UNMATCHED_KEY). Reused GVAs
+        # come from the shared metadata store and are NOT registered in this
+        # process' local gva tracker, so they are not writable here. reused>0 on
+        # the very first request => likely stale metadata; ranks_per_key>1 =>
+        # likely the shared-key registration gap across TP ranks.
+        ranks_per_key = self.tp_size // self.put_step
+        logger.warning(
+            "GVA-DBG req=%s role=%s pp_rank=%s ranks_per_key=%d total=%d "
+            "reused=%d alloc=%d; reused(key_tail,gva)=%s; alloc(key_tail,gva)=%s",
+            request_tracker.req_id,
+            self.kv_role,
+            self.pp_rank,
+            ranks_per_key,
+            len(block_keys),
+            len(reused_pairs),
+            len(alloc_pairs),
+            [(k[-16:], g) for k, g in reused_pairs[:4]],
+            [(k[-16:], g) for k, g in alloc_pairs[:4]],
+        )
 
         request_tracker.block_keys = block_keys
         request_tracker.block_gvas = block_gvas
