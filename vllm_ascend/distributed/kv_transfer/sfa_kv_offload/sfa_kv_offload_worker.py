@@ -105,6 +105,31 @@ cpu_sparse_attn = load(
 class SFAKVOffloadWorker:
     # The main class for the cache engine.
 
+    _CPU_CACHE_ALIGNMENT = 2 * 1024 * 1024
+
+    @staticmethod
+    def _align_memory(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
+        data_ptr = tensor.data_ptr()
+        aligned_addr = (data_ptr + alignment - 1) // alignment * alignment
+        offset = (aligned_addr - data_ptr) // tensor.element_size()
+        return tensor[int(offset):]
+
+    @classmethod
+    def _empty_aligned_cpu_tensor(
+        cls,
+        shape: list[int],
+        dtype: torch.dtype,
+        alignment: int = _CPU_CACHE_ALIGNMENT,
+    ) -> torch.Tensor:
+        num_elements = int(np.prod(shape))
+        extra_elements = cdiv(alignment, torch.empty((), dtype=dtype).element_size())
+        tensor = empty_tensor(
+            [num_elements + extra_elements],
+            dtype=dtype,
+            pin_memory=True,
+        )
+        return cls._align_memory(tensor, alignment)[:num_elements].view(shape)
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -251,8 +276,20 @@ class SFAKVOffloadWorker:
             cpu_block_num = npu_block_num * cpu_block_num_multiple
             cpu_cache_size_single_card = cpu_block_num * self.block_size * (512 + 64) * torch.bfloat16.itemsize * self.num_layers
             logger.info(f'KV offload allocate {cpu_block_num} cpu blocks, size = {cpu_cache_size_single_card / 1024 / 1024 / 1024} GB per rank')
-            self.k_caches_cpu: list[torch.Tensor] = [empty_tensor([cpu_block_num, self.block_size, 1, 512], dtype=torch.bfloat16, pin_memory=True) for _ in range(self.num_layers)]
-            self.v_caches_cpu: list[torch.Tensor] = [empty_tensor([cpu_block_num, self.block_size, 1, 64], dtype=torch.bfloat16, pin_memory=True) for _ in range(self.num_layers)]
+            self.k_caches_cpu: list[torch.Tensor] = [
+                self._empty_aligned_cpu_tensor(
+                    [cpu_block_num, self.block_size, 1, 512],
+                    dtype=torch.bfloat16,
+                )
+                for _ in range(self.num_layers)
+            ]
+            self.v_caches_cpu: list[torch.Tensor] = [
+                self._empty_aligned_cpu_tensor(
+                    [cpu_block_num, self.block_size, 1, 64],
+                    dtype=torch.bfloat16,
+                )
+                for _ in range(self.num_layers)
+            ]
 
             # topk cache reuse related
             self.lru_workspace_threads = 8
