@@ -1018,6 +1018,15 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
         super().__init__(vllm_config, kv_cache_config, engine_id)
         self.layer_send_done_events: list[threading.Event] | None = None
 
+    def update_decoder_info(self, req_id: str, req_meta: Any) -> Any:
+        """Override: in memfabric pull mode, P does NOT need D's metadata
+        (P is not pushing to D — D reads from P). Skip GET_META entirely
+        to avoid flooding D's ROUTER with 61 unnecessary requests that
+        delay MF_META / READ_READY."""
+        if self._backend == BACKEND_MEMFABRIC:
+            return req_meta
+        return super().update_decoder_info(req_id, req_meta)
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if self._backend == BACKEND_MEMFABRIC:
             # memfabric pull: swap in _MembPullSendingThread (notifies D to read,
