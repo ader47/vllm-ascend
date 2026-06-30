@@ -101,6 +101,25 @@ class MemfabricBackend:
             return -1
         return 0
 
+    def batch_transfer_sync_read(
+        self,
+        session_id: str,
+        local_buffers: list[int],
+        peer_buffers: list[int],
+        length_list: list[int],
+    ) -> int:
+        ret = self._engine.batch_transfer_sync_read(
+            session_id, local_buffers, peer_buffers, length_list
+        )
+        if ret != 0:
+            logger.error(
+                "memfabric batch_transfer_sync_read failed (ret=%s) for session %s",
+                ret,
+                session_id,
+            )
+            return -1
+        return 0
+
 
 class GlobalTE:
     """Process-wide, config-aware transport-engine factory.
