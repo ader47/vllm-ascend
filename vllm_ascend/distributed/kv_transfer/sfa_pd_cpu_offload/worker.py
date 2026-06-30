@@ -940,6 +940,10 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         layer_idx = send_task.layer_idx
 
         if not send_task.send_request:
+            logger.warning(
+                "MembPull: send_task.send_request EMPTY for layer %d (%s) — "
+                "scheduler did not populate requests, skipping",
+                layer_idx, layer_name)
             return
         req_meta = next(iter(send_task.send_request.values()))
         remote_host = req_meta.remote_host
