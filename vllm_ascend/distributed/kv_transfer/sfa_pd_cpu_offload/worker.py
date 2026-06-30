@@ -21,23 +21,31 @@ import re
 import threading
 from typing import TYPE_CHECKING, Any
 
+import msgspec
 import torch
+import zmq
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
-from vllm.utils.network_utils import get_ip
+from vllm.utils.network_utils import get_ip, make_zmq_path
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_layerwise_connector as _mlc
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
+    DONE_SENDING_MSG,
+    FAILED_SENDING_MSG,
+    GET_META_MSG,
     KVCacheRecvingLayerThread,
     KVCacheSendingLayerThread,
     LayerMetadata,
     MooncakeAgentMetadata,
     MooncakeLayerwiseConnectorWorker,
+    ensure_zmq_recv,
+    ensure_zmq_send,
     get_external_request_id,
+    zmq_ctx,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker import (
     SFAKVOffloadWorker,
@@ -67,6 +75,70 @@ def _layer_idx(layer_name: str) -> int:
     match = _LAYER_IDX_RE.search(layer_name)
     assert match is not None, f"no transformer layer index in layer name {layer_name!r}"
     return int(match.group(1))
+
+
+STAGING_DONE = b"staging_done"
+STAGING_ACK = b"staging_ack"
+
+
+class SFARecvLayerThread(KVCacheRecvingLayerThread):
+    """Extends base recv thread to also handle STAGING_DONE per-layer.
+
+    On STAGING_DONE(layer_idx): invoke the worker's copy callback, then reply
+    STAGING_ACK so P can proceed to push the next main MLA layer.
+    """
+
+    def __init__(self, *args, on_staging_done=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_staging_done = on_staging_done
+
+    def run(self):
+        """Override base run to intercept STAGING_DONE in the ZMQ loop."""
+        from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
+
+        handshake_port = self.side_channel_port + self.tp_rank
+        path = make_zmq_path("tcp", self.side_channel_host, handshake_port)
+        logger.info("SFA PD recv (staging-aware) listening on: %s", path)
+        encoder = msgspec.msgpack.Encoder()
+        encoded_data = encoder.encode(self.metadata)
+        ctx = zmq.Context()
+        try:
+            sock = make_zmq_socket(ctx=ctx, path=path, socket_type=zmq.ROUTER, bind=True)
+            self.ready_event.set()
+            decoder = msgspec.msgpack.Decoder(type=tuple)
+            while True:
+                try:
+                    frames = sock.recv_multipart()
+                    if len(frames) < 2:
+                        continue
+                    identity = frames[0]
+                    payload = [f for f in frames[1:] if f != b""]
+                    if len(payload) != 1:
+                        continue
+                    msg = decoder.decode(payload[0])
+                    if msg[0] == STAGING_DONE:
+                        layer_idx = msg[1]
+                        if self._on_staging_done is not None:
+                            self._on_staging_done(layer_idx)
+                        sock.send_multipart((identity, b"", encoder.encode((STAGING_ACK, layer_idx))))
+                    elif msg[0] == GET_META_MSG:
+                        sock.send_multipart((identity, b"", encoded_data))
+                    elif msg[0] == DONE_SENDING_MSG:
+                        request_id = msg[1]
+                        trans_count = msg[2]
+                        side_channel_path = msg[3]
+                        self.update_done_task(request_id, trans_count, side_channel_path)
+                        sock.send_multipart((identity, b"", b"ACK"))
+                    elif msg[0] == FAILED_SENDING_MSG:
+                        request_id = msg[1]
+                        self.update_failed_task(request_id)
+                        sock.send_multipart((identity, b"", b"ACK"))
+                    else:
+                        logger.error("SFA recv got unexpected message %s", msg)
+                except Exception as e:
+                    logger.error("SFA recv exception: %s: %s", type(e), e)
+        finally:
+            ctx.destroy(linger=0)
 
 
 def _resolve_kv_transfer_backend(vllm_config: VllmConfig) -> str:
@@ -166,15 +238,22 @@ class SFAPDCpuOffloadWorker:
         # SFA worker allocates k_caches_cpu/v_caches_cpu + LRU buffers here.
         self.sfa_worker.register_kv_caches(kv_caches)
 
-        # CPU pool owned by the composed SFA worker (filled remotely by P).
-        # IMPORTANT: register the EXACT same memory the LRU load reads — the SFA
-        # worker captured `gvas_*_bases = [t.data_ptr() ...]` during its own
-        # register_kv_caches, so we must advertise those ptrs verbatim (no copy).
+        # CPU pool owned by the composed SFA worker (filled via staging copy).
+        # HW limitation: P HBM -> D DRAM cross-node RDMA is not available.
+        # Solution: P pushes main MLA to a 1-slot HBM staging buffer, then
+        # signals per-layer DONE; D copies staging -> CPU pool locally and ACKs.
         assert self.sfa_worker.k_caches_cpu is not None, (
             "Composed SFA worker did not allocate the CPU pool"
         )
         k_caches_cpu = self.sfa_worker.k_caches_cpu
         v_caches_cpu = self.sfa_worker.v_caches_cpu
+
+        # 1-slot HBM staging for main MLA (reused per-layer via ACK handshake).
+        # indexer goes direct (HBM->HBM), no staging.
+        self.staging_k = torch.empty_like(k_caches_cpu[0], device="npu")
+        self.staging_v = torch.empty_like(v_caches_cpu[0], device="npu")
+        # Store CPU pool refs for the per-layer copy callback.
+        self._cpu_pools = list(zip(k_caches_cpu, v_caches_cpu))
 
         # Build per-layer LayerMetadata keyed by the REAL layer names, matching
         # how mooncake P consumes them in get_transfer_meta: it looks up
@@ -217,35 +296,43 @@ class SFAPDCpuOffloadWorker:
 
         ptrs: list[int] = []
         lengths: list[int] = []
+        _staging_registered = False
         for pool_idx, (indexer_name, main_name) in enumerate(zip(indexer_names, main_names)):
             main_tuple = list(kv_caches[main_name])
             indexer_t = main_tuple[2]  # dsa_k_indexer, NPU device memory
-            k_cpu = k_caches_cpu[pool_idx]
-            v_cpu = v_caches_cpu[pool_idx]
 
             idx_ptr, idx_len, idx_scale = _region(indexer_t)
-            k_ptr, k_len, k_scale = _region(k_cpu)
-            v_ptr, v_len, v_scale = _region(v_cpu)
+            sk_ptr, sk_len, sk_scale = _region(self.staging_k)
+            sv_ptr, sv_len, sv_scale = _region(self.staging_v)
 
-            # group 0 indexer (single dsa_k tensor) under its own layer_name
+            # group 0 indexer (single dsa_k tensor) under its own layer_name —
+            # direct HBM, P pushes straight to D indexer.
             self.layer_metadata[indexer_name] = LayerMetadata(
                 tensor_group_idx=[_INDEXER_GROUP_IDX],
                 kv_caches_base_addr=[idx_ptr],
                 block_len=[idx_len],
                 block_size_scale=[idx_scale],
             )
-            # group 1 main MLA (k, v) under the main layer_name — order matches
-            # P's main [k_nope, v_rope] so get_transfer_meta pairs them correctly
+            # group 1 main MLA (k, v) — P pushes to HBM staging (not CPU pool
+            # DRAM, which cross-node RDMA can't reach). D copies staging->CPU
+            # pool locally after each layer's STAGING_DONE handshake.
             self.layer_metadata[main_name] = LayerMetadata(
                 tensor_group_idx=[_MAIN_GROUP_IDX, _MAIN_GROUP_IDX],
-                kv_caches_base_addr=[k_ptr, v_ptr],
-                block_len=[k_len, v_len],
-                block_size_scale=[k_scale, v_scale],
+                kv_caches_base_addr=[sk_ptr, sv_ptr],
+                block_len=[sk_len, sv_len],
+                block_size_scale=[sk_scale, sv_scale],
             )
 
-            for t in (indexer_t, k_cpu, v_cpu):
-                ptrs.append(t.data_ptr())
-                lengths.append(t.numel() * t.element_size())
+            # Register indexer per-layer (unique HBM tensor per layer).
+            # Register staging ONCE (1-slot, shared across all main layers).
+            ptrs.append(indexer_t.data_ptr())
+            lengths.append(indexer_t.numel() * indexer_t.element_size())
+            if not _staging_registered:
+                ptrs.append(self.staging_k.data_ptr())
+                lengths.append(self.staging_k.numel() * self.staging_k.element_size())
+                ptrs.append(self.staging_v.data_ptr())
+                lengths.append(self.staging_v.numel() * self.staging_v.element_size())
+                _staging_registered = True
 
         # CRITICAL: one register_buffer call — global_te.register_buffer has a
         # process-wide latch (is_register_buffer); a second call is a no-op.
@@ -260,7 +347,7 @@ class SFAPDCpuOffloadWorker:
             layer_metadata=self.layer_metadata,
         )
         ready_event = threading.Event()
-        self.kv_recv_layer_thread = KVCacheRecvingLayerThread(
+        self.kv_recv_layer_thread = SFARecvLayerThread(
             self.tp_rank,
             self.side_channel_port,
             self.vllm_config.parallel_config.tensor_parallel_size,
@@ -268,6 +355,7 @@ class SFAPDCpuOffloadWorker:
             " ",  # local_engine_id placeholder (mirrors mooncake)
             metadata,
             ready_event,
+            on_staging_done=self._on_staging_done,
         )
         self.kv_recv_layer_thread.start()
         ready_event.wait()
@@ -370,6 +458,17 @@ class SFAPDCpuOffloadWorker:
             return None
         return {rid: self._cpu_blocks_by_req.get(rid, 0) for rid in req_ids}
 
+    def _on_staging_done(self, layer_idx: int) -> None:
+        """Called by D recv thread when P finishes pushing main MLA layer L
+        to the staging HBM buffer. Copy staging -> CPU pool (HBM->DRAM, local),
+        then the recv thread sends STAGING_ACK back to P so P can push the
+        next layer (1-slot staging, no double buffer needed)."""
+        if not self._cpu_pools:
+            return
+        k_cpu, v_cpu = self._cpu_pools[layer_idx]
+        k_cpu.copy_(self.staging_k)
+        v_cpu.copy_(self.staging_v)
+
     def _refresh_cpu_blocks_by_req(self, metadata: KVConnectorMetadata):
         # SFAKVOffloadConnectorMetadata.requests is a list[ReqMeta]. For this
         # connector ReqMeta.block_ids_cpu IS the flat main-MLA CPU block list
@@ -390,12 +489,12 @@ class SFAPDCpuOffloadWorker:
 # P side (kv_producer) — layer-wise RDMA push with per-layer completion
 # ======================================================================
 class _SFAPDCpuSendingThread(KVCacheSendingLayerThread):
-    """Sending thread that signals per-layer send completion.
+    """Sending thread that signals per-layer send completion + staging ACK.
 
-    After the synchronous ``batch_transfer_sync_write`` returns, the source KV
-    buffer has been fully read by RDMA and may be reused by P's prefill for a
-    later layer. We set ``layer_send_done_events[layer_idx]`` so the buffer-reuse
-    scheduler can gate on it.
+    For main MLA layers (group 1), after push completes the data lands in D's
+    HBM staging buffer. P must wait for D's STAGING_ACK (D copied staging→CPU
+    pool) before pushing the next layer, because staging is a 1-slot buffer.
+    Indexer layers (group 0) go direct to D HBM — no staging, no ACK needed.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -404,14 +503,60 @@ class _SFAPDCpuSendingThread(KVCacheSendingLayerThread):
         self.layer_send_done_events: list[threading.Event] = [
             threading.Event() for _ in range(total_layers)
         ]
+        self._poller = zmq.Poller()
 
     def _transfer_kv_cache(self, send_task: Any) -> None:  # type: ignore[override]
         super()._transfer_kv_cache(send_task)
-        # Mark this layer's send complete regardless of per-req failure so a
-        # waiter never blocks forever; failures are surfaced via failed_reqs.
         idx = send_task.layer_idx
         if 0 <= idx < len(self.layer_send_done_events):
             self.layer_send_done_events[idx].set()
+
+        # For main MLA layers (group 1 = staging path), wait for D's ACK
+        # before returning — D has copied staging→CPU pool, staging slot
+        # is now free for the next layer.
+        layer_name = send_task.layer_name
+        local_meta = self.layer_metadata.get(layer_name)
+        if local_meta is not None and _MAIN_GROUP_IDX in local_meta.tensor_group_idx:
+            transformer_layer_idx = _layer_idx(layer_name)
+            self._staging_handshake(send_task, transformer_layer_idx)
+
+    def _staging_handshake(self, send_task: Any, transformer_layer_idx: int) -> None:
+        """Send STAGING_DONE to D, block until STAGING_ACK received.
+
+        Uses the first req's remote_host:remote_port as D's ZMQ endpoint
+        (same handshake port the base mooncake layerwise uses for DONE_SENDING).
+
+        Args:
+            transformer_layer_idx: the transformer layer index (0..N-1), used
+              by D to index into _cpu_pools. NOT the mooncake global layer_idx
+              (which counts indexer + main layers interleaved).
+        """
+        if not send_task.send_request:
+            return
+        req_meta = next(iter(send_task.send_request.values()))
+        remote_host = req_meta.remote_host
+        remote_port = req_meta.remote_port
+        if not remote_host or not remote_port:
+            return
+        path = make_zmq_path("tcp", remote_host, remote_port)
+        encoder = msgspec.msgpack.Encoder()
+        encoded = encoder.encode((STAGING_DONE, transformer_layer_idx))
+        try:
+            with zmq_ctx(zmq.REQ, path) as sock:
+                sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
+                ensure_zmq_send(sock, encoded, path)
+                resp = ensure_zmq_recv(sock, self._poller, path, timeout=self.timeout)
+                ack_msg = msgspec.msgpack.Decoder(type=tuple).decode(resp)
+                if ack_msg[0] != STAGING_ACK:
+                    logger.warning(
+                        "STAGING handshake: unexpected ACK %s for layer %d",
+                        ack_msg, transformer_layer_idx,
+                    )
+        except Exception as e:
+            logger.error(
+                "STAGING handshake failed for layer %d (host=%s:%s): %s",
+                transformer_layer_idx, remote_host, remote_port, e,
+            )
 
 
 class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
