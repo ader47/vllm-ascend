@@ -773,6 +773,16 @@ class MembPullReadThread(threading.Thread):
                 lengths.append(v_block_len)
 
         if local_ptrs:
+            # Pre-read checksum (sample first block to detect uninitialized data)
+            if is_indexer and d_bid_list:
+                d_indexer = w._indexer_tensors[pool_idx]
+                pre_sum = d_indexer[d_bid_list[0]].float().sum().item()
+            elif not is_indexer and d_bid_list:
+                k_cpu, v_cpu = w._cpu_pools[pool_idx]
+                pre_sum = k_cpu[d_bid_list[0]].float().sum().item()
+            else:
+                pre_sum = 0.0
+
             ret = self.engine.batch_transfer_sync_read(
                 self._p_session, local_ptrs, peer_ptrs, lengths
             )
@@ -780,6 +790,22 @@ class MembPullReadThread(threading.Thread):
                 raise RuntimeError(
                     f"memfabric read failed for layer {layer_name}, ret={ret}"
                 )
+
+            # Post-read checksum: compare with pre to confirm data was written.
+            # Non-zero post + different from pre = data actually transferred.
+            if is_indexer and d_bid_list:
+                post_sum = d_indexer[d_bid_list[0]].float().sum().item()
+            elif not is_indexer and d_bid_list:
+                post_sum = k_cpu[d_bid_list[0]].float().sum().item()
+            else:
+                post_sum = 0.0
+            logger.info(
+                "MembPull read layer %s (pool_idx=%d, is_indexer=%s): "
+                "%d blocks, %d transfers, pre=%.4f post=%.4f",
+                layer_name, pool_idx, is_indexer,
+                len(d_bid_list) if d_bid_list else 0,
+                len(local_ptrs), pre_sum, post_sum,
+            )
 
 
 # ======================================================================
@@ -913,8 +939,8 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             return
         req_meta = next(iter(send_task.send_request.values()))
         remote_host = req_meta.remote_host
-        # D binds ZMQ on side_channel_port + tp_rank (one ROUTER per rank).
-        # req_meta.remote_port is the base; add our tp_rank to match D's rank.
+        # req_meta.remote_port already includes tp_rank offset (set by the
+        # mooncake layerwise base class). D binds ROUTER on this port.
         remote_port = req_meta.remote_port
         if not remote_host or not remote_port:
             return
