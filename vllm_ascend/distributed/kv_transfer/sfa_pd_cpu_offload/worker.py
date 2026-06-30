@@ -833,7 +833,7 @@ class _SFAPDCpuSendingThread(KVCacheSendingLayerThread):
             return
         req_meta = next(iter(send_task.send_request.values()))
         remote_host = req_meta.remote_host
-        remote_port = req_meta.remote_port + self.tp_rank
+        remote_port = req_meta.remote_port
         if not remote_host or not remote_port:
             return
         path = make_zmq_path("tcp", remote_host, remote_port)
@@ -895,7 +895,7 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         remote_host = req_meta.remote_host
         # D binds ZMQ on side_channel_port + tp_rank (one ROUTER per rank).
         # req_meta.remote_port is the base; add our tp_rank to match D's rank.
-        remote_port = req_meta.remote_port + self.tp_rank
+        remote_port = req_meta.remote_port
         if not remote_host or not remote_port:
             return
 
