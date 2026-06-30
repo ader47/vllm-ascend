@@ -82,15 +82,13 @@ def _layer_idx(layer_name: str) -> int:
 STAGING_DONE = b"staging_done"
 STAGING_ACK = b"staging_ack"
 MF_META = b"mf_meta"  # P→D: (MF_META, p_session, p_layer_meta_serialized)
-# Role-driven READ_READY: P has 1 kv_cache_group (main MLA at group 0; the
-# indexer shares those same slots on P), while D has 2 groups (indexer=group 0
-# in HBM, main MLA=group 1 offloaded to CPU). Positional per-group block lists
-# can't bridge that asymmetry, so each READ_READY carries a single role + flat
-# block lists. P sends one MAIN and one INDEXER READ_READY per transformer layer.
-READ_READY = b"read_ready"  # P→D: (READ_READY, layer_idx, layer_name, role, p_block_ids, d_block_ids)
+# READ_READY carries BOTH legs in ONE message (one ZMQ round-trip per layer).
+# P has 1 kv_cache_group (main MLA at group 0; the indexer shares those same
+# slots on P), while D has 2 groups (indexer=group 0 in HBM, main MLA=group 1
+# offloaded to CPU). Positional per-group block lists can't bridge that
+# asymmetry, so READ_READY carries flat block lists per role instead.
+READ_READY = b"read_ready"  # P→D: (READ_READY, layer_idx, layer_name, p_block_ids, d_main_ids, d_indexer_ids)
 READ_DONE = b"read_done"  # D→P: (READ_DONE, layer_idx)
-ROLE_MAIN = "main"  # P k,v (tensor [0],[1]) → D CPU pool (main_cpu_ids)
-ROLE_INDEXER = "indexer"  # P dsa_k (tensor [2])   → D indexer HBM (indexer_npu_ids)
 
 
 class SFARecvLayerThread(KVCacheRecvingLayerThread):
@@ -652,16 +650,14 @@ class MembPullReadThread(threading.Thread):
                     elif msg_type == READ_READY:
                         layer_idx = msg[1]
                         layer_name = msg[2]
-                        role = msg[3]  # ROLE_MAIN or ROLE_INDEXER
-                        p_block_ids = msg[4]  # P's block ids for this role (flat)
-                        d_block_ids = msg[5]  # D's destination block ids for this role (flat)
+                        p_block_ids = msg[3]  # P's block ids (shared by main + indexer on P)
+                        d_main_ids = msg[4]  # D main CPU pool block ids (main_cpu_ids)
+                        d_indexer_ids = msg[5]  # D indexer HBM block ids (indexer_npu_ids)
                         try:
-                            self._do_read(layer_name, role, p_block_ids, d_block_ids)
+                            self._do_read(layer_name, p_block_ids, d_main_ids, d_indexer_ids)
                             sock.send_multipart((identity, b"", encoder.encode((READ_DONE, layer_idx))))
                         except Exception as e:
-                            logger.error(
-                                "MembPull read failed for layer %d (%s, role=%s): %s", layer_idx, layer_name, role, e
-                            )
+                            logger.error("MembPull read failed for layer %d (%s): %s", layer_idx, layer_name, e)
                             sock.send_multipart((identity, b"", encoder.encode((READ_DONE, layer_idx))))
 
                     elif msg_type == DONE_SENDING_MSG:
@@ -696,25 +692,20 @@ class MembPullReadThread(threading.Thread):
     def _do_read(
         self,
         layer_name: str,
-        role: str,
         p_block_ids: list[int],
-        d_block_ids: list[int],
+        d_main_ids: list[int],
+        d_indexer_ids: list[int],
     ) -> None:
-        """Read one role's KV from P HBM → D local via memfabric (pull).
+        """Read one layer's KV (main MLA + indexer) from P HBM → D in one pull.
 
-        role == ROLE_MAIN:     P tensors [0]=k, [1]=v   → D CPU pool (main_cpu_ids).
-        role == ROLE_INDEXER:  P tensor  [2]=dsa_k      → D indexer HBM (indexer_npu_ids).
+        Both legs share ``p_block_ids``: on P the indexer is written into
+        ``dsa_k_cache`` (= kv_caches[main][2]) at the SAME slots as main MLA
+        (the indexer scatter reuses the main slot_mapping). Destinations differ:
+          main     → D CPU pool at ``d_main_ids`` (P tensors [0]=k, [1]=v)
+          indexer  → D indexer HBM at ``d_indexer_ids`` (P tensor [2]=dsa_k,
+                     exposed via MF_META as the main layer's tensor [2])
 
-        P always sends READ_READY under the MAIN layer name; the indexer tensor
-        is exposed as that main layer's tensor [2] in MF_META (the mooncake base
-        registers the full 3-tuple ``(k, v, dsa_k)``), so no separate indexer
-        layer entry is needed.
-
-        Args:
-            p_block_ids: P's block ids. On P the indexer shares the main MLA
-                slots, so both roles use the same P block list.
-            d_block_ids: D's destination block ids for THIS role —
-                ``indexer_npu_ids`` for indexer, ``main_cpu_ids`` for main.
+        All transfers are issued in a single ``batch_transfer_sync_read``.
         """
         if self._p_session is None:
             raise RuntimeError("MF_META not received before READ_READY")
@@ -739,14 +730,8 @@ class MembPullReadThread(threading.Thread):
             )
             return
 
-        if not p_block_ids or not d_block_ids:
-            logger.warning(
-                "MembPull _do_read: empty block list for %s role=%s (p_block_ids=%d, d_block_ids=%d), skip",
-                layer_name,
-                role,
-                len(p_block_ids),
-                len(d_block_ids),
-            )
+        if not p_block_ids:
+            logger.warning("MembPull _do_read: empty p_block_ids for %s, skip", layer_name)
             return
 
         p_base_addrs = p_meta["base_addrs"]
@@ -755,62 +740,71 @@ class MembPullReadThread(threading.Thread):
         local_ptrs: list[int] = []
         peer_ptrs: list[int] = []
         lengths: list[int] = []
+        n_main = 0
+        n_indexer = 0
 
-        if role == ROLE_MAIN:
-            # P tensors [0]=k, [1]=v → D CPU pool.
+        # Main MLA leg: P tensors [0]=k, [1]=v → D CPU pool.
+        if d_main_ids:
             p_k_base, p_v_base = p_base_addrs[0], p_base_addrs[1]
             p_k_len, p_v_len = p_block_len[0], p_block_len[1]
             k_cpu, v_cpu = w._cpu_pools[pool_idx]
-            for p_bid, d_bid in zip(p_block_ids, d_block_ids):
+            for p_bid, d_bid in zip(p_block_ids, d_main_ids):
                 peer_ptrs.append(p_k_base + p_bid * p_k_len)
                 local_ptrs.append(k_cpu.data_ptr() + d_bid * p_k_len)
                 lengths.append(p_k_len)
                 peer_ptrs.append(p_v_base + p_bid * p_v_len)
                 local_ptrs.append(v_cpu.data_ptr() + d_bid * p_v_len)
                 lengths.append(p_v_len)
-        elif role == ROLE_INDEXER:
-            # P tensor [2]=dsa_k → D indexer HBM (dsa_k alias at indexer_npu_ids).
+            n_main = min(len(p_block_ids), len(d_main_ids))
+
+        # Indexer leg: P tensor [2]=dsa_k → D indexer HBM (dsa_k alias at
+        # indexer_npu_ids). D consumes dsa_k at vLLM-block granularity — the
+        # indexer scatter (sfa_v1) does ``dsa_k.view(-1, idx_dim)[bid*block_size
+        # + offset]``, i.e. ``block_size`` rows of ``idx_dim`` per block, which
+        # is exactly P's p_dsa_len. So a block-for-block copy of p_dsa_len bytes
+        # lands correctly; dsa_k's dim-0 ("dsa block") is NOT the transfer stride.
+        if d_indexer_ids:
             if len(p_base_addrs) < 3:
                 logger.error(
                     "MembPull indexer: P layer_meta for %s has %d tensors, need >=3 "
-                    "(dsa_k must be registered as the main layer's tensor [2]); skip",
+                    "(dsa_k must be registered as the main layer's tensor [2]); skip indexer leg",
                     layer_name,
                     len(p_base_addrs),
                 )
-                return
-            p_dsa_base = p_base_addrs[2]
-            p_dsa_len = p_block_len[2]
-            d_indexer = w._indexer_tensors[pool_idx]
-            # D consumes dsa_k at vLLM-block granularity — the indexer scatter
-            # (sfa_v1) does ``dsa_k.view(-1, idx_dim)[bid*block_size + offset]``,
-            # i.e. ``block_size`` rows of ``idx_dim`` per block, which is exactly
-            # P's p_dsa_len (both sides = block_size × index_head_dim × es). So a
-            # block-for-block copy of p_dsa_len bytes lands correctly; dsa_k's
-            # dim-0 ("dsa block", dsa_block_size tokens) is NOT the transfer
-            # stride. Shape logged at debug for diagnosis.
-            logger.debug(
-                "MembPull indexer %s: p_dsa_len=%d, D dsa_k shape=%s",
+            else:
+                p_dsa_base = p_base_addrs[2]
+                p_dsa_len = p_block_len[2]
+                d_indexer = w._indexer_tensors[pool_idx]
+                logger.debug(
+                    "MembPull indexer %s: p_dsa_len=%d, D dsa_k shape=%s",
+                    layer_name,
+                    p_dsa_len,
+                    tuple(d_indexer.shape),
+                )
+                for p_bid, d_bid in zip(p_block_ids, d_indexer_ids):
+                    peer_ptrs.append(p_dsa_base + p_bid * p_dsa_len)
+                    local_ptrs.append(d_indexer.data_ptr() + d_bid * p_dsa_len)
+                    lengths.append(p_dsa_len)
+                n_indexer = min(len(p_block_ids), len(d_indexer_ids))
+
+        if not local_ptrs:
+            logger.warning(
+                "MembPull _do_read: nothing to transfer for %s (main=%d, indexer=%d)",
                 layer_name,
-                p_dsa_len,
-                tuple(d_indexer.shape),
+                n_main,
+                n_indexer,
             )
-            for p_bid, d_bid in zip(p_block_ids, d_block_ids):
-                peer_ptrs.append(p_dsa_base + p_bid * p_dsa_len)
-                local_ptrs.append(d_indexer.data_ptr() + d_bid * p_dsa_len)
-                lengths.append(p_dsa_len)
-        else:
-            logger.error("MembPull _do_read: unknown role %r for layer %s", role, layer_name)
             return
 
         ret = self.engine.batch_transfer_sync_read(self._p_session, local_ptrs, peer_ptrs, lengths)
         if ret != 0:
-            raise RuntimeError(f"memfabric read failed for layer {layer_name} role={role}, ret={ret}")
+            raise RuntimeError(f"memfabric read failed for layer {layer_name}, ret={ret}")
         logger.info(
-            "MembPull read layer %s role=%s (pool_idx=%d): %d blocks, %d transfers",
+            "MembPull read layer %s (pool_idx=%d): main=%d blocks, indexer=%d blocks, %d transfers",
             layer_name,
-            role,
             pool_idx,
-            min(len(p_block_ids), len(d_block_ids)),
+            n_main,
+            n_indexer,
             len(local_ptrs),
         )
 
@@ -937,53 +931,47 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         encoder: msgspec.msgpack.Encoder,
         layer_idx: int,
         layer_name: str,
-        role: str,
         p_block_ids: list[int],
-        d_block_ids: list[int],
+        d_main_ids: list[int],
+        d_indexer_ids: list[int],
     ) -> bool:
-        """Send one role's READ_READY, block until D replies READ_DONE.
+        """Send one combined READ_READY (main + indexer), block until READ_DONE.
 
         Returns True iff D acknowledged with READ_DONE (or there was nothing to
-        transfer); False on a send/recv failure or an unexpected reply, so the
+        transfer); False on a send/recv failure or unexpected reply, so the
         caller can withhold the buffer-reuse signal and surface the failure
         instead of silently letting P overwrite a buffer D never read.
         """
-        if not p_block_ids or not d_block_ids:
+        if not p_block_ids or (not d_main_ids and not d_indexer_ids):
             logger.warning(
-                "MembPull: skip READ_READY layer %d (%s) role=%s — empty block list (p=%d, d=%d)",
+                "MembPull: skip READ_READY layer %d (%s) — empty blocks (p=%d, main=%d, indexer=%d)",
                 layer_idx,
                 layer_name,
-                role,
                 len(p_block_ids),
-                len(d_block_ids),
+                len(d_main_ids),
+                len(d_indexer_ids),
             )
             return True  # nothing to transfer; not a failure
-        encoded = encoder.encode((READ_READY, layer_idx, layer_name, role, p_block_ids, d_block_ids))
+        encoded = encoder.encode((READ_READY, layer_idx, layer_name, p_block_ids, d_main_ids, d_indexer_ids))
         try:
             resp = self._send_recv(path, encoded)
             ack_msg = msgspec.msgpack.Decoder(type=tuple).decode(resp)
             if ack_msg[0] != READ_DONE:
                 logger.warning(
-                    "MembPull: unexpected ACK %s for layer %d (%s) role=%s",
+                    "MembPull: unexpected ACK %s for layer %d (%s)",
                     ack_msg,
                     layer_idx,
                     layer_name,
-                    role,
                 )
                 return False
             return True
         except Exception as e:
-            logger.error(
-                "MembPull handshake failed for layer %d (%s) role=%s: %s",
-                layer_idx,
-                layer_name,
-                role,
-                e,
-            )
+            logger.error("MembPull handshake failed for layer %d (%s): %s", layer_idx, layer_name, e)
             return False
 
     def _transfer_kv_cache(self, send_task: Any) -> None:  # type: ignore[override]
-        """Override: no write. Notify D to read MAIN + INDEXER legs, wait for both.
+        """Override: no write. Notify D to read this layer (main + indexer) in one
+        combined READ_READY, wait for READ_DONE.
 
         P has a single kv_cache_group (main MLA), and on P the indexer KV is
         written into ``dsa_k_cache`` (= kv_caches[main][2]) at the SAME slots as
@@ -1057,17 +1045,14 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             if remote and len(remote) > 1:
                 agg_d_main.extend(remote[1])
 
-        # Main MLA leg: P k,v → D CPU pool.
-        main_ok = self._send_read_ready(path, encoder, layer_idx, layer_name, ROLE_MAIN, agg_p_blocks, agg_d_main)
-        # Indexer leg: P dsa_k → D indexer HBM.
-        indexer_ok = self._send_read_ready(
-            path, encoder, layer_idx, layer_name, ROLE_INDEXER, agg_p_blocks, agg_d_indexer
-        )
+        # One combined READ_READY per layer: main (k,v → D CPU pool) + indexer
+        # (dsa_k → D indexer HBM) in a single ZMQ round-trip + a single RDMA read.
+        ok = self._send_read_ready(path, encoder, layer_idx, layer_name, agg_p_blocks, agg_d_main, agg_d_indexer)
 
-        # Only signal "buffer safe to reuse" if D actually read BOTH legs. On
+        # Only signal "buffer safe to reuse" if D actually read the layer. On
         # failure, withhold the signal so wait_for_layer_send stalls (a visible
         # failure) instead of letting P overwrite a buffer D never consumed.
-        if main_ok and indexer_ok and 0 <= layer_idx < len(self.layer_send_done_events):
+        if ok and 0 <= layer_idx < len(self.layer_send_done_events):
             self.layer_send_done_events[layer_idx].set()
 
         # After the last layer, send DONE_SENDING so D reports done_recving.
