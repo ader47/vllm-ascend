@@ -869,7 +869,6 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         total_layers: int = kwargs.get("total_layers")  # type: ignore[assignment]
         super().__init__(*args, **kwargs)
         self.timeout = 10.0
-        self._poller = zmq.Poller()
         self._mf_meta_sent = False
         # P's memfabric session (unique_id) — set by producer worker
         self.p_session: str = ""
@@ -878,6 +877,27 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         self.layer_send_done_events: list[threading.Event] = [
             threading.Event() for _ in range(total_layers)
         ]
+        # Persistent ZMQ Context — creating a new Context per message (zmq_ctx)
+        # causes I/O thread churn + TCP resource exhaustion when 4 P ranks fire
+        # hundreds of messages rapidly on the same machine.
+        self._persist_ctx = zmq.Context()
+
+    def _send_recv(self, path: str, encoded: bytes) -> bytes:
+        """Send a ZMQ REQ message, block until response. Uses a short-lived
+        socket from the persistent Context (clean REQ state per message,
+        no Context creation overhead)."""
+        from vllm.utils.network_utils import make_zmq_socket
+        sock = make_zmq_socket(
+            ctx=self._persist_ctx, path=path, socket_type=zmq.REQ, bind=False
+        )
+        sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        try:
+            ensure_zmq_send(sock, encoded, path)
+            return ensure_zmq_recv(sock, poller, path, timeout=self.timeout)
+        finally:
+            sock.close(linger=0)
 
     def _transfer_kv_cache(self, send_task: Any) -> None:  # type: ignore[override]
         """Override: no write. Just notify D to read + wait."""
@@ -913,12 +933,9 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
                 }
             meta_encoded = encoder.encode((MF_META, self.p_session, encoder.encode(p_meta_dict)))
             try:
-                with zmq_ctx(zmq.REQ, path) as sock:
-                    sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
-                    ensure_zmq_send(sock, meta_encoded, path)
-                    ensure_zmq_recv(sock, self._poller, path, timeout=self.timeout)
-                    self._mf_meta_sent = True
-                    logger.info("MF_META sent to D (session=%s)", self.p_session)
+                self._send_recv(path, meta_encoded)
+                self._mf_meta_sent = True
+                logger.info("MF_META sent to D (session=%s)", self.p_session)
             except Exception as e:
                 logger.error("Failed to send MF_META: %s", e)
 
@@ -939,19 +956,16 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             (READ_READY, layer_idx, layer_name, agg_local, agg_remote)
         )
         try:
-            with zmq_ctx(zmq.REQ, path) as sock:
-                sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
-                ensure_zmq_send(sock, ready_encoded, path)
-                resp = ensure_zmq_recv(sock, self._poller, path, timeout=self.timeout)
-                ack_msg = msgspec.msgpack.Decoder(type=tuple).decode(resp)
-                if ack_msg[0] != READ_DONE:
-                    logger.warning(
-                        "MembPull: unexpected ACK %s for layer %d (%s)",
-                        ack_msg, layer_idx, layer_name,
-                    )
-                # Mark this layer's buffer as safe to reuse (D has read it).
-                if 0 <= layer_idx < len(self.layer_send_done_events):
-                    self.layer_send_done_events[layer_idx].set()
+            resp = self._send_recv(path, ready_encoded)
+            ack_msg = msgspec.msgpack.Decoder(type=tuple).decode(resp)
+            if ack_msg[0] != READ_DONE:
+                logger.warning(
+                    "MembPull: unexpected ACK %s for layer %d (%s)",
+                    ack_msg, layer_idx, layer_name,
+                )
+            # Mark this layer's buffer as safe to reuse (D has read it).
+            if 0 <= layer_idx < len(self.layer_send_done_events):
+                self.layer_send_done_events[layer_idx].set()
         except Exception as e:
             logger.error(
                 "MembPull handshake failed for layer %d (%s): %s",
@@ -970,10 +984,7 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
                         (DONE_SENDING_MSG, external_req_id, 0, "")
                     )
                     try:
-                        with zmq_ctx(zmq.REQ, path) as dsock:
-                            dsock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
-                            ensure_zmq_send(dsock, done_encoded, path)
-                            ensure_zmq_recv(dsock, self._poller, path, timeout=self.timeout)
+                        self._send_recv(path, done_encoded)
                     except Exception as e:
                         logger.error("MembPull DONE_SENDING failed for %s: %s", req_id, e)
 
