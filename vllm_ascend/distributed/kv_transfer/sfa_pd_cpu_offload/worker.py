@@ -217,15 +217,6 @@ class SFAPDCpuOffloadWorker:
 
         ptrs: list[int] = []
         lengths: list[int] = []
-        # memfabric's aclrtRtIpcSetMemoryName (IPC) needs the device storage
-        # BASE handle; indexer_t is a view into a larger device storage, so its
-        # data_ptr() offset is rejected (set memory name failed: 507899). Register
-        # the underlying storage once (dedup shared storages). mooncake accepts any
-        # ptr, so keep view data_ptr there to avoid pinning the whole 5-tuple storage.
-        register_storage_base = (
-            _resolve_kv_transfer_backend(self.vllm_config) == BACKEND_MEMFABRIC
-        )
-        registered_storage: set[int] = set()
         for pool_idx, (indexer_name, main_name) in enumerate(zip(indexer_names, main_names)):
             main_tuple = list(kv_caches[main_name])
             indexer_t = main_tuple[2]  # dsa_k_indexer, NPU device memory
@@ -253,17 +244,8 @@ class SFAPDCpuOffloadWorker:
             )
 
             for t in (indexer_t, k_cpu, v_cpu):
-                if register_storage_base:
-                    storage = t.untyped_storage()
-                    storage_ptr = storage.data_ptr()
-                    if storage_ptr == 0 or storage_ptr in registered_storage:
-                        continue
-                    registered_storage.add(storage_ptr)
-                    ptrs.append(storage_ptr)
-                    lengths.append(storage.nbytes())
-                else:
-                    ptrs.append(t.data_ptr())
-                    lengths.append(t.numel() * t.element_size())
+                ptrs.append(t.data_ptr())
+                lengths.append(t.numel() * t.element_size())
 
         # CRITICAL: one register_buffer call — global_te.register_buffer has a
         # process-wide latch (is_register_buffer); a second call is a no-op.
