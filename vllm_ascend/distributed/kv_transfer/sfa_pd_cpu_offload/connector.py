@@ -40,6 +40,40 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
+class SFAPDProducerScheduler(MooncakeLayerwiseConnectorScheduler):
+    """P-side scheduler for SFA PD.
+
+    In standard mooncake PD, the proxy sets ``do_remote_prefill=True`` on P's
+    request, which triggers the base class to populate ``_reqs_need_recv``
+    (block IDs for KV push). SFA PD uses a metaserver rendezvous where D
+    advertises ``do_remote_decode=True`` (not ``do_remote_prefill=True``).
+
+    This override detects ``do_remote_decode=True`` + ``remote_block_ids`` and
+    manually populates ``_reqs_need_recv`` with P's allocated blocks, so that
+    ``save_kv_layer`` → ``_transfer_kv_cache`` has the block IDs it needs
+    to send READ_READY (pull) or push KV (staging).
+
+    P still computes prefill normally (``get_num_new_matched_tokens`` returns
+    ``(0, False)``). We only add block tracking after allocation.
+    """
+
+    def update_state_after_alloc(self, request, blocks, num_external_tokens):
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+        # If base class didn't populate (do_remote_prefill=False), do it manually
+        params = request.kv_transfer_params
+        if (
+            params is not None
+            and params.get("do_remote_decode")
+            and params.get("remote_block_ids")
+            and request.request_id not in self._reqs_need_recv
+        ):
+            local_block_ids = blocks.get_unhashed_block_ids_all_groups()
+            prompt_tokens = len(request.prompt_token_ids)
+            self._reqs_need_recv[request.request_id] = (
+                request, local_block_ids, prompt_tokens,
+            )
+
+
 class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     """One connector class branching on ``role`` and ``kv_role``.
 
@@ -98,7 +132,7 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             # Producer scheduler reuses mooncake send-setup; consumer scheduler
             # is the D-side CPU-block allocator/advertiser.
             if self.is_producer:
-                self.connector_scheduler = MooncakeLayerwiseConnectorScheduler(
+                self.connector_scheduler = SFAPDProducerScheduler(
                     vllm_config, kv_cache_config, str(self.engine_id)
                 )
             else:
