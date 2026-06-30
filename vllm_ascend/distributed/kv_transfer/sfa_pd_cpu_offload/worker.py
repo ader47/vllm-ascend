@@ -868,7 +868,7 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         total_layers: int = kwargs.get("total_layers")  # type: ignore[assignment]
         super().__init__(*args, **kwargs)
-        self.timeout = 1.0
+        self.timeout = 10.0
         self._poller = zmq.Poller()
         self._mf_meta_sent = False
         # P's memfabric session (unique_id) — set by producer worker
