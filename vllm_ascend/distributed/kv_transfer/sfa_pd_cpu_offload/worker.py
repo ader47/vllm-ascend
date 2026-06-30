@@ -17,6 +17,7 @@ reading it (see plan risk #3 / buffer-reuse gating).
 from __future__ import annotations
 
 import math
+import os
 import re
 import threading
 from typing import TYPE_CHECKING, Any
@@ -428,10 +429,14 @@ class SFAPDCpuOffloadWorker:
         if hasattr(self, "_mf_read_thread") and self._mf_read_thread is not None:
             done = self._mf_read_thread.get_and_clear_done()
             done_recving: set[str] = set()
-            for ext_id in done:
+            still_pending: set[str] = set()
+            for ext_id in done | self._pending_done:
                 internal = self.request_map.get(ext_id)
                 if internal is not None:
                     done_recving.add(internal)
+                else:
+                    still_pending.add(ext_id)
+            self._pending_done = still_pending
             return set(), done_recving
 
         # mooncake staging mode: existing logic
@@ -921,12 +926,23 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             )
 
         # After the last layer, send DONE_SENDING so D reports done_recving.
-        # (Base class does this inside _transfer_kv_cache which we skip.)
+        # Send directly via ZMQ (can't use callback_func = send_done_send_signal
+        # because it accesses req_meta.trans_count which is empty — we skipped
+        # super()._transfer_kv_cache() that populates it).
         if layer_idx == self.total_layers - 1:
-            layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
             for req_id, req_meta in send_task.send_request.items():
                 if req_meta.chunk_finish:
-                    self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
+                    external_req_id = get_external_request_id(req_id)
+                    done_encoded = encoder.encode(
+                        (DONE_SENDING_MSG, external_req_id, 0, "")
+                    )
+                    try:
+                        with zmq_ctx(zmq.REQ, path) as dsock:
+                            dsock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
+                            ensure_zmq_send(dsock, done_encoded, path)
+                            ensure_zmq_recv(dsock, self._poller, path, timeout=self.timeout)
+                    except Exception as e:
+                        logger.error("MembPull DONE_SENDING failed for %s: %s", req_id, e)
 
 
 class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
@@ -941,11 +957,29 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, engine_id: str):
         self._backend = _resolve_kv_transfer_backend(vllm_config)
         if self._backend == BACKEND_MEMFABRIC:
-            self._mf_unique_id = f"{get_ip()}:{get_tensor_model_parallel_rank()}"
+            tp_rank = get_tensor_model_parallel_rank()
+            tp_size = vllm_config.parallel_config.tensor_parallel_size
+            side_channel_port = (
+                vllm_config.kv_transfer_config.kv_port
+                + vllm_config.parallel_config.data_parallel_rank * tp_size
+            )
+            # P's memfabric session port (must be a real TCP port, offset past
+            # ZMQ ports just like D side). unique_id = "P_IP:P_store_port".
+            mf_session_port = side_channel_port + tp_size + tp_rank
+            self._mf_unique_id = f"{get_ip()}:{mf_session_port}"
+            # P must connect to D's config store (D is store server). Read D's
+            # store URL from env var (set in launch script: D_IP:D_store_port).
+            mf_store_url = os.environ.get("MF_CONFIG_STORE_URL")
+            if not mf_store_url:
+                logger.warning(
+                    "MF_CONFIG_STORE_URL not set; memfabric P may not reach D's "
+                    "config store. Set it to tcp://<D_IP>:<D_store_port>."
+                )
             global_te.configure(
                 backend=BACKEND_MEMFABRIC,
                 role=MEMFABRIC_ROLE_PREFILL,
                 unique_id=self._mf_unique_id,
+                store_url=mf_store_url,
                 device_id=torch.npu.current_device(),
             )
         super().__init__(vllm_config, kv_cache_config, engine_id)
