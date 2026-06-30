@@ -45,6 +45,12 @@ ADDITIONAL_CONFIG='{"use_offload": false}'
 # Decode node MUST start first — it runs the in-process config store; P then
 # connects lazily on its first RDMA write (no separate store process needed).
 export VLLM_ASCEND_KV_TRANSFER_BACKEND="${VLLM_ASCEND_KV_TRANSFER_BACKEND:-mooncake}"
+# memfabric only: P must connect to D's config store. Set MF_CONFIG_STORE_URL
+# to D's store address: tcp://<D_IP>:<D_store_port>
+# D store_port = D_KV_PORT + D_TP_SIZE + D_TP_SIZE + tp_rank (one per rank).
+# e.g. D KV_PORT=20005, TP=4, tp_rank=0 → 20013.
+# Export per-rank in multi-process launch, or set MF_CONFIG_STORE_URL externally.
+# export MF_CONFIG_STORE_URL="tcp://<D_IP>:<D_store_port>"
 
 export HCCL_IF_IP="${HCCL_IF_IP:-127.0.0.1}"
 export GLOO_SOCKET_IFNAME="$NET_IFACE"

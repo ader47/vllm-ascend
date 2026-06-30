@@ -437,6 +437,17 @@ class SFAPDCpuOffloadWorker:
                 else:
                     still_pending.add(ext_id)
             self._pending_done = still_pending
+
+            # Failed requests: unblock them (load will error / wrong KV)
+            failed = self._mf_read_thread.get_and_clear_failed()
+            still_pending_failed: set[str] = set()
+            for ext_id in failed | self._pending_failed:
+                internal = self.request_map.get(ext_id)
+                if internal is not None:
+                    done_recving.add(internal)
+                else:
+                    still_pending_failed.add(ext_id)
+            self._pending_failed = still_pending_failed
             return set(), done_recving
 
         # mooncake staging mode: existing logic
@@ -608,6 +619,12 @@ class MembPullReadThread(threading.Thread):
             d = self._done_requests
             self._done_requests = set()
             return d
+
+    def get_and_clear_failed(self) -> set[str]:
+        with self._lock:
+            f = self._failed_requests
+            self._failed_requests = set()
+            return f
 
     def run(self):
         from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
@@ -849,15 +866,26 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        total_layers: int = kwargs.get("total_layers")  # type: ignore[assignment]
         super().__init__(*args, **kwargs)
         self.timeout = 1.0
         self._poller = zmq.Poller()
         self._mf_meta_sent = False
         # P's memfabric session (unique_id) — set by producer worker
         self.p_session: str = ""
+        # Buffer-reuse gate: set after READ_DONE so model runner knows the
+        # layer's KV has been read by D and the buffer can be reused.
+        self.layer_send_done_events: list[threading.Event] = [
+            threading.Event() for _ in range(total_layers)
+        ]
 
     def _transfer_kv_cache(self, send_task: Any) -> None:  # type: ignore[override]
         """Override: no write. Just notify D to read + wait."""
+        # CRITICAL: wait for the KV to be fully written to P HBM before
+        # notifying D to read. Without this, D may read stale/unwritten data.
+        if send_task.wait_event is not None:
+            send_task.wait_event.synchronize()
+
         layer_name = send_task.layer_name
         layer_idx = send_task.layer_idx
 
@@ -919,6 +947,9 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
                         "MembPull: unexpected ACK %s for layer %d (%s)",
                         ack_msg, layer_idx, layer_name,
                     )
+                # Mark this layer's buffer as safe to reuse (D has read it).
+                if 0 <= layer_idx < len(self.layer_send_done_events):
+                    self.layer_send_done_events[layer_idx].set()
         except Exception as e:
             logger.error(
                 "MembPull handshake failed for layer %d (%s): %s",
@@ -1012,7 +1043,7 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
                 super().register_kv_caches(kv_caches)
             finally:
                 _mlc.KVCacheSendingLayerThread = orig  # type: ignore[assignment]
-        if isinstance(self.kv_send_layer_thread, _SFAPDCpuSendingThread):
+        if isinstance(self.kv_send_layer_thread, (_SFAPDCpuSendingThread, _MembPullSendingThread)):
             self.layer_send_done_events = self.kv_send_layer_thread.layer_send_done_events
 
     def wait_for_layer_send(self, layer_idx: int) -> None:
