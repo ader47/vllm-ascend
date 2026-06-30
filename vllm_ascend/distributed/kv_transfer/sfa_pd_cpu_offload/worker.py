@@ -729,10 +729,14 @@ class MembPullReadThread(threading.Thread):
                 pool_idx = idx
                 break
         if pool_idx is None:
+            logger.warning("MembPull _do_read: layer %s not in indexer/main names, skip", layer_name)
             return  # not a layer we handle
 
         p_meta = self._p_layer_meta.get(layer_name)
         if p_meta is None:
+            logger.warning(
+                "MembPull _do_read: layer %s not in P layer_meta (MF_META not received? "
+                "have %d layers), skip", layer_name, len(self._p_layer_meta))
             return
 
         local_ptrs: list[int] = []
