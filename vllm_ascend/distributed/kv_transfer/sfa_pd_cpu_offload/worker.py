@@ -748,6 +748,12 @@ class MembPullReadThread(threading.Thread):
             p_bid_list = p_blocks[0] if p_blocks and len(p_blocks) > 0 else []
             d_bid_list = d_blocks[0] if d_blocks and len(d_blocks) > 0 else []
             if not p_bid_list or not d_bid_list:
+                logger.warning(
+                    "MembPull _do_read: indexer blocks empty for %s "
+                    "(p_blocks=%d groups, d_blocks=%d groups, p_bid=%d, d_bid=%d)",
+                    layer_name, len(p_blocks) if p_blocks else 0,
+                    len(d_blocks) if d_blocks else 0,
+                    len(p_bid_list), len(d_bid_list))
                 return
             block_len = p_meta["block_len"][0]
             p_base = p_meta["base_addrs"][0]
@@ -762,6 +768,12 @@ class MembPullReadThread(threading.Thread):
             p_bid_list = p_blocks[1] if p_blocks and len(p_blocks) > 1 else []
             d_bid_list = d_blocks[1] if d_blocks and len(d_blocks) > 1 else []
             if not p_bid_list or not d_bid_list:
+                logger.warning(
+                    "MembPull _do_read: main blocks empty for %s "
+                    "(p_blocks=%d groups, d_blocks=%d groups, p_bid=%d, d_bid=%d)",
+                    layer_name, len(p_blocks) if p_blocks else 0,
+                    len(d_blocks) if d_blocks else 0,
+                    len(p_bid_list), len(d_bid_list))
                 return
             k_cpu, v_cpu = w._cpu_pools[pool_idx]
             k_block_len = p_meta["block_len"][0]
