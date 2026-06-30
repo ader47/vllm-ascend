@@ -14,6 +14,7 @@ stock mooncake is a **per-layer send-completion event** — P's prefill reuses K
 buffers across layers and may only reuse a buffer once its RDMA push has finished
 reading it (see plan risk #3 / buffer-reuse gating).
 """
+
 from __future__ import annotations
 
 import math
@@ -80,9 +81,16 @@ def _layer_idx(layer_name: str) -> int:
 
 STAGING_DONE = b"staging_done"
 STAGING_ACK = b"staging_ack"
-MF_META = b"mf_meta"        # P→D: (MF_META, p_session, p_layer_meta_serialized)
-READ_READY = b"read_ready"   # P→D: (READ_READY, layer_idx, layer_name, p_block_ids_k, p_block_ids_v)
-READ_DONE = b"read_done"     # D→P: (READ_DONE, layer_idx)
+MF_META = b"mf_meta"  # P→D: (MF_META, p_session, p_layer_meta_serialized)
+# Role-driven READ_READY: P has 1 kv_cache_group (main MLA at group 0; the
+# indexer shares those same slots on P), while D has 2 groups (indexer=group 0
+# in HBM, main MLA=group 1 offloaded to CPU). Positional per-group block lists
+# can't bridge that asymmetry, so each READ_READY carries a single role + flat
+# block lists. P sends one MAIN and one INDEXER READ_READY per transformer layer.
+READ_READY = b"read_ready"  # P→D: (READ_READY, layer_idx, layer_name, role, p_block_ids, d_block_ids)
+READ_DONE = b"read_done"  # D→P: (READ_DONE, layer_idx)
+ROLE_MAIN = "main"  # P k,v (tensor [0],[1]) → D CPU pool (main_cpu_ids)
+ROLE_INDEXER = "indexer"  # P dsa_k (tensor [2])   → D indexer HBM (indexer_npu_ids)
 
 
 class SFARecvLayerThread(KVCacheRecvingLayerThread):
@@ -174,8 +182,7 @@ class SFAPDCpuOffloadWorker:
         # Handshake base port (mirrors mooncake layerwise).
         self.side_channel_port = (
             vllm_config.kv_transfer_config.kv_port
-            + vllm_config.parallel_config.data_parallel_rank
-            * vllm_config.parallel_config.tensor_parallel_size
+            + vllm_config.parallel_config.data_parallel_rank * vllm_config.parallel_config.tensor_parallel_size
         )
 
         self.layer_metadata: dict[str, LayerMetadata] = {}
@@ -236,9 +243,7 @@ class SFAPDCpuOffloadWorker:
         ``(k_nope, v_rope, dsa_k_indexer, topk_buf_k, topk_buf_v)``.
         """
         # --- D side: compose the SFA worker for LRU load + CPU pool ---
-        self.sfa_worker = SFAKVOffloadWorker(
-            self.vllm_config, self.use_layerwise, self.kv_cache_config
-        )
+        self.sfa_worker = SFAKVOffloadWorker(self.vllm_config, self.use_layerwise, self.kv_cache_config)
         # SFA worker allocates k_caches_cpu/v_caches_cpu + LRU buffers here.
         self.sfa_worker.register_kv_caches(kv_caches)
 
@@ -246,17 +251,13 @@ class SFAPDCpuOffloadWorker:
         # HW limitation: P HBM -> D DRAM cross-node RDMA is not available.
         # Solution: P pushes main MLA to a 1-slot HBM staging buffer, then
         # signals per-layer DONE; D copies staging -> CPU pool locally and ACKs.
-        assert self.sfa_worker.k_caches_cpu is not None, (
-            "Composed SFA worker did not allocate the CPU pool"
-        )
+        assert self.sfa_worker.k_caches_cpu is not None, "Composed SFA worker did not allocate the CPU pool"
         k_caches_cpu = self.sfa_worker.k_caches_cpu
         v_caches_cpu = self.sfa_worker.v_caches_cpu
 
         backend = _resolve_kv_transfer_backend(self.vllm_config)
         if backend == BACKEND_MEMFABRIC:
-            return self._register_memfabric_pull(
-                kv_caches, k_caches_cpu, v_caches_cpu
-            )
+            return self._register_memfabric_pull(kv_caches, k_caches_cpu, v_caches_cpu)
 
         # --- mooncake staging path (existing) ---
         # 1-slot HBM staging for main MLA (reused per-layer via ACK handshake).
@@ -277,13 +278,8 @@ class SFAPDCpuOffloadWorker:
         # layer_name comes from kv_cache_config group 0, paired by transformer
         # index (both lists are in layers.0..N order).
         num_blocks = self.kv_cache_config.num_blocks
-        indexer_names = list(
-            self.kv_cache_config.kv_cache_groups[_INDEXER_GROUP_IDX].layer_names
-        )
-        main_names = [
-            n for n, v in kv_caches.items()
-            if len(v if isinstance(v, (list, tuple)) else [v]) == 5
-        ]
+        indexer_names = list(self.kv_cache_config.kv_cache_groups[_INDEXER_GROUP_IDX].layer_names)
+        main_names = [n for n, v in kv_caches.items() if len(v if isinstance(v, (list, tuple)) else [v]) == 5]
         assert len(main_names) == len(indexer_names), (
             f"main layers ({len(main_names)}) != indexer layers ({len(indexer_names)})"
         )
@@ -505,13 +501,8 @@ class SFAPDCpuOffloadWorker:
         """memfabric pull mode: D does NOT register anything. Only P registers
         its HBM. D creates a read engine + MembPullReadThread."""
         num_blocks = self.kv_cache_config.num_blocks
-        indexer_names = list(
-            self.kv_cache_config.kv_cache_groups[_INDEXER_GROUP_IDX].layer_names
-        )
-        main_names = [
-            n for n, v in kv_caches.items()
-            if len(v if isinstance(v, (list, tuple)) else [v]) == 5
-        ]
+        indexer_names = list(self.kv_cache_config.kv_cache_groups[_INDEXER_GROUP_IDX].layer_names)
+        main_names = [n for n, v in kv_caches.items() if len(v if isinstance(v, (list, tuple)) else [v]) == 5]
         main_by_layer_idx = {_layer_idx(name): name for name in main_names}
         main_names = [main_by_layer_idx[_layer_idx(name)] for name in indexer_names]
 
@@ -560,9 +551,9 @@ class SFAPDCpuOffloadWorker:
         self._mf_read_thread.ready_event.wait()
         self.kv_recv_layer_thread = None  # not used in pull mode
         logger.info(
-            "SFAPDCpuOffload D-side registered (memfabric pull): "
-            "%d indexer + %d main layers, zero D-side registration",
-            len(indexer_names), len(main_names),
+            "SFAPDCpuOffload D-side registered (memfabric pull): %d indexer + %d main layers, zero D-side registration",
+            len(indexer_names),
+            len(main_names),
         )
 
     def _refresh_cpu_blocks_by_req(self, metadata: KVConnectorMetadata):
@@ -653,25 +644,25 @@ class MembPullReadThread(threading.Thread):
                     if msg_type == MF_META:
                         self._p_session = msg[1]
                         self._p_layer_meta = msgspec.msgpack.decode(msg[2])
-                        logger.info("Received MF_META: P session=%s, %d layers",
-                                    self._p_session, len(self._p_layer_meta))
+                        logger.info(
+                            "Received MF_META: P session=%s, %d layers", self._p_session, len(self._p_layer_meta)
+                        )
                         sock.send_multipart((identity, b"", b"ACK"))
 
                     elif msg_type == READ_READY:
                         layer_idx = msg[1]
                         layer_name = msg[2]
-                        p_blocks = msg[3]  # P's local_block_ids (list of lists per group)
-                        d_blocks = msg[4]  # D's remote_block_ids (list of lists per group)
+                        role = msg[3]  # ROLE_MAIN or ROLE_INDEXER
+                        p_block_ids = msg[4]  # P's block ids for this role (flat)
+                        d_block_ids = msg[5]  # D's destination block ids for this role (flat)
                         try:
-                            self._do_read(layer_name, p_blocks, d_blocks)
-                            sock.send_multipart(
-                                (identity, b"", encoder.encode((READ_DONE, layer_idx)))
-                            )
+                            self._do_read(layer_name, role, p_block_ids, d_block_ids)
+                            sock.send_multipart((identity, b"", encoder.encode((READ_DONE, layer_idx))))
                         except Exception as e:
-                            logger.error("MembPull read failed for layer %d: %s", layer_idx, e)
-                            sock.send_multipart(
-                                (identity, b"", encoder.encode((READ_DONE, layer_idx)))
+                            logger.error(
+                                "MembPull read failed for layer %d (%s, role=%s): %s", layer_idx, layer_name, role, e
                             )
+                            sock.send_multipart((identity, b"", encoder.encode((READ_DONE, layer_idx))))
 
                     elif msg_type == DONE_SENDING_MSG:
                         # P finished all layers for this request
@@ -705,123 +696,123 @@ class MembPullReadThread(threading.Thread):
     def _do_read(
         self,
         layer_name: str,
-        p_blocks: list[list[int]],
-        d_blocks: list[list[int]],
+        role: str,
+        p_block_ids: list[int],
+        d_block_ids: list[int],
     ) -> None:
-        """Read one layer's KV from P HBM → D local via memfabric.
+        """Read one role's KV from P HBM → D local via memfabric (pull).
 
-        p_blocks: P's local_block_ids per group (peer addresses on P).
-        d_blocks: D's remote_block_ids per group (local addresses on D).
+        role == ROLE_MAIN:     P tensors [0]=k, [1]=v   → D CPU pool (main_cpu_ids).
+        role == ROLE_INDEXER:  P tensor  [2]=dsa_k      → D indexer HBM (indexer_npu_ids).
+
+        P always sends READ_READY under the MAIN layer name; the indexer tensor
+        is exposed as that main layer's tensor [2] in MF_META (the mooncake base
+        registers the full 3-tuple ``(k, v, dsa_k)``), so no separate indexer
+        layer entry is needed.
+
+        Args:
+            p_block_ids: P's block ids. On P the indexer shares the main MLA
+                slots, so both roles use the same P block list.
+            d_block_ids: D's destination block ids for THIS role —
+                ``indexer_npu_ids`` for indexer, ``main_cpu_ids`` for main.
         """
         if self._p_session is None:
             raise RuntimeError("MF_META not received before READ_READY")
 
         w = self._worker
-        is_indexer = layer_name in w._indexer_names
+        # Locate the transformer-layer pool index from the MAIN layer name.
         pool_idx = None
-        for idx, (iname, mname) in enumerate(zip(w._indexer_names, w._main_names)):
-            if layer_name == iname:
-                is_indexer = True
-                pool_idx = idx
-                break
+        for idx, mname in enumerate(w._main_names):
             if layer_name == mname:
-                is_indexer = False
                 pool_idx = idx
                 break
         if pool_idx is None:
-            logger.warning("MembPull _do_read: layer %s not in indexer/main names, skip", layer_name)
-            return  # not a layer we handle
+            logger.warning("MembPull _do_read: layer %s not in main names, skip", layer_name)
+            return
 
         p_meta = self._p_layer_meta.get(layer_name)
         if p_meta is None:
             logger.warning(
-                "MembPull _do_read: layer %s not in P layer_meta (MF_META not received? "
-                "have %d layers), skip", layer_name, len(self._p_layer_meta))
+                "MembPull _do_read: layer %s not in P layer_meta (MF_META not received? have %d layers), skip",
+                layer_name,
+                len(self._p_layer_meta),
+            )
             return
+
+        if not p_block_ids or not d_block_ids:
+            logger.warning(
+                "MembPull _do_read: empty block list for %s role=%s (p_block_ids=%d, d_block_ids=%d), skip",
+                layer_name,
+                role,
+                len(p_block_ids),
+                len(d_block_ids),
+            )
+            return
+
+        p_base_addrs = p_meta["base_addrs"]
+        p_block_len = p_meta["block_len"]
 
         local_ptrs: list[int] = []
         peer_ptrs: list[int] = []
         lengths: list[int] = []
 
-        if is_indexer:
-            # indexer (group 0): P HBM → D indexer HBM
-            p_bid_list = p_blocks[0] if p_blocks and len(p_blocks) > 0 else []
-            d_bid_list = d_blocks[0] if d_blocks and len(d_blocks) > 0 else []
-            if not p_bid_list or not d_bid_list:
-                logger.warning(
-                    "MembPull _do_read: indexer blocks empty for %s "
-                    "(p_blocks=%d groups, d_blocks=%d groups, p_bid=%d, d_bid=%d)",
-                    layer_name, len(p_blocks) if p_blocks else 0,
-                    len(d_blocks) if d_blocks else 0,
-                    len(p_bid_list), len(d_bid_list))
-                return
-            block_len = p_meta["block_len"][0]
-            p_base = p_meta["base_addrs"][0]
-            d_indexer = w._indexer_tensors[pool_idx]
-            d_base = d_indexer.data_ptr()
-            for p_bid, d_bid in zip(p_bid_list, d_bid_list):
-                local_ptrs.append(d_base + d_bid * block_len)
-                peer_ptrs.append(p_base + p_bid * block_len)
-                lengths.append(block_len)
-        else:
-            # main MLA (group 1): P HBM → D CPU pool DRAM
-            p_bid_list = p_blocks[1] if p_blocks and len(p_blocks) > 1 else []
-            d_bid_list = d_blocks[1] if d_blocks and len(d_blocks) > 1 else []
-            if not p_bid_list or not d_bid_list:
-                logger.warning(
-                    "MembPull _do_read: main blocks empty for %s "
-                    "(p_blocks=%d groups, d_blocks=%d groups, p_bid=%d, d_bid=%d)",
-                    layer_name, len(p_blocks) if p_blocks else 0,
-                    len(d_blocks) if d_blocks else 0,
-                    len(p_bid_list), len(d_bid_list))
-                return
+        if role == ROLE_MAIN:
+            # P tensors [0]=k, [1]=v → D CPU pool.
+            p_k_base, p_v_base = p_base_addrs[0], p_base_addrs[1]
+            p_k_len, p_v_len = p_block_len[0], p_block_len[1]
             k_cpu, v_cpu = w._cpu_pools[pool_idx]
-            k_block_len = p_meta["block_len"][0]
-            v_block_len = p_meta["block_len"][1]
-            p_k_base = p_meta["base_addrs"][0]
-            p_v_base = p_meta["base_addrs"][1]
-            for p_bid, d_bid in zip(p_bid_list, d_bid_list):
-                local_ptrs.append(k_cpu.data_ptr() + d_bid * k_block_len)
-                peer_ptrs.append(p_k_base + p_bid * k_block_len)
-                lengths.append(k_block_len)
-                local_ptrs.append(v_cpu.data_ptr() + d_bid * v_block_len)
-                peer_ptrs.append(p_v_base + p_bid * v_block_len)
-                lengths.append(v_block_len)
-
-        if local_ptrs:
-            # Pre-read checksum (sample first block to detect uninitialized data)
-            if is_indexer and d_bid_list:
-                d_indexer = w._indexer_tensors[pool_idx]
-                pre_sum = d_indexer[d_bid_list[0]].float().sum().item()
-            elif not is_indexer and d_bid_list:
-                k_cpu, v_cpu = w._cpu_pools[pool_idx]
-                pre_sum = k_cpu[d_bid_list[0]].float().sum().item()
-            else:
-                pre_sum = 0.0
-
-            ret = self.engine.batch_transfer_sync_read(
-                self._p_session, local_ptrs, peer_ptrs, lengths
-            )
-            if ret != 0:
-                raise RuntimeError(
-                    f"memfabric read failed for layer {layer_name}, ret={ret}"
+            for p_bid, d_bid in zip(p_block_ids, d_block_ids):
+                peer_ptrs.append(p_k_base + p_bid * p_k_len)
+                local_ptrs.append(k_cpu.data_ptr() + d_bid * p_k_len)
+                lengths.append(p_k_len)
+                peer_ptrs.append(p_v_base + p_bid * p_v_len)
+                local_ptrs.append(v_cpu.data_ptr() + d_bid * p_v_len)
+                lengths.append(p_v_len)
+        elif role == ROLE_INDEXER:
+            # P tensor [2]=dsa_k → D indexer HBM (dsa_k alias at indexer_npu_ids).
+            if len(p_base_addrs) < 3:
+                logger.error(
+                    "MembPull indexer: P layer_meta for %s has %d tensors, need >=3 "
+                    "(dsa_k must be registered as the main layer's tensor [2]); skip",
+                    layer_name,
+                    len(p_base_addrs),
                 )
-
-            # Post-read checksum: compare with pre to confirm data was written.
-            # Non-zero post + different from pre = data actually transferred.
-            if is_indexer and d_bid_list:
-                post_sum = d_indexer[d_bid_list[0]].float().sum().item()
-            elif not is_indexer and d_bid_list:
-                post_sum = k_cpu[d_bid_list[0]].float().sum().item()
-            else:
-                post_sum = 0.0
-            logger.info(
-                "MembPull read layer %s (pool_idx=%d, is_indexer=%s): "
-                "%d blocks, %d transfers, pre=%.4f post=%.4f",
-                layer_name, pool_idx, is_indexer,
-                len(d_bid_list) if d_bid_list else 0,
-                len(local_ptrs), pre_sum, post_sum,
+                return
+            p_dsa_base = p_base_addrs[2]
+            p_dsa_len = p_block_len[2]
+            d_indexer = w._indexer_tensors[pool_idx]
+            # D consumes dsa_k at vLLM-block granularity — the indexer scatter
+            # (sfa_v1) does ``dsa_k.view(-1, idx_dim)[bid*block_size + offset]``,
+            # i.e. ``block_size`` rows of ``idx_dim`` per block, which is exactly
+            # P's p_dsa_len (both sides = block_size × index_head_dim × es). So a
+            # block-for-block copy of p_dsa_len bytes lands correctly; dsa_k's
+            # dim-0 ("dsa block", dsa_block_size tokens) is NOT the transfer
+            # stride. Shape logged at debug for diagnosis.
+            logger.debug(
+                "MembPull indexer %s: p_dsa_len=%d, D dsa_k shape=%s",
+                layer_name,
+                p_dsa_len,
+                tuple(d_indexer.shape),
             )
+            for p_bid, d_bid in zip(p_block_ids, d_block_ids):
+                peer_ptrs.append(p_dsa_base + p_bid * p_dsa_len)
+                local_ptrs.append(d_indexer.data_ptr() + d_bid * p_dsa_len)
+                lengths.append(p_dsa_len)
+        else:
+            logger.error("MembPull _do_read: unknown role %r for layer %s", role, layer_name)
+            return
+
+        ret = self.engine.batch_transfer_sync_read(self._p_session, local_ptrs, peer_ptrs, lengths)
+        if ret != 0:
+            raise RuntimeError(f"memfabric read failed for layer {layer_name} role={role}, ret={ret}")
+        logger.info(
+            "MembPull read layer %s role=%s (pool_idx=%d): %d blocks, %d transfers",
+            layer_name,
+            role,
+            pool_idx,
+            min(len(p_block_ids), len(d_block_ids)),
+            len(local_ptrs),
+        )
 
 
 # ======================================================================
@@ -840,9 +831,7 @@ class _SFAPDCpuSendingThread(KVCacheSendingLayerThread):
         total_layers: int = kwargs.get("total_layers")  # type: ignore[assignment]
         super().__init__(*args, **kwargs)
         self.timeout = 1.0
-        self.layer_send_done_events: list[threading.Event] = [
-            threading.Event() for _ in range(total_layers)
-        ]
+        self.layer_send_done_events: list[threading.Event] = [threading.Event() for _ in range(total_layers)]
         self._poller = zmq.Poller()
 
     def _transfer_kv_cache(self, send_task: Any) -> None:  # type: ignore[override]
@@ -890,12 +879,16 @@ class _SFAPDCpuSendingThread(KVCacheSendingLayerThread):
                 if ack_msg[0] != STAGING_ACK:
                     logger.warning(
                         "STAGING handshake: unexpected ACK %s for layer %d",
-                        ack_msg, transformer_layer_idx,
+                        ack_msg,
+                        transformer_layer_idx,
                     )
         except Exception as e:
             logger.error(
                 "STAGING handshake failed for layer %d (host=%s:%s): %s",
-                transformer_layer_idx, remote_host, remote_port, e,
+                transformer_layer_idx,
+                remote_host,
+                remote_port,
+                e,
             )
 
 
@@ -916,9 +909,7 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         self.p_session: str = ""
         # Buffer-reuse gate: set after READ_DONE so model runner knows the
         # layer's KV has been read by D and the buffer can be reused.
-        self.layer_send_done_events: list[threading.Event] = [
-            threading.Event() for _ in range(total_layers)
-        ]
+        self.layer_send_done_events: list[threading.Event] = [threading.Event() for _ in range(total_layers)]
         # Persistent ZMQ Context — creating a new Context per message (zmq_ctx)
         # causes I/O thread churn + TCP resource exhaustion when 4 P ranks fire
         # hundreds of messages rapidly on the same machine.
@@ -929,9 +920,8 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         socket from the persistent Context (clean REQ state per message,
         no Context creation overhead)."""
         from vllm.utils.network_utils import make_zmq_socket
-        sock = make_zmq_socket(
-            ctx=self._persist_ctx, path=path, socket_type=zmq.REQ, bind=False
-        )
+
+        sock = make_zmq_socket(ctx=self._persist_ctx, path=path, socket_type=zmq.REQ, bind=False)
         sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
         poller = zmq.Poller()
         poller.register(sock, zmq.POLLIN)
@@ -941,10 +931,69 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         finally:
             sock.close(linger=0)
 
+    def _send_read_ready(
+        self,
+        path: str,
+        encoder: msgspec.msgpack.Encoder,
+        layer_idx: int,
+        layer_name: str,
+        role: str,
+        p_block_ids: list[int],
+        d_block_ids: list[int],
+    ) -> bool:
+        """Send one role's READ_READY, block until D replies READ_DONE.
+
+        Returns True iff D acknowledged with READ_DONE (or there was nothing to
+        transfer); False on a send/recv failure or an unexpected reply, so the
+        caller can withhold the buffer-reuse signal and surface the failure
+        instead of silently letting P overwrite a buffer D never read.
+        """
+        if not p_block_ids or not d_block_ids:
+            logger.warning(
+                "MembPull: skip READ_READY layer %d (%s) role=%s — empty block list (p=%d, d=%d)",
+                layer_idx,
+                layer_name,
+                role,
+                len(p_block_ids),
+                len(d_block_ids),
+            )
+            return True  # nothing to transfer; not a failure
+        encoded = encoder.encode((READ_READY, layer_idx, layer_name, role, p_block_ids, d_block_ids))
+        try:
+            resp = self._send_recv(path, encoded)
+            ack_msg = msgspec.msgpack.Decoder(type=tuple).decode(resp)
+            if ack_msg[0] != READ_DONE:
+                logger.warning(
+                    "MembPull: unexpected ACK %s for layer %d (%s) role=%s",
+                    ack_msg,
+                    layer_idx,
+                    layer_name,
+                    role,
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.error(
+                "MembPull handshake failed for layer %d (%s) role=%s: %s",
+                layer_idx,
+                layer_name,
+                role,
+                e,
+            )
+            return False
+
     def _transfer_kv_cache(self, send_task: Any) -> None:  # type: ignore[override]
-        """Override: no write. Just notify D to read + wait."""
-        # CRITICAL: wait for the KV to be fully written to P HBM before
-        # notifying D to read. Without this, D may read stale/unwritten data.
+        """Override: no write. Notify D to read MAIN + INDEXER legs, wait for both.
+
+        P has a single kv_cache_group (main MLA), and on P the indexer KV is
+        written into ``dsa_k_cache`` (= kv_caches[main][2]) at the SAME slots as
+        main MLA (the indexer scatter reuses the main slot_mapping). So both
+        legs are sourced from the same P block list. D advertised
+        ``remote_block_ids = [indexer_npu_ids (group 0), main_cpu_ids (group 1)]``,
+        so the destination block lists are role-specific.
+        """
+        # CRITICAL: wait for the KV (incl. the dsa_k scatter) to be fully written
+        # to P HBM before notifying D to read, else D reads stale/unwritten data.
         if send_task.wait_event is not None:
             send_task.wait_event.synchronize()
 
@@ -955,7 +1004,9 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             logger.warning(
                 "MembPull: send_task.send_request EMPTY for layer %d (%s) — "
                 "scheduler did not populate requests, skipping",
-                layer_idx, layer_name)
+                layer_idx,
+                layer_name,
+            )
             return
         req_meta = next(iter(send_task.send_request.values()))
         remote_host = req_meta.remote_host
@@ -968,7 +1019,10 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         path = make_zmq_path("tcp", remote_host, remote_port)
         encoder = msgspec.msgpack.Encoder()
 
-        # First call: send MF_META (P session + P layer addresses)
+        # First call: send MF_META (P session + P layer addresses). P's
+        # layer_metadata[main_name] carries [k, v, dsa_k] (3 tensors) because the
+        # mooncake base registers the full 3-tuple, so D reaches the indexer
+        # tensor as base_addrs[2] without a separate indexer layer entry.
         if not self._mf_meta_sent:
             p_meta_dict = {}
             for ln, meta in self.layer_metadata.items():
@@ -985,50 +1039,46 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             except Exception as e:
                 logger.error("Failed to send MF_META: %s", e)
 
-        # Aggregate block IDs across all requests in this send_task
-        agg_local: list[list[int]] = []
-        agg_remote: list[list[int]] = []
-        for req_meta in send_task.send_request.values():
-            for g, blocks in enumerate(req_meta.local_block_ids):
-                while len(agg_local) <= g:
-                    agg_local.append([])
-                agg_local[g].extend(blocks)
-            for g, blocks in enumerate(req_meta.remote_block_ids):
-                while len(agg_remote) <= g:
-                    agg_remote.append([])
-                agg_remote[g].extend(blocks)
+        # Aggregate block IDs across all requests in this send_task.
+        #   local_block_ids[0]  = P main MLA blocks (P's only group) — used for
+        #                          BOTH main and indexer (indexer shares slots).
+        #   remote_block_ids[0] = D indexer HBM blocks (indexer_npu_ids).
+        #   remote_block_ids[1] = D main CPU pool blocks (main_cpu_ids).
+        agg_p_blocks: list[int] = []
+        agg_d_indexer: list[int] = []
+        agg_d_main: list[int] = []
+        for rm in send_task.send_request.values():
+            local = rm.local_block_ids
+            remote = rm.remote_block_ids
+            if local and len(local) > 0:
+                agg_p_blocks.extend(local[0])
+            if remote and len(remote) > 0:
+                agg_d_indexer.extend(remote[0])
+            if remote and len(remote) > 1:
+                agg_d_main.extend(remote[1])
 
-        ready_encoded = encoder.encode(
-            (READ_READY, layer_idx, layer_name, agg_local, agg_remote)
+        # Main MLA leg: P k,v → D CPU pool.
+        main_ok = self._send_read_ready(path, encoder, layer_idx, layer_name, ROLE_MAIN, agg_p_blocks, agg_d_main)
+        # Indexer leg: P dsa_k → D indexer HBM.
+        indexer_ok = self._send_read_ready(
+            path, encoder, layer_idx, layer_name, ROLE_INDEXER, agg_p_blocks, agg_d_indexer
         )
-        try:
-            resp = self._send_recv(path, ready_encoded)
-            ack_msg = msgspec.msgpack.Decoder(type=tuple).decode(resp)
-            if ack_msg[0] != READ_DONE:
-                logger.warning(
-                    "MembPull: unexpected ACK %s for layer %d (%s)",
-                    ack_msg, layer_idx, layer_name,
-                )
-            # Mark this layer's buffer as safe to reuse (D has read it).
-            if 0 <= layer_idx < len(self.layer_send_done_events):
-                self.layer_send_done_events[layer_idx].set()
-        except Exception as e:
-            logger.error(
-                "MembPull handshake failed for layer %d (%s): %s",
-                layer_idx, layer_name, e,
-            )
+
+        # Only signal "buffer safe to reuse" if D actually read BOTH legs. On
+        # failure, withhold the signal so wait_for_layer_send stalls (a visible
+        # failure) instead of letting P overwrite a buffer D never consumed.
+        if main_ok and indexer_ok and 0 <= layer_idx < len(self.layer_send_done_events):
+            self.layer_send_done_events[layer_idx].set()
 
         # After the last layer, send DONE_SENDING so D reports done_recving.
         # Send directly via ZMQ (can't use callback_func = send_done_send_signal
         # because it accesses req_meta.trans_count which is empty — we skipped
         # super()._transfer_kv_cache() that populates it).
         if layer_idx == self.total_layers - 1:
-            for req_id, req_meta in send_task.send_request.items():
-                if req_meta.chunk_finish:
+            for req_id, rm in send_task.send_request.items():
+                if rm.chunk_finish:
                     external_req_id = get_external_request_id(req_id)
-                    done_encoded = encoder.encode(
-                        (DONE_SENDING_MSG, external_req_id, 0, "")
-                    )
+                    done_encoded = encoder.encode((DONE_SENDING_MSG, external_req_id, 0, ""))
                     try:
                         self._send_recv(path, done_encoded)
                     except Exception as e:
@@ -1050,8 +1100,7 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
             tp_rank = get_tensor_model_parallel_rank()
             tp_size = vllm_config.parallel_config.tensor_parallel_size
             side_channel_port = (
-                vllm_config.kv_transfer_config.kv_port
-                + vllm_config.parallel_config.data_parallel_rank * tp_size
+                vllm_config.kv_transfer_config.kv_port + vllm_config.parallel_config.data_parallel_rank * tp_size
             )
             # P's memfabric session port (must be a real TCP port, offset past
             # ZMQ ports just like D side). unique_id = "P_IP:P_store_port".
@@ -1097,6 +1146,7 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
             def _patched_init(self_inner, *a, **kw):
                 _orig_init(self_inner, *a, **kw)
                 self_inner.p_session = _mf_uid
+
             _MembPullSendingThread.__init__ = _patched_init  # type: ignore[assignment]
             try:
                 super().register_kv_caches(kv_caches)
