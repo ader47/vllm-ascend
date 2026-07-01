@@ -153,21 +153,13 @@ class SFAPDCpuOffloadWorker:
     # ------------------------------------------------------------------
     def _ensure_engine(self):
         if self.engine is None:
-            # device_name=None reuses the process-wide "ascend" engine; we
-            # assume host-pinned registration is accepted (user-confirmed).
             backend = _resolve_kv_transfer_backend(self.vllm_config)
             if backend == BACKEND_MEMFABRIC:
-                # D-side unique_id = "<host>:<port>"; memfabric derives its
-                # config-store address from it, and the Prefill peer reuses the
-                # same "<host>:<port>" (advertised via te_rpc_port) as dest_session.
-                # Offset 2*tp_size past the ZMQ ports to avoid bind collision
-                # with P/D ZMQ ROUTER ports on a single host.
-                tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-                mf_session_port = self.side_channel_port + 2 * tp_size + self.tp_rank
+                # unique_id/store_url are derived by _build_memfabric from
+                # engine.get_rpc_port() — no caller-computed port needed.
                 global_te.configure(
                     backend=BACKEND_MEMFABRIC,
                     role=MEMFABRIC_ROLE_DECODE,
-                    unique_id=f"{self.side_channel_host}:{mf_session_port}",
                     device_id=torch.npu.current_device(),
                 )
             self.engine = global_te.get_transfer_engine(self.side_channel_host, None)
@@ -972,24 +964,18 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, engine_id: str):
         self._backend = _resolve_kv_transfer_backend(vllm_config)
         if self._backend == BACKEND_MEMFABRIC:
-            tp_rank = get_tensor_model_parallel_rank()
             tp_size = vllm_config.parallel_config.tensor_parallel_size
             side_channel_port = (
                 vllm_config.kv_transfer_config.kv_port + vllm_config.parallel_config.data_parallel_rank * tp_size
             )
-            # Pre-compute a fallback unique_id (used by _patched_init if
-            # global_te._unique_id isn't set yet). _build_memfabric overrides
-            # this with engine.get_rpc_port() — the real unique_id memfabric
-            # registers under. p_session always uses the real value.
-            mf_session_port = side_channel_port + 2 * tp_size + tp_rank
-            self._mf_unique_id = f"{get_ip()}:{mf_session_port}"
-            # store_url is NOT needed: memfabric only extracts the protocol
-            # prefix ("tcp://") from it. The real peer address flows through
-            # unique_id (self) and dest_session (via MF_META p_session).
+            # unique_id is derived by _build_memfabric from engine.get_rpc_port()
+            # — no caller-computed port needed. _mf_unique_id is a fallback for
+            # _patched_init (used only if _build_memfabric hasn't run yet, which
+            # shouldn't happen since super().__init__ builds the engine first).
+            self._mf_unique_id = f"{get_ip()}:{side_channel_port}"
             global_te.configure(
                 backend=BACKEND_MEMFABRIC,
                 role=MEMFABRIC_ROLE_PREFILL,
-                unique_id=self._mf_unique_id,
                 device_id=torch.npu.current_device(),
             )
         super().__init__(vllm_config, kv_cache_config, engine_id)
