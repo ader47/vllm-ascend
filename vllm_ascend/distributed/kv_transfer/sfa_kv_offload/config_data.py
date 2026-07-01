@@ -11,6 +11,13 @@ class RequestTracker:
     req_id: str
     allocated_block_ids_npu: list[int]
     allocated_block_ids_cpu: list[int]
+    # Part A (PD memfabric pull): full main MLA blocks go to the CPU pool, the
+    # optional partial last block stays in HBM. num_full = count of FULL main
+    # blocks (== len(allocated_block_ids_cpu)); partial_hbm_bid = D's HBM block
+    # id for the partial block (logical-last group1 block), or None when
+    # prompt_len is a multiple of block_size (no partial).
+    num_full: int = 0
+    partial_hbm_bid: int | None = None
 
     def update(
         self,
@@ -28,6 +35,11 @@ class ReqMeta:
     block_ids_npu: list[int]
     block_ids_cpu: list[int]
     num_new_offload_blocks: int = 0
+    # Part A (PD memfabric pull): _do_read routes the first `num_full` of P's
+    # p_block_ids to the CPU pool (1:1 with block_ids_cpu), and the last one
+    # (the partial) to D HBM at partial_hbm_bid (None ⇒ no partial).
+    num_full: int = 0
+    partial_hbm_bid: int | None = None
 
     @staticmethod
     def from_request_tracker(
@@ -40,15 +52,17 @@ class ReqMeta:
             block_ids_npu=tracker.allocated_block_ids_npu,
             block_ids_cpu=tracker.allocated_block_ids_cpu,
             num_new_offload_blocks=num_new_offload_blocks,
+            num_full=tracker.num_full,
+            partial_hbm_bid=tracker.partial_hbm_bid,
         )
 
 
 class SFAKVOffloadConnectorMetadata(KVConnectorMetadata):
     def __init__(
-            self,
-            unfinished_request_ids: set[str],
-            preempted_req_ids: set[str] | None,
-        ):
+        self,
+        unfinished_request_ids: set[str],
+        preempted_req_ids: set[str] | None,
+    ):
         self.requests: list[ReqMeta] = []
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids

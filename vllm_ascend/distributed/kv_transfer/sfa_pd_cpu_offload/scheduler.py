@@ -20,7 +20,6 @@ import httpx
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
-from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
@@ -117,16 +116,26 @@ class SFAPDCpuOffloadScheduler:
         indexer_npu_ids = (
             npu_block_ids_by_group[_INDEXER_GROUP_IDX] if len(npu_block_ids_by_group) > _INDEXER_GROUP_IDX else []
         )
+        main_hbm_ids = npu_block_ids_by_group[_MAIN_GROUP_IDX] if len(npu_block_ids_by_group) > _MAIN_GROUP_IDX else []
 
-        # One-shot CPU block allocation for the main MLA group (full prompt).
+        # Part A: the CPU pool stores only FULL main MLA blocks (floor division).
+        # The optional partial last block stays in HBM — D's logical-last group1
+        # block — so decode can append to it; it is offloaded to CPU once full
+        # (decode offload path). num_offloaded_blocks == len(main_cpu_ids) ==
+        # num_full, so the threshold auto-excludes the partial (decode reads it
+        # from HBM, not the stale CPU copy).
         prompt_len = len(request.prompt_token_ids)
-        num_main_cpu_blocks = cdiv(prompt_len, self._main_block_size)
+        num_main_cpu_blocks = prompt_len // self._main_block_size
+        has_partial = (prompt_len % self._main_block_size) != 0
         main_cpu_ids = self.cpu_block_manager.allocate_block(num_main_cpu_blocks) if num_main_cpu_blocks > 0 else []
+        partial_hbm_bid = main_hbm_ids[-1] if (has_partial and main_hbm_ids) else None
 
         tracker = RequestTracker(
             req_id=request.request_id,
             allocated_block_ids_npu=list(indexer_npu_ids),
             allocated_block_ids_cpu=list(main_cpu_ids),
+            num_full=num_main_cpu_blocks,
+            partial_hbm_bid=partial_hbm_bid,
         )
         self._request_trackers[request.request_id] = tracker
         self._reqs_need_recv.add(request.request_id)
@@ -156,10 +165,11 @@ class SFAPDCpuOffloadScheduler:
             future = self.executor.submit(self._access_metaserver, url=metaserver, message=kv_transfer_params)
             future.add_done_callback(self._on_metaserver_done)
         logger.info(
-            "SFAPDCpuOffload D advertised req %s: indexer NPU=%d blocks, main CPU=%d blocks -> %s",
+            "SFAPDCpuOffload D advertised req %s: indexer NPU=%d, main CPU(full)=%d, partial_hbm=%s -> %s",
             request.request_id,
             len(indexer_npu_ids),
             len(main_cpu_ids),
+            partial_hbm_bid,
             metaserver,
         )
 
@@ -184,6 +194,8 @@ class SFAPDCpuOffloadScheduler:
                     block_ids_npu=tracker.allocated_block_ids_npu,
                     block_ids_cpu=tracker.allocated_block_ids_cpu,
                     num_new_offload_blocks=0,  # D does not save; CPU pool filled by P
+                    num_full=tracker.num_full,
+                    partial_hbm_bid=tracker.partial_hbm_bid,
                 )
             )
 

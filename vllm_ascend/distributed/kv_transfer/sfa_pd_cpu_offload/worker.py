@@ -195,12 +195,15 @@ class SFAPDCpuOffloadWorker:
         # thread's done_recving (keyed by external id from P's DONE signal) back
         # to the vLLM-internal id that the scheduler expects.
         self.request_map: dict[str, str] = {}
-        # external_req_id -> (indexer_npu_ids, main_cpu_ids): D's OWN destination
-        # blocks per request, populated in start_load_kv from connector_meta
-        # (ReqMeta.block_ids_npu/cpu). The read thread looks them up by the
-        # external req_id P sends in READ_READY — D never receives its own block
-        # ids from P (pull model: P sends only its source blocks).
-        self._dest_blocks_by_req: dict[str, tuple[list[int], list[int]]] = {}
+        # external_req_id -> (indexer_npu_ids, main_cpu_ids, num_full,
+        # partial_hbm_bid): D's OWN destination blocks per request, populated in
+        # start_load_kv from connector_meta. Part A: the first num_full main
+        # blocks → CPU pool; the optional partial last block → D HBM at
+        # partial_hbm_bid (None ⇒ no partial).
+        self._dest_blocks_by_req: dict[str, tuple[list[int], list[int], int, int | None]] = {}
+        # main layer name -> (k_nope HBM, v_rope HBM); the partial block's HBM
+        # dest. Populated in register_kv_caches.
+        self._hbm_kv: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         # External req ids whose DONE/FAILED signal arrived before request_map
         # was seeded (see get_finished). Retried every step until mapped.
         self._pending_done: set[str] = set()
@@ -262,6 +265,11 @@ class SFAPDCpuOffloadWorker:
         assert self.sfa_worker.k_caches_cpu is not None, "Composed SFA worker did not allocate the CPU pool"
         k_caches_cpu = self.sfa_worker.k_caches_cpu
         v_caches_cpu = self.sfa_worker.v_caches_cpu
+
+        # Part A: D's main MLA HBM k/v tensors (group1 paged cache) — the partial
+        # last block lands here instead of the CPU pool. Keyed by main layer name
+        # (the 5-tuple layers); tuple[0]=k_nope, tuple[1]=v_rope.
+        self._hbm_kv = {n: (t[0], t[1]) for n, t in kv_caches.items() if isinstance(t, (list, tuple)) and len(t) == 5}
 
         backend = _resolve_kv_transfer_backend(self.vllm_config)
         if backend == BACKEND_MEMFABRIC:
@@ -394,12 +402,15 @@ class SFAPDCpuOffloadWorker:
                 self.request_map[ext_id] = req_id
                 indexer_ids = list(getattr(req, "block_ids_npu", []) or [])
                 main_ids = list(getattr(req, "block_ids_cpu", []) or [])
-                self._dest_blocks_by_req[ext_id] = (indexer_ids, main_ids)
+                num_full = getattr(req, "num_full", 0) or 0
+                partial_hbm_bid = getattr(req, "partial_hbm_bid", None)
+                self._dest_blocks_by_req[ext_id] = (indexer_ids, main_ids, num_full, partial_hbm_bid)
                 logger.info(
-                    "MembPull D stored dest blocks req %s: indexer(HBM)=%d, main(CPU)=%d",
+                    "MembPull D stored dest blocks req %s: indexer(HBM)=%d, main(CPU full)=%d, partial_hbm=%s",
                     ext_id,
                     len(indexer_ids),
                     len(main_ids),
+                    partial_hbm_bid,
                 )
         # Refresh the per-req CPU-block count (Phase 3 source of truth) and
         # forward the unchanged load kickoff to the SFA worker.
@@ -749,7 +760,7 @@ class MembPullReadThread(threading.Thread):
                 layer_name,
             )
             return
-        d_indexer_ids, d_main_ids = dest  # (block_ids_npu, block_ids_cpu)
+        d_indexer_ids, d_main_ids, num_full, partial_hbm_bid = dest  # (npu, cpu, num_full, partial_hbm_bid)
 
         # Locate the transformer-layer pool index from the MAIN layer name.
         pool_idx = None
@@ -783,19 +794,38 @@ class MembPullReadThread(threading.Thread):
         n_main = 0
         n_indexer = 0
 
-        # Main MLA leg: P tensors [0]=k, [1]=v → D CPU pool.
-        if d_main_ids:
-            p_k_base, p_v_base = p_base_addrs[0], p_base_addrs[1]
-            p_k_len, p_v_len = p_block_len[0], p_block_len[1]
+        # Main MLA leg. Part A: the first `num_full` of P's blocks are FULL → D
+        # CPU pool (1:1 with d_main_ids); the optional last block is the PARTIAL
+        # → D main MLA HBM (group1) at partial_hbm_bid, so decode can append.
+        p_k_base, p_v_base = p_base_addrs[0], p_base_addrs[1]
+        p_k_len, p_v_len = p_block_len[0], p_block_len[1]
+        full_p_blocks = p_block_ids[:num_full]
+        if full_p_blocks and d_main_ids:
             k_cpu, v_cpu = w._cpu_pools[pool_idx]
-            for p_bid, d_bid in zip(p_block_ids, d_main_ids):
+            for p_bid, d_bid in zip(full_p_blocks, d_main_ids):
                 peer_ptrs.append(p_k_base + p_bid * p_k_len)
                 local_ptrs.append(k_cpu.data_ptr() + d_bid * p_k_len)
                 lengths.append(p_k_len)
                 peer_ptrs.append(p_v_base + p_bid * p_v_len)
                 local_ptrs.append(v_cpu.data_ptr() + d_bid * p_v_len)
                 lengths.append(p_v_len)
-            n_main = min(len(p_block_ids), len(d_main_ids))
+            n_main = min(len(full_p_blocks), len(d_main_ids))
+        # Partial last block → D HBM (whole block_size transfers; the tail beyond
+        # prompt_len is garbage and gets overwritten as decode appends).
+        if partial_hbm_bid is not None and num_full < len(p_block_ids):
+            hbm_kv = w._hbm_kv.get(layer_name)
+            if hbm_kv is None:
+                logger.warning("MembPull _do_read: no HBM k/v for partial block %s, skip partial", layer_name)
+            else:
+                k_hbm, v_hbm = hbm_kv
+                partial_p_bid = p_block_ids[num_full]
+                peer_ptrs.append(p_k_base + partial_p_bid * p_k_len)
+                local_ptrs.append(k_hbm.data_ptr() + partial_hbm_bid * p_k_len)
+                lengths.append(p_k_len)
+                peer_ptrs.append(p_v_base + partial_p_bid * p_v_len)
+                local_ptrs.append(v_hbm.data_ptr() + partial_hbm_bid * p_v_len)
+                lengths.append(p_v_len)
+                n_main += 1
 
         # Indexer leg: P tensor [2]=dsa_k → D indexer HBM. D's indexer
         # block_size is `scale`× P's (D uses coarser indexer blocks, e.g. 4× →
@@ -874,6 +904,14 @@ class MembPullReadThread(threading.Thread):
                 k_cpu, v_cpu = w._cpu_pools[pool_idx]
                 mk = k_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
                 mv = v_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
+                # Part A: the partial last block is in HBM (not the CPU pool) —
+                # add it so D's main sum matches P's (full + partial) source sum.
+                if partial_hbm_bid is not None:
+                    hbm_kv = w._hbm_kv.get(layer_name)
+                    if hbm_kv is not None:
+                        k_hbm, v_hbm = hbm_kv
+                        mk += k_hbm[partial_hbm_bid].float().sum().item()
+                        mv += v_hbm[partial_hbm_bid].float().sum().item()
                 mi = w._indexer_tensors[pool_idx][d_indexer_ids].float().sum().item() if d_indexer_ids else 0.0
                 logger.info(
                     "MFV D layer %s req %s main_k=%.6f main_v=%.6f idx_post=%.6f",
