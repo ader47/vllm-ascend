@@ -160,14 +160,8 @@ class SFAPDCpuOffloadWorker:
                 # D-side unique_id = "<host>:<port>"; memfabric derives its
                 # config-store address from it, and the Prefill peer reuses the
                 # same "<host>:<port>" (advertised via te_rpc_port) as dest_session.
-                # Offset 2*tp_size past the ZMQ ports: on a single host P binds
-                # ZMQ at P_kv+rank and D at D_kv+rank, and the launch convention
-                # is D_kv = P_kv + tp_size, so the combined ZMQ footprint is
-                # [P_kv .. P_kv+2*tp_size). Starting memfabric at +tp_size would
-                # collide (D store would land on P_kv+tp_size+rank = D's ZMQ
-                # range on P's side; P's unique_id would land on D's ZMQ range).
-                # +2*tp_size also matches the launch script's MF_CONFIG_STORE_URL
-                # formula (D_kv + tp_size + tp_size + rank).
+                # Offset 2*tp_size past the ZMQ ports to avoid bind collision
+                # with P/D ZMQ ROUTER ports on a single host.
                 tp_size = self.vllm_config.parallel_config.tensor_parallel_size
                 mf_session_port = self.side_channel_port + 2 * tp_size + self.tp_rank
                 global_te.configure(
@@ -983,26 +977,19 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
             side_channel_port = (
                 vllm_config.kv_transfer_config.kv_port + vllm_config.parallel_config.data_parallel_rank * tp_size
             )
-            # P's memfabric session port. Offset 2*tp_size past P's ZMQ base:
-            # with the single-host convention D_kv = P_kv + tp_size, an offset of
-            # only tp_size (P_kv+tp_size+rank) would land P's unique_id exactly on
-            # D's ZMQ ROUTER ports (D_kv+rank) → bind/listen collision. 2*tp_size
-            # clears both P and D ZMQ ranges. unique_id = "P_IP:P_session_port".
+            # Pre-compute a fallback unique_id (used by _patched_init if
+            # global_te._unique_id isn't set yet). _build_memfabric overrides
+            # this with engine.get_rpc_port() — the real unique_id memfabric
+            # registers under. p_session always uses the real value.
             mf_session_port = side_channel_port + 2 * tp_size + tp_rank
             self._mf_unique_id = f"{get_ip()}:{mf_session_port}"
-            # P must connect to D's config store (D is store server). Read D's
-            # store URL from env var (set in launch script: D_IP:D_store_port).
-            mf_store_url = os.environ.get("MF_CONFIG_STORE_URL")
-            if not mf_store_url:
-                logger.warning(
-                    "MF_CONFIG_STORE_URL not set; memfabric P may not reach D's "
-                    "config store. Set it to tcp://<D_IP>:<D_store_port>."
-                )
+            # store_url is NOT needed: memfabric only extracts the protocol
+            # prefix ("tcp://") from it. The real peer address flows through
+            # unique_id (self) and dest_session (via MF_META p_session).
             global_te.configure(
                 backend=BACKEND_MEMFABRIC,
                 role=MEMFABRIC_ROLE_PREFILL,
                 unique_id=self._mf_unique_id,
-                store_url=mf_store_url,
                 device_id=torch.npu.current_device(),
             )
         super().__init__(vllm_config, kv_cache_config, engine_id)
