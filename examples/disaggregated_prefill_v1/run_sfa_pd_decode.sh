@@ -1,0 +1,77 @@
+#!/bin/bash
+# =============================================================================
+# SFA PD-disaggregated CPU-offload — Decode (D) node launcher.
+# Connector: SFAPDCpuOffloadConnector, kv_role = kv_consumer.
+#
+# D-side worker composes SFAKVOffloadWorker (LRU H2D load + CPU pool) and:
+#   - allocates main-MLA CPU blocks one-shot (full prompt) in the scheduler
+#   - registers indexer NPU + main MLA CPU pool with Mooncake in ONE call
+#   - advertises per-layer split base addrs via KVCacheRecvingLayerThread
+# The remote P then RDMA-writes indexer KV -> HBM, main MLA KV -> CPU pool.
+# D reuses the existing SFA LRU-resident H2D load path unchanged.
+#
+# START ORDER: launch D first (its recving thread must be up before P can
+# GET_META its layer base addrs), then P, then the proxy.
+# =============================================================================
+set -euo pipefail
+
+# ---------------------------- CONFIG (edit me) -------------------------------
+MODEL_PATH="/path/to/DeepSeek-V3.2"     # MUST match the P node
+SERVE_HOST="0.0.0.0"                    # external HTTP listen addr (proxy connects here)
+SERVE_PORT=8200                         # external HTTP port
+TP_SIZE=4                               # tensor parallel size (P and D MUST match)
+VISIBLE_DEVICES=4,5,6,7                 # NPU cards for the D node (must NOT overlap P)
+NET_IFACE="lo"                          # NIC for gloo/tp/hccl; multi-host -> real iface
+
+# Mooncake gives each TP rank its own ZMQ port = KV_PORT + tp_rank. With
+# TP_SIZE=4 this node occupies KV_PORT+0..+3. Single host: D's KV_PORT must be
+# >= P's KV_PORT + TP_SIZE to avoid collision (P uses 20001 -> 20001-20004, so D
+# uses 20005 -> 20005-20008). Multi-host (different IPs) can reuse ports.
+KV_PORT=20005                           # Mooncake side-channel base port (P's 20001 + TP_SIZE)
+KV_RANK=1                               # D node kv_rank (P=0, D=1; inert for mooncake)
+
+# D MUST run with use_offload=true: it drives the SFA offload code path in the
+# model runner (5-tuple kv_cache, num_offloaded_blocks, indexer_block_table, the
+# LRU-resident H2D load). Without it the connector registers but the model never
+# drives it.
+#
+# lru_resident_cache_config:
+#   - enabled=true is REQUIRED whenever buffer_size != 2048: model_runner uses
+#     resident_capacity = buffer_size only when (use_offload and enabled), else
+#     falls back to 2048 and diverges from the SFA worker -> shape mismatch.
+#   - buffer_size (resident capacity, in tokens) must be >= topk and divisible by
+#     block_size (128). Larger = more KV resident on HBM, fewer H2D misses.
+#   - topk must equal the model's sparse topk (2048 for DeepSeek-V3.2).
+ADDITIONAL_CONFIG='{"use_offload": true, "lru_resident_cache_config": {"enabled": true, "buffer_size": 4096, "topk": 2048}}'
+# ----------------------------------------------------------------------------
+
+# KV transfer backend: "mooncake" (default) or "memfabric". With memfabric D
+# runs the in-process config store at <ip>:<KV_PORT+tp_rank> — start D BEFORE P.
+export VLLM_ASCEND_KV_TRANSFER_BACKEND="${VLLM_ASCEND_KV_TRANSFER_BACKEND:-mooncake}"
+
+export HCCL_IF_IP="${HCCL_IF_IP:-127.0.0.1}"
+export GLOO_SOCKET_IFNAME="$NET_IFACE"
+export TP_SOCKET_IFNAME="$NET_IFACE"
+export HCCL_SOCKET_IFNAME="$NET_IFACE"
+export ASCEND_RT_VISIBLE_DEVICES="$VISIBLE_DEVICES"
+export PHYSICAL_DEVICES="${PHYSICAL_DEVICES:-$VISIBLE_DEVICES}"
+
+exec vllm serve "$MODEL_PATH" \
+  --host "$SERVE_HOST" \
+  --port "$SERVE_PORT" \
+  --tensor-parallel-size "$TP_SIZE" \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 4096 \
+  --trust-remote-code \
+  --enforce-eager \
+  --gpu-memory-utilization 0.8 \
+  --additional-config "$ADDITIONAL_CONFIG" \
+  --kv-transfer-config "{
+    \"kv_connector\": \"SFAPDCpuOffloadConnector\",
+    \"kv_buffer_device\": \"npu\",
+    \"kv_role\": \"kv_consumer\",
+    \"kv_parallel_size\": 1,
+    \"kv_port\": ${KV_PORT},
+    \"kv_rank\": ${KV_RANK},
+    \"kv_connector_extra_config\": {\"use_layerwise\": true}
+  }"

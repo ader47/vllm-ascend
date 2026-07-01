@@ -110,6 +110,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # KV transfer backend selection for the SFA PD CPU offload connector.
+    # "mooncake" (default): use the mooncake TransferEngine.
+    # "memfabric": use the memfabric TransferEngine. Requires MF_CONFIG_STORE_URL
+    #   to point at the Decode node's in-process config store, and the Decode node
+    #   must be started before Prefill. Can be overridden per-deployment via
+    #   kv_connector_extra_config["transfer_backend"].
+    "VLLM_ASCEND_KV_TRANSFER_BACKEND": lambda: os.getenv("VLLM_ASCEND_KV_TRANSFER_BACKEND", "mooncake"),
 }
 
 # end-env-vars-definition

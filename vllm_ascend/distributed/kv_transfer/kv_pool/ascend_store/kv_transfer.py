@@ -526,6 +526,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         ready_event: threading.Event,
         num_layers: int,
         enable_kv_event: bool = False,
+        layer_save_finished_events: list[threading.Event] = [],
     ):
         super().__init__(
             m_store, token_database, block_size, tp_rank, dcp_size, ready_event, name="KVCacheStoreLayerSendingThread"
@@ -533,6 +534,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.final_layer_id = num_layers - 1
         self.put_step = put_step
         self.enable_kv_event = enable_kv_event
+        self.layer_save_finished_events = layer_save_finished_events
         self.layerwise_event_starts: dict[str, set[int]] = defaultdict(set)
         self.stored_requests: dict[str, int] = defaultdict(int)
         self.done_task_lock = threading.Lock()
@@ -601,8 +603,41 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.request_queue.put(req_meta)
 
     def _handle_request(  # type: ignore[override]
-        self, req_meta: LayerMultiBlockReqMeta
+        self, req_metas: list[LayerMultiBlockReqMeta]
     ):
+        # logger.info(f'>>>>> handle request, req_metas = {len(req_metas)}')
+        if len(req_metas) == 0:
+            return
+
+        layer_id = req_metas[0].layer_id
+
+        for req_meta in req_metas:
+            req_id = req_meta.req_id
+            is_last_chunk = req_meta.is_last_chunk
+            block_ids_npu = req_meta.block_ids_npu
+            block_ids_cpu = req_meta.block_ids_cpu
+            (k_cache_npu, v_cache_npu) = req_meta.cache_npu
+            (k_cache_cpu, v_cache_cpu) = req_meta.cache_cpu
+            if len(block_ids_npu) != len(block_ids_cpu):
+                logger.error(
+                    f'Offload req {req_id} fail! '
+                    f'npu block num ({len(block_ids_npu)}) '
+                    f'cpu block num ({len(block_ids_cpu)}) size mismatch'
+                )
+            if self.tp_rank == 0 and layer_id == 0:
+                logger.info(f'>>>>> kv sending thread offload {len(block_ids_npu)} blocks of req {req_id}')
+            k_cache_cpu[block_ids_cpu] = k_cache_npu[block_ids_npu].to('cpu')
+            v_cache_cpu[block_ids_cpu] = v_cache_npu[block_ids_npu].to('cpu')
+
+            if layer_id == self.final_layer_id and is_last_chunk:
+                # seem useless, need to check
+                self.set_finished_request(req_meta.req_id)
+
+        req_metas.clear()
+        self.request_queue.task_done()
+        self.layer_save_finished_events[layer_id].set()
+        return
+
         starts = req_meta.starts
         ends = req_meta.ends
         keys = req_meta.keys

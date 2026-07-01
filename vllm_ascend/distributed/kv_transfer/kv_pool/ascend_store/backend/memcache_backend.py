@@ -21,6 +21,7 @@ class MmcDirect(Enum):
 
 class MemcacheBackend(Backend):
     def __init__(self, parallel_config: ParallelConfig, lazy_init: bool = False):
+        return
         self.local_rank = get_world_group().local_rank
         self.store: Any | None = None
         self._is_a2 = get_ascend_device_type() in {AscendDeviceType.A2}
@@ -73,10 +74,12 @@ class MemcacheBackend(Backend):
             raise
 
     def set_device(self):
+        return
         device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
 
     def register_buffer(self, ptrs: list[int], sizes: list[int]):
+        return
         self._registered_buffers = (list(ptrs), list(sizes))
         self._register_buffers_if_needed()
 
