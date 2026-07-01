@@ -136,6 +136,7 @@ class SFAPDCpuOffloadScheduler:
             allocated_block_ids_cpu=list(main_cpu_ids),
             num_full=num_main_cpu_blocks,
             partial_hbm_bid=partial_hbm_bid,
+            main_hbm_ids=list(main_hbm_ids),
         )
         self._request_trackers[request.request_id] = tracker
         self._reqs_need_recv.add(request.request_id)
@@ -184,7 +185,24 @@ class SFAPDCpuOffloadScheduler:
 
         meta = SFAKVOffloadConnectorMetadata(set(), scheduler_output.preempted_req_ids)
 
-        def _add_req(req_id: str) -> None:
+        # B1: maps from scheduled_cached_reqs for decode offload computation.
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        num_computed_by_req: dict[str, int] = dict(zip(cached_reqs.req_ids, cached_reqs.num_computed_tokens))
+        new_main_hbm_by_req: dict[str, list[int]] = {}
+        for i, rid in enumerate(cached_reqs.req_ids):
+            nbi = cached_reqs.new_block_ids[i]
+            if nbi is None:
+                nbi = []
+            elif isinstance(nbi, tuple):
+                # multi-group: tuple of per-group lists; last = main MLA (group1)
+                nbi = nbi[-1] if len(nbi) > 0 else []
+            new_main_hbm_by_req[rid] = list(nbi)
+
+        def _add_req(
+            req_id: str,
+            offload_src: list[int] | None = None,
+            offload_dst: list[int] | None = None,
+        ) -> None:
             tracker = self._request_trackers.get(req_id)
             if tracker is None:
                 return
@@ -193,30 +211,52 @@ class SFAPDCpuOffloadScheduler:
                     req_id=tracker.req_id,
                     block_ids_npu=tracker.allocated_block_ids_npu,
                     block_ids_cpu=tracker.allocated_block_ids_cpu,
-                    num_new_offload_blocks=0,  # D does not save; CPU pool filled by P
+                    num_new_offload_blocks=0,  # PD uses its own offload path (B1)
                     num_full=tracker.num_full,
                     partial_hbm_bid=tracker.partial_hbm_bid,
+                    offload_src_hbm_ids=offload_src or [],
+                    offload_dst_cpu_ids=offload_dst or [],
                 )
             )
 
-        # Seed every newly-allocated remote-prefill request ONCE, even while it
-        # async-waits for KV — the worker needs this to build request_map so
-        # get_finished can report done_recving (without it the req never gets
-        # scheduled -> stuck "reqs num: 0").
+        # Seed every newly-allocated remote-prefill request ONCE (prefill: no
+        # decode offload). The worker needs this to build request_map so
+        # get_finished can report done_recving.
         seeded: set[str] = set()
         for req_id in list(self._reqs_need_recv):
             _add_req(req_id)
             seeded.add(req_id)
         self._reqs_need_recv.clear()
 
-        # Also include currently-scheduled requests (feeds the LRU-load
-        # cpu_block_table on the composed SFA worker).
+        # Decode (cached) requests: extend the main MLA HBM block table, then
+        # offload any blocks that newly filled this step HBM->CPU. Part A put the
+        # prompt's full blocks in CPU (num_offloaded starts at num_full) and the
+        # partial in HBM; as decode fills the partial (and later blocks), they
+        # enter [num_offloaded:num_blocks_after_step] and get offloaded here.
         for req_id in list(self._request_trackers):
             if req_id in seeded:
                 continue
             if req_id not in scheduler_output.num_scheduled_tokens:
                 continue
-            _add_req(req_id)
+            tracker = self._request_trackers[req_id]
+            tracker.main_hbm_ids.extend(new_main_hbm_by_req.get(req_id, []))
+            num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            num_computed = num_computed_by_req.get(req_id, 0)
+            num_blocks_after_step = (num_computed + num_new_tokens) // self._main_block_size
+            num_offloaded = len(tracker.allocated_block_ids_cpu)
+            end = min(num_blocks_after_step, len(tracker.main_hbm_ids))
+            offload_src = tracker.main_hbm_ids[num_offloaded:end] if end > num_offloaded else []
+            offload_dst = self.cpu_block_manager.allocate_block(len(offload_src)) if offload_src else []
+            if offload_src:
+                tracker.allocated_block_ids_cpu.extend(offload_dst)
+                logger.info(
+                    "SFAPD B1 offload req %s: %d blocks HBM->CPU (num_offloaded %d->%d)",
+                    req_id,
+                    len(offload_src),
+                    num_offloaded,
+                    num_offloaded + len(offload_src),
+                )
+            _add_req(req_id, offload_src, offload_dst)
         return meta
 
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:

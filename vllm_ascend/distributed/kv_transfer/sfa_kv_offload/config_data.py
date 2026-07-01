@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
@@ -18,6 +18,11 @@ class RequestTracker:
     # prompt_len is a multiple of block_size (no partial).
     num_full: int = 0
     partial_hbm_bid: int | None = None
+    # B1 (decode offload): main MLA group1 HBM block table for this request
+    # (full table, logical order). Extended with new group1 blocks each decode
+    # step. The decode-filled range [num_offloaded:num_blocks_after_step] is the
+    # offload source. (num_offloaded == len(allocated_block_ids_cpu).)
+    main_hbm_ids: list[int] = field(default_factory=list)
 
     def update(
         self,
@@ -40,6 +45,12 @@ class ReqMeta:
     # (the partial) to D HBM at partial_hbm_bid (None ⇒ no partial).
     num_full: int = 0
     partial_hbm_bid: int | None = None
+    # B1 (decode offload): the main MLA HBM blocks to copy HBM→CPU this step
+    # (offload_src) and the CPU pool blocks to copy them into (offload_dst).
+    # Populated by the PD scheduler for decode steps where blocks fill; empty
+    # otherwise (prefill, or no new full blocks).
+    offload_src_hbm_ids: list[int] = field(default_factory=list)
+    offload_dst_cpu_ids: list[int] = field(default_factory=list)
 
     @staticmethod
     def from_request_tracker(
