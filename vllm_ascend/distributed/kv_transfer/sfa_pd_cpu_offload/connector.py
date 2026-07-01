@@ -9,6 +9,7 @@ from :class:`SFAKVOffloadWorker`.
 
 See ``/Users/liufeng/.claude/plans/luminous-shimmying-wind.md`` for the design.
 """
+
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -19,6 +20,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
+from vllm.logger import logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -61,6 +63,22 @@ class SFAPDProducerScheduler(MooncakeLayerwiseConnectorScheduler):
         super().update_state_after_alloc(request, blocks, num_external_tokens)
         # If base class didn't populate (do_remote_prefill=False), do it manually
         params = request.kv_transfer_params
+        # DIAG: log exactly what P received from the D rendezvous, and P's own
+        # allocated blocks. D advertises remote_block_ids=[indexer_ids, main_ids];
+        # if this shows something else (e.g. only one group), the rendezvous/
+        # proxy path mangled it.
+        if params is not None and params.get("do_remote_decode"):
+            rbi = params.get("remote_block_ids")
+            try:
+                rbi_lens = [len(g) for g in rbi] if rbi is not None else None
+            except TypeError:
+                rbi_lens = f"non-iterable:{rbi!r}"
+            logger.info(
+                "SFAPDProducerScheduler req %s do_remote_decode: remote_block_ids lens=%s (local groups=%s)",
+                request.request_id,
+                rbi_lens,
+                len(list(blocks.get_block_ids())),
+            )
         if (
             params is not None
             and params.get("do_remote_decode")
@@ -70,7 +88,9 @@ class SFAPDProducerScheduler(MooncakeLayerwiseConnectorScheduler):
             local_block_ids = blocks.get_unhashed_block_ids_all_groups()
             prompt_tokens = len(request.prompt_token_ids)
             self._reqs_need_recv[request.request_id] = (
-                request, local_block_ids, prompt_tokens,
+                request,
+                local_block_ids,
+                prompt_tokens,
             )
 
 
@@ -90,17 +110,13 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         role: KVConnectorRole,
         kv_cache_config: KVCacheConfig | None = None,
     ):
-        super().__init__(
-            vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config
-        )
+        super().__init__(vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.is_producer = vllm_config.kv_transfer_config.is_kv_producer
         self.is_consumer = vllm_config.kv_transfer_config.is_kv_consumer
         # SFA path is layer-wise on both sides.
-        self.use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
-            "use_layerwise", True
-        )
+        self.use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", True)
         self.engine_id = vllm_config.kv_transfer_config.engine_id
 
         # Guard the asymmetric use_offload assumption (the launch scripts must
@@ -111,6 +127,7 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         #   D (consumer)  : use_offload=true  — drives the SFA offload code path
         #                    (5-tuple kv_cache, num_offloaded_blocks, LRU load).
         from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+
         # AscendConfig may not be initialized yet at connector construction
         # time; init_ascend_config is idempotent (no-op if already done).
         init_ascend_config(vllm_config)
@@ -132,9 +149,7 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             # Producer scheduler reuses mooncake send-setup; consumer scheduler
             # is the D-side CPU-block allocator/advertiser.
             if self.is_producer:
-                self.connector_scheduler = SFAPDProducerScheduler(
-                    vllm_config, kv_cache_config, str(self.engine_id)
-                )
+                self.connector_scheduler = SFAPDProducerScheduler(vllm_config, kv_cache_config, str(self.engine_id))
             else:
                 self.connector_scheduler = SFAPDCpuOffloadScheduler(
                     vllm_config,
@@ -147,9 +162,7 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         else:
             self.connector_scheduler = None
             if self.is_producer:
-                self.connector_worker = SFAPDCpuOffloadProducerWorker(
-                    vllm_config, kv_cache_config, str(self.engine_id)
-                )
+                self.connector_worker = SFAPDCpuOffloadProducerWorker(vllm_config, kv_cache_config, str(self.engine_id))
             else:
                 self.connector_worker = SFAPDCpuOffloadWorker(
                     vllm_config,
@@ -162,13 +175,9 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     # ------------------------------------------------------------------
     # Scheduler side
     # ------------------------------------------------------------------
-    def get_num_new_matched_tokens(
-        self, request: "Request", num_computed_tokens: int
-    ) -> tuple[int, bool]:
+    def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         assert self.connector_scheduler is not None
-        return self.connector_scheduler.get_num_new_matched_tokens(
-            request, num_computed_tokens
-        )
+        return self.connector_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
 
     def update_state_after_alloc(
         self,
@@ -177,19 +186,13 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         num_external_tokens: int,
     ):
         assert self.connector_scheduler is not None
-        return self.connector_scheduler.update_state_after_alloc(
-            request, blocks, num_external_tokens
-        )
+        return self.connector_scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
 
-    def build_connector_meta(
-        self, scheduler_output: SchedulerOutput
-    ) -> KVConnectorMetadata:
+    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.build_connector_meta(scheduler_output)
 
-    def request_finished(
-        self, request: "Request", block_ids: list[int]
-    ) -> tuple[bool, dict[str, Any] | None]:
+    def request_finished(self, request: "Request", block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
@@ -199,9 +202,7 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
-        return self.connector_scheduler.request_finished_all_groups(
-            request, block_ids
-        )
+        return self.connector_scheduler.request_finished_all_groups(request, block_ids)
 
     # ------------------------------------------------------------------
     # Worker side
@@ -238,9 +239,7 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # NOTE: signature diverges by role — mooncake (P) needs the metadata
         # tuple, the composed SFA worker (D) takes none. The worker branches
         # internally; we forward the bound args.
-        self.connector_worker.save_kv_layer(
-            layer_name, kv_layer, attn_metadata, self._get_connector_metadata()
-        )
+        self.connector_worker.save_kv_layer(layer_name, kv_layer, attn_metadata, self._get_connector_metadata())
 
     def wait_for_save(self):
         # No-op (matches mooncake layerwise): P pushes per-layer with completion

@@ -1044,6 +1044,16 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         for rm in send_task.send_request.values():
             local = rm.local_block_ids
             remote = rm.remote_block_ids
+            if layer_idx == 0:
+                try:
+                    rbi_lens = [len(g) for g in remote] if remote else None
+                except TypeError:
+                    rbi_lens = f"non-iterable:{remote!r}"
+                logger.info(
+                    "MembPull P layer 0 req-side: local_block_ids lens=%s, remote_block_ids lens=%s",
+                    [len(g) for g in local] if local else None,
+                    rbi_lens,
+                )
             if local and len(local) > 0:
                 agg_p_blocks.extend(local[0])
             if remote and len(remote) > 0:
