@@ -1,18 +1,16 @@
 # mypy: ignore-errors
 # SPDX-License-Identifier: Apache-2.0
-"""Worker side of the PD-disaggregated SFA connector.
+"""Worker side of the PD-disaggregated SFA connector (memfabric pull mode).
 
-D (``kv_consumer``): composes :class:`SFAKVOffloadWorker` for the unchanged
-LRU-resident H2D load path + CPU pool, and adds Mooncake recv advertisement so
-the remote P node can RDMA-write indexer KV into HBM and main MLA KV into the
-CPU pool.
+D (``kv_consumer``): composes :class:`SFAKVOffloadWorker` for the LRU-resident
+H2D load path + CPU pool, and runs a memfabric pull read thread. P notifies D
+per layer via READ_READY; D reads indexer KV into HBM and main MLA KV into the
+CPU pool (the partial last block stays in HBM until decode fills it, then the
+B1 offload path copies it to CPU).
 
-P (``kv_producer``): layer-wise RDMA push, reusing
-:class:`MooncakeLayerwiseConnectorWorker`. The split destination (indexer→D HBM,
-main MLA→D CPU) is metadata-driven on the sender side, so the only addition over
-stock mooncake is a **per-layer send-completion event** — P's prefill reuses KV
-buffers across layers and may only reuse a buffer once its RDMA push has finished
-reading it (see plan risk #3 / buffer-reuse gating).
+P (``kv_producer``): reuses :class:`MooncakeLayerwiseConnectorWorker` for the
+send setup, but swaps in a pull-mode sending thread that notifies D to read
+(no RDMA push). A per-layer send-completion event gates P's KV buffer reuse.
 """
 
 from __future__ import annotations
@@ -196,10 +194,8 @@ class SFAPDCpuOffloadWorker:
         # SFA worker allocates k_caches_cpu/v_caches_cpu + LRU buffers here.
         self.sfa_worker.register_kv_caches(kv_caches)
 
-        # CPU pool owned by the composed SFA worker (filled via staging copy).
-        # HW limitation: P HBM -> D DRAM cross-node RDMA is not available.
-        # Solution: P pushes main MLA to a 1-slot HBM staging buffer, then
-        # signals per-layer DONE; D copies staging -> CPU pool locally and ACKs.
+        # CPU pool owned by the composed SFA worker. P fills it via memfabric
+        # pull (D reads main MLA KV from P HBM into this CPU pool).
         assert self.sfa_worker.k_caches_cpu is not None, "Composed SFA worker did not allocate the CPU pool"
         k_caches_cpu = self.sfa_worker.k_caches_cpu
         v_caches_cpu = self.sfa_worker.v_caches_cpu
@@ -759,7 +755,7 @@ class MembPullReadThread(threading.Thread):
 
 
 # ======================================================================
-# P side (kv_producer) — layer-wise RDMA push with per-layer completion
+# P side (kv_producer) — memfabric pull: notify D to read, per-layer completion
 # ======================================================================
 class _MembPullSendingThread(KVCacheSendingLayerThread):
     """P-side sending thread for memfabric pull mode.
@@ -960,12 +956,12 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
 
 
 class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
-    """P-side worker = stock mooncake layerwise push + per-layer send-done gate.
+    """P-side worker = mooncake layerwise send setup + pull-mode sending thread.
 
-    The split destination (indexer→D HBM, main MLA→D CPU) needs NO sender-side
-    branching: ``get_transfer_meta`` derives ``dst`` from the decoder-advertised
-    ``remote_layer_metadata[...]`` base addrs, which the D side populated with the
-    indexer NPU ptr and the main-MLA CPU-pool ptr respectively.
+    Reuses the mooncake base for send-queue setup, but swaps in
+    :class:`_MembPullSendingThread` (notifies D to read via READ_READY, does NOT
+    push). D looks up its own destination blocks by req_id; P sends only its
+    source block ids. A per-layer send-done event gates P's KV buffer reuse.
     """
 
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, engine_id: str):
@@ -1072,10 +1068,11 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
         self.layer_send_done_events = self.kv_send_layer_thread.layer_send_done_events
 
     def wait_for_layer_send(self, layer_idx: int) -> None:
-        """Block until layer ``layer_idx``'s RDMA push has read its source buffer.
+        """Block until D has read layer ``layer_idx``'s KV (buffer-reuse gate).
 
-        Call this from P's prefill before reusing a KV buffer that layer
-        ``layer_idx`` wrote, so the push finishes reading before overwrite.
+        In pull mode D reads P's KV via memfabric; this waits for D's READ_DONE
+        before P reuses the KV buffer for a later layer, so D finishes reading
+        before P overwrites it.
         """
         if self.layer_send_done_events is None:
             return
