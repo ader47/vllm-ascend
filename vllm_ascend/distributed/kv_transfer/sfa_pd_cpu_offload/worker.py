@@ -1186,14 +1186,30 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
         return super().update_decoder_info(req_id, req_meta)
 
     def start_load_kv(self, metadata: KVConnectorMetadata) -> None:
-        """Override: in memfabric pull mode, P does not load or push via the
-        mooncake base path — sending happens per-layer in ``_transfer_kv_cache``
-        (READ_READY). The base's producer branch (``_align_remote_block_ids`` +
-        transfer mappings) assumes symmetric P/D kv_cache_group structure and
-        indexes ``remote_block_size[i]``; with P=1 group vs D=2 groups (and D no
-        longer sending remote_block_size) it raises IndexError. That branch is
-        dead in pull mode anyway, so skip it entirely."""
+        """Override: in memfabric pull mode, skip the mooncake base producer
+        branch (it builds push transfer mappings, needs ``remote_block_ids``
+        which D no longer sends, and assumes symmetric P/D kv_cache_group
+        structure → IndexError on P's 1 group). But preserve what
+        ``_transfer_kv_cache`` relies on:
+
+        * reset ``self.current_layer`` — the per-step layer counter that
+          ``save_kv_layer`` increments; without the reset it drifts to
+          ``>= total_layers`` and every request after the first is skipped.
+        * adjust ``remote_port`` by ``tp_rank`` — D's ROUTER binds
+          ``side_channel_port + tp_rank`` (one per rank) but D advertises the
+          base port, so each P rank must send to ``base + tp_rank``.
+
+        ``remote_host`` / ``local_block_ids`` are already correct from
+        ``build_connector_meta`` and need no transformation (P's single group
+        is at kernel granularity, scale 1)."""
         if self._backend == BACKEND_MEMFABRIC:
+            self.current_layer = 0
+            for req_meta in getattr(metadata, "requests", {}).values():
+                if req_meta.remote_port is None:
+                    continue
+                remote_tp_size = req_meta.remote_tp_size or self.tp_size
+                tp_ratio = max(1, self.tp_size // remote_tp_size)
+                req_meta.remote_port = req_meta.remote_port + self.tp_rank // tp_ratio
             return
         super().start_load_kv(metadata)
 
