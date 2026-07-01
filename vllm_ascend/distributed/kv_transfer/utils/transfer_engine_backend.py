@@ -24,6 +24,7 @@ Backend selection: :meth:`GlobalTE.configure` (called by the SFA connector
 workers before the engine is built) or the ``VLLM_ASCEND_KV_TRANSFER_BACKEND``
 env var (default ``mooncake``). Only the selected backend's library is imported.
 """
+
 from __future__ import annotations
 
 import threading
@@ -84,23 +85,6 @@ class MemfabricBackend:
         ret = self._engine.register_memory(ptr, size)
         return 0 if ret == 0 else -1
 
-    def batch_transfer_sync_write(
-        self,
-        session_id: str,
-        src_list: list[int],
-        dst_list: list[int],
-        length_list: list[int],
-    ) -> int:
-        ret = self._engine.batch_transfer_sync_write(session_id, src_list, dst_list, length_list)
-        if ret != 0:
-            logger.error(
-                "memfabric batch_transfer_sync_write failed (ret=%s) for session %s",
-                ret,
-                session_id,
-            )
-            return -1
-        return 0
-
     def batch_transfer_sync_read(
         self,
         session_id: str,
@@ -108,9 +92,7 @@ class MemfabricBackend:
         peer_buffers: list[int],
         length_list: list[int],
     ) -> int:
-        ret = self._engine.batch_transfer_sync_read(
-            session_id, local_buffers, peer_buffers, length_list
-        )
+        ret = self._engine.batch_transfer_sync_read(session_id, local_buffers, peer_buffers, length_list)
         if ret != 0:
             logger.error(
                 "memfabric batch_transfer_sync_read failed (ret=%s) for session %s",
@@ -170,13 +152,10 @@ class GlobalTE:
                     )
                 return
             if backend not in _VALID_BACKENDS:
-                raise ValueError(
-                    f"Invalid KV transfer backend {backend!r}; expected one of {_VALID_BACKENDS}"
-                )
+                raise ValueError(f"Invalid KV transfer backend {backend!r}; expected one of {_VALID_BACKENDS}")
             if role is not None and role not in (MEMFABRIC_ROLE_PREFILL, MEMFABRIC_ROLE_DECODE):
                 raise ValueError(
-                    f"Invalid memfabric role {role!r}; expected "
-                    f"{MEMFABRIC_ROLE_PREFILL!r} or {MEMFABRIC_ROLE_DECODE!r}"
+                    f"Invalid memfabric role {role!r}; expected {MEMFABRIC_ROLE_PREFILL!r} or {MEMFABRIC_ROLE_DECODE!r}"
                 )
             self._backend = backend
             self._role = role
@@ -190,10 +169,7 @@ class GlobalTE:
                 if self.engine is None:
                     backend = self.backend
                     if backend not in _VALID_BACKENDS:
-                        raise ValueError(
-                            f"Invalid KV transfer backend {backend!r}; "
-                            f"expected one of {_VALID_BACKENDS}"
-                        )
+                        raise ValueError(f"Invalid KV transfer backend {backend!r}; expected one of {_VALID_BACKENDS}")
                     self.engine = self._build(backend, hostname, device_name)
                     logger.info("KV transfer backend = %s, role = %s", backend, self._role)
         return self.engine
@@ -231,17 +207,12 @@ class GlobalTE:
         device_name = device_name if device_name is not None else ""
         ret_value = engine.initialize(hostname, "P2PHANDSHAKE", "ascend", device_name)
         if ret_value != 0:
-            raise RuntimeError(
-                f"TransferEngine initialization failed with ret_value: {ret_value}"
-            )
+            raise RuntimeError(f"TransferEngine initialization failed with ret_value: {ret_value}")
         return engine
 
     def _build_memfabric(self, hostname: str):
         if self._role not in (MEMFABRIC_ROLE_PREFILL, MEMFABRIC_ROLE_DECODE):
-            raise RuntimeError(
-                "memfabric backend requires role='Prefill'/'Decode'; "
-                "call global_te.configure() first"
-            )
+            raise RuntimeError("memfabric backend requires role='Prefill'/'Decode'; call global_te.configure() first")
         # Decode side must own a unique_id — it determines the config-store
         # address (pytransfer.cpp derives store url from unique_id). Prefill
         # never starts a store, so its unique_id is informational only.
@@ -250,19 +221,6 @@ class GlobalTE:
                 "memfabric Decode role requires unique_id (e.g. '<host>:<port>'); "
                 "call global_te.configure(unique_id=...) first"
             )
-        unique_id = self._unique_id or f"{hostname}:{self._device_id}"
-        # store_url carries the protocol; memfabric derives the real store
-        # address from unique_id. Use the full tcp://<unique_id> form — memfabric
-        # examples require tcp://IP:PORT, and a bare tcp://<host> (no port) can
-        # trip the store-url parser (smem ExtractIpPortFromUrl).
-        store_url = self._store_url or f"tcp://{unique_id}"
-        if self._role == MEMFABRIC_ROLE_DECODE:
-            self._advertised_rpc_port = self._port_from_unique_id(unique_id)
-        logger.info(
-            "memfabric TransferEngine initialize: store_url=%s unique_id=%s "
-            "role=%s device_id=%s",
-            store_url, unique_id, self._role, self._device_id,
-        )
         try:
             from memfabric_hybrid import TransferEngine as MFTransferEngine  # type: ignore
         except ImportError as e:
@@ -272,7 +230,31 @@ class GlobalTE:
                 "https://gitee.com/ascend/memfabric_hybrid"
             ) from e
         engine = MFTransferEngine()
-        ret = engine.initialize(store_url, unique_id, self._role, self._device_id)
+        self._advertised_rpc_port = self._port_from_unique_id(engine.get_rpc_port())
+        # unique_id = self._unique_id or f"{hostname}:{engine.get_rpc_port()}"
+        unique_id = f"{hostname}:{self._advertised_rpc_port}"
+        # Record the unique_id memfabric ACTUALLY registered under, so callers
+        # (the SFA producer) can advertise it as the read session_id. This
+        # overrides the value passed to configure(): memfabric picks its own rpc
+        # port via engine.get_rpc_port(), so the configured unique_id is NOT the
+        # session the peer must address.
+        self._unique_id = unique_id
+        # store_url carries the protocol; memfabric derives the real store
+        # address from unique_id. Use the full tcp://<unique_id> form — memfabric
+        # examples require tcp://IP:PORT, and a bare tcp://<host> (no port) can
+        # trip the store-url parser (smem ExtractIpPortFromUrl).
+        store_url = self._store_url or f"tcp://{unique_id}"
+
+        logger.info(
+            "memfabric TransferEngine initialize: store_url=%s unique_id=%s role=%s device_id=%s",
+            store_url,
+            unique_id,
+            self._role,
+            self._device_id,
+        )
+        ret = engine.initialize(
+            store_url, unique_id, self._role, self._device_id, store_server_role="Prefill"
+        )  # read P节点需要改成, storeServerRole="Prefill"
         if ret != 0:
             raise RuntimeError(
                 f"memfabric TransferEngine initialize failed (ret={ret}); "
@@ -301,10 +283,7 @@ class GlobalTE:
                 # mooncake returns !=0 on failure; MemfabricBackend returns -1.
                 # Treat any non-zero as failure.
                 if ret_value != 0:
-                    raise RuntimeError(
-                        f"Memory registration failed (backend={self.backend}, "
-                        f"ret={ret_value})."
-                    )
+                    raise RuntimeError(f"Memory registration failed (backend={self.backend}, ret={ret_value}).")
             self.is_register_buffer = True
 
 

@@ -217,10 +217,16 @@ class SFAPDCpuOffloadWorker:
                 # D-side unique_id = "<host>:<port>"; memfabric derives its
                 # config-store address from it, and the Prefill peer reuses the
                 # same "<host>:<port>" (advertised via te_rpc_port) as dest_session.
-                # Offset past the ZMQ recv ports (side_channel_port + tp_rank,
-                # occupied by KVCacheRecvingLayerThread) to avoid a bind collision.
+                # Offset 2*tp_size past the ZMQ ports: on a single host P binds
+                # ZMQ at P_kv+rank and D at D_kv+rank, and the launch convention
+                # is D_kv = P_kv + tp_size, so the combined ZMQ footprint is
+                # [P_kv .. P_kv+2*tp_size). Starting memfabric at +tp_size would
+                # collide (D store would land on P_kv+tp_size+rank = D's ZMQ
+                # range on P's side; P's unique_id would land on D's ZMQ range).
+                # +2*tp_size also matches the launch script's MF_CONFIG_STORE_URL
+                # formula (D_kv + tp_size + tp_size + rank).
                 tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-                mf_session_port = self.side_channel_port + tp_size + self.tp_rank
+                mf_session_port = self.side_channel_port + 2 * tp_size + self.tp_rank
                 global_te.configure(
                     backend=BACKEND_MEMFABRIC,
                     role=MEMFABRIC_ROLE_DECODE,
@@ -1087,9 +1093,12 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
             side_channel_port = (
                 vllm_config.kv_transfer_config.kv_port + vllm_config.parallel_config.data_parallel_rank * tp_size
             )
-            # P's memfabric session port (must be a real TCP port, offset past
-            # ZMQ ports just like D side). unique_id = "P_IP:P_store_port".
-            mf_session_port = side_channel_port + tp_size + tp_rank
+            # P's memfabric session port. Offset 2*tp_size past P's ZMQ base:
+            # with the single-host convention D_kv = P_kv + tp_size, an offset of
+            # only tp_size (P_kv+tp_size+rank) would land P's unique_id exactly on
+            # D's ZMQ ROUTER ports (D_kv+rank) → bind/listen collision. 2*tp_size
+            # clears both P and D ZMQ ranges. unique_id = "P_IP:P_session_port".
+            mf_session_port = side_channel_port + 2 * tp_size + tp_rank
             self._mf_unique_id = f"{get_ip()}:{mf_session_port}"
             # P must connect to D's config store (D is store server). Read D's
             # store URL from env var (set in launch script: D_IP:D_store_port).
@@ -1126,11 +1135,17 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
             _mlc.KVCacheSendingLayerThread = _MembPullSendingThread  # type: ignore[assignment]
             # Patch __init__ to inject p_session (hack: base class doesn't pass it)
             _orig_init = _MembPullSendingThread.__init__
-            _mf_uid = self._mf_unique_id
 
             def _patched_init(self_inner, *a, **kw):
                 _orig_init(self_inner, *a, **kw)
-                self_inner.p_session = _mf_uid
+                # The sending thread is constructed AFTER the engine is built
+                # (base-class order: register_buffer then create thread), so
+                # global_te._unique_id now holds the unique_id memfabric ACTUALLY
+                # registered under (set in _build_memfabric). Prefer it over the
+                # pre-computed _mf_unique_id — memfabric picks its own rpc port
+                # (engine.get_rpc_port()), so the computed id is NOT the session
+                # D must read from.
+                self_inner.p_session = global_te._unique_id or self._mf_unique_id
 
             _MembPullSendingThread.__init__ = _patched_init  # type: ignore[assignment]
             try:
