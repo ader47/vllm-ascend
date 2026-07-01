@@ -864,6 +864,27 @@ class MembPullReadThread(threading.Thread):
         ret = self.engine.batch_transfer_sync_read(self._p_session, local_ptrs, peer_ptrs, lengths)
         if ret != 0:
             raise RuntimeError(f"memfabric read failed for layer {layer_name}, ret={ret}")
+        # Verify-mode (VLLM_ASCEND_MF_VERIFY=1): log D's destination sums so the
+        # user can diff against P's source sums (MFV P ...). main_k/main_v should
+        # match P exactly (1:1 byte copy); idx_post is the full D indexer block
+        # sum (D blocks are 4× P's and only len(p_block_ids)/scale slots written,
+        # so it won't equal P's idx — use it only as a "data landed" check).
+        if os.environ.get("VLLM_ASCEND_MF_VERIFY") == "1":
+            try:
+                k_cpu, v_cpu = w._cpu_pools[pool_idx]
+                mk = k_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
+                mv = v_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
+                mi = w._indexer_tensors[pool_idx][d_indexer_ids].float().sum().item() if d_indexer_ids else 0.0
+                logger.info(
+                    "MFV D layer %s req %s main_k=%.6f main_v=%.6f idx_post=%.6f",
+                    layer_name,
+                    ext_req_id,
+                    mk,
+                    mv,
+                    mi,
+                )
+            except Exception as ve:  # noqa: BLE001 - verify must never break the read path
+                logger.warning("MFV D checksum failed for %s: %s", layer_name, ve)
         logger.info(
             "MembPull read layer %s req %s (pool_idx=%d): main=%d/%d blocks, indexer=%d/%d (scale split), %d transfers",
             layer_name,
@@ -1103,6 +1124,10 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         # (local_block_ids[0] — P's single group serves both main k/v and the
         # indexer dsa_k, which share slots on P) + the external req_id. D looks
         # up its destination blocks by req_id; P never handles D's block ids.
+        # Verify-mode (VLLM_ASCEND_MF_VERIFY=1): log P's source-block sums so the
+        # user can diff against D's destination sums (MFV D ...) per (layer, req).
+        verify = os.environ.get("VLLM_ASCEND_MF_VERIFY") == "1"
+        src_caches = getattr(self, "_source_kv_caches", None)
         all_ok = True
         for req_id, rm in send_task.send_request.items():
             local = rm.local_block_ids
@@ -1110,6 +1135,20 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             ext_id = get_external_request_id(req_id)
             if layer_idx == 0:
                 logger.info("MembPull P send READ_READY layer 0 req %s: p_blocks=%d", ext_id, len(p_block_ids))
+            if verify and src_caches is not None and p_block_ids:
+                src = src_caches.get(layer_name)
+                if isinstance(src, (list, tuple)) and len(src) >= 3:
+                    mk = src[0][p_block_ids].float().sum().item()
+                    mv = src[1][p_block_ids].float().sum().item()
+                    mi = src[2][p_block_ids].float().sum().item()
+                    logger.info(
+                        "MFV P layer %s req %s main_k=%.6f main_v=%.6f idx=%.6f",
+                        layer_name,
+                        ext_id,
+                        mk,
+                        mv,
+                        mi,
+                    )
             if not self._send_read_ready(path, encoder, layer_idx, layer_name, ext_id, p_block_ids):
                 all_ok = False
 
@@ -1239,6 +1278,10 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
             finally:
                 _mlc.KVCacheSendingLayerThread = orig  # type: ignore[assignment]
                 _MembPullSendingThread.__init__ = _orig_init  # type: ignore[assignment]
+            # Stash source tensors on the sending thread for env-gated verify
+            # checksums (VLLM_ASCEND_MF_VERIFY=1): P sums its source blocks so
+            # the user can compare against D's destination sums in the logs.
+            self.kv_send_layer_thread._source_kv_caches = kv_caches
         else:
             # mooncake staging push: swap in _SFAPDCpuSendingThread
             orig = _mlc.KVCacheSendingLayerThread
