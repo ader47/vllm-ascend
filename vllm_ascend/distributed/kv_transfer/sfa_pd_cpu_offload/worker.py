@@ -1185,6 +1185,18 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
             return req_meta
         return super().update_decoder_info(req_id, req_meta)
 
+    def start_load_kv(self, metadata: KVConnectorMetadata) -> None:
+        """Override: in memfabric pull mode, P does not load or push via the
+        mooncake base path — sending happens per-layer in ``_transfer_kv_cache``
+        (READ_READY). The base's producer branch (``_align_remote_block_ids`` +
+        transfer mappings) assumes symmetric P/D kv_cache_group structure and
+        indexes ``remote_block_size[i]``; with P=1 group vs D=2 groups (and D no
+        longer sending remote_block_size) it raises IndexError. That branch is
+        dead in pull mode anyway, so skip it entirely."""
+        if self._backend == BACKEND_MEMFABRIC:
+            return
+        super().start_load_kv(metadata)
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if self._backend == BACKEND_MEMFABRIC:
             # memfabric pull: swap in _MembPullSendingThread (notifies D to read,
