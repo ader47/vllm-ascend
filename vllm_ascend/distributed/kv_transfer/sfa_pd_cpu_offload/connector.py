@@ -20,7 +20,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
-from vllm.logger import logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -43,55 +42,24 @@ if TYPE_CHECKING:
 
 
 class SFAPDProducerScheduler(MooncakeLayerwiseConnectorScheduler):
-    """P-side scheduler for SFA PD.
+    """P-side scheduler for SFA PD (pull mode).
 
-    In standard mooncake PD, the proxy sets ``do_remote_prefill=True`` on P's
-    request, which triggers the base class to populate ``_reqs_need_recv``
-    (block IDs for KV push). SFA PD uses a metaserver rendezvous where D
-    advertises ``do_remote_decode=True`` (not ``do_remote_prefill=True``).
-
-    This override detects ``do_remote_decode=True`` + ``remote_block_ids`` and
-    manually populates ``_reqs_need_recv`` with P's allocated blocks, so that
-    ``save_kv_layer`` → ``_transfer_kv_cache`` has the block IDs it needs
-    to send READ_READY (pull) or push KV (staging).
-
-    P still computes prefill normally (``get_num_new_matched_tokens`` returns
-    ``(0, False)``). We only add block tracking after allocation.
+    No override is needed: D's metaserver rendezvous carries only
+    ``do_remote_decode=True`` + ZMQ contact info (NO block ids — D keeps its own
+    blocks and looks them up by req_id). The mooncake base class's
+    ``do_remote_decode`` branch populates ``_reqs_need_send_layerwise`` with P's
+    own allocated blocks, which is exactly what ``_transfer_kv_cache`` reads to
+    build READ_READY. (An earlier override populated ``_reqs_need_recv`` from
+    D's ``remote_block_ids`` — a push-model leftover, now dead.)
     """
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens):
+        # Pull mode: D's rendezvous sends only do_remote_decode=True + contact
+        # info (no block ids). The mooncake base do_remote_decode branch
+        # populates _reqs_need_send_layerwise with P's own blocks, which is what
+        # _transfer_kv_cache reads to build READ_READY. No P-side override of
+        # _reqs_need_recv is needed (that was a push-model leftover, now dead).
         super().update_state_after_alloc(request, blocks, num_external_tokens)
-        # If base class didn't populate (do_remote_prefill=False), do it manually
-        params = request.kv_transfer_params
-        # DIAG: log exactly what P received from the D rendezvous, and P's own
-        # allocated blocks. D advertises remote_block_ids=[indexer_ids, main_ids];
-        # if this shows something else (e.g. only one group), the rendezvous/
-        # proxy path mangled it.
-        if params is not None and params.get("do_remote_decode"):
-            rbi = params.get("remote_block_ids")
-            try:
-                rbi_lens = [len(g) for g in rbi] if rbi is not None else None
-            except TypeError:
-                rbi_lens = f"non-iterable:{rbi!r}"
-            logger.info(
-                "SFAPDProducerScheduler req %s do_remote_decode: remote_block_ids lens=%s (local groups=%s)",
-                request.request_id,
-                rbi_lens,
-                len(list(blocks.get_block_ids())),
-            )
-        if (
-            params is not None
-            and params.get("do_remote_decode")
-            and params.get("remote_block_ids")
-            and request.request_id not in self._reqs_need_recv
-        ):
-            local_block_ids = blocks.get_unhashed_block_ids_all_groups()
-            prompt_tokens = len(request.prompt_token_ids)
-            self._reqs_need_recv[request.request_id] = (
-                request,
-                local_block_ids,
-                prompt_tokens,
-            )
 
 
 class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):

@@ -2,13 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Scheduler side of the PD-disaggregated SFA connector.
 
-D (``kv_consumer``): on ``update_state_after_alloc`` allocate the main-MLA CPU
-blocks (one-shot, full prompt) via :class:`CPUBlockManager`, and advertise the
-split ``remote_block_ids`` (indexer NPU + main MLA CPU) + host/port/engine_id to
-the Prefill node through the metaserver rendezvous (mirrors mooncake layerwise).
+D (``kv_consumer``): on ``update_state_after_alloc`` allocate indexer NPU
+blocks + main-MLA CPU blocks (one-shot, full prompt), store them in
+RequestTracker, and send a metaserver rendezvous notification to P carrying
+only contact info + ``do_remote_decode`` (NO block ids — D keeps its blocks and
+looks them up by req_id when P's READ_READY arrives).
 
-P (``kv_producer``): send setup — Phase 2.
+P (``kv_producer``): send setup handled by the mooncake layerwise base.
 """
+
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -69,8 +71,7 @@ class SFAPDCpuOffloadScheduler:
         self.side_channel_host = get_ip()
         self.side_channel_port = (
             vllm_config.kv_transfer_config.kv_port
-            + vllm_config.parallel_config.data_parallel_rank
-            * vllm_config.parallel_config.tensor_parallel_size
+            + vllm_config.parallel_config.data_parallel_rank * vllm_config.parallel_config.tensor_parallel_size
         )
 
         # CPU block pool for the main MLA group. Sized to hold the remote
@@ -91,9 +92,7 @@ class SFAPDCpuOffloadScheduler:
     # ------------------------------------------------------------------
     # D side (kv_consumer)
     # ------------------------------------------------------------------
-    def get_num_new_matched_tokens(
-        self, request: Request, num_computed_tokens: int
-    ) -> tuple[int, bool]:
+    def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
         # Pull the entire prompt KV from the remote P node into D's CPU pool
         # (main MLA) / HBM (indexer). Async relative to engine execution.
         params = request.kv_transfer_params
@@ -116,19 +115,13 @@ class SFAPDCpuOffloadScheduler:
         # vLLM-allocated NPU block ids per group (indexer + main MLA).
         npu_block_ids_by_group = list(blocks.get_block_ids())
         indexer_npu_ids = (
-            npu_block_ids_by_group[_INDEXER_GROUP_IDX]
-            if len(npu_block_ids_by_group) > _INDEXER_GROUP_IDX
-            else []
+            npu_block_ids_by_group[_INDEXER_GROUP_IDX] if len(npu_block_ids_by_group) > _INDEXER_GROUP_IDX else []
         )
 
         # One-shot CPU block allocation for the main MLA group (full prompt).
         prompt_len = len(request.prompt_token_ids)
         num_main_cpu_blocks = cdiv(prompt_len, self._main_block_size)
-        main_cpu_ids = (
-            self.cpu_block_manager.allocate_block(num_main_cpu_blocks)
-            if num_main_cpu_blocks > 0
-            else []
-        )
+        main_cpu_ids = self.cpu_block_manager.allocate_block(num_main_cpu_blocks) if num_main_cpu_blocks > 0 else []
 
         tracker = RequestTracker(
             req_id=request.request_id,
@@ -139,14 +132,16 @@ class SFAPDCpuOffloadScheduler:
         self._reqs_need_recv.add(request.request_id)
         self._remote_prefilled.add(request.request_id)
 
-        # Advertise the split destination to P via the metaserver rendezvous.
-        # remote_block_ids[0] = D indexer NPU blocks, [1] = D main MLA CPU blocks.
+        # Notify P via the metaserver rendezvous that D is ready to pull this
+        # request. D does NOT send its block ids to P — D keeps them (stored in
+        # RequestTracker, passed to the D worker via connector_meta) and looks
+        # them up by req_id when P's READ_READY arrives. Only contact info +
+        # the do_remote_decode "go" flag go to P. (Sending block ids to P was a
+        # push-model leftover; in pull mode P only needs P's own source blocks.)
         kv_transfer_params = dict(
             request_id=get_external_request_id(request.request_id),
             do_remote_prefill=False,
             do_remote_decode=True,
-            remote_block_ids=[list(indexer_npu_ids), list(main_cpu_ids)],
-            remote_block_size=self.block_size,
             remote_engine_id=self.engine_id,
             remote_host=self.side_channel_host,
             remote_port=self.side_channel_port,
@@ -158,9 +153,7 @@ class SFAPDCpuOffloadScheduler:
         params["do_remote_prefill"] = False
         metaserver = params.get("metaserver")
         if metaserver is not None and not params.get("do_virtual", False):
-            future = self.executor.submit(
-                self._access_metaserver, url=metaserver, message=kv_transfer_params
-            )
+            future = self.executor.submit(self._access_metaserver, url=metaserver, message=kv_transfer_params)
             future.add_done_callback(self._on_metaserver_done)
         logger.info(
             "SFAPDCpuOffload D advertised req %s: indexer NPU=%d blocks, main CPU=%d blocks -> %s",
@@ -170,9 +163,7 @@ class SFAPDCpuOffloadScheduler:
             metaserver,
         )
 
-    def build_connector_meta(
-        self, scheduler_output: SchedulerOutput
-    ) -> KVConnectorMetadata:
+    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         # Delayed free: release CPU blocks of requests that finished in a prior
         # step and have now fully left the batch. Keeping them one extra step
         # avoids racing with an in-flight LRU H2D load (batch_copy) issued during
@@ -216,9 +207,7 @@ class SFAPDCpuOffloadScheduler:
             _add_req(req_id)
         return meta
 
-    def request_finished(
-        self, request: Request, block_ids: list[int]
-    ) -> tuple[bool, dict[str, Any] | None]:
+    def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
         return self.request_finished_all_groups(request, (block_ids,))
 
     def request_finished_all_groups(
