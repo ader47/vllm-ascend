@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """PD-disaggregated SFA KV-transfer connector.
 
-On the Decode node (``kv_consumer``) the bulk MLA KV is pushed by the remote
-Prefill node (``kv_producer``) directly into a CPU pinned offload pool; the
-indexer KV lands in HBM. The D-side load path (LRU-resident H2D) is reused
-from :class:`SFAKVOffloadWorker`.
+On the Decode node (``kv_consumer``), remote Prefill exposes its KV and Decode
+pulls the bulk MLA KV into a CPU pinned offload pool; the indexer KV lands in
+HBM. The D-side load path (LRU-resident H2D) is reused from
+:class:`SFAKVOffloadWorker`.
 
 See ``/Users/liufeng/.claude/plans/luminous-shimmying-wind.md`` for the design.
 """
@@ -24,15 +24,13 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
-    MooncakeLayerwiseConnectorScheduler,
-)
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.scheduler import (
     SFAPDCpuOffloadScheduler,
+    SFAPDProducerScheduler,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.worker import (
+    SFAPDCpuOffloadConsumerWorker,
     SFAPDCpuOffloadProducerWorker,
-    SFAPDCpuOffloadWorker,
 )
 
 if TYPE_CHECKING:
@@ -41,35 +39,14 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
-class SFAPDProducerScheduler(MooncakeLayerwiseConnectorScheduler):
-    """P-side scheduler for SFA PD (pull mode).
-
-    No override is needed: D's metaserver rendezvous carries only
-    ``do_remote_decode=True`` + ZMQ contact info (NO block ids — D keeps its own
-    blocks and looks them up by req_id). The mooncake base class's
-    ``do_remote_decode`` branch populates ``_reqs_need_send_layerwise`` with P's
-    own allocated blocks, which is exactly what ``_transfer_kv_cache`` reads to
-    build READ_READY. (An earlier override populated ``_reqs_need_recv`` from
-    D's ``remote_block_ids`` — a push-model leftover, now dead.)
-    """
-
-    def update_state_after_alloc(self, request, blocks, num_external_tokens):
-        # Pull mode: D's rendezvous sends only do_remote_decode=True + contact
-        # info (no block ids). The mooncake base do_remote_decode branch
-        # populates _reqs_need_send_layerwise with P's own blocks, which is what
-        # _transfer_kv_cache reads to build READ_READY. No P-side override of
-        # _reqs_need_recv is needed (that was a push-model leftover, now dead).
-        super().update_state_after_alloc(request, blocks, num_external_tokens)
-
-
 class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     """One connector class branching on ``role`` and ``kv_role``.
 
     * SCHEDULER + producer : P-side send setup (reuses mooncake layerwise logic).
     * SCHEDULER + consumer : D-side CPU-block allocation / advertisement tracking.
-    * WORKER + producer    : P-side layer-wise RDMA push.
+    * WORKER + producer    : P-side layer-wise READ_READY notifications.
     * WORKER + consumer    : D-side : composes ``SFAKVOffloadWorker`` (LRU load +
-      CPU pool) + mooncake recv advertisement + indexer/main split registration.
+      CPU pool) + memfabric pull read + indexer/main split registration.
     """
 
     def __init__(
@@ -123,8 +100,6 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                     vllm_config,
                     self.use_layerwise,
                     kv_cache_config,
-                    self.is_producer,
-                    self.is_consumer,
                 )
             self.connector_worker = None
         else:
@@ -132,12 +107,10 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             if self.is_producer:
                 self.connector_worker = SFAPDCpuOffloadProducerWorker(vllm_config, kv_cache_config, str(self.engine_id))
             else:
-                self.connector_worker = SFAPDCpuOffloadWorker(
+                self.connector_worker = SFAPDCpuOffloadConsumerWorker(
                     vllm_config,
                     self.use_layerwise,
                     kv_cache_config,
-                    self.is_producer,
-                    self.is_consumer,
                 )
 
     # ------------------------------------------------------------------
@@ -192,8 +165,8 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.start_load_kv(self._get_connector_metadata())
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        # SFA loads inside ``prepare_lru_resident_and_load`` (D) / nothing to wait
-        # for on P (push is fire-and-forget per layer).
+        # SFA loads inside ``prepare_lru_resident_and_load`` (D); P waits via
+        # ``wait_for_layer_send`` when its layer buffer may be reused.
         return
 
     def save_kv_layer(
@@ -210,9 +183,9 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.save_kv_layer(layer_name, kv_layer, attn_metadata, self._get_connector_metadata())
 
     def wait_for_save(self):
-        # No-op (matches mooncake layerwise): P pushes per-layer with completion
-        # signalled via the per-layer send events / the DONE callback, not here;
-        # D does not save locally (its CPU pool is filled remotely by P). Do NOT
+        # No-op (matches mooncake layerwise): P sends per-layer READ_READY with
+        # completion signalled via the per-layer send events / the DONE callback;
+        # D does not save locally (its CPU pool is filled by D pulling from P). Do NOT
         # forward to the worker — the producer worker (mooncake subclass) has no
         # wait_for_save method.
         return
@@ -255,8 +228,8 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             return None
         return self.connector_worker.get_num_cpu_blocks(req_ids)
 
-    # P-side buffer-reuse gate: block until a layer's RDMA push has finished
-    # reading its source KV buffer, so the buffer may be reused by a later layer.
+    # P-side buffer-reuse gate: block until D has read a layer's source KV buffer,
+    # so the buffer may be reused by a later layer.
     def wait_for_layer_send(self, layer_idx: int) -> None:
         worker = self.connector_worker
         if worker is None or not hasattr(worker, "wait_for_layer_send"):

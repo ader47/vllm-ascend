@@ -24,6 +24,7 @@ from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
+    MooncakeLayerwiseConnectorScheduler,
     get_external_request_id,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
@@ -44,20 +45,37 @@ _INDEXER_GROUP_IDX = 0
 _MAIN_GROUP_IDX = 1
 
 
+class SFAPDProducerScheduler(MooncakeLayerwiseConnectorScheduler):
+    """P-side scheduler for SFA PD (pull mode).
+
+    No override is needed: D's metaserver rendezvous carries only
+    ``do_remote_decode=True`` + ZMQ contact info (NO block ids — D keeps its own
+    blocks and looks them up by req_id). The mooncake base class's
+    ``do_remote_decode`` branch populates ``_reqs_need_send_layerwise`` with P's
+    own allocated blocks, which is exactly what ``_transfer_kv_cache`` reads to
+    build READ_READY. (An earlier override populated ``_reqs_need_recv`` from
+    D's ``remote_block_ids`` — a push-model leftover, now dead.)
+    """
+
+    def update_state_after_alloc(self, request, blocks, num_external_tokens):
+        # Pull mode: D's rendezvous sends only do_remote_decode=True + contact
+        # info (no block ids). The mooncake base do_remote_decode branch
+        # populates _reqs_need_send_layerwise with P's own blocks, which is what
+        # _transfer_kv_cache reads to build READ_READY. No P-side override of
+        # _reqs_need_recv is needed (that was a push-model leftover, now dead).
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+
+
 class SFAPDCpuOffloadScheduler:
     def __init__(
         self,
         vllm_config: VllmConfig,
         use_layerwise: bool,
         kv_cache_config: KVCacheConfig | None,
-        is_producer: bool,
-        is_consumer: bool,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.use_layerwise = use_layerwise
-        self.is_producer = is_producer
-        self.is_consumer = is_consumer
         self.engine_id = vllm_config.kv_transfer_config.engine_id
 
         self.block_size = [
@@ -80,7 +98,6 @@ class SFAPDCpuOffloadScheduler:
         self.cpu_block_manager = CPUBlockManager(cpu_block_num)
 
         self._request_trackers: dict[str, RequestTracker] = {}
-        self._remote_prefilled: set[str] = set()
         # req_ids awaiting their first build_connector_meta seed (so the worker
         # can build request_map for get_finished even while async-waiting KV).
         self._reqs_need_recv: set[str] = set()
@@ -140,7 +157,6 @@ class SFAPDCpuOffloadScheduler:
         )
         self._request_trackers[request.request_id] = tracker
         self._reqs_need_recv.add(request.request_id)
-        self._remote_prefilled.add(request.request_id)
 
         # Notify P via the metaserver rendezvous that D is ready to pull this
         # request. D does NOT send its block ids to P — D keeps them (stored in
@@ -271,7 +287,6 @@ class SFAPDCpuOffloadScheduler:
         # Do NOT free the CPU blocks here — defer to the next build_connector_meta
         # after the request has left the batch (see delayed free above).
         tracker = self._request_trackers.pop(request.request_id, None)
-        self._remote_prefilled.discard(request.request_id)
         if tracker is not None:
             self._pending_free[request.request_id] = tracker.allocated_block_ids_cpu
         return False, None
@@ -296,11 +311,3 @@ class SFAPDCpuOffloadScheduler:
     def _on_metaserver_done(future):
         if future.exception():
             logger.error("Access metaserver fail: %s", future.exception())
-
-    # ------------------------------------------------------------------
-    # P side (kv_producer) — Phase 2
-    # ------------------------------------------------------------------
-    # Producer send setup (get_num_new_matched_tokens -> 0; update_state_after_alloc
-    # -> _reqs_need_send_layerwise; build_connector_meta -> send tasks) will mirror
-    # MooncakeLayerwiseConnectorScheduler once Phase 2 lands. The D-side paths above
-    # are exercised first because the CPU pool + indexer must be ready before P pushes.

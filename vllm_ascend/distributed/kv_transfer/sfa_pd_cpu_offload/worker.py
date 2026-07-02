@@ -93,23 +93,19 @@ def _resolve_kv_transfer_backend(vllm_config: VllmConfig) -> str:
     return extra.get("transfer_backend") or envs.VLLM_ASCEND_KV_TRANSFER_BACKEND
 
 
-class SFAPDCpuOffloadWorker:
+class SFAPDCpuOffloadConsumerWorker:
     def __init__(
         self,
         vllm_config: VllmConfig,
         use_layerwise: bool,
         kv_cache_config: KVCacheConfig | None,
-        is_producer: bool,
-        is_consumer: bool,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.use_layerwise = use_layerwise
-        self.is_producer = is_producer
-        self.is_consumer = is_consumer
         self.tp_rank = get_tensor_model_parallel_rank()  # TP-local rank for the per-rank ZMQ port
         self.side_channel_host = get_ip()
-        # Handshake base port (mirrors mooncake layerwise).
+        # D-side ZMQ control-plane base port; each TP rank listens on base + tp_rank.
         self.side_channel_port = (
             vllm_config.kv_transfer_config.kv_port
             + vllm_config.parallel_config.data_parallel_rank * vllm_config.parallel_config.tensor_parallel_size
@@ -142,9 +138,6 @@ class SFAPDCpuOffloadWorker:
         self._pending_done: set[str] = set()
         self._pending_failed: set[str] = set()
 
-        # P-side state (Phase 2).
-        self.kv_send_layer_thread = None
-
     # ------------------------------------------------------------------
     # Common
     # ------------------------------------------------------------------
@@ -164,10 +157,10 @@ class SFAPDCpuOffloadWorker:
 
     # ------------------------------------------------------------------
     # D side (kv_consumer) — this class is only instantiated for consumers;
-    # producers use :class:`SFAPDCpuOffloadProducerWorker`.
+    # Producers use :class:`SFAPDCpuOffloadProducerWorker`.
     # ------------------------------------------------------------------
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        """Register indexer (NPU) + main MLA (CPU pool) with Mooncake.
+        """Prepare D-side indexer HBM + main MLA CPU-pool destinations.
 
         The sfa model runner hands a 5-tuple per layer:
         ``(k_nope, v_rope, dsa_k_indexer, topk_buf_k, topk_buf_v)``.
@@ -408,7 +401,7 @@ class MembPullReadThread(threading.Thread):
         tp_rank: int,
         side_channel_port: int,
         engine: Any,
-        worker: SFAPDCpuOffloadWorker,
+        worker: SFAPDCpuOffloadConsumerWorker,
     ):
         super().__init__(daemon=True, name=f"MembPullReadThread-TP{tp_rank}")
         self.tp_rank = tp_rank
@@ -759,6 +752,8 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         from vllm.utils.network_utils import make_zmq_socket
 
         sock = make_zmq_socket(ctx=self._persist_ctx, path=path, socket_type=zmq.REQ, bind=False)
+        # Set a timeout so the send/recv doesn't block forever if D is dead or unreachable. 
+        # The caller can catch the exception and handle it (e.g., log, retry, or fail the request).
         sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
         poller = zmq.Poller()
         poller.register(sock, zmq.POLLIN)
@@ -939,15 +934,6 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, engine_id: str):
         self._backend = _resolve_kv_transfer_backend(vllm_config)
         if self._backend == BACKEND_MEMFABRIC:
-            tp_size = vllm_config.parallel_config.tensor_parallel_size
-            side_channel_port = (
-                vllm_config.kv_transfer_config.kv_port + vllm_config.parallel_config.data_parallel_rank * tp_size
-            )
-            # unique_id is derived by _build_memfabric from engine.get_rpc_port()
-            # — no caller-computed port needed. _mf_unique_id is a fallback for
-            # _patched_init (used only if _build_memfabric hasn't run yet, which
-            # shouldn't happen since super().__init__ builds the engine first).
-            self._mf_unique_id = f"{get_ip()}:{side_channel_port}"
             global_te.configure(
                 backend=BACKEND_MEMFABRIC,
                 role=MEMFABRIC_ROLE_PREFILL,
@@ -1008,11 +994,10 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
             # The sending thread is constructed AFTER the engine is built
             # (base-class order: register_buffer then create thread), so
             # global_te._unique_id now holds the unique_id memfabric ACTUALLY
-            # registered under (set in _build_memfabric). Prefer it over the
-            # pre-computed _mf_unique_id — memfabric picks its own rpc port
-            # (engine.get_rpc_port()), so the computed id is NOT the session
-            # D must read from.
-            self_inner.p_session = global_te._unique_id or self._mf_unique_id
+            # registered under (set in _build_memfabric). It is the session D
+            # must read from.
+            assert global_te._unique_id is not None, "memfabric unique_id was not initialized before send thread setup"
+            self_inner.p_session = global_te._unique_id
 
         _MembPullSendingThread.__init__ = _patched_init  # type: ignore[assignment]
         try:
