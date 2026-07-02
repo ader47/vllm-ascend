@@ -212,9 +212,8 @@ class SFAKVOffloadWorker:
         self.load_stream = torch_npu.npu.Stream()
         self.save_stream = None
         self.side_compute_stream = torch_npu.npu.Stream()
-        self.kv_cache_config.num_blocks
-        allocate_dram_size = 64 * 1024 * 1024 * 1024 # TODO get from config
-        zbal_h2d_init(allocate_dram_size, self.max_num_topk_rows * self.sfa_sparse_topk * 2)
+        self.allocate_dram_size = 64 * 1024 * 1024 * 1024  # TODO get from config
+        zbal_h2d_init(self.allocate_dram_size, self.max_num_topk_rows * self.sfa_sparse_topk * 2)
 
     def _infer_group_block_sizes(
         self,
