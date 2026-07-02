@@ -982,6 +982,20 @@ class MooncakeLayerwiseConnectorScheduler:
             remote_cache_tokens = params["remote_cached_tokens"]
             local_transferred_tokens = remote_cache_tokens
             local_computed_tokens = 0
+            logger.info(
+                "MooncakeLayerwiseConnector P register remote-decode req %s: "
+                "local_block_ids=%s, local_transferred_tokens=%s, "
+                "local_computed_tokens=%s, remote_host=%s, remote_port=%s, "
+                "remote_tp_size=%s, remote_cached_tokens=%s",
+                request.request_id,
+                local_block_ids,
+                local_transferred_tokens,
+                local_computed_tokens,
+                params.get("remote_host"),
+                params.get("remote_port"),
+                params.get("remote_tp_size"),
+                remote_cache_tokens,
+            )
             self._reqs_need_send_layerwise[request.request_id] = SendReqInfo(
                 local_block_ids=local_block_ids,
                 local_transferred_tokens=local_transferred_tokens,
@@ -1018,6 +1032,11 @@ class MooncakeLayerwiseConnectorScheduler:
             for req_id, new_blocks in zip(cached_reqs.req_ids, cached_reqs.new_block_ids):
                 if req_id in self._reqs_need_send_layerwise and new_blocks is not None:
                     self._reqs_need_send_layerwise[req_id].extend_local_block_ids(new_blocks)
+                    logger.info(
+                        "MooncakeLayerwiseConnector P extend remote-decode req %s: new_blocks=%s",
+                        req_id,
+                        new_blocks,
+                    )
             computed_tokens = dict(
                 list(zip(cached_reqs.req_ids, cached_reqs.num_computed_tokens))
                 + [(x.req_id, x.num_computed_tokens) for x in new_reqs]
@@ -1035,6 +1054,17 @@ class MooncakeLayerwiseConnectorScheduler:
                     )
                     send_req_info.update_computed_tokens(
                         computed_tokens.get(req_id, 0) + scheduled_tokens - spec_decode_tokens
+                    )
+                    logger.info(
+                        "MooncakeLayerwiseConnector P build meta req %s: scheduled_tokens=%s, "
+                        "spec_decode_tokens=%s, computed_before=%s, local_computed_tokens=%s, "
+                        "local_transferred_tokens=%s",
+                        req_id,
+                        scheduled_tokens,
+                        spec_decode_tokens,
+                        computed_tokens.get(req_id, 0),
+                        send_req_info.local_computed_tokens,
+                        send_req_info.local_transferred_tokens,
                     )
 
                     def add_transfer_task(req_id, send_req_info: SendReqInfo, chunk_finish=False):
@@ -1054,6 +1084,21 @@ class MooncakeLayerwiseConnectorScheduler:
                             prompt_len=len(request.all_token_ids),
                             local_computed_tokens=local_computed_tokens,
                             local_transed_tokens=local_transed_tokens,
+                        )
+                        logger.info(
+                            "MooncakeLayerwiseConnector P add transfer task req %s: "
+                            "local_block_ids=%s, local_transed_tokens=%s, "
+                            "local_computed_tokens=%s, remote_cache_tokens=%s, "
+                            "prompt_len=%s, chunk_finish=%s, remote_host=%s, remote_port=%s",
+                            req_id,
+                            local_block_ids,
+                            local_transed_tokens,
+                            local_computed_tokens,
+                            request.kv_transfer_params.get("remote_cached_tokens"),
+                            len(request.all_token_ids),
+                            chunk_finish,
+                            request.kv_transfer_params.get("remote_host"),
+                            request.kv_transfer_params.get("remote_port"),
                         )
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug(

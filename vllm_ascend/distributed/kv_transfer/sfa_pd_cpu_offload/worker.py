@@ -207,10 +207,12 @@ class SFAPDCpuOffloadConsumerWorker:
                 partial_hbm_bid = getattr(req, "partial_hbm_bid", None)
                 self._dest_blocks_by_req[ext_id] = (indexer_ids, main_ids, num_full, partial_hbm_bid)
                 logger.info(
-                    "MembPull D stored dest blocks req %s: indexer(HBM)=%d, main(CPU full)=%d, partial_hbm=%s",
+                    "MembPull D stored dest blocks req %s: indexer_hbm_ids=%s, "
+                    "main_cpu_ids=%s, num_full=%s, partial_hbm=%s",
                     ext_id,
-                    len(indexer_ids),
-                    len(main_ids),
+                    indexer_ids,
+                    main_ids,
+                    num_full,
                     partial_hbm_bid,
                 )
         # Refresh the per-req CPU-block count (Phase 3 source of truth) and
@@ -289,6 +291,16 @@ class SFAPDCpuOffloadConsumerWorker:
                 else:
                     still_pending_failed.add(ext_id)
             self._pending_failed = still_pending_failed
+            if done or failed or done_recving or self._pending_done or self._pending_failed:
+                logger.info(
+                    "MembPull D get_finished: done_ext=%s, failed_ext=%s, "
+                    "done_recving_internal=%s, pending_done_ext=%s, pending_failed_ext=%s",
+                    done,
+                    failed,
+                    done_recving,
+                    self._pending_done,
+                    self._pending_failed,
+                )
             return set(), done_recving
 
         # memfabric pull mode only (mooncake staging path removed). If the read
@@ -460,6 +472,15 @@ class MembPullReadThread(threading.Thread):
                         logger.info(
                             "Received MF_META: P session=%s, %d layers", self._p_session, len(self._p_layer_meta)
                         )
+                        for layer_name, layer_meta in self._p_layer_meta.items():
+                            logger.info(
+                                "MembPull D recv MF_META layer=%s: base_addrs=%s, "
+                                "block_len=%s, block_size_scale=%s",
+                                layer_name,
+                                layer_meta.get("base_addrs"),
+                                layer_meta.get("block_len"),
+                                layer_meta.get("block_size_scale"),
+                            )
                         sock.send_multipart((identity, b"", b"ACK"))
 
                     elif msg_type == READ_READY:
@@ -467,9 +488,22 @@ class MembPullReadThread(threading.Thread):
                         layer_name = msg[2]
                         ext_req_id = msg[3]  # external req_id — D looks up its own dest blocks by this
                         p_block_ids = msg[4]  # P's source block ids (shared by main + indexer on P)
+                        logger.info(
+                            "MembPull D recv READ_READY: layer=%d (%s), req=%s, p_block_ids=%s",
+                            layer_idx,
+                            layer_name,
+                            ext_req_id,
+                            p_block_ids,
+                        )
                         try:
                             self._do_read(layer_name, ext_req_id, p_block_ids)
                             sock.send_multipart((identity, b"", encoder.encode((READ_DONE, layer_idx))))
+                            logger.info(
+                                "MembPull D sent READ_DONE: layer=%d (%s), req=%s",
+                                layer_idx,
+                                layer_name,
+                                ext_req_id,
+                            )
                         except Exception as e:
                             logger.error(
                                 "MembPull read failed for layer %d (%s) req %s: %s",
@@ -485,12 +519,14 @@ class MembPullReadThread(threading.Thread):
                         request_id = msg[1]
                         with self._lock:
                             self._done_requests.add(request_id)
+                        logger.info("MembPull D recv DONE_SENDING: req=%s", request_id)
                         sock.send_multipart((identity, b"", b"ACK"))
 
                     elif msg_type == FAILED_SENDING_MSG:
                         request_id = msg[1]
                         with self._lock:
                             self._failed_requests.add(request_id)
+                        logger.info("MembPull D recv FAILED_SENDING: req=%s", request_id)
                         sock.send_multipart((identity, b"", b"ACK"))
 
                     elif msg_type == GET_META_MSG:
@@ -544,6 +580,17 @@ class MembPullReadThread(threading.Thread):
             )
             return
         d_indexer_ids, d_main_ids, num_full, partial_hbm_bid = dest  # (npu, cpu, num_full, partial_hbm_bid)
+        logger.info(
+            "MembPull D resolve dest: layer=%s, req=%s, p_block_ids=%s, "
+            "d_main_cpu_ids=%s, d_indexer_hbm_ids=%s, num_full=%s, partial_hbm=%s",
+            layer_name,
+            ext_req_id,
+            p_block_ids,
+            d_main_ids,
+            d_indexer_ids,
+            num_full,
+            partial_hbm_bid,
+        )
 
         # Locate the transformer-layer pool index from the MAIN layer name.
         pool_idx = None
@@ -674,6 +721,21 @@ class MembPullReadThread(threading.Thread):
             )
             return
 
+        logger.info(
+            "MembPull D start memfabric read: layer=%s, req=%s, p_session=%s, "
+            "p_block_ids=%s, d_main_cpu_ids=%s, d_indexer_hbm_ids=%s, "
+            "partial_hbm=%s, n_main=%d, n_indexer=%d, transfers=%d",
+            layer_name,
+            ext_req_id,
+            self._p_session,
+            p_block_ids,
+            d_main_ids,
+            d_indexer_ids,
+            partial_hbm_bid,
+            n_main,
+            n_indexer,
+            len(local_ptrs),
+        )
         ret = self.engine.batch_transfer_sync_read(self._p_session, local_ptrs, peer_ptrs, lengths)
         if ret != 0:
             raise RuntimeError(f"memfabric read failed for layer {layer_name}, ret={ret}")
@@ -707,7 +769,8 @@ class MembPullReadThread(threading.Thread):
             except Exception as ve:  # noqa: BLE001 - verify must never break the read path
                 logger.warning("MFV D checksum failed for %s: %s", layer_name, ve)
         logger.info(
-            "MembPull read layer %s req %s (pool_idx=%d): main=%d/%d blocks, indexer=%d/%d (scale split), %d transfers",
+            "MembPull D finished read: layer=%s, req=%s, pool_idx=%d, "
+            "main=%d/%d blocks, indexer=%d/%d blocks (scale split), transfers=%d",
             layer_name,
             ext_req_id,
             pool_idx,
@@ -790,6 +853,14 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             return True  # nothing to transfer; not a failure
         encoded = encoder.encode((READ_READY, layer_idx, layer_name, ext_req_id, p_block_ids))
         try:
+            logger.info(
+                "MembPull P send READ_READY: layer=%d (%s), req=%s, p_block_ids=%s, path=%s",
+                layer_idx,
+                layer_name,
+                ext_req_id,
+                p_block_ids,
+                path,
+            )
             resp = self._send_recv(path, encoded)
             ack_msg = msgspec.msgpack.Decoder(type=tuple).decode(resp)
             if ack_msg[0] != READ_DONE:
@@ -801,6 +872,13 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
                     ext_req_id,
                 )
                 return False
+            logger.info(
+                "MembPull P recv READ_DONE: layer=%d (%s), req=%s, ack=%s",
+                layer_idx,
+                layer_name,
+                ext_req_id,
+                ack_msg,
+            )
             return True
         except Exception as e:
             logger.error(
@@ -829,6 +907,12 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
 
         layer_name = send_task.layer_name
         layer_idx = send_task.layer_idx
+        logger.info(
+            "MembPull P transfer task ready: layer=%d (%s), reqs=%s",
+            layer_idx,
+            layer_name,
+            list(send_task.send_request.keys()) if send_task.send_request else [],
+        )
 
         if not send_task.send_request:
             logger.warning(
@@ -844,10 +928,25 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         # mooncake layerwise base class). D binds ROUTER on this port.
         remote_port = req_meta.remote_port
         if not remote_host or not remote_port:
+            logger.warning(
+                "MembPull P missing remote endpoint for layer %d (%s): host=%s, port=%s",
+                layer_idx,
+                layer_name,
+                remote_host,
+                remote_port,
+            )
             return
 
         path = make_zmq_path("tcp", remote_host, remote_port)
         encoder = msgspec.msgpack.Encoder()
+        logger.info(
+            "MembPull P transfer endpoint: layer=%d (%s), path=%s, remote_host=%s, remote_port=%s",
+            layer_idx,
+            layer_name,
+            path,
+            remote_host,
+            remote_port,
+        )
 
         # First call: send MF_META (P session + P layer addresses). P's
         # layer_metadata[main_name] carries [k, v, dsa_k] (3 tensors) because the
@@ -861,11 +960,24 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
                     "block_len": list(meta.block_len),
                     "block_size_scale": list(meta.block_size_scale),
                 }
+                logger.info(
+                    "MembPull P send MF_META layer=%s: base_addrs=%s, "
+                    "block_len=%s, block_size_scale=%s",
+                    ln,
+                    p_meta_dict[ln]["base_addrs"],
+                    p_meta_dict[ln]["block_len"],
+                    p_meta_dict[ln]["block_size_scale"],
+                )
             meta_encoded = encoder.encode((MF_META, self.p_session, encoder.encode(p_meta_dict)))
             try:
                 self._send_recv(path, meta_encoded)
                 self._mf_meta_sent = True
-                logger.info("MF_META sent to D (session=%s)", self.p_session)
+                logger.info(
+                    "MembPull P sent MF_META: session=%s, layers=%d, path=%s",
+                    self.p_session,
+                    len(p_meta_dict),
+                    path,
+                )
             except Exception as e:
                 logger.error("Failed to send MF_META: %s", e)
 
@@ -906,6 +1018,12 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         # stalls (a visible failure) instead of silent corruption.
         if all_ok and 0 <= layer_idx < len(self.layer_send_done_events):
             self.layer_send_done_events[layer_idx].set()
+            logger.info(
+                "MembPull P layer send complete: layer=%d (%s), reqs=%s",
+                layer_idx,
+                layer_name,
+                list(send_task.send_request.keys()),
+            )
 
         # After the last layer, send DONE_SENDING so D reports done_recving.
         # Send directly via ZMQ (can't use callback_func = send_done_send_signal
@@ -918,6 +1036,12 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
                     done_encoded = encoder.encode((DONE_SENDING_MSG, external_req_id, 0, ""))
                     try:
                         self._send_recv(path, done_encoded)
+                        logger.info(
+                            "MembPull P sent DONE_SENDING: req=%s, external_req=%s, path=%s",
+                            req_id,
+                            external_req_id,
+                            path,
+                        )
                     except Exception as e:
                         logger.error("MembPull DONE_SENDING failed for %s: %s", req_id, e)
 
@@ -970,12 +1094,28 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
         is at kernel granularity, scale 1)."""
         if self._backend == BACKEND_MEMFABRIC:
             self.current_layer = 0
-            for req_meta in getattr(metadata, "requests", {}).values():
+            for req_id, req_meta in getattr(metadata, "requests", {}).items():
                 if req_meta.remote_port is None:
                     continue
                 remote_tp_size = req_meta.remote_tp_size or self.tp_size
                 tp_ratio = max(1, self.tp_size // remote_tp_size)
+                old_remote_port = req_meta.remote_port
                 req_meta.remote_port = req_meta.remote_port + self.tp_rank // tp_ratio
+                logger.info(
+                    "MembPull P start_load_kv req %s: remote_host=%s, "
+                    "remote_port=%s->%s, tp_rank=%s, tp_ratio=%s, local_block_ids=%s, "
+                    "chunk_finish=%s, local_computed_tokens=%s, local_transed_tokens=%s",
+                    req_id,
+                    req_meta.remote_host,
+                    old_remote_port,
+                    req_meta.remote_port,
+                    self.tp_rank,
+                    tp_ratio,
+                    req_meta.local_block_ids,
+                    req_meta.chunk_finish,
+                    req_meta.local_computed_tokens,
+                    req_meta.local_transed_tokens,
+                )
             return
         super().start_load_kv(metadata)
 
@@ -1010,6 +1150,11 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
         # the user can compare against D's destination sums in the logs.
         self.kv_send_layer_thread._source_kv_caches = kv_caches
         self.layer_send_done_events = self.kv_send_layer_thread.layer_send_done_events
+        logger.info(
+            "MembPull P registered kv caches: layers=%d, p_session=%s",
+            len(kv_caches),
+            global_te._unique_id,
+        )
 
     def wait_for_layer_send(self, layer_idx: int) -> None:
         """Block until D has read layer ``layer_idx``'s KV (buffer-reuse gate).
