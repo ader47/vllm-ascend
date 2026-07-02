@@ -209,9 +209,10 @@ class SFAPDCpuOffloadScheduler:
             meta.add_request(
                 ReqMeta(
                     req_id=tracker.req_id,
-                    block_ids_npu=tracker.allocated_block_ids_npu,
+                    block_ids_npu=tracker.main_hbm_ids,
                     block_ids_cpu=tracker.allocated_block_ids_cpu,
-                    num_new_offload_blocks=0,  # PD uses its own offload path (B1)
+                    block_ids_indexer=tracker.allocated_block_ids_npu,
+                    num_new_offload_blocks=len(offload_src) if offload_src else 0,
                     num_full=tracker.num_full,
                     partial_hbm_bid=tracker.partial_hbm_bid,
                     offload_src_hbm_ids=offload_src or [],

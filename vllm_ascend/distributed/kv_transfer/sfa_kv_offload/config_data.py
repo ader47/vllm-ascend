@@ -40,15 +40,18 @@ class ReqMeta:
     block_ids_npu: list[int]
     block_ids_cpu: list[int]
     num_new_offload_blocks: int = 0
+    # PD: indexer block ids live here (block_ids_npu is repurposed as main MLA
+    # HBM ids so sfa_worker.process_layer_data can use it as the offload source).
+    block_ids_indexer: list[int] = field(default_factory=list)
     # Part A (PD memfabric pull): _do_read routes the first `num_full` of P's
     # p_block_ids to the CPU pool (1:1 with block_ids_cpu), and the last one
     # (the partial) to D HBM at partial_hbm_bid (None ⇒ no partial).
     num_full: int = 0
     partial_hbm_bid: int | None = None
-    # B1 (decode offload): the main MLA HBM blocks to copy HBM→CPU this step
-    # (offload_src) and the CPU pool blocks to copy them into (offload_dst).
-    # Populated by the PD scheduler for decode steps where blocks fill; empty
-    # otherwise (prefill, or no new full blocks).
+    # B1 (decode offload, kept for verify/debug): the main MLA HBM blocks to
+    # copy HBM→CPU this step (offload_src) and the CPU pool blocks to copy
+    # them into (offload_dst). The actual offload is driven by
+    # num_new_offload_blocks + sfa_worker.process_layer_data.
     offload_src_hbm_ids: list[int] = field(default_factory=list)
     offload_dst_cpu_ids: list[int] = field(default_factory=list)
 

@@ -137,9 +137,6 @@ class SFAPDCpuOffloadWorker:
         # main layer name -> (k_nope HBM, v_rope HBM); the partial block's HBM
         # dest. Populated in register_kv_caches.
         self._hbm_kv: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-        # B1: per-step decode offload pairs (src HBM block ids, dst CPU block
-        # ids); reset in start_load_kv, consumed by save_kv_layer.
-        self._offload_pairs: list[tuple[list[int], list[int]]] = []
         # External req ids whose DONE/FAILED signal arrived before request_map
         # was seeded (see get_finished). Retried every step until mapped.
         self._pending_done: set[str] = set()
@@ -200,8 +197,8 @@ class SFAPDCpuOffloadWorker:
     # -- D-side forwards to the composed SFA worker (LRU load path) --
     def start_load_kv(self, metadata: KVConnectorMetadata):
         assert self.sfa_worker is not None
-        # B1: reset decode offload pairs for this step (consumed by save_kv_layer).
-        self._offload_pairs: list[tuple[list[int], list[int]]] = []
+        # B1: reset decode offload — now driven by sfa_worker.process_layer_data
+        # (num_new_offload_blocks > 0 triggers it in sfa_worker.start_load_kv).
         # Seed external->internal request id map for get_finished, and store D's
         # own destination blocks per request (keyed by external id, which is what
         # P sends in READ_READY). The scheduler includes remote-prefill requests
@@ -211,7 +208,7 @@ class SFAPDCpuOffloadWorker:
             if req_id is not None:
                 ext_id = get_external_request_id(req_id)
                 self.request_map[ext_id] = req_id
-                indexer_ids = list(getattr(req, "block_ids_npu", []) or [])
+                indexer_ids = list(getattr(req, "block_ids_indexer", []) or [])
                 main_ids = list(getattr(req, "block_ids_cpu", []) or [])
                 num_full = getattr(req, "num_full", 0) or 0
                 partial_hbm_bid = getattr(req, "partial_hbm_bid", None)
@@ -223,13 +220,9 @@ class SFAPDCpuOffloadWorker:
                     len(main_ids),
                     partial_hbm_bid,
                 )
-                # B1: collect decode offload pairs (src HBM ids -> dst CPU ids).
-                src = list(getattr(req, "offload_src_hbm_ids", []) or [])
-                dst = list(getattr(req, "offload_dst_cpu_ids", []) or [])
-                if src and dst:
-                    self._offload_pairs.append((src, dst))
         # Refresh the per-req CPU-block count (Phase 3 source of truth) and
-        # forward the unchanged load kickoff to the SFA worker.
+        # forward the load kickoff to the SFA worker (which also builds offload
+        # tasks via process_layer_data when num_new_offload_blocks > 0).
         self._refresh_cpu_blocks_by_req(metadata)
         self.sfa_worker.start_load_kv(metadata)
 
@@ -269,33 +262,15 @@ class SFAPDCpuOffloadWorker:
         attn_metadata: AttentionMetadata,
         connector_metadata: KVConnectorMetadata,
     ) -> None:
-        # B1: offload decode-filled main MLA blocks HBM -> CPU pool. Part A put
-        # the prompt's full blocks in CPU (via P) and the partial in HBM; this
-        # copies blocks that just filled during decode into the CPU pool, so
-        # num_offloaded_blocks grows and decode routes them via LRU. Sync copy
-        # (HBM->CPU .to('cpu') is blocking); verified-correct, can go async later.
-        pairs = getattr(self, "_offload_pairs", None)
-        if not pairs:
-            return
-        pool_idx = None
-        for idx, mname in enumerate(self._main_names):
-            if layer_name == mname:
-                pool_idx = idx
-                break
-        if pool_idx is None:
-            return
-        hbm_kv = self._hbm_kv.get(layer_name)
-        if hbm_kv is None:
-            return
-        k_hbm, v_hbm = hbm_kv
-        k_cpu, v_cpu = self._cpu_pools[pool_idx]
-        for src, dst in pairs:
-            k_cpu[dst] = k_hbm[src].to("cpu")
-            v_cpu[dst] = v_hbm[src].to("cpu")
+        # B1: offload decode-filled main MLA blocks HBM -> CPU pool via the
+        # composed SFA worker's async background thread (process_layer_data built
+        # the per-layer tasks in start_load_kv from num_new_offload_blocks).
+        if self.sfa_worker is not None:
+            self.sfa_worker.save_kv_layer(layer_name)
 
     def wait_for_save(self):
-        # Nothing to wait for on D (no local save).
-        return
+        if self.sfa_worker is not None:
+            self.sfa_worker.wait_for_save()
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         # memfabric pull mode: done comes from MembPullReadThread
