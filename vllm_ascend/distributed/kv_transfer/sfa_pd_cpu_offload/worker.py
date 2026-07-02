@@ -602,6 +602,28 @@ class MembPullReadThread(threading.Thread):
             logger.warning("MembPull _do_read: layer %s not in main names, skip", layer_name)
             return
 
+        # Main-MLA CPU-pool index MUST match the resident-load side. _main_names
+        # (and the _indexer_tensors array used below) are ordered by the indexer
+        # group, but the sfa_worker CPU pool (k_caches_cpu / _cpu_pools) is ordered
+        # by offload_layer_names (kv_caches dict order). If those orderings differ,
+        # indexing the pool with pool_idx writes this layer's KV into another
+        # layer's slot while the resident load later reads yet another slot —
+        # scrambling every layer's KV (output goes fully garbled; MFV sums still
+        # match because they checksum the slot the pull targeted, not the slot the
+        # resident read path uses). Index the main-MLA pool by the resident-load
+        # offload_id; pool_idx is still correct for _indexer_tensors (that array is
+        # in _main_names order).
+        offload_id = w.sfa_worker._get_offload_layer_id(layer_name)
+        if pool_idx != offload_id:
+            logger.warning(
+                "MembPull _do_read: layer-order mismatch for %s — pull _main_names "
+                "idx=%d != resident offload_id=%d; main MLA was being written to the "
+                "wrong CPU-pool slot. Using offload_id.",
+                layer_name,
+                pool_idx,
+                offload_id,
+            )
+
         p_meta = self._p_layer_meta.get(layer_name)
         if p_meta is None:
             logger.warning(
@@ -631,7 +653,7 @@ class MembPullReadThread(threading.Thread):
         p_k_len, p_v_len = p_block_len[0], p_block_len[1]
         full_p_blocks = p_block_ids[:num_full]
         if full_p_blocks and d_main_ids:
-            k_cpu, v_cpu = w._cpu_pools[pool_idx]
+            k_cpu, v_cpu = w._cpu_pools[offload_id]
             for p_bid, d_bid in zip(full_p_blocks, d_main_ids):
                 peer_ptrs.append(p_k_base + p_bid * p_k_len)
                 local_ptrs.append(k_cpu.data_ptr() + d_bid * p_k_len)
@@ -746,7 +768,7 @@ class MembPullReadThread(threading.Thread):
         # so it won't equal P's idx — use it only as a "data landed" check).
         if os.environ.get("VLLM_ASCEND_MF_VERIFY") == "1":
             try:
-                k_cpu, v_cpu = w._cpu_pools[pool_idx]
+                k_cpu, v_cpu = w._cpu_pools[offload_id]
                 mk = k_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
                 mv = v_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
                 # Part A: the partial last block is in HBM (not the CPU pool) —

@@ -1380,6 +1380,16 @@ class NPUModelRunner(GPUModelRunner):
             is_prefill = num_scheduled_tokens > decode_threshold
             num_offloaded_blocks[is_prefill] = 0
 
+            if torch.distributed.get_rank() == 0:
+                logger.info(
+                    ">>>>> offload threshold: req_ids=%s, num_offloaded_blocks=%s, "
+                    "num_computed=%s, is_prefill=%s",
+                    list(self.input_batch.req_ids[:num_reqs]),
+                    num_offloaded_blocks.tolist(),
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
+                    is_prefill.tolist(),
+                )
+
             self.num_offloaded_blocks.np[:num_reqs] = num_offloaded_blocks
             self.num_offloaded_blocks.copy_to_gpu(num_reqs)
             self.tokens_per_req.np[:num_reqs] = num_scheduled_tokens[:num_reqs]
