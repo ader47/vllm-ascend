@@ -335,6 +335,7 @@ class SFAPDCpuOffloadConsumerWorker:
         # Store layer info for MembPullReadThread
         self._indexer_names = indexer_names
         self._main_names = main_names
+        self._main_name_to_idx = {n: i for i, n in enumerate(main_names)}
         self._cpu_pools = list(zip(k_caches_cpu, v_caches_cpu))
         self._indexer_tensors = []
         for main_name in main_names:
@@ -535,30 +536,104 @@ class MembPullReadThread(threading.Thread):
         finally:
             ctx.destroy(linger=0)
 
-    def _prepare_read_transfer(
+    def _resolve_read_layer(self, layer_name: str) -> dict[str, Any] | None:
+        """Resolve all layer-constant read state once per layer. The old code
+        recomputed this per request (a linear scan of _main_names, an offload_id
+        lookup, a p_meta lookup, and all base/length/scale derivation per req).
+        Returns None if the whole layer must be skipped (logged once); per-req
+        skips stay in _build_req_descriptors."""
+        w = self._worker
+        pool_idx = w._main_name_to_idx.get(layer_name)
+        if pool_idx is None:
+            logger.warning("MembPull _do_read: layer %s not in main names, skip", layer_name)
+            return None
+        # Main-MLA CPU pool is indexed by the resident-load offload_id, NOT pool_idx
+        # (_cpu_pools follows offload_layer_names order; _main_names/indexer tensors
+        # follow the indexer group). pool_idx stays correct for the indexer tensor.
+        offload_id = w.sfa_worker._get_offload_layer_id(layer_name)
+        if pool_idx != offload_id and envs.VLLM_ASCEND_SFA_DEBUG:
+            logger.warning(
+                "MembPull _do_read: layer-order mismatch for %s — pull _main_names "
+                "idx=%d != resident offload_id=%d; main MLA was being written to the "
+                "wrong CPU-pool slot. Using offload_id.",
+                layer_name, pool_idx, offload_id,
+            )
+        p_meta = self._p_layer_meta.get(layer_name)
+        if p_meta is None:
+            logger.warning(
+                "MembPull _do_read: layer %s not in P layer_meta (MF_META not received? have %d layers), skip",
+                layer_name,
+                len(self._p_layer_meta),
+            )
+            return None
+        p_base_addrs = p_meta["base_addrs"]
+        p_block_len = p_meta["block_len"]
+
+        k_cpu, v_cpu = w._cpu_pools[offload_id]
+        hbm_kv = w._hbm_kv.get(layer_name)
+        if hbm_kv is None:
+            k_hbm_ptr = v_hbm_ptr = None
+        else:
+            k_hbm_ptr, v_hbm_ptr = hbm_kv[0].data_ptr(), hbm_kv[1].data_ptr()
+
+        # Indexer leg constants (None if the layer can't do the indexer leg).
+        indexer = None
+        if len(p_base_addrs) < 3:
+            logger.error(
+                "MembPull indexer: P layer_meta for %s has %d tensors, need >=3 "
+                "(dsa_k must be registered as the main layer's tensor [2]); skip indexer leg",
+                layer_name,
+                len(p_base_addrs),
+            )
+        else:
+            p_dsa_len = p_block_len[2]
+            d_indexer = w._indexer_tensors[pool_idx]
+            d_dsa_len = d_indexer.element_size() * math.prod(d_indexer.shape[1:])
+            if p_dsa_len <= 0 or d_dsa_len % p_dsa_len != 0:
+                logger.error(
+                    "MembPull indexer %s: D dsa_k block_len=%d not a multiple of P=%d; skip indexer leg",
+                    layer_name,
+                    d_dsa_len,
+                    p_dsa_len,
+                )
+            else:
+                indexer = {
+                    "p_dsa_base": p_base_addrs[2],
+                    "p_dsa_len": p_dsa_len,
+                    "d_base": d_indexer.data_ptr(),
+                    "d_dsa_len": d_dsa_len,
+                    "scale": d_dsa_len // p_dsa_len,
+                    "shape": tuple(d_indexer.shape),
+                }
+
+        return {
+            "layer_name": layer_name,
+            "pool_idx": pool_idx,
+            "offload_id": offload_id,
+            "p_k_base": p_base_addrs[0],
+            "p_v_base": p_base_addrs[1],
+            "p_k_len": p_block_len[0],
+            "p_v_len": p_block_len[1],
+            "k_cpu_ptr": k_cpu.data_ptr(),
+            "v_cpu_ptr": v_cpu.data_ptr(),
+            "k_hbm_ptr": k_hbm_ptr,
+            "v_hbm_ptr": v_hbm_ptr,
+            "indexer": indexer,
+        }
+
+    def _build_req_descriptors(
         self,
-        layer_name: str,
+        layer: dict[str, Any],
         ext_req_id: str,
         p_block_ids: list[int],
+        want_info: bool,
     ) -> tuple[list[int], list[int], list[int], dict[str, Any] | None]:
-        """Build memfabric read descriptors for one request in one layer.
-
-        P sends only its source block ids + ext_req_id; D looks up its OWN
-        destination blocks for this request in
-        ``worker._dest_blocks_by_req[ext_req_id]`` = (indexer_npu_ids,
-        main_cpu_ids). Those were allocated by D's scheduler and passed to the
-        worker via connector_meta (pull model: D's block ids never travel to P).
-
-        Both legs share ``p_block_ids`` (on P the indexer is written into
-        dsa_k_cache at the SAME slots as main MLA). Destinations differ:
-          main     → D CPU pool at main_cpu_ids (P tensors [0]=k, [1]=v)
-          indexer  → D indexer HBM at indexer_npu_ids (P tensor [2]=dsa_k)
-        """
-        if self._p_session is None:
-            raise RuntimeError("MF_META not received before READ_READY_BATCH")
-
+        """Build memfabric read descriptors for one request using layer-constant
+        state from _resolve_read_layer. Empty ptrs (+ None info) for per-req
+        skips (no dest / empty p_block_ids / nothing to transfer)."""
         w = self._worker
-        # D's own destination blocks for this request (allocated by D scheduler).
+        layer_name = layer["layer_name"]
+
         dest = w._dest_blocks_by_req.get(ext_req_id)
         if dest is None:
             logger.warning(
@@ -580,81 +655,30 @@ class MembPullReadThread(threading.Thread):
                 num_full,
                 partial_hbm_bid,
             )
-
-        # Locate the transformer-layer pool index from the MAIN layer name.
-        pool_idx = None
-        for idx, mname in enumerate(w._main_names):
-            if layer_name == mname:
-                pool_idx = idx
-                break
-        if pool_idx is None:
-            logger.warning("MembPull _do_read: layer %s not in main names, skip", layer_name)
-            return [], [], [], None
-
-        # Main-MLA CPU-pool index MUST match the resident-load side. _main_names
-        # (and the _indexer_tensors array used below) are ordered by the indexer
-        # group, but the sfa_worker CPU pool (k_caches_cpu / _cpu_pools) is ordered
-        # by offload_layer_names (kv_caches dict order). If those orderings differ,
-        # indexing the pool with pool_idx writes this layer's KV into another
-        # layer's slot while the resident load later reads yet another slot —
-        # scrambling every layer's KV (output goes fully garbled; MFV sums still
-        # match because they checksum the slot the pull targeted, not the slot the
-        # resident read path uses). Index the main-MLA pool by the resident-load
-        # offload_id; pool_idx is still correct for _indexer_tensors (that array is
-        # in _main_names order).
-        offload_id = w.sfa_worker._get_offload_layer_id(layer_name)
-        if pool_idx != offload_id:
-            # Diagnostic only: confirms the layer-order mismatch (_main_names
-            # vs offload_layer_names) was detected and the fix (use offload_id)
-            # handled it. Gated -- the fix is correct, no action needed in prod.
-            if envs.VLLM_ASCEND_SFA_DEBUG:
-                logger.warning(
-                    "MembPull _do_read: layer-order mismatch for %s — pull _main_names "
-                    "idx=%d != resident offload_id=%d; main MLA was being written to the "
-                    "wrong CPU-pool slot. Using offload_id.",
-                    layer_name,
-                    pool_idx,
-                    offload_id,
-                )
-
-        p_meta = self._p_layer_meta.get(layer_name)
-        if p_meta is None:
-            logger.warning(
-                "MembPull _do_read: layer %s not in P layer_meta (MF_META not received? have %d layers), skip",
-                layer_name,
-                len(self._p_layer_meta),
-            )
-            return [], [], [], None
-
         if not p_block_ids:
             logger.warning("MembPull _do_read: empty p_block_ids for %s, skip", layer_name)
             return [], [], [], None
 
-        p_base_addrs = p_meta["base_addrs"]
-        p_block_len = p_meta["block_len"]
+        p_k_base, p_v_base = layer["p_k_base"], layer["p_v_base"]
+        p_k_len, p_v_len = layer["p_k_len"], layer["p_v_len"]
 
-        # Build per-leg (peer, local, length) int64 arrays and concatenate once,
-        # replacing three O(blocks) Python append loops (main k/v, partial, indexer).
         peer_chunks: list[np.ndarray] = []
         local_chunks: list[np.ndarray] = []
         length_chunks: list[np.ndarray] = []
         n_main = 0
         n_indexer = 0
 
-        # Main MLA leg: the first `num_full` P blocks are FULL -> D CPU pool
-        # (1:1 with d_main_ids); the optional last block is the PARTIAL -> D HBM.
-        p_k_base, p_v_base = p_base_addrs[0], p_base_addrs[1]
-        p_k_len, p_v_len = p_block_len[0], p_block_len[1]
+        # Main MLA leg: first `num_full` P blocks FULL -> D CPU pool; optional
+        # last PARTIAL -> D HBM.
         full_p_blocks = p_block_ids[:num_full]
         n_full = min(len(full_p_blocks), len(d_main_ids))
         if n_full:
-            k_cpu, v_cpu = w._cpu_pools[offload_id]
             full_p = np.array(full_p_blocks[:n_full], dtype=np.int64)
             d_main = np.array(d_main_ids[:n_full], dtype=np.int64)
             peer_k = p_k_base + full_p * p_k_len
             peer_v = p_v_base + full_p * p_v_len
-            local_k = k_cpu.data_ptr() + d_main * p_k_len
-            local_v = v_cpu.data_ptr() + d_main * p_v_len
+            local_k = layer["k_cpu_ptr"] + d_main * p_k_len
+            local_v = layer["v_cpu_ptr"] + d_main * p_v_len
             # Interleave [k0,v0,k1,v1,...] to match the original per-block order.
             peer_chunks.append(np.stack([peer_k, peer_v], axis=1).ravel())
             local_chunks.append(np.stack([local_k, local_v], axis=1).ravel())
@@ -662,74 +686,42 @@ class MembPullReadThread(threading.Thread):
                 np.full(n_full, p_k_len, dtype=np.int64),
                 np.full(n_full, p_v_len, dtype=np.int64)], axis=1).ravel())
             n_main = n_full
-        # Partial last block -> D HBM (whole block_size transfers; the tail beyond
-        # prompt_len is garbage and gets overwritten as decode appends).
         if partial_hbm_bid is not None and num_full < len(p_block_ids):
-            hbm_kv = w._hbm_kv.get(layer_name)
-            if hbm_kv is None:
+            k_hbm_ptr = layer["k_hbm_ptr"]
+            if k_hbm_ptr is None:
                 logger.warning("MembPull _do_read: no HBM k/v for partial block %s, skip partial", layer_name)
             else:
-                k_hbm, v_hbm = hbm_kv
                 partial_p_bid = p_block_ids[num_full]
                 peer_chunks.append(np.array(
                     [p_k_base + partial_p_bid * p_k_len,
                      p_v_base + partial_p_bid * p_v_len], dtype=np.int64))
                 local_chunks.append(np.array(
-                    [k_hbm.data_ptr() + partial_hbm_bid * p_k_len,
-                     v_hbm.data_ptr() + partial_hbm_bid * p_v_len], dtype=np.int64))
+                    [k_hbm_ptr + partial_hbm_bid * p_k_len,
+                     layer["v_hbm_ptr"] + partial_hbm_bid * p_v_len], dtype=np.int64))
                 length_chunks.append(np.array([p_k_len, p_v_len], dtype=np.int64))
                 n_main += 1
 
-        # Indexer leg: P tensor [2]=dsa_k -> D indexer HBM. D's indexer block is
-        # `scale`x P's, so each D block splits into `scale` P-sized sub-addresses;
-        # extra sub-addresses beyond len(p_block_ids) are discarded (zip-truncate).
-        if d_indexer_ids:
-            if len(p_base_addrs) < 3:
-                logger.error(
-                    "MembPull indexer: P layer_meta for %s has %d tensors, need >=3 "
-                    "(dsa_k must be registered as the main layer's tensor [2]); skip indexer leg",
-                    layer_name,
-                    len(p_base_addrs),
-                )
-            else:
-                p_dsa_base = p_base_addrs[2]
-                p_dsa_len = p_block_len[2]  # P per-indexer-block bytes (kv-block granularity)
-                d_indexer = w._indexer_tensors[pool_idx]
-                # D per-indexer-block bytes (coarser — spans scale× P's blocks).
-                d_dsa_len = d_indexer.element_size() * math.prod(d_indexer.shape[1:])
-                d_base = d_indexer.data_ptr()
-                if p_dsa_len <= 0 or d_dsa_len % p_dsa_len != 0:
-                    logger.error(
-                        "MembPull indexer %s: D dsa_k block_len=%d not a multiple of P=%d; skip indexer leg",
-                        layer_name,
-                        d_dsa_len,
-                        p_dsa_len,
-                    )
-                else:
-                    scale = d_dsa_len // p_dsa_len
-                    # (D_blocks, scale) outer sum, flattened d_bid-major (matches the
-                    # original for-d_bid/for-off append order), then truncate to the
-                    # shorter of p_block_ids / D sub-addresses.
-                    d_idx = np.array(d_indexer_ids, dtype=np.int64)
-                    offs = np.arange(scale, dtype=np.int64)
-                    d_sub = (d_base + d_idx[:, None] * d_dsa_len + offs * p_dsa_len).reshape(-1)
-                    n_pairs = min(len(p_block_ids), d_sub.shape[0])
-                    p_idx = np.array(p_block_ids[:n_pairs], dtype=np.int64)
-                    logger.debug(
-                        "MembPull indexer %s: p_dsa_len=%d d_dsa_len=%d scale=%d, "
-                        "D dsa_k shape=%s, D_sub=%d P_blocks=%d",
-                        layer_name,
-                        p_dsa_len,
-                        d_dsa_len,
-                        scale,
-                        tuple(d_indexer.shape),
-                        int(d_sub.shape[0]),
-                        len(p_block_ids),
-                    )
-                    peer_chunks.append(p_dsa_base + p_idx * p_dsa_len)
-                    local_chunks.append(d_sub[:n_pairs])
-                    length_chunks.append(np.full(n_pairs, p_dsa_len, dtype=np.int64))
-                    n_indexer = n_pairs
+        # Indexer leg: each D block splits into `scale` P-sized sub-addresses;
+        # extra sub-addresses beyond len(p_block_ids) are discarded.
+        idx = layer["indexer"]
+        if idx is not None and d_indexer_ids:
+            p_dsa_base, p_dsa_len = idx["p_dsa_base"], idx["p_dsa_len"]
+            d_base, d_dsa_len, scale = idx["d_base"], idx["d_dsa_len"], idx["scale"]
+            d_idx_arr = np.array(d_indexer_ids, dtype=np.int64)
+            offs = np.arange(scale, dtype=np.int64)
+            d_sub = (d_base + d_idx_arr[:, None] * d_dsa_len + offs * p_dsa_len).reshape(-1)
+            n_pairs = min(len(p_block_ids), d_sub.shape[0])
+            p_idx = np.array(p_block_ids[:n_pairs], dtype=np.int64)
+            logger.debug(
+                "MembPull indexer %s: p_dsa_len=%d d_dsa_len=%d scale=%d, "
+                "D dsa_k shape=%s, D_sub=%d P_blocks=%d",
+                layer_name, p_dsa_len, d_dsa_len, scale, idx["shape"],
+                int(d_sub.shape[0]), len(p_block_ids),
+            )
+            peer_chunks.append(p_dsa_base + p_idx * p_dsa_len)
+            local_chunks.append(d_sub[:n_pairs])
+            length_chunks.append(np.full(n_pairs, p_dsa_len, dtype=np.int64))
+            n_indexer = n_pairs
 
         if not peer_chunks:
             logger.warning(
@@ -744,20 +736,24 @@ class MembPullReadThread(threading.Thread):
         local_ptrs = np.concatenate(local_chunks).tolist()
         lengths = np.concatenate(length_chunks).tolist()
 
-        read_info = {
-            "layer_name": layer_name,
-            "ext_req_id": ext_req_id,
-            "pool_idx": pool_idx,
-            "offload_id": offload_id,
-            "p_block_ids": p_block_ids,
-            "d_main_ids": d_main_ids,
-            "d_indexer_ids": d_indexer_ids,
-            "partial_hbm_bid": partial_hbm_bid,
-            "n_main": n_main,
-            "n_indexer": n_indexer,
-            "num_transfers": len(local_ptrs),
-        }
-        return local_ptrs, peer_ptrs, lengths, read_info
+        # Build read_info only when a consumer is active (_log_read_result is
+        # gated on VLLM_ASCEND_MF_VERIFY / VLLM_ASCEND_SFA_DEBUG); otherwise this
+        # dict would be allocated per req per layer and immediately discarded.
+        info = None
+        if want_info:
+            info = {
+                "layer_name": layer_name,
+                "ext_req_id": ext_req_id,
+                "pool_idx": layer["pool_idx"],
+                "offload_id": layer["offload_id"],
+                "d_main_ids": d_main_ids,
+                "d_indexer_ids": d_indexer_ids,
+                "partial_hbm_bid": partial_hbm_bid,
+                "n_main": n_main,
+                "n_indexer": n_indexer,
+                "num_transfers": len(local_ptrs),
+            }
+        return peer_ptrs, local_ptrs, lengths, info
 
     def _log_read_result(self, read_info: dict[str, Any]) -> None:
         # Verify-mode (VLLM_ASCEND_MF_VERIFY=1): log D's destination sums so the
@@ -820,16 +816,21 @@ class MembPullReadThread(threading.Thread):
         if self._p_session is None:
             raise RuntimeError("MF_META not received before READ_READY_BATCH")
 
+        # Resolve layer-constant state once (pool idx, offload id, p_meta, base
+        # addrs/lengths, scale, CPU/HBM pool ptrs); was recomputed per req before.
+        layer = self._resolve_read_layer(layer_name)
+        if layer is None:
+            return  # layer-level skip, already logged once
+
+        want_info = bool(envs.VLLM_ASCEND_MF_VERIFY or envs.VLLM_ASCEND_SFA_DEBUG)
         all_local_ptrs: list[int] = []
         all_peer_ptrs: list[int] = []
         all_lengths: list[int] = []
         read_infos: list[dict[str, Any]] = []
         for ext_req_id, p_block_ids in read_reqs:
             try:
-                local_ptrs, peer_ptrs, lengths, read_info = self._prepare_read_transfer(
-                    layer_name,
-                    ext_req_id,
-                    p_block_ids,
+                local_ptrs, peer_ptrs, lengths, read_info = self._build_req_descriptors(
+                    layer, ext_req_id, p_block_ids, want_info
                 )
             except Exception as e:  # noqa: BLE001 - keep other reqs in the layer moving
                 logger.error(
@@ -839,12 +840,13 @@ class MembPullReadThread(threading.Thread):
                     e,
                 )
                 continue
-            if not local_ptrs or read_info is None:
+            if not local_ptrs:
                 continue
             all_local_ptrs.extend(local_ptrs)
             all_peer_ptrs.extend(peer_ptrs)
             all_lengths.extend(lengths)
-            read_infos.append(read_info)
+            if want_info:
+                read_infos.append(read_info)
 
         if not all_local_ptrs:
             logger.warning(
