@@ -201,9 +201,11 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         **kwargs,
     ) -> None:
         assert self.connector_worker is not None
-        # NOTE: signature diverges by role — mooncake (P) needs the metadata
-        # tuple, the composed SFA worker (D) takes none. The worker branches
-        # internally; we forward the bound args.
+        # SFA attention calls this every forward, including profiling / graph
+        # capture where no per-step connector metadata is bound. Nothing to save
+        # then; skip rather than trip _get_connector_metadata's assert.
+        if not self.has_connector_metadata():
+            return
         self.connector_worker.save_kv_layer(layer_name, kv_layer, attn_metadata, self._get_connector_metadata())
 
     def wait_for_save(self):
