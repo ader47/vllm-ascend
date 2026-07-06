@@ -367,17 +367,17 @@ class SFAPDCpuOffloadScheduler:
     # helpers
     # ------------------------------------------------------------------
     def _access_metaserver(self, url: str, message: dict[str, Any]):
-        client = httpx.Client(limits=httpx.Limits(max_connections=100000), timeout=None)
-        retry = 0
-        while retry < 3:
-            retry += 1
-            try:
-                client.post(url, json=message)
-                return
-            except Exception as e:
-                logger.error("Failed to connect to metaserver: %s, retry %s", url, retry)
-                if retry == 3:
-                    raise e
+        with httpx.Client(limits=httpx.Limits(max_connections=100000), timeout=None) as client:
+            retry = 0
+            while retry < 3:
+                retry += 1
+                try:
+                    client.post(url, json=message)
+                    return
+                except Exception as e:
+                    logger.error("Failed to connect to metaserver: %s, retry %s", url, retry)
+                    if retry == 3:
+                        raise e
 
     @staticmethod
     def _on_metaserver_done(future):

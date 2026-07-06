@@ -1000,31 +1000,16 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         layer_idx = send_task.layer_idx
         layer_name = send_task.layer_name
 
-        if not send_task.send_request:
-            self._signal_layer_done(layer_idx)
-            return
-
-        req_meta = next(iter(send_task.send_request.values()))
-        remote_host = req_meta.remote_host
-        remote_port = req_meta.remote_port
-        if not remote_host or not remote_port:
-            self._signal_layer_done(layer_idx)
-            return
-
-        path = make_zmq_path("tcp", remote_host, remote_port)
-        dealer = self._ensure_dealer(path)
-
-        # MF_META (first call, synchronous: send + block recv one reply)
-        if not self._mf_meta_sent:
-            self._send_mf_meta(dealer, encoder)
-
         # Fire one READ_READY_BATCH for this layer (DEALER async send, no wait).
         read_reqs: list[tuple[str, list[int]]] = []
+        endpoints: set[tuple[str, int]] = set()
         for req_id, rm in send_task.send_request.items():
             p_block_ids = rm.local_block_ids[0] if rm.local_block_ids else []
             ext_id = get_external_request_id(req_id)
             if p_block_ids:
                 read_reqs.append((ext_id, p_block_ids))
+                if rm.remote_host and rm.remote_port:
+                    endpoints.add((rm.remote_host, rm.remote_port))
             if envs.VLLM_ASCEND_SFA_DEBUG:
                 logger.info(
                     "MembPull P add READ_READY_BATCH item: layer=%d (%s), req=%s, p_blocks=%d",
@@ -1034,6 +1019,17 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         if read_reqs:
             if 0 <= layer_idx < len(self.layer_send_done_events):
                 self.layer_send_done_events[layer_idx].clear()
+            if len(endpoints) != 1:
+                raise RuntimeError(
+                    f"MembPull layer {layer_idx} expects exactly one D endpoint, got {sorted(endpoints)}"
+                )
+            remote_host, remote_port = next(iter(endpoints))
+            path = make_zmq_path("tcp", remote_host, remote_port)
+            dealer = self._ensure_dealer(path)
+
+            # MF_META (first call, synchronous: send + block recv one reply)
+            if not self._mf_meta_sent:
+                self._send_mf_meta(dealer, encoder)
             dealer.send(encoder.encode((READ_READY_BATCH, layer_idx, layer_name, read_reqs)))
             if envs.VLLM_ASCEND_SFA_DEBUG:
                 logger.info(
@@ -1065,11 +1061,14 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             }
         dealer.send(encoder.encode((MF_META, self.p_session, encoder.encode(p_meta_dict))))
         if dealer.poll(timeout=int(self.timeout * 1000)):
-            dealer.recv_multipart()  # consume D's reply (e.g. [b"", b"ACK"])
+            frames = dealer.recv_multipart()
+            payload = [f for f in frames if f != b""]
+            if payload != [b"ACK"]:
+                raise RuntimeError(f"MembPull P MF_META got unexpected reply: {payload!r}")
             self._mf_meta_sent = True
             logger.info("MembPull P sent MF_META: session=%s, layers=%d", self.p_session, len(p_meta_dict))
         else:
-            logger.error("MembPull P MF_META timed out (no reply from D)")
+            raise RuntimeError("MembPull P MF_META timed out (no reply from D)")
 
     def _drain_read_done(self, decoder: msgspec.msgpack.Decoder) -> None:
         """Non-blocking: recv all pending READ_DONEs from ALL DEALER sockets.

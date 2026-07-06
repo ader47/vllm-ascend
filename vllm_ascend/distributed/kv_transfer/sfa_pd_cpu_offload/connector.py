@@ -10,6 +10,7 @@ HBM. The D-side load path (LRU-resident H2D) is reused from
 See ``/Users/liufeng/.claude/plans/luminous-shimmying-wind.md`` for the design.
 """
 
+import re
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
     from vllm.v1.attention.backend import AttentionMetadata
     from vllm.v1.request import Request
+
+_LAYER_IDX_RE = re.compile(r"layers\.(\d+)")
 
 
 class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
@@ -180,8 +183,7 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """
         if not self.is_producer:
             return
-        import re
-        match = re.search(r'layers\.(\d+)', layer_name)
+        match = _LAYER_IDX_RE.search(layer_name)
         if match is None:
             return
         layer_idx = int(match.group(1))
