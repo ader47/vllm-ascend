@@ -22,6 +22,7 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 import msgspec
+import numpy as np
 import torch
 import zmq
 from vllm.config import VllmConfig
@@ -632,29 +633,36 @@ class MembPullReadThread(threading.Thread):
         p_base_addrs = p_meta["base_addrs"]
         p_block_len = p_meta["block_len"]
 
-        local_ptrs: list[int] = []
-        peer_ptrs: list[int] = []
-        lengths: list[int] = []
+        # Build per-leg (peer, local, length) int64 arrays and concatenate once,
+        # replacing three O(blocks) Python append loops (main k/v, partial, indexer).
+        peer_chunks: list[np.ndarray] = []
+        local_chunks: list[np.ndarray] = []
+        length_chunks: list[np.ndarray] = []
         n_main = 0
         n_indexer = 0
 
-        # Main MLA leg. Part A: the first `num_full` of P's blocks are FULL → D
-        # CPU pool (1:1 with d_main_ids); the optional last block is the PARTIAL
-        # → D main MLA HBM (group1) at partial_hbm_bid, so decode can append.
+        # Main MLA leg: the first `num_full` P blocks are FULL -> D CPU pool
+        # (1:1 with d_main_ids); the optional last block is the PARTIAL -> D HBM.
         p_k_base, p_v_base = p_base_addrs[0], p_base_addrs[1]
         p_k_len, p_v_len = p_block_len[0], p_block_len[1]
         full_p_blocks = p_block_ids[:num_full]
-        if full_p_blocks and d_main_ids:
+        n_full = min(len(full_p_blocks), len(d_main_ids))
+        if n_full:
             k_cpu, v_cpu = w._cpu_pools[offload_id]
-            for p_bid, d_bid in zip(full_p_blocks, d_main_ids):
-                peer_ptrs.append(p_k_base + p_bid * p_k_len)
-                local_ptrs.append(k_cpu.data_ptr() + d_bid * p_k_len)
-                lengths.append(p_k_len)
-                peer_ptrs.append(p_v_base + p_bid * p_v_len)
-                local_ptrs.append(v_cpu.data_ptr() + d_bid * p_v_len)
-                lengths.append(p_v_len)
-            n_main = min(len(full_p_blocks), len(d_main_ids))
-        # Partial last block → D HBM (whole block_size transfers; the tail beyond
+            full_p = np.array(full_p_blocks[:n_full], dtype=np.int64)
+            d_main = np.array(d_main_ids[:n_full], dtype=np.int64)
+            peer_k = p_k_base + full_p * p_k_len
+            peer_v = p_v_base + full_p * p_v_len
+            local_k = k_cpu.data_ptr() + d_main * p_k_len
+            local_v = v_cpu.data_ptr() + d_main * p_v_len
+            # Interleave [k0,v0,k1,v1,...] to match the original per-block order.
+            peer_chunks.append(np.stack([peer_k, peer_v], axis=1).ravel())
+            local_chunks.append(np.stack([local_k, local_v], axis=1).ravel())
+            length_chunks.append(np.stack([
+                np.full(n_full, p_k_len, dtype=np.int64),
+                np.full(n_full, p_v_len, dtype=np.int64)], axis=1).ravel())
+            n_main = n_full
+        # Partial last block -> D HBM (whole block_size transfers; the tail beyond
         # prompt_len is garbage and gets overwritten as decode appends).
         if partial_hbm_bid is not None and num_full < len(p_block_ids):
             hbm_kv = w._hbm_kv.get(layer_name)
@@ -663,20 +671,18 @@ class MembPullReadThread(threading.Thread):
             else:
                 k_hbm, v_hbm = hbm_kv
                 partial_p_bid = p_block_ids[num_full]
-                peer_ptrs.append(p_k_base + partial_p_bid * p_k_len)
-                local_ptrs.append(k_hbm.data_ptr() + partial_hbm_bid * p_k_len)
-                lengths.append(p_k_len)
-                peer_ptrs.append(p_v_base + partial_p_bid * p_v_len)
-                local_ptrs.append(v_hbm.data_ptr() + partial_hbm_bid * p_v_len)
-                lengths.append(p_v_len)
+                peer_chunks.append(np.array(
+                    [p_k_base + partial_p_bid * p_k_len,
+                     p_v_base + partial_p_bid * p_v_len], dtype=np.int64))
+                local_chunks.append(np.array(
+                    [k_hbm.data_ptr() + partial_hbm_bid * p_k_len,
+                     v_hbm.data_ptr() + partial_hbm_bid * p_v_len], dtype=np.int64))
+                length_chunks.append(np.array([p_k_len, p_v_len], dtype=np.int64))
                 n_main += 1
 
-        # Indexer leg: P tensor [2]=dsa_k → D indexer HBM. D's indexer
-        # block_size is `scale`× P's (D uses coarser indexer blocks, e.g. 4× →
-        # fewer of them: 2 D blocks cover the same tokens as ~7-8 P blocks), so
-        # each D indexer block is split into `scale` P-sized sub-addresses to
-        # align with P's finer block list. Extra D sub-addresses (D_blocks ×
-        # scale > len(P blocks)) are discarded by zip.
+        # Indexer leg: P tensor [2]=dsa_k -> D indexer HBM. D's indexer block is
+        # `scale`x P's, so each D block splits into `scale` P-sized sub-addresses;
+        # extra sub-addresses beyond len(p_block_ids) are discarded (zip-truncate).
         if d_indexer_ids:
             if len(p_base_addrs) < 3:
                 logger.error(
@@ -701,12 +707,14 @@ class MembPullReadThread(threading.Thread):
                     )
                 else:
                     scale = d_dsa_len // p_dsa_len
-                    # Split each D indexer block into `scale` P-sized sub-addresses.
-                    d_sub_addrs: list[int] = []
-                    for d_bid in d_indexer_ids:
-                        d_block_base = d_base + d_bid * d_dsa_len
-                        for off in range(scale):
-                            d_sub_addrs.append(d_block_base + off * p_dsa_len)
+                    # (D_blocks, scale) outer sum, flattened d_bid-major (matches the
+                    # original for-d_bid/for-off append order), then truncate to the
+                    # shorter of p_block_ids / D sub-addresses.
+                    d_idx = np.array(d_indexer_ids, dtype=np.int64)
+                    offs = np.arange(scale, dtype=np.int64)
+                    d_sub = (d_base + d_idx[:, None] * d_dsa_len + offs * p_dsa_len).reshape(-1)
+                    n_pairs = min(len(p_block_ids), d_sub.shape[0])
+                    p_idx = np.array(p_block_ids[:n_pairs], dtype=np.int64)
                     logger.debug(
                         "MembPull indexer %s: p_dsa_len=%d d_dsa_len=%d scale=%d, "
                         "D dsa_k shape=%s, D_sub=%d P_blocks=%d",
@@ -715,18 +723,15 @@ class MembPullReadThread(threading.Thread):
                         d_dsa_len,
                         scale,
                         tuple(d_indexer.shape),
-                        len(d_sub_addrs),
+                        int(d_sub.shape[0]),
                         len(p_block_ids),
                     )
-                    # Pair with P's blocks; zip truncates to the shorter, discarding
-                    # any extra D sub-addresses (e.g. 8 D sub-addrs vs 7 P blocks).
-                    for p_bid, d_sub in zip(p_block_ids, d_sub_addrs):
-                        peer_ptrs.append(p_dsa_base + p_bid * p_dsa_len)
-                        local_ptrs.append(d_sub)
-                        lengths.append(p_dsa_len)
-                    n_indexer = min(len(p_block_ids), len(d_sub_addrs))
+                    peer_chunks.append(p_dsa_base + p_idx * p_dsa_len)
+                    local_chunks.append(d_sub[:n_pairs])
+                    length_chunks.append(np.full(n_pairs, p_dsa_len, dtype=np.int64))
+                    n_indexer = n_pairs
 
-        if not local_ptrs:
+        if not peer_chunks:
             logger.warning(
                 "MembPull _do_read: nothing to transfer for %s (main=%d, indexer=%d)",
                 layer_name,
@@ -734,6 +739,10 @@ class MembPullReadThread(threading.Thread):
                 n_indexer,
             )
             return [], [], [], None
+
+        peer_ptrs = np.concatenate(peer_chunks).tolist()
+        local_ptrs = np.concatenate(local_chunks).tolist()
+        lengths = np.concatenate(length_chunks).tolist()
 
         read_info = {
             "layer_name": layer_name,
