@@ -753,7 +753,7 @@ class MembPullReadThread(threading.Thread):
                 "n_indexer": n_indexer,
                 "num_transfers": len(local_ptrs),
             }
-        return peer_ptrs, local_ptrs, lengths, info
+        return local_ptrs, peer_ptrs, lengths, info
 
     def _log_read_result(self, read_info: dict[str, Any]) -> None:
         # Verify-mode (VLLM_ASCEND_MF_VERIFY=1): log D's destination sums so the
