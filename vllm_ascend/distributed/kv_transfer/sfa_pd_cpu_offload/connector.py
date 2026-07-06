@@ -167,9 +167,25 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.start_load_kv(self._get_connector_metadata())
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        # SFA loads inside ``prepare_lru_resident_and_load`` (D); P waits via
-        # ``wait_for_layer_send`` when its layer buffer may be reused.
-        return
+        """Per-layer gate called before each layer's attention computation.
+
+        D-side: no-op (SFA loads inside ``prepare_lru_resident_and_load``).
+        P-side: **buffer-reuse gate** — before P overwrites a shared HBM buffer
+        for this layer, ensure D has finished reading it (READ_DONE received).
+        Uses ``wait_for_layer_send(layer_idx)`` internally.
+
+        The per-layer send-done events are set by the pipelined MembPull send
+        thread when READ_DONE arrives, and cleared here for the next cycle.
+        If the event is not set (first cycle, or already cleared) → skip (no wait).
+        """
+        if not self.is_producer:
+            return
+        import re
+        match = re.search(r'layers\.(\d+)', layer_name)
+        if match is None:
+            return
+        layer_idx = int(match.group(1))
+        self.wait_for_layer_send(layer_idx)
 
     def save_kv_layer(
         self,
