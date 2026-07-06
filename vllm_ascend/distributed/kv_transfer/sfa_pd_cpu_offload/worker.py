@@ -1019,6 +1019,9 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         if read_reqs:
             if 0 <= layer_idx < len(self.layer_send_done_events):
                 self.layer_send_done_events[layer_idx].clear()
+            pd_done = getattr(self, "layer_transfer_finished_events", None)
+            if pd_done is not None and 0 <= layer_idx < len(pd_done):
+                pd_done[layer_idx].clear()
             if len(endpoints) != 1:
                 raise RuntimeError(
                     f"MembPull layer {layer_idx} expects exactly one D endpoint, got {sorted(endpoints)}"
@@ -1219,6 +1222,27 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
             len(kv_caches),
             global_te._unique_id,
         )
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: list[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        connector_metadata: KVConnectorMetadata,
+        **kwargs,
+    ) -> None:
+        if (
+            self._backend == BACKEND_MEMFABRIC
+            and getattr(connector_metadata, "requests", None)
+            and self.current_layer < self.total_layers
+        ):
+            layer_idx = self.current_layer
+            if self.layer_send_done_events is not None and 0 <= layer_idx < len(self.layer_send_done_events):
+                self.layer_send_done_events[layer_idx].clear()
+            pd_done = getattr(self.kv_send_layer_thread, "layer_transfer_finished_events", None)
+            if pd_done is not None and 0 <= layer_idx < len(pd_done):
+                pd_done[layer_idx].clear()
+        super().save_kv_layer(layer_name, kv_layer, attn_metadata, connector_metadata, **kwargs)
 
     def wait_for_layer_send(self, layer_idx: int) -> None:
         """Block until D has read layer ``layer_idx``'s KV (buffer-reuse gate).
