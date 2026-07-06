@@ -45,6 +45,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker import (
     SFAKVOffloadWorker,
 )
+from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.config import get_offload_tp_rank
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.transfer_engine_backend import (
     BACKEND_MEMFABRIC,
@@ -124,6 +125,8 @@ class SFAPDCpuOffloadConsumerWorker:
         self.kv_cache_config = kv_cache_config
         self.use_layerwise = use_layerwise
         self.tp_rank = get_tensor_model_parallel_rank()  # TP-local rank for the per-rank ZMQ port
+        self.offload_tp_rank = get_offload_tp_rank(vllm_config)
+        self.is_offload_tp_rank = self.tp_rank == self.offload_tp_rank
         self.side_channel_host = get_ip()
         # D-side ZMQ control-plane base port; each TP rank listens on base + tp_rank.
         self.side_channel_port = (
@@ -156,6 +159,10 @@ class SFAPDCpuOffloadConsumerWorker:
         # External req ids whose DONE signal arrived before request_map
         # was seeded (see get_finished). Retried every step until mapped.
         self._pending_done: set[str] = set()
+        # Non-active TP ranks vote once per request in get_finished (not every
+        # step) so the active rank gates the finished-recving countdown.
+        self._local_done: set[str] = set()
+        self._local_done_reported: set[str] = set()
 
     # ------------------------------------------------------------------
     # Common
@@ -184,6 +191,14 @@ class SFAPDCpuOffloadConsumerWorker:
         The sfa model runner hands a 5-tuple per layer:
         ``(k_nope, v_rope, dsa_k_indexer, topk_buf_k, topk_buf_v)``.
         """
+        if not self.is_offload_tp_rank:
+            logger.info(
+                "SFAPDCpuOffload D-side TP rank %s skips SFA CPU pool; active offload_tp_rank=%s",
+                self.tp_rank,
+                self.offload_tp_rank,
+            )
+            return
+
         # --- D side: compose the SFA worker for LRU load + CPU pool ---
         self.sfa_worker = SFAKVOffloadWorker(self.vllm_config, self.use_layerwise, self.kv_cache_config)
         # SFA worker allocates k_caches_cpu/v_caches_cpu + LRU buffers here.
@@ -208,6 +223,17 @@ class SFAPDCpuOffloadConsumerWorker:
 
     # -- D-side forwards to the composed SFA worker (LRU load path) --
     def start_load_kv(self, metadata: KVConnectorMetadata):
+        if not self.is_offload_tp_rank:
+            for req in getattr(metadata, "requests", []):
+                req_id = getattr(req, "req_id", None)
+                if req_id is None:
+                    continue
+                self._cpu_blocks_by_req[req_id] = 0
+                if req_id not in self._local_done_reported:
+                    self._local_done.add(req_id)
+                    self._local_done_reported.add(req_id)
+            return
+
         assert self.sfa_worker is not None
         # B1: reset decode offload — now driven by sfa_worker.process_layer_data
         # (num_new_offload_blocks > 0 triggers it in sfa_worker.start_load_kv).
@@ -256,6 +282,8 @@ class SFAPDCpuOffloadConsumerWorker:
         token_to_req: torch.Tensor | None = None,
         capturing: bool = False,
     ) -> bool:
+        if not self.is_offload_tp_rank:
+            return False
         assert self.sfa_worker is not None
         return self.sfa_worker.prepare_lru_resident_and_load(
             layer_name,
@@ -275,6 +303,8 @@ class SFAPDCpuOffloadConsumerWorker:
         attn_metadata: AttentionMetadata,
         connector_metadata: KVConnectorMetadata,
     ) -> None:
+        if not self.is_offload_tp_rank:
+            return
         # B1: offload decode-filled main MLA blocks HBM -> CPU pool via the
         # composed SFA worker's async background thread (process_layer_data built
         # the per-layer tasks in start_load_kv from num_new_offload_blocks).
@@ -282,6 +312,8 @@ class SFAPDCpuOffloadConsumerWorker:
             self.sfa_worker.save_kv_layer(layer_name)
 
     def wait_for_save(self):
+        if not self.is_offload_tp_rank:
+            return
         if self.sfa_worker is not None:
             self.sfa_worker.wait_for_save()
 
@@ -292,9 +324,11 @@ class SFAPDCpuOffloadConsumerWorker:
             self.request_map.pop(ext_id, None)
             self._dest_blocks_by_req.pop(ext_id, None)
             self._pending_done.discard(ext_id)
+            self._local_done_reported.discard(req_id)
 
     def get_finished(self, finished_req_ids: set[str] | None = None) -> tuple[set[str], set[str]]:
-        done_recving: set[str] = set()
+        done_recving: set[str] = self._local_done
+        self._local_done = set()
 
         # memfabric pull mode: done comes from MembPullReadThread
         if hasattr(self, "_mf_read_thread") and self._mf_read_thread is not None:
@@ -336,6 +370,8 @@ class SFAPDCpuOffloadConsumerWorker:
 
     def get_num_cpu_blocks(self, req_ids: list[str]) -> dict[str, int] | None:
         """Per-req actual main-MLA CPU-block count for the solution-1 threshold."""
+        if not self.is_offload_tp_rank:
+            return {rid: 0 for rid in req_ids}
         if self.sfa_worker is None:
             return None
         result = {rid: self._cpu_blocks_by_req[rid] for rid in req_ids if rid in self._cpu_blocks_by_req}
@@ -1163,6 +1199,8 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
                 device_id=torch.npu.current_device(),
             )
         super().__init__(vllm_config, kv_cache_config, engine_id)
+        self.offload_tp_rank = get_offload_tp_rank(vllm_config)
+        self.is_offload_tp_rank = self.tp_rank == self.offload_tp_rank
         self.layer_send_done_events: list[threading.Event] | None = None
 
     def update_decoder_info(self, req_id: str, req_meta: Any) -> Any:
@@ -1193,6 +1231,8 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
         is at kernel granularity, scale 1)."""
         if self._backend == BACKEND_MEMFABRIC:
             self.current_layer = 0
+            if not self.is_offload_tp_rank:
+                return
             for req_id, req_meta in getattr(metadata, "requests", {}).items():
                 if req_meta.remote_port is None:
                     continue
@@ -1222,6 +1262,14 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         # memfabric pull mode only (mooncake staging path removed).
         assert self._backend == BACKEND_MEMFABRIC, "SFAPDCpuOffloadConnector P side supports memfabric pull only."
+        if not self.is_offload_tp_rank:
+            logger.info(
+                "MembPull P TP rank %s skips memfabric send setup; active offload_tp_rank=%s",
+                self.tp_rank,
+                self.offload_tp_rank,
+            )
+            return
+
         # Swap in _MembPullSendingThread (notifies D to read, does NOT push).
         # Set its p_session before the base class constructs it.
         orig = _mlc.KVCacheSendingLayerThread
@@ -1264,6 +1312,11 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
         connector_metadata: KVConnectorMetadata,
         **kwargs,
     ) -> None:
+        if self._backend == BACKEND_MEMFABRIC and not self.is_offload_tp_rank:
+            if getattr(connector_metadata, "requests", None):
+                self.current_layer += 1
+            return
+
         if (
             self._backend == BACKEND_MEMFABRIC
             and getattr(connector_metadata, "requests", None)

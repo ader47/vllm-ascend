@@ -36,6 +36,7 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_scheduler import (
     CPUBlockManager,
 )
+from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.config import get_offload_tp_rank
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -78,6 +79,7 @@ class SFAPDCpuOffloadScheduler:
         self.kv_cache_config = kv_cache_config
         self.use_layerwise = use_layerwise
         self.engine_id = vllm_config.kv_transfer_config.engine_id
+        self.offload_tp_rank = get_offload_tp_rank(vllm_config)
 
         self.block_size = [
             group_spec.kv_cache_spec.block_size
@@ -137,6 +139,10 @@ class SFAPDCpuOffloadScheduler:
         # req_id -> CPU block ids pending delayed free (see build_connector_meta).
         self._pending_free: dict[str, list[int]] = {}
         self.executor = ThreadPoolExecutor(32)
+        logger.info(
+            "SFAPDCpuOffload scheduler uses TP rank %s as the only SFA CPU-offload rank",
+            self.offload_tp_rank,
+        )
 
     # ------------------------------------------------------------------
     # D side (kv_consumer)

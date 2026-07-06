@@ -50,6 +50,10 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     * WORKER + producer    : P-side layer-wise READ_READY notifications.
     * WORKER + consumer    : D-side : composes ``SFAKVOffloadWorker`` (LRU load +
       CPU pool) + memfabric pull read + indexer/main split registration.
+
+    ``kv_connector_extra_config["offload_tp_rank"]`` selects the single TP rank
+    that owns the SFA CPU pool and memfabric pull path on both P and D. It
+    defaults to 0.
     """
 
     def __init__(
