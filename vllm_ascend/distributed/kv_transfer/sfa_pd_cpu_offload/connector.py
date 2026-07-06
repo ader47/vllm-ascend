@@ -174,9 +174,9 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         for this layer, ensure D has finished reading it (READ_DONE received).
         Uses ``wait_for_layer_send(layer_idx)`` internally.
 
-        The per-layer send-done events are set by the pipelined MembPull send
-        thread when READ_DONE arrives, and cleared here for the next cycle.
-        If the event is not set (first cycle, or already cleared) → skip (no wait).
+        The per-layer send-done events are cleared when a READ_READY_BATCH is
+        sent and set again by the pipelined MembPull send thread when READ_DONE
+        arrives. Events are initially set, so the first cycle does not block.
         """
         if not self.is_producer:
             return
