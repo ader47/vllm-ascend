@@ -72,6 +72,29 @@ def _layer_idx(layer_name: str) -> int:
     return int(match.group(1))
 
 
+def _coalesce_desc(
+    peer: np.ndarray,
+    local: np.ndarray,
+    length: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Merge adjacent descriptors whose peer AND local addresses are both
+    contiguous into one descriptor of summed length. The memfabric engine
+    issues one transfer per descriptor, so coalescing a run of R contiguous
+    blocks into one descriptor cuts both descriptor count and per-op overhead.
+    Lossless: the merged descriptor covers exactly the same bytes."""
+    n = peer.shape[0]
+    if n <= 1:
+        return peer, local, length
+    contiguous = (peer[1:] == peer[:-1] + length[:-1]) & (local[1:] == local[:-1] + length[:-1])
+    if contiguous.all():
+        return peer[:1], local[:1], np.array([int(length.sum())], dtype=np.int64)
+    run_start = np.concatenate(([0], np.nonzero(~contiguous)[0] + 1))
+    run_end = np.append(run_start[1:] - 1, n - 1)
+    cum = np.cumsum(length)
+    merged_len = cum[run_end] - cum[run_start] + length[run_start]
+    return peer[run_start], local[run_start], merged_len
+
+
 MF_META = b"mf_meta"  # P→D: (MF_META, p_session, p_layer_meta_serialized)
 # READ_READY_BATCH (pull model): P sends its OWN source block ids + external
 # req_ids for one layer; D looks up its destination blocks by req_id.
@@ -675,16 +698,20 @@ class MembPullReadThread(threading.Thread):
         if n_full:
             full_p = np.array(full_p_blocks[:n_full], dtype=np.int64)
             d_main = np.array(d_main_ids[:n_full], dtype=np.int64)
-            peer_k = p_k_base + full_p * p_k_len
-            peer_v = p_v_base + full_p * p_v_len
-            local_k = layer["k_cpu_ptr"] + d_main * p_k_len
-            local_v = layer["v_cpu_ptr"] + d_main * p_v_len
-            # Interleave [k0,v0,k1,v1,...] to match the original per-block order.
-            peer_chunks.append(np.stack([peer_k, peer_v], axis=1).ravel())
-            local_chunks.append(np.stack([local_k, local_v], axis=1).ravel())
-            length_chunks.append(np.stack([
-                np.full(n_full, p_k_len, dtype=np.int64),
-                np.full(n_full, p_v_len, dtype=np.int64)], axis=1).ravel())
+            len_k = np.full(n_full, p_k_len, dtype=np.int64)
+            len_v = np.full(n_full, p_v_len, dtype=np.int64)
+            # Coalesce the k and v legs separately (each is in block order); a run
+            # of contiguous blocks on both P and D becomes one descriptor.
+            cp, cl, clen = _coalesce_desc(p_k_base + full_p * p_k_len,
+                                          layer["k_cpu_ptr"] + d_main * p_k_len, len_k)
+            peer_chunks.append(cp)
+            local_chunks.append(cl)
+            length_chunks.append(clen)
+            cp, cl, clen = _coalesce_desc(p_v_base + full_p * p_v_len,
+                                          layer["v_cpu_ptr"] + d_main * p_v_len, len_v)
+            peer_chunks.append(cp)
+            local_chunks.append(cl)
+            length_chunks.append(clen)
             n_main = n_full
         if partial_hbm_bid is not None and num_full < len(p_block_ids):
             k_hbm_ptr = layer["k_hbm_ptr"]
@@ -718,9 +745,14 @@ class MembPullReadThread(threading.Thread):
                 layer_name, p_dsa_len, d_dsa_len, scale, idx["shape"],
                 int(d_sub.shape[0]), len(p_block_ids),
             )
-            peer_chunks.append(p_dsa_base + p_idx * p_dsa_len)
-            local_chunks.append(d_sub[:n_pairs])
-            length_chunks.append(np.full(n_pairs, p_dsa_len, dtype=np.int64))
+            cp, cl, clen = _coalesce_desc(
+                p_dsa_base + p_idx * p_dsa_len,
+                d_sub[:n_pairs],
+                np.full(n_pairs, p_dsa_len, dtype=np.int64),
+            )
+            peer_chunks.append(cp)
+            local_chunks.append(cl)
+            length_chunks.append(clen)
             n_indexer = n_pairs
 
         if not peer_chunks:
@@ -752,6 +784,8 @@ class MembPullReadThread(threading.Thread):
                 "n_main": n_main,
                 "n_indexer": n_indexer,
                 "num_transfers": len(local_ptrs),
+                # pre-coalesce descriptor count (2 per main block incl. partial + 1 per indexer pair)
+                "atomic_transfers": 2 * n_main + n_indexer,
             }
         return local_ptrs, peer_ptrs, lengths, info
 
@@ -857,13 +891,15 @@ class MembPullReadThread(threading.Thread):
             return
 
         if envs.VLLM_ASCEND_SFA_DEBUG:
+            atomic_total = sum(r.get("atomic_transfers", 0) for r in read_infos)
             logger.info(
                 "MembPull D start batched memfabric read: layer=%s, reqs=%d, "
-                "p_session=%s, transfers=%d",
+                "p_session=%s, transfers=%d (coalesced from %d)",
                 layer_name,
                 len(read_infos),
                 self._p_session,
                 len(all_local_ptrs),
+                atomic_total,
             )
         ret = self.engine.batch_transfer_sync_read(self._p_session, all_local_ptrs, all_peer_ptrs, all_lengths)
         if ret != 0:
