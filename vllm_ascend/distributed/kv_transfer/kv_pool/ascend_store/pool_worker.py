@@ -830,6 +830,13 @@ class KVPoolWorker:
     def process_layer_data(self, requests: list[ReqMeta]) -> None:
         if not requests:
             return
+        # Hand each layer a fresh task list every step. The worker-side
+        # transfer_tasks.clear() races with this append at the step boundary
+        # and can wipe an unprocessed task (skipped load → shared buffer keeps
+        # the previous layer's KV → cross-layer corruption).
+        for layer_id in range(self.num_layers):
+            self.layer_save_tasks[layer_id] = []
+            self.layer_load_tasks[layer_id] = []
         for layer_id in range(self.num_layers):
             self._process_save_for_layer_batch(requests, layer_id)
         self._build_shared_save_data()
