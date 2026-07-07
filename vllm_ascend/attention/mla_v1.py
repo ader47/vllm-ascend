@@ -29,6 +29,7 @@ from vllm_ascend.attention.utils import (
     ascend_chunked_prefill_workspace_size,
     enable_cp,
     enabling_mlapo,
+    maybe_debug_checksum_kv,
     maybe_record_attention_compute_start,
     maybe_save_kv_layer_to_connector,
     split_decodes_and_prefills,
@@ -1765,6 +1766,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
                 layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv
             )
+        maybe_debug_checksum_kv("LOAD", layer_name, kv_cache)
         # Open the layerwise prefetch gate before attention. Mirror the gate's
         # arming condition: wait_for_kv_layer_from_connector only runs on the
         # prefill path, so a decode-only step must not record.
@@ -1811,5 +1813,6 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         del o_proj_input
         if self.is_kv_producer and not self.is_kv_both:
+            maybe_debug_checksum_kv("SAVE", layer_name, kv_cache)
             maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
         return output_padded

@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
@@ -7,6 +8,7 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group, is_v1_kv_transfer_group
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.logger import logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
@@ -444,6 +446,22 @@ def maybe_record_attention_compute_start():
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
     record_attention_compute_start()
+
+
+def maybe_debug_checksum_kv(stage: str, layer_name: str, kv_cache) -> None:
+    """TEMP debug aid for layer-reuse accuracy: log a cheap K-cache checksum.
+
+    Enable with VLLM_ASCEND_KV_CHECKSUM=1. Compare the same layer's checksum
+    across requests to localize corruption (load vs save vs compute). Remove
+    after debugging.
+    """
+    if os.getenv("VLLM_ASCEND_KV_CHECKSUM") != "1":
+        return
+    try:
+        k = kv_cache[0] if isinstance(kv_cache, (tuple, list)) else kv_cache
+        logger.info("[KVCS-%s] layer=%s ksum=%.6f", stage, layer_name, k.float().sum().item())
+    except Exception as e:  # noqa: BLE001
+        logger.info("[KVCS-%s] layer=%s err=%s", stage, layer_name, e)
 
 
 def maybe_save_kv_layer_to_connector(
