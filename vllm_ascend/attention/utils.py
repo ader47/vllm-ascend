@@ -9,6 +9,7 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
+from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.utils import (
     AscendDeviceType,
     get_ascend_config,
@@ -429,6 +430,20 @@ def wait_for_kv_layer_from_connector(layer_name: str):
         return
     # TODO: assert ascendMetadata
     connector.wait_for_layer_load(layer_name)
+
+
+def maybe_record_attention_compute_start():
+    """Record the compute-stream boundary immediately before the attention op.
+
+    Opens the per-layer ``AttentionComputeStartGate`` that layerwise KV-pool
+    prefetch threads wait on before submitting H2D loads for upcoming layers,
+    so those transfers overlap with this layer's attention compute. No-op
+    unless a v1 KV-transfer connector is registered and a gate has been armed
+    by the layerwise load path (otherwise the gate stays ``None``).
+    """
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+    record_attention_compute_start()
 
 
 def maybe_save_kv_layer_to_connector(

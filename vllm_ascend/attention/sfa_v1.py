@@ -30,6 +30,7 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
     enable_cp,
+    maybe_record_attention_compute_start,
     maybe_save_kv_layer_to_connector,
     trans_rope_weight,
     transdata,
@@ -1827,6 +1828,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
 
+        # Open the layerwise prefetch gate before the attention compute below —
+        # indexer_select_post_process also runs an attention kernel, so record
+        # ahead of it (and the main sparse flash attention) to overlap H2D.
+        maybe_record_attention_compute_start()
         if self.enable_dsa_cp and attn_metadata.dsa_cp_context is not None:
             topk_num_tokens = attn_metadata.dsa_cp_context.local_end_with_pad - attn_metadata.dsa_cp_context.local_start
         else:
