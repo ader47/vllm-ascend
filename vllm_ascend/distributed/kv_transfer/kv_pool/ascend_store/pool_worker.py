@@ -868,6 +868,21 @@ class KVPoolWorker:
 
     def wait_for_layer_load(self) -> None:
         assert self.layer_load_finished_events is not None
+        # Buffer-reuse gate: this layer's load/compute overwrites the shared
+        # slot of its buffer-mate (prefetch_layer_map[current]); wait for that
+        # mate's save copy to finish first, else the send thread reads
+        # cross-layer KV and pollutes the pool. No-op without reuse (empty map)
+        # or for first occupants / independent layers (absent from the map).
+        reuse_mate = self.prefetch_layer_map.get(self.current_layer)
+        if reuse_mate is not None:
+            assert self.layer_save_finished_events is not None
+            if not self.layer_save_finished_events[reuse_mate].wait(timeout=30):
+                logger.warning(
+                    "Layerwise buffer-reuse: save of layer %d (mate of %d) timed out",
+                    reuse_mate,
+                    self.current_layer,
+                )
+            self.layer_save_finished_events[reuse_mate].clear()
         reset_attention_compute_start_gate()
         self._submit_ready_layer_loads()
         should_wait = bool(self.layer_load_tasks[self.current_layer])
