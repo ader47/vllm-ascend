@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import queue
 import threading
 import time
@@ -1185,12 +1186,22 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             self.max_transfer_blocks,
             self.max_transfer_bytes,
         )
-        # wait for KV transfer (PD)
-        # if self.layer_transfer_finished_events is not None:
-        #     is_finish = self.layer_transfer_finished_events[layer_id].wait(timeout=30)
-        #     if not is_finish:
-        #         logger.error("Layerwise %d PD transfer wait timed out", layer_id)
-        #     self.layer_transfer_finished_events[layer_id].clear()
+        # wait for KV transfer (PD): the co-located PD send thread (mooncake push
+        # or sfa_pd pull) sets layer_transfer_finished_events[layer_id] once D has
+        # read this layer. Waiting here couples layer_save_finished_events (which
+        # the recv reuse gate consumes via wait_for_save=mate) to PD completion, so
+        # the reuse gate protects the PD read too -- without this, under layer reuse
+        # L+num_shared_buffers overwrites the shared buffer while D is still reading L.
+        _pd_ev = self.layer_transfer_finished_events
+        if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG"):
+            logger.info("[PDWAIT] L=%d events_none=%s", layer_id, _pd_ev is None)
+        if _pd_ev is not None:
+            if not _pd_ev[layer_id].wait(timeout=30):
+                logger.error("Layerwise %d PD transfer wait timed out", layer_id)
+            else:
+                if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG"):
+                    logger.info("[PDWAIT] L=%d pd_done", layer_id)
+            _pd_ev[layer_id].clear()
         if res != 0:
             logger.error("Layerwise %d save batch_copy failed with return code %d", layer_id, res)
         for req_id in req_meta.req_ids:
@@ -1282,6 +1293,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
         if len(transfer_tasks) == 0:
             if wait_for_save is not None:
+                if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG"):
+                    logger.info("[RECVGATE] layer=%d waiting_for_save=%d", layer_id, wait_for_save)
                 while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
                     logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
                 logger.debug("Layer save event cleared: layer %d", wait_for_save)
