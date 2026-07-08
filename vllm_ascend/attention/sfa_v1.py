@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar, Tuple
+import os
 
 import scipy  # type: ignore
 import torch
@@ -1884,6 +1885,12 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         output[...] = self.o_proj(attn_output)[0]
 
+        if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG"):
+            try:
+                _k = kv_cache[0] if isinstance(kv_cache, (tuple, list)) else kv_cache
+                logger.info("[KVSUM-P] layer=%s ksum=%.6f", layer_name, _k.float().sum().item())
+            except Exception as e:  # noqa: BLE001
+                logger.info("[KVSUM-P] layer=%s err=%s", layer_name, e)
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
         return output_padded
