@@ -612,6 +612,12 @@ class KVPoolWorker:
         self.layerwise_retrievers: list[Any] = []
         if self.use_layerwise:
             self.next_layer_to_submit = 0
+            # Reown per-layer task lists every step so the recv thread can never
+            # re-submit stale tasks from a previous step. process_layer_data also
+            # resets them, but it is skipped on the empty-request early return.
+            for layer_id in range(self.num_layers):
+                self.layer_save_tasks[layer_id] = []
+                self.layer_load_tasks[layer_id] = []
             reset_attention_compute_start_gate()
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         if len(metadata.requests) == 0:
@@ -849,15 +855,18 @@ class KVPoolWorker:
         recv_thread = self.kv_recv_thread
 
         def submit_layer_load(layer_id: int) -> bool:
-            if not self.layer_load_tasks[layer_id]:
-                return False
-            wait_for_save_layer = None
+            reuse_mate = self.prefetch_layer_map.get(layer_id)
+            has_load = bool(self.layer_load_tasks[layer_id])
+            if not has_load and reuse_mate is None:
+                return False  # independent / first-occupant with no load
+            # One task for both: non-empty transfer_tasks = real load; empty =
+            # reused-no-load gate (recv's len==0 branch), both gated on the mate.
             attention_start_gate = None
-            if layer_id != self.current_layer:
+            if has_load and layer_id != self.current_layer:
                 attention_start_gate = get_attention_compute_start_gate()
             recv_thread.add_request(
                 LayerLoadTask(  # type: ignore[arg-type]
-                    wait_for_save_layer=wait_for_save_layer,
+                    wait_for_save_layer=reuse_mate,
                     transfer_tasks=self.layer_load_tasks[layer_id],
                     layer_id=layer_id,
                     attention_start_gate=attention_start_gate,
@@ -875,30 +884,21 @@ class KVPoolWorker:
 
     def wait_for_layer_load(self) -> None:
         assert self.layer_load_finished_events is not None
-        # Buffer-reuse gate: this layer's load/compute overwrites the shared
-        # slot of its buffer-mate (prefetch_layer_map[current]); wait for that
-        # mate's save copy to finish first, else the send thread reads
-        # cross-layer KV and pollutes the pool. No-op without reuse (empty map)
-        # or for first occupants / independent layers (absent from the map).
-        reuse_mate = self.prefetch_layer_map.get(self.current_layer)
-        if reuse_mate is not None:
-            assert self.layer_save_finished_events is not None
-            if not self.layer_save_finished_events[reuse_mate].wait(timeout=30):
-                logger.warning(
-                    "Layerwise buffer-reuse: save of layer %d (mate of %d) timed out",
-                    reuse_mate,
-                    self.current_layer,
-                )
-            self.layer_save_finished_events[reuse_mate].clear()
         reset_attention_compute_start_gate()
+        # Submit current + prefetch (real loads and reused-no-load gate tasks).
+        # layer_load_tasks is safe to read here: recv no longer clears it (reowned
+        # per step in process_layer_data).
         self._submit_ready_layer_loads()
-        should_wait = bool(self.layer_load_tasks[self.current_layer])
-        if not should_wait:
+        needs_wait = (
+            bool(self.layer_load_tasks[self.current_layer])
+            or self.prefetch_layer_map.get(self.current_layer) is not None
+        )
+        if not needs_wait:
+            # Independent / first-occupant with no load: no gate, no H2D.
             self.layer_load_finished_events[self.current_layer].clear()
             return
-        is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=10)
-        if not is_finish:
-            logger.info("Layerwise %d load wait timed out", self.current_layer)
+        while not self.layer_load_finished_events[self.current_layer].wait(timeout=30):
+            logger.info("Layerwise %d load not done, keep waiting", self.current_layer)
         logger.debug(">>>>>>>>>>>>>>>>>>>> clear load layer %d", self.current_layer)
         self.layer_load_finished_events[self.current_layer].clear()
 
@@ -921,9 +921,12 @@ class KVPoolWorker:
         else:
             self.layer_save_finished_events[self.current_layer].set()
         if self.current_layer == self.num_layers - 1:
-            is_finish = self.layer_save_finished_events[self.num_layers - 1].wait(timeout=10)
-            if not is_finish:
-                logger.info("Layerwise %d save wait timed out", self.current_layer)
+            # Step-end drain: send thread is FIFO, so save_finished[last] means
+            # all saves landed -> buffers/GVAs safe to reuse next step.
+            while not self.layer_save_finished_events[self.num_layers - 1].wait(timeout=30):
+                logger.warning(
+                    "Layerwise %d save drain not done, keep waiting", self.current_layer
+                )
             for layer_id in range(self.num_layers):
                 if self.layer_save_finished_events[layer_id].is_set():
                     logger.debug(">>>>>>>>>>>>>>>>>>>> clear save layer %d", layer_id)

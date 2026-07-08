@@ -3,6 +3,7 @@
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    _DEFAULT_MAX_PREFETCH_LAYERS,
     get_layer_load_start_block,
     get_layerwise_config,
     get_layerwise_independent_layers,
@@ -35,18 +36,27 @@ class TestNumSharedBuffers:
         with pytest.raises(ValueError):
             get_layerwise_num_shared_buffers(27, {"layerwise_num_shared_buffers": 0})
 
+    def test_default_rejects_zero_layers(self):
+        with pytest.raises(ValueError):
+            get_layerwise_num_shared_buffers(0, None)
+        with pytest.raises(ValueError):
+            get_layerwise_num_shared_buffers(0, {})
+
 
 class TestNumPrefetchLayers:
-    def test_default_one(self):
-        assert get_layerwise_num_prefetch_layers(None) == 1
-        assert get_layerwise_num_prefetch_layers({}) == 1
+    def test_default_equals_num_shared_buffers(self):
+        assert get_layerwise_num_prefetch_layers(6, None) == 6
+        assert get_layerwise_num_prefetch_layers(6, {}) == 6
 
-    def test_from_extra_config(self):
-        assert get_layerwise_num_prefetch_layers({"layerwise_prefetch_layers": 3}) == 3
+    def test_default_capped_for_large_shared_buffers(self):
+        assert get_layerwise_num_prefetch_layers(100, None) == _DEFAULT_MAX_PREFETCH_LAYERS
+
+    def test_explicit_overrides_default(self):
+        assert get_layerwise_num_prefetch_layers(6, {"layerwise_prefetch_layers": 3}) == 3
 
     def test_less_than_one_rejected(self):
         with pytest.raises(ValueError):
-            get_layerwise_num_prefetch_layers({"layerwise_prefetch_layers": 0})
+            get_layerwise_num_prefetch_layers(6, {"layerwise_prefetch_layers": 0})
 
 
 class TestIndependentLayers:

@@ -1348,7 +1348,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "
         logger.debug("Layer load event set: layer %d", layer_id)
         self.layer_load_finished_events[layer_id].set()
-        transfer_tasks.clear()
+        # Do NOT clear transfer_tasks: it aliases the worker's
+        # layer_load_tasks[layer_id]; clearing races with wait_for_layer_load's
+        # bool() read. The list is reowned per step in process_layer_data.
         self.request_queue.task_done()
         self.get_event.set()
 

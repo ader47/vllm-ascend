@@ -6,6 +6,11 @@ _EXTRA_CONFIG_KEY_NUM_SHARED_BUFFERS = "layerwise_num_shared_buffers"
 _EXTRA_CONFIG_KEY_PREFETCH_LAYERS = "layerwise_prefetch_layers"
 _EXTRA_CONFIG_KEY_INDEPENDENT_LAYERS = "layerwise_independent_layers"
 
+# Prefetch auto-defaults to num_shared_buffers (the max useful overlap -- a reused
+# load gates on its mate num_shared_buffers layers back). Capped so a very large
+# num_shared_buffers doesn't burst-submit too many loads at layer 0.
+_DEFAULT_MAX_PREFETCH_LAYERS = 8
+
 
 @dataclass(frozen=True)
 class LayerwiseConfig:
@@ -31,6 +36,8 @@ def get_layerwise_num_shared_buffers(
 ) -> int:
     value = extra_config.get(_EXTRA_CONFIG_KEY_NUM_SHARED_BUFFERS) if extra_config else None
     if value is None:
+        if num_layers < 1:
+            raise ValueError("num_layers must be at least 1 to default num_shared_buffers")
         return num_layers
     num_shared_buffers = _parse_int_config(value, _EXTRA_CONFIG_KEY_NUM_SHARED_BUFFERS)
     if num_shared_buffers < 1:
@@ -39,11 +46,14 @@ def get_layerwise_num_shared_buffers(
 
 
 def get_layerwise_num_prefetch_layers(
+    num_shared_buffers: int,
     extra_config: dict[str, Any] | None = None,
 ) -> int:
     value = extra_config.get(_EXTRA_CONFIG_KEY_PREFETCH_LAYERS) if extra_config else None
     if value is None:
-        return 1
+        # Default = num_shared_buffers: overlap is capped at nsb-1 by the gate, so
+        # this is the sweet spot. Clip pathological nsb to bound the layer-0 burst.
+        return min(num_shared_buffers, _DEFAULT_MAX_PREFETCH_LAYERS)
     num_prefetch_layers = _parse_int_config(value, _EXTRA_CONFIG_KEY_PREFETCH_LAYERS)
     if num_prefetch_layers < 1:
         raise ValueError(f"{_EXTRA_CONFIG_KEY_PREFETCH_LAYERS} must be at least 1")
@@ -99,7 +109,7 @@ def get_layerwise_config(
     extra_config: dict[str, Any] | None = None,
 ) -> LayerwiseConfig:
     num_shared_buffers = get_layerwise_num_shared_buffers(num_layers, extra_config)
-    num_prefetch_layers = get_layerwise_num_prefetch_layers(extra_config)
+    num_prefetch_layers = get_layerwise_num_prefetch_layers(num_shared_buffers, extra_config)
     independent_layers = get_layerwise_independent_layers(num_layers, extra_config)
     independent_layer_indices = set(independent_layers)
     reused_layers = [i for i in range(num_layers) if i not in independent_layer_indices]
