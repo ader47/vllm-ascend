@@ -1886,29 +1886,38 @@ class AscendSFAImpl(MLAAttentionImpl):
         output[...] = self.o_proj(attn_output)[0]
 
         if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG") and not self.use_offload:
-            # Ground-truth "P computed" sample, on the compute stream right after
-            # this layer's KV scatter and BEFORE the save hook enqueues the send.
-            # It captures layer L's true data before any layer-reuse overwrite of
-            # the shared slot. Read alongside [KVVAL-PSEND] (slot at notify time)
-            # and D's [KVVAL-DLOAD]:
+            # Ground-truth "P computed" sample per main-MLA leg (K, V), on the
+            # compute stream right after this layer's KV scatter and BEFORE the
+            # save hook enqueues the send. Captures layer L's true data before
+            # any layer-reuse overwrite of the shared slot. (The indexer/dsa leg
+            # is not sampled here -- its write timing on the non-offload path is
+            # covered by [KVVAL-PSEND] vs [KVVAL-DLOAD].) Read alongside
+            # [KVVAL-PSEND] (slot at notify time) and D's [KVVAL-DLOAD]:
             #   PSTORE != PSEND        -> P overwrote the shared slot before D
             #                             read it (reuse-gate bug on P).
             #   PSTORE == PSEND != DLOAD -> transfer / load corrupts the layer.
             #   PSTORE == PSEND == DLOAD -> lossless; corruption is D-side usage.
             try:
-                _k = kv_cache[0] if isinstance(kv_cache, (tuple, list)) else kv_cache
                 _valid = slot_mapping[slot_mapping >= 0]
                 if _valid.numel() > 0:
                     _bids = torch.unique(_valid // self.block_size).tolist()
-                    _stk = torch.stack([_k[b].reshape(-1) for b in _bids])
-                    _absmax = _stk.abs().max(dim=1).values.tolist()
-                    logger.info(
-                        "[KVVAL-PSTORE] layer=%s nblocks=%d vals0=%s absmax=%s",
-                        layer_name,
-                        len(_bids),
-                        _stk[0, :8].tolist(),
-                        " ".join(f"{b}:{a:.4g}" for b, a in zip(_bids, _absmax)),
-                    )
+                    _kv = kv_cache if isinstance(kv_cache, (tuple, list)) else [kv_cache]
+                    for _leg, _t in (
+                        ("K", _kv[0]),
+                        ("V", _kv[1] if len(_kv) > 1 else None),
+                    ):
+                        if _t is None:
+                            continue
+                        _stk = torch.stack([_t[b].reshape(-1) for b in _bids])
+                        _absmax = _stk.abs().max(dim=1).values.tolist()
+                        logger.info(
+                            "[KVVAL-PSTORE] leg=%s layer=%s nblocks=%d vals0=%s absmax=%s",
+                            _leg,
+                            layer_name,
+                            len(_bids),
+                            _stk[0, :8].tolist(),
+                            " ".join(f"{b}:{a:.4g}" for b, a in zip(_bids, _absmax)),
+                        )
             except Exception as e:  # noqa: BLE001
                 logger.info("[KVVAL-PSTORE] layer=%s err=%s", layer_name, e)
 

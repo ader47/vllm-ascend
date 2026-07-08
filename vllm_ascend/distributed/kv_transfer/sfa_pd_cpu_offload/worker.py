@@ -96,6 +96,41 @@ def _coalesce_desc(
     return peer[run_start], local[run_start], merged_len
 
 
+def _pd_reuse_sample_leg(
+    tag: str,
+    leg: str,
+    layer_name: str,
+    tensor,
+    block_len_bytes: int,
+    sample_bids,
+    label_bids,
+) -> None:
+    """Debug-only ([KVVAL-PSEND]/[KVVAL-DLOAD]): per-block absmax + block-0
+    first-8 for one KV leg (K / V). ``sample_bids`` are the tensor's physical
+    blocks to read; ``label_bids`` are the ids to print (the P block id, so a
+    P-side line and a D-side line line up by the same key). No-op when there is
+    nothing to sample. Uses the exact per-block byte stride (block_id *
+    block_len_bytes), matching memfabric's addressing regardless of layout."""
+    sample_bids = [int(b) for b in sample_bids]
+    if not sample_bids or block_len_bytes <= 0:
+        return
+    elems = block_len_bytes // tensor.element_size()
+    if elems <= 0:
+        return
+    flat = tensor.reshape(-1)
+    stk = torch.stack([flat[b * elems:(b + 1) * elems] for b in sample_bids])
+    absmax = stk.abs().max(dim=1).values.tolist()
+    logger.info(
+        "[%s] leg=%s layer=%s nblocks=%d vals0=%s absmax=%s",
+        tag,
+        leg,
+        layer_name,
+        len(sample_bids),
+        stk[0, :8].tolist(),
+        " ".join(f"{lb}:{a:.4g}" for lb, a in zip(label_bids, absmax)),
+    )
+
+
 MF_META = b"mf_meta"  # P→D: (MF_META, p_session, p_layer_meta_serialized)
 # READ_READY_BATCH (pull model): P sends its OWN source block ids + external
 # req_ids for one layer; D looks up its destination blocks by req_id.
@@ -914,13 +949,12 @@ class MembPullReadThread(threading.Thread):
                 all_local_ptrs[0] if all_local_ptrs else 0,
                 all_lengths[0] if all_lengths else 0,
             )
-            # Block-aware "D received" sample: ALL live dest blocks D just pulled
-            # into its CPU pool, keyed by P block id so each entry lines up with
-            # the producer's [KVVAL-PSEND] for the same (layer, p_block). Only the
-            # full blocks land in the CPU pool (a trailing partial block, if any,
-            # goes to HBM and is skipped here); they pair positionally as
-            # p_block_ids0[i] -> d_main_ids0[i]. Per-block absmax (one sync) plus
-            # block-0 first-8 values as a concrete anchor.
+            # Block-aware "D received" sample per KV leg (K, V, indexer), keyed by
+            # P block id so each lines up with the producer's [KVVAL-PSEND]. K/V
+            # land in the CPU pool (full blocks; a trailing partial -> HBM, skipped
+            # here, pairs as p_block_ids0[i] -> d_main_ids0[i]); the indexer lands
+            # in HBM, one D block per `scale` P sub-blocks, so only its first block
+            # is sampled (compare magnitude vs P's indexer leg).
             try:
                 w = self._worker
                 ext_req_id0, p_block_ids0 = read_reqs[0]
@@ -928,22 +962,25 @@ class MembPullReadThread(threading.Thread):
                 d_main_ids0 = dest0[1] if dest0 else []
                 n = min(len(p_block_ids0), len(d_main_ids0))
                 if n > 0:
-                    k_cpu = w._cpu_pools[layer["offload_id"]][0]
-                    elems = layer["p_k_len"] // k_cpu.element_size()
-                    flat = k_cpu.reshape(-1)
-                    p_bids = p_block_ids0[:n]
-                    d_bids = d_main_ids0[:n]
-                    absmax = (
-                        torch.stack([flat[db * elems:(db + 1) * elems] for db in d_bids])
-                        .abs().max(dim=1).values.tolist()
+                    k_cpu, v_cpu = w._cpu_pools[layer["offload_id"]]
+                    _pd_reuse_sample_leg(
+                        "KVVAL-DLOAD", "K", layer_name, k_cpu, layer["p_k_len"],
+                        d_main_ids0[:n], p_block_ids0[:n],
                     )
-                    anchor = flat[d_bids[0] * elems:d_bids[0] * elems + 8].tolist()
+                    _pd_reuse_sample_leg(
+                        "KVVAL-DLOAD", "V", layer_name, v_cpu, layer["p_v_len"],
+                        d_main_ids0[:n], p_block_ids0[:n],
+                    )
+                idx = layer["indexer"]
+                if idx is not None and dest0 and dest0[0]:
+                    indexer_t = w._indexer_tensors[layer["pool_idx"]]
+                    elems = idx["d_dsa_len"] // indexer_t.element_size()
+                    off = dest0[0][0] * elems
+                    flat = indexer_t.reshape(-1)
                     logger.info(
-                        "[KVVAL-DLOAD] layer=%s nblocks=%d vals0=%s absmax=%s",
-                        layer_name,
-                        len(p_block_ids0),
-                        anchor,
-                        " ".join(f"{pb}:{am:.4g}" for pb, am in zip(p_bids, absmax)),
+                        "[KVVAL-DLOAD] leg=IDX layer=%s d_block=%d vals=%s absmax=%.6g",
+                        layer_name, dest0[0][0],
+                        flat[off:off + 8].tolist(), flat[off:off + elems].abs().max().item(),
                     )
             except Exception as e:  # noqa: BLE001
                 logger.info("[KVVAL-DLOAD] layer=%s err=%s", layer_name, e)
@@ -1109,31 +1146,37 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             if not self._mf_meta_sent:
                 self._send_mf_meta(dealer, encoder)
             if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG"):
-                # Block-aware "P computed" sample: ALL source HBM blocks P is
-                # about to let D pull, keyed by P block id to match D's
-                # [KVVAL-DLOAD]. wait_event was synchronized above, so the KV
-                # scatter for this layer is complete; under layer reuse the shared
-                # slot still holds layer L here (D is not notified until the
-                # READ_READY_BATCH below, so L+nsb cannot have overwritten).
-                # Per-block absmax (one sync) plus block-0 first-8 as an anchor.
+                # Block-aware "P computed" sample per KV leg (K, V, indexer),
+                # keyed by P block id to match D's [KVVAL-DLOAD]. wait_event was
+                # synchronized above, so the KV scatter for this layer is complete;
+                # under layer reuse the shared slot still holds layer L here (D is
+                # not notified until the READ_READY_BATCH below, so L+nsb cannot
+                # have overwritten).
                 try:
                     _, p_block_ids0 = read_reqs[0]
                     if p_block_ids0:
-                        src_k = self._source_kv_caches[layer_name][0]
-                        elems = self.layer_metadata[layer_name].block_len[0] // src_k.element_size()
-                        flat = src_k.reshape(-1)
-                        absmax = (
-                            torch.stack([flat[pb * elems:(pb + 1) * elems] for pb in p_block_ids0])
-                            .abs().max(dim=1).values.tolist()
+                        src = self._source_kv_caches[layer_name]
+                        blen = self.layer_metadata[layer_name].block_len
+                        _pd_reuse_sample_leg(
+                            "KVVAL-PSEND", "K", layer_name, src[0], blen[0],
+                            p_block_ids0, p_block_ids0,
                         )
-                        anchor = flat[p_block_ids0[0] * elems:p_block_ids0[0] * elems + 8].tolist()
-                        logger.info(
-                            "[KVVAL-PSEND] layer=%s nblocks=%d vals0=%s absmax=%s",
-                            layer_name,
-                            len(p_block_ids0),
-                            anchor,
-                            " ".join(f"{pb}:{am:.4g}" for pb, am in zip(p_block_ids0, absmax)),
+                        _pd_reuse_sample_leg(
+                            "KVVAL-PSEND", "V", layer_name, src[1], blen[1],
+                            p_block_ids0, p_block_ids0,
                         )
+                        if len(src) > 2:
+                            # Indexer (dsa_k) is src[2]; one D block spans `scale`
+                            # P sub-blocks, so sample only the first P block and
+                            # compare magnitude vs D's IDX leg.
+                            elems = blen[2] // src[2].element_size()
+                            off = p_block_ids0[0] * elems
+                            flat = src[2].reshape(-1)
+                            logger.info(
+                                "[KVVAL-PSEND] leg=IDX layer=%s p_block=%d vals=%s absmax=%.6g",
+                                layer_name, p_block_ids0[0],
+                                flat[off:off + 8].tolist(), flat[off:off + elems].abs().max().item(),
+                            )
                 except Exception as e:  # noqa: BLE001
                     logger.info("[KVVAL-PSEND] layer=%s err=%s", layer_name, e)
             dealer.send(encoder.encode((READ_READY_BATCH, layer_idx, layer_name, read_reqs, done_ext_ids)))
