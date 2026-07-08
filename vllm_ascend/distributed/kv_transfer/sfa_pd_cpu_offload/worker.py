@@ -16,6 +16,7 @@ send setup, but swaps in a pull-mode sending thread that notifies D to read
 from __future__ import annotations
 
 import math
+import os
 import queue
 import re
 import threading
@@ -904,6 +905,15 @@ class MembPullReadThread(threading.Thread):
         ret = self.engine.batch_transfer_sync_read(self._p_session, all_local_ptrs, all_peer_ptrs, all_lengths)
         if ret != 0:
             raise RuntimeError(f"memfabric batch read failed for layer {layer_name}, ret={ret}")
+        if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG"):
+            logger.info(
+                "[MFPULL-D] layer=%s transfers=%d peer0=0x%x local0=0x%x len0=%d",
+                layer_name,
+                len(all_local_ptrs),
+                all_peer_ptrs[0] if all_peer_ptrs else 0,
+                all_local_ptrs[0] if all_local_ptrs else 0,
+                all_lengths[0] if all_lengths else 0,
+            )
         for read_info in read_infos:
             self._log_read_result(read_info)
 
