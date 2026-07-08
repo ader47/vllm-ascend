@@ -1193,14 +1193,9 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         # the reuse gate protects the PD read too -- without this, under layer reuse
         # L+num_shared_buffers overwrites the shared buffer while D is still reading L.
         _pd_ev = self.layer_transfer_finished_events
-        if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG"):
-            logger.info("[PDWAIT] L=%d events_none=%s", layer_id, _pd_ev is None)
         if _pd_ev is not None:
             if not _pd_ev[layer_id].wait(timeout=30):
                 logger.error("Layerwise %d PD transfer wait timed out", layer_id)
-            else:
-                if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG"):
-                    logger.info("[PDWAIT] L=%d pd_done", layer_id)
             _pd_ev[layer_id].clear()
         if res != 0:
             logger.error("Layerwise %d save batch_copy failed with return code %d", layer_id, res)

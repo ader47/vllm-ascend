@@ -914,6 +914,39 @@ class MembPullReadThread(threading.Thread):
                 all_local_ptrs[0] if all_local_ptrs else 0,
                 all_lengths[0] if all_lengths else 0,
             )
+            # Block-aware "D received" sample: ALL live dest blocks D just pulled
+            # into its CPU pool, keyed by P block id so each entry lines up with
+            # the producer's [KVVAL-PSEND] for the same (layer, p_block). Only the
+            # full blocks land in the CPU pool (a trailing partial block, if any,
+            # goes to HBM and is skipped here); they pair positionally as
+            # p_block_ids0[i] -> d_main_ids0[i]. Per-block absmax (one sync) plus
+            # block-0 first-8 values as a concrete anchor.
+            try:
+                w = self._worker
+                ext_req_id0, p_block_ids0 = read_reqs[0]
+                dest0 = w._dest_blocks_by_req.get(ext_req_id0)
+                d_main_ids0 = dest0[1] if dest0 else []
+                n = min(len(p_block_ids0), len(d_main_ids0))
+                if n > 0:
+                    k_cpu = w._cpu_pools[layer["offload_id"]][0]
+                    elems = layer["p_k_len"] // k_cpu.element_size()
+                    flat = k_cpu.reshape(-1)
+                    p_bids = p_block_ids0[:n]
+                    d_bids = d_main_ids0[:n]
+                    absmax = (
+                        torch.stack([flat[db * elems:(db + 1) * elems] for db in d_bids])
+                        .abs().max(dim=1).values.tolist()
+                    )
+                    anchor = flat[d_bids[0] * elems:d_bids[0] * elems + 8].tolist()
+                    logger.info(
+                        "[KVVAL-DLOAD] layer=%s nblocks=%d vals0=%s absmax=%s",
+                        layer_name,
+                        len(p_block_ids0),
+                        anchor,
+                        " ".join(f"{pb}:{am:.4g}" for pb, am in zip(p_bids, absmax)),
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.info("[KVVAL-DLOAD] layer=%s err=%s", layer_name, e)
         for read_info in read_infos:
             self._log_read_result(read_info)
 
@@ -1075,6 +1108,34 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             # MF_META (first call, synchronous: send + block recv one reply)
             if not self._mf_meta_sent:
                 self._send_mf_meta(dealer, encoder)
+            if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG"):
+                # Block-aware "P computed" sample: ALL source HBM blocks P is
+                # about to let D pull, keyed by P block id to match D's
+                # [KVVAL-DLOAD]. wait_event was synchronized above, so the KV
+                # scatter for this layer is complete; under layer reuse the shared
+                # slot still holds layer L here (D is not notified until the
+                # READ_READY_BATCH below, so L+nsb cannot have overwritten).
+                # Per-block absmax (one sync) plus block-0 first-8 as an anchor.
+                try:
+                    _, p_block_ids0 = read_reqs[0]
+                    if p_block_ids0:
+                        src_k = self._source_kv_caches[layer_name][0]
+                        elems = self.layer_metadata[layer_name].block_len[0] // src_k.element_size()
+                        flat = src_k.reshape(-1)
+                        absmax = (
+                            torch.stack([flat[pb * elems:(pb + 1) * elems] for pb in p_block_ids0])
+                            .abs().max(dim=1).values.tolist()
+                        )
+                        anchor = flat[p_block_ids0[0] * elems:p_block_ids0[0] * elems + 8].tolist()
+                        logger.info(
+                            "[KVVAL-PSEND] layer=%s nblocks=%d vals0=%s absmax=%s",
+                            layer_name,
+                            len(p_block_ids0),
+                            anchor,
+                            " ".join(f"{pb}:{am:.4g}" for pb, am in zip(p_block_ids0, absmax)),
+                        )
+                except Exception as e:  # noqa: BLE001
+                    logger.info("[KVVAL-PSEND] layer=%s err=%s", layer_name, e)
             dealer.send(encoder.encode((READ_READY_BATCH, layer_idx, layer_name, read_reqs, done_ext_ids)))
             if envs.VLLM_ASCEND_SFA_DEBUG:
                 logger.info(

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib
 import math
-import os
 import threading
 from collections.abc import Generator
 from typing import Any
@@ -894,14 +893,6 @@ class KVPoolWorker:
             bool(self.layer_load_tasks[self.current_layer])
             or self.prefetch_layer_map.get(self.current_layer) is not None
         )
-        if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG"):
-            logger.info(
-                "[ASC-WFLL] role=%s current=%d needs_wait=%s mate=%s",
-                self.kv_role,
-                self.current_layer,
-                needs_wait,
-                self.prefetch_layer_map.get(self.current_layer),
-            )
         if not needs_wait:
             # Independent / first-occupant with no load: no gate, no H2D.
             self.layer_load_finished_events[self.current_layer].clear()

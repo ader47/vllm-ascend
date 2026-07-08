@@ -70,36 +70,6 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 
-def _pd_reuse_kvval_probe(stage: str, layer_name: str, kv_cache) -> None:
-    """TEMP debug: log head/mid/tail values of the K cache for P-vs-D comparison.
-
-    stage="PSAVE" at P-side save (computed KV); stage="DLOAD" right after the D
-    load (received KV). Enable with VLLM_ASCEND_PD_REUSE_DEBUG=1. Compare P-node
-    [KVVAL-PSAVE] against D-node [KVVAL-DLOAD] per layer: a mismatch means the
-    PD transfer / load corrupted the KV. Remove after diagnosis.
-    """
-    if not os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG"):
-        return
-    try:
-        _k = kv_cache[0] if isinstance(kv_cache, (tuple, list)) else kv_cache
-        try:
-            _f = _k.view(-1)
-        except RuntimeError:
-            _f = _k.reshape(-1)
-        _n = _f.numel()
-        _m = _n // 2
-        logger.info(
-            "[KVVAL-%s] layer=%s head8=%s mid4=%s tail8=%s",
-            stage,
-            layer_name,
-            _f[:8].tolist(),
-            _f[_m:_m + 4].tolist(),
-            _f[-8:].tolist(),
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.info("[KVVAL-%s] layer=%s err=%s", stage, layer_name, e)
-
-
 def _build_cpu_sparse_indices_from_slots(
     current_slots: torch.Tensor,
     cpu_mask: torch.Tensor,
@@ -1614,7 +1584,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 k_li, k_li_scale = None, None
             wait_for_kv_layer_from_connector(layer_name)
-            _pd_reuse_kvval_probe("DLOAD", layer_name, kv_cache)
         # native
         else:
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
@@ -1646,7 +1615,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             if not self.use_offload:
                 # TODO we may need to do kv preload here
                 wait_for_kv_layer_from_connector(layer_name)
-                _pd_reuse_kvval_probe("DLOAD", layer_name, kv_cache)
 
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
@@ -1917,7 +1885,33 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         output[...] = self.o_proj(attn_output)[0]
 
-        _pd_reuse_kvval_probe("PSAVE", layer_name, kv_cache)
+        if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG") and not self.use_offload:
+            # Ground-truth "P computed" sample, on the compute stream right after
+            # this layer's KV scatter and BEFORE the save hook enqueues the send.
+            # It captures layer L's true data before any layer-reuse overwrite of
+            # the shared slot. Read alongside [KVVAL-PSEND] (slot at notify time)
+            # and D's [KVVAL-DLOAD]:
+            #   PSTORE != PSEND        -> P overwrote the shared slot before D
+            #                             read it (reuse-gate bug on P).
+            #   PSTORE == PSEND != DLOAD -> transfer / load corrupts the layer.
+            #   PSTORE == PSEND == DLOAD -> lossless; corruption is D-side usage.
+            try:
+                _k = kv_cache[0] if isinstance(kv_cache, (tuple, list)) else kv_cache
+                _valid = slot_mapping[slot_mapping >= 0]
+                if _valid.numel() > 0:
+                    _bids = torch.unique(_valid // self.block_size).tolist()
+                    _stk = torch.stack([_k[b].reshape(-1) for b in _bids])
+                    _absmax = _stk.abs().max(dim=1).values.tolist()
+                    logger.info(
+                        "[KVVAL-PSTORE] layer=%s nblocks=%d vals0=%s absmax=%s",
+                        layer_name,
+                        len(_bids),
+                        _stk[0, :8].tolist(),
+                        " ".join(f"{b}:{a:.4g}" for b, a in zip(_bids, _absmax)),
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.info("[KVVAL-PSTORE] layer=%s err=%s", layer_name, e)
+
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
         return output_padded
