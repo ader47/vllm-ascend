@@ -104,13 +104,14 @@ def _pd_reuse_sample_leg(
     block_len_bytes: int,
     sample_bids,
     label_bids,
+    n_vals: int = 4,
 ) -> None:
-    """Debug-only ([KVVAL-PSEND]/[KVVAL-DLOAD]): per-block absmax + block-0
-    first-8 for one KV leg (K / V). ``sample_bids`` are the tensor's physical
-    blocks to read; ``label_bids`` are the ids to print (the P block id, so a
-    P-side line and a D-side line line up by the same key). No-op when there is
-    nothing to sample. Uses the exact per-block byte stride (block_id *
-    block_len_bytes), matching memfabric's addressing regardless of layout."""
+    """Debug-only ([KVVAL-PSTORE]/[KVVAL-PSEND]/[KVVAL-DLOAD]): per-block local
+    values (first ``n_vals``) + absmax for one KV leg, keyed by ``label_bids`` so
+    a P-side line and a D-side line line up by block id. ``sample_bids`` are the
+    tensor's physical blocks to read; ``label_bids`` are the ids to print. No-op
+    when there is nothing to sample. Uses the exact per-block byte stride
+    (block_id * block_len_bytes), matching memfabric's addressing."""
     sample_bids = [int(b) for b in sample_bids]
     if not sample_bids or block_len_bytes <= 0:
         return
@@ -120,14 +121,17 @@ def _pd_reuse_sample_leg(
     flat = tensor.reshape(-1)
     stk = torch.stack([flat[b * elems:(b + 1) * elems] for b in sample_bids])
     absmax = stk.abs().max(dim=1).values.tolist()
+    first = stk[:, :n_vals].tolist()
     logger.info(
-        "[%s] leg=%s layer=%s nblocks=%d vals0=%s absmax=%s",
+        "[%s] leg=%s layer=%s nblocks=%d %s",
         tag,
         leg,
         layer_name,
         len(sample_bids),
-        stk[0, :8].tolist(),
-        " ".join(f"{lb}:{a:.4g}" for lb, a in zip(label_bids, absmax)),
+        " ".join(
+            f"{lb}:{am:.3g}(" + ",".join(f"{x:.3g}" for x in vs) + ")"
+            for lb, am, vs in zip(label_bids, absmax, first)
+        ),
     )
 
 
@@ -940,7 +944,7 @@ class MembPullReadThread(threading.Thread):
         ret = self.engine.batch_transfer_sync_read(self._p_session, all_local_ptrs, all_peer_ptrs, all_lengths)
         if ret != 0:
             raise RuntimeError(f"memfabric batch read failed for layer {layer_name}, ret={ret}")
-        if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG"):
+        if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG", "0") == "1":
             logger.info(
                 "[MFPULL-D] layer=%s transfers=%d peer0=0x%x local0=0x%x len0=%d",
                 layer_name,
@@ -950,11 +954,11 @@ class MembPullReadThread(threading.Thread):
                 all_lengths[0] if all_lengths else 0,
             )
             # Block-aware "D received" sample per KV leg (K, V, indexer), keyed by
-            # P block id so each lines up with the producer's [KVVAL-PSEND]. K/V
-            # land in the CPU pool (full blocks; a trailing partial -> HBM, skipped
-            # here, pairs as p_block_ids0[i] -> d_main_ids0[i]); the indexer lands
-            # in HBM, one D block per `scale` P sub-blocks, so only its first block
-            # is sampled (compare magnitude vs P's indexer leg).
+            # P block id so each lines up with the producer's [KVVAL-PSEND]. Full
+            # K/V blocks land in the CPU pool (p_block_ids0[i] -> d_main_ids0[i]);
+            # the trailing partial block lands in D HBM (sampled separately); the
+            # indexer lands in HBM, one D block per `scale` P sub-blocks, so only
+            # its first block is sampled (compare magnitude vs P's indexer leg).
             try:
                 w = self._worker
                 ext_req_id0, p_block_ids0 = read_reqs[0]
@@ -971,6 +975,18 @@ class MembPullReadThread(threading.Thread):
                         "KVVAL-DLOAD", "V", layer_name, v_cpu, layer["p_v_len"],
                         d_main_ids0[:n], p_block_ids0[:n],
                     )
+                # Trailing partial block -> D HBM.
+                if dest0 is not None and dest0[3] is not None and len(p_block_ids0) > n:
+                    hbm_kv = w._hbm_kv.get(layer_name)
+                    if hbm_kv is not None:
+                        _pd_reuse_sample_leg(
+                            "KVVAL-DLOAD", "K", layer_name, hbm_kv[0], layer["p_k_len"],
+                            [dest0[3]], [p_block_ids0[n]],
+                        )
+                        _pd_reuse_sample_leg(
+                            "KVVAL-DLOAD", "V", layer_name, hbm_kv[1], layer["p_v_len"],
+                            [dest0[3]], [p_block_ids0[n]],
+                        )
                 idx = layer["indexer"]
                 if idx is not None and dest0 and dest0[0]:
                     indexer_t = w._indexer_tensors[layer["pool_idx"]]
@@ -1145,7 +1161,7 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             # MF_META (first call, synchronous: send + block recv one reply)
             if not self._mf_meta_sent:
                 self._send_mf_meta(dealer, encoder)
-            if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG"):
+            if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG", "0") == "1":
                 # Block-aware "P computed" sample per KV leg (K, V, indexer),
                 # keyed by P block id to match D's [KVVAL-DLOAD]. wait_event was
                 # synchronized above, so the KV scatter for this layer is complete;
@@ -1389,6 +1405,34 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
             pd_done = getattr(self.kv_send_layer_thread, "layer_transfer_finished_events", None)
             if pd_done is not None and 0 <= layer_idx < len(pd_done):
                 pd_done[layer_idx].clear()
+        if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG", "0") == "1":
+            # Ground-truth "P wrote" sample for ALL of the request's blocks, taken
+            # here at the end of layer L's forward (= pre-overwrite: L+nsb computes
+            # later in the same pass). block_table lists every physical block of
+            # the request (incl. earlier chunks), so this lines up 1:1 by block id
+            # with [KVVAL-PSEND] and D's [KVVAL-DLOAD]. (slot_mapping would only
+            # cover the current chunk's blocks.)
+            try:
+                # NULL_BLOCK_ID = 0 (vLLM reserves block 0 for padding); filter
+                # it out so we sample only the request's real blocks.
+                bids = torch.unique(attn_metadata.block_table[attn_metadata.block_table > 0]).tolist()
+                if bids and layer_name in self._source_kv_caches:
+                    src = self._source_kv_caches[layer_name]
+                    blen = self.layer_metadata[layer_name].block_len
+                    _pd_reuse_sample_leg("KVVAL-PSTORE", "K", layer_name, src[0], blen[0], bids, bids)
+                    _pd_reuse_sample_leg("KVVAL-PSTORE", "V", layer_name, src[1], blen[1], bids, bids)
+            except Exception as e:  # noqa: BLE001
+                logger.info("[KVVAL-PSTORE] layer=%s err=%s", layer_name, e)
+        if os.getenv("VLLM_ASCEND_PD_REUSE_SYNCFIX", "0") == "1":
+            # Pure full-device sync (NO printing): isolates whether the
+            # scatter->notify race is fixed by synchronization alone. Run with
+            # VLLM_ASCEND_PD_REUSE_DEBUG=0 + VLLM_ASCEND_PD_REUSE_SYNCFIX=1; if
+            # accuracy is correct, the bug is a missing stream sync at this
+            # boundary (the [KVVAL-*] probes' .item() was acting as this sync).
+            if not getattr(self, "_syncfix_logged", False):
+                logger.info("VLLM_ASCEND_PD_REUSE_SYNCFIX=1: torch.npu.synchronize() active in save_kv_layer")
+                self._syncfix_logged = True
+            torch.npu.synchronize()
         super().save_kv_layer(layer_name, kv_layer, attn_metadata, connector_metadata, **kwargs)
 
     def wait_for_layer_send(self, layer_idx: int) -> None:

@@ -1288,7 +1288,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
         if len(transfer_tasks) == 0:
             if wait_for_save is not None:
-                if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG"):
+                if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG", "0") == "1":
                     logger.info("[RECVGATE] layer=%d waiting_for_save=%d", layer_id, wait_for_save)
                 while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
                     logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
