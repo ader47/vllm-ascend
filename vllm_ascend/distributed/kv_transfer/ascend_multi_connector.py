@@ -40,7 +40,13 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             is_layerwise_sender = isinstance(
                 c, MooncakeLayerwiseConnector
             ) or isinstance(scheduler, MooncakeLayerwiseConnectorScheduler)
-            if i == chosen_connector or is_layerwise_sender:
+            # Some senders are not chosen for prefix loading but still need
+            # real local block ids to notify their remote peer.
+            requires_full_blocks = bool(
+                getattr(c, "requires_full_blocks_on_update_after_alloc", False)
+                or getattr(scheduler, "requires_full_blocks_on_update_after_alloc", False)
+            )
+            if i == chosen_connector or is_layerwise_sender or requires_full_blocks:
                 # Forward call to the chosen connector (if any).
                 c.update_state_after_alloc(request, blocks, num_external_tokens)
             else:

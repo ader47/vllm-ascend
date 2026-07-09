@@ -79,6 +79,8 @@ class SFAPDProducerScheduler:
     the pull-mode sending thread; D looks up its destination blocks by req_id.
     """
 
+    requires_full_blocks_on_update_after_alloc = True
+
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, engine_id: str):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
