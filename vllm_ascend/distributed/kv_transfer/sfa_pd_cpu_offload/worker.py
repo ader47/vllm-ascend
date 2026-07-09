@@ -198,11 +198,7 @@ class SFAPDCpuOffloadConsumerWorker:
         # Part A: D's main MLA HBM k/v tensors (group1 paged cache) — the partial
         # last block lands here instead of the CPU pool. Keyed by main layer name
         # (the 5-tuple layers); tuple[0]=k_nope, tuple[1]=v_rope.
-        self._hbm_kv = {
-            n: (t[0], t[1])
-            for n, t in kv_caches.items()
-            if isinstance(t, (list, tuple)) and len(t) in (5, 6)
-        }
+        self._hbm_kv = {n: (t[0], t[1]) for n, t in kv_caches.items() if isinstance(t, (list, tuple)) and len(t) == 5}
 
         # memfabric pull mode only (the mooncake staging path has been removed).
         assert _resolve_kv_transfer_backend(self.vllm_config) == BACKEND_MEMFABRIC, (
@@ -355,13 +351,7 @@ class SFAPDCpuOffloadConsumerWorker:
         its HBM. D creates a read engine + MembPullReadThread."""
         num_blocks = self.kv_cache_config.num_blocks
         indexer_names = list(self.kv_cache_config.kv_cache_groups[_INDEXER_GROUP_IDX].layer_names)
-
-        def _offload_tuple_len(v: object) -> int:
-            return len(v) if isinstance(v, (list, tuple)) else 1
-
-        main_names = [
-            n for n, v in kv_caches.items() if _offload_tuple_len(v) in (5, 6)
-        ]
+        main_names = [n for n, v in kv_caches.items() if len(v if isinstance(v, (list, tuple)) else [v]) == 5]
         main_by_layer_idx = {_layer_idx(name): name for name in main_names}
         main_names = [main_by_layer_idx[_layer_idx(name)] for name in indexer_names]
 
@@ -371,35 +361,19 @@ class SFAPDCpuOffloadConsumerWorker:
         self._main_name_to_idx = {n: i for i, n in enumerate(main_names)}
         self._cpu_pools = list(zip(k_caches_cpu, v_caches_cpu))
         self._indexer_tensors = []
-        self._indexer_scale_tensors: list[torch.Tensor | None] = []
         for main_name in main_names:
             main_tuple = list(kv_caches[main_name])
             self._indexer_tensors.append(main_tuple[2])  # dsa_k_indexer
-            self._indexer_scale_tensors.append(
-                main_tuple[5] if len(main_tuple) >= 6 else None
-            )
 
         # Build layer_metadata (D's local addresses, for compatibility)
         for pool_idx, (iname, mname) in enumerate(zip(indexer_names, main_names)):
             indexer_t = self._indexer_tensors[pool_idx]
-            indexer_scale_t = self._indexer_scale_tensors[pool_idx]
             k_cpu, v_cpu = self._cpu_pools[pool_idx]
-            indexer_addrs = [indexer_t.data_ptr()]
-            indexer_block_lens = [indexer_t.element_size() * math.prod(indexer_t.shape[1:])]
-            indexer_block_scales = [indexer_t.shape[0] // num_blocks if num_blocks else 1]
-            if indexer_scale_t is not None:
-                indexer_addrs.append(indexer_scale_t.data_ptr())
-                indexer_block_lens.append(
-                    indexer_scale_t.element_size() * math.prod(indexer_scale_t.shape[1:])
-                )
-                indexer_block_scales.append(
-                    indexer_scale_t.shape[0] // num_blocks if num_blocks else 1
-                )
             self.layer_metadata[iname] = LayerMetadata(
                 tensor_group_idx=[_INDEXER_GROUP_IDX],
-                kv_caches_base_addr=indexer_addrs,
-                block_len=indexer_block_lens,
-                block_size_scale=indexer_block_scales,
+                kv_caches_base_addr=[indexer_t.data_ptr()],
+                block_len=[indexer_t.element_size() * math.prod(indexer_t.shape[1:])],
+                block_size_scale=[indexer_t.shape[0] // num_blocks if num_blocks else 1],
             )
             self.layer_metadata[mname] = LayerMetadata(
                 tensor_group_idx=[_MAIN_GROUP_IDX, _MAIN_GROUP_IDX],
@@ -655,36 +629,6 @@ class MembPullReadThread(threading.Thread):
                     "shape": tuple(d_indexer.shape),
                 }
 
-        scale = None
-        scale_tensor = (
-            w._indexer_scale_tensors[pool_idx]
-            if pool_idx < len(w._indexer_scale_tensors)
-            else None
-        )
-        if scale_tensor is not None:
-            if len(p_base_addrs) < 4:
-                scale = {"error": "p_addr_mismatch", "p_n": len(p_base_addrs)}
-            else:
-                p_scale_len = p_block_len[3]
-                d_scale_len = (
-                    scale_tensor.element_size()
-                    * math.prod(scale_tensor.shape[1:])
-                )
-                if p_scale_len <= 0 or d_scale_len % p_scale_len != 0:
-                    scale = {
-                        "error": "layout_mismatch",
-                        "p_scale_len": p_scale_len,
-                        "d_scale_len": d_scale_len,
-                    }
-                else:
-                    scale = {
-                        "p_scale_base": p_base_addrs[3],
-                        "p_scale_len": p_scale_len,
-                        "d_scale_base": scale_tensor.data_ptr(),
-                        "d_scale_len": d_scale_len,
-                        "scale_factor": d_scale_len // p_scale_len,
-                    }
-
         return {
             "layer_name": layer_name,
             "pool_idx": pool_idx,
@@ -698,7 +642,6 @@ class MembPullReadThread(threading.Thread):
             "k_hbm_ptr": k_hbm_ptr,
             "v_hbm_ptr": v_hbm_ptr,
             "indexer": indexer,
-            "scale": scale,
         }
 
     def _build_req_descriptors(
@@ -811,49 +754,6 @@ class MembPullReadThread(threading.Thread):
             local_chunks.append(cl)
             length_chunks.append(clen)
             n_indexer = n_pairs
-
-        # Indexer scale leg (LIC8): P non-offload C8 tensor [3] → D six-tuple [5].
-        # Fail loud on any layout mismatch: silently skipping the scale leg would
-        # leave D's [5] stale/uninitialized and corrupt indexer dequant.
-        scale = layer.get("scale")
-        if scale is not None and d_indexer_ids:
-            if "error" in scale:
-                if scale["error"] == "p_addr_mismatch":
-                    raise RuntimeError(
-                        f"MembPull indexer scale {layer_name}: D is LIC8 (has scale "
-                        f"tensor) but P exposed only {scale['p_n']} base addrs "
-                        f"(no scale leg) — P/D LIC8 config mismatch."
-                    )
-                raise RuntimeError(
-                    f"MembPull indexer scale {layer_name}: D scale block_len="
-                    f"{scale['d_scale_len']} not a multiple of P={scale['p_scale_len']} — "
-                    f"scale layout mismatch; refusing to transfer to avoid silent "
-                    f"stale-scale corruption."
-                )
-            p_scale_base = scale["p_scale_base"]
-            p_scale_len = scale["p_scale_len"]
-            d_scale_base = scale["d_scale_base"]
-            d_scale_len = scale["d_scale_len"]
-            scale_factor = scale["scale_factor"]
-            d_scale_sub_addrs: list[int] = []
-            for d_bid in d_indexer_ids:
-                d_block_base = d_scale_base + d_bid * d_scale_len
-                for off in range(scale_factor):
-                    d_scale_sub_addrs.append(d_block_base + off * p_scale_len)
-            n_scale_pairs = min(len(p_block_ids), len(d_scale_sub_addrs))
-            if n_scale_pairs:
-                p_scale_arr = np.array(p_block_ids[:n_scale_pairs], dtype=np.int64)
-                d_scale_arr = np.array(
-                    d_scale_sub_addrs[:n_scale_pairs], dtype=np.int64
-                )
-                cp, cl, clen = _coalesce_desc(
-                    p_scale_base + p_scale_arr * p_scale_len,
-                    d_scale_arr,
-                    np.full(n_scale_pairs, p_scale_len, dtype=np.int64),
-                )
-                peer_chunks.append(cp)
-                local_chunks.append(cl)
-                length_chunks.append(clen)
 
         if not peer_chunks:
             logger.warning(

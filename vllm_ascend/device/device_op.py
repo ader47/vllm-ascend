@@ -385,28 +385,16 @@ class BaseDeviceAdaptor:
         # So two branches are maintained temporarily.
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
         if sfa_impl.use_sparse_c8_indexer:
-            # NOTE: use_sparse_c8_indexer is a global flag. Under offload the
-            # per-layer C8 layout (six-tuple) is enforced uniform across all
-            # sparse layers by SFAKVOffloadWorker._register_offload_layers
-            # (mixed 5/6 tuples raise there), so this global gate is safe.
-            use_offload = sfa_impl.use_offload
-            if use_offload:
-                assert len(kv_cache) == 6
-                key_idx = 2
-                scale_idx = 5
-            else:
-                assert len(kv_cache) == 4
-                key_idx = 2
-                scale_idx = 3
+            assert len(kv_cache) == 4
             assert q_li_scale is not None
             assert q_li_shape_ori is not None
             weights = weights.to(torch.float16)
             topk_indices = torch.ops._C_ascend.npu_lightning_indexer_quant(
                 query=q_li.view(q_li_shape_ori),
-                key=kv_cache[key_idx],
+                key=kv_cache[2],
                 weights=weights,
                 query_dequant_scale=q_li_scale.view(q_li_shape_ori[:-1]),
-                key_dequant_scale=kv_cache[scale_idx].squeeze(2),  # B S N D -> B S D
+                key_dequant_scale=kv_cache[3].squeeze(2),  # B S N D -> B S D
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
                 block_table=block_table,
@@ -1464,34 +1452,22 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         use_torch_npu_lightning_indexer: bool,
     ) -> torch.Tensor:
         if use_sparse_c8_indexer:
-            # NOTE: use_sparse_c8_indexer is a global flag. Under offload the
-            # per-layer C8 layout (six-tuple) is enforced uniform across all
-            # sparse layers by SFAKVOffloadWorker._register_offload_layers
-            # (mixed 5/6 tuples raise there), so this global gate is safe.
-            use_offload = sfa_impl.use_offload
-            if use_offload:
-                assert len(kv_cache) == 6
-                key_idx = 2
-                scale_idx = 5
-            else:
-                assert len(kv_cache) == 3
-                key_idx = 1
-                scale_idx = 2
+            assert len(kv_cache) == 3
             assert q_li_shape_ori is not None
 
             if q_li_scale is not None:
                 q_li_scale = q_li_scale.view(q_li_shape_ori[:-1])
-                key_dequant_scale = kv_cache[scale_idx].squeeze(2)
+                key_dequant_scale = kv_cache[2].squeeze(2)
 
                 topk_indices = torch_npu.npu_quant_lightning_indexer(
                     query=q_li.view(q_li_shape_ori),
-                    key=kv_cache[key_idx],
+                    key=kv_cache[1],
                     weights=weights,
                     query_dequant_scale=q_li_scale,
                     key_dequant_scale=key_dequant_scale,
                     actual_seq_lengths_query=actual_seq_lengths_query,
                     actual_seq_lengths_key=actual_seq_lengths_key,
-                    block_table=block_table,
+                    block_table=attn_metadata.block_table,
                     query_quant_mode=0,
                     key_quant_mode=0,
                     layout_query="TND",
@@ -1502,11 +1478,11 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             else:
                 topk_indices, _ = torch_npu.npu_lightning_indexer(
                     query=q_li.view(q_li_shape_ori),
-                    key=kv_cache[key_idx],
+                    key=kv_cache[1],
                     weights=weights,
                     actual_seq_lengths_query=actual_seq_lengths_query,
                     actual_seq_lengths_key=actual_seq_lengths_key,
-                    block_table=block_table,
+                    block_table=attn_metadata.block_table,
                     layout_query="TND",
                     layout_key="PA_BSND",
                     sparse_count=2048,

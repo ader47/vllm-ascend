@@ -35,16 +35,6 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.kv_transfer import (
     KVCacheStoreLayerSendingThread,
     KVTransferThread,
 )
-from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.offload_kv_cache_layout import (
-    OFFLOAD_C8_TUPLE_LEN,
-    OFFLOAD_INDEXER_S,
-    OFFLOAD_MAIN_K,
-    OFFLOAD_MAIN_V,
-    OFFLOAD_RESIDENT_K,
-    OFFLOAD_RESIDENT_V,
-    OFFLOAD_TUPLE_LEN,
-    is_offload_c8_kv_cache,
-)
 
 _SUBSCRIBED_COMPUTE_STREAMS = set()
 def get_subscribed_compute_streams() -> set:
@@ -253,27 +243,10 @@ class SFAKVOffloadWorker:
         self.offload_layer_names = [
             layer_name
             for layer_name, cache_or_caches in kv_caches.items()
-            if len(self._as_cache_tuple(cache_or_caches))
-            in (OFFLOAD_TUPLE_LEN, OFFLOAD_C8_TUPLE_LEN)
+            if len(self._as_cache_tuple(cache_or_caches)) == 5
         ]
         if not self.offload_layer_names:
             raise ValueError("SFA KV Offload did not find SFA KV cache layers.")
-
-        # Under offload, the attention path (sfa_v1.py / device_op.py) gates the
-        # C8 indexer read on the GLOBAL use_sparse_c8_indexer flag, not per-layer.
-        # Mixed five/six-tuple layers would therefore route a non-C8 layer through
-        # the quant indexer (or vice versa). Forbid it here so the global gate
-        # stays sound; C8 must be all-or-nothing across sparse offload layers.
-        tuple_lens = {
-            len(self._as_cache_tuple(kv_caches[name])) for name in self.offload_layer_names
-        }
-        if len(tuple_lens) > 1:
-            raise ValueError(
-                "SFA KV offload does not support mixed LIC8 / non-LIC8 layers: "
-                f"found tuple lengths {sorted(tuple_lens)} "
-                f"(five-tuple and six-tuple coexist). Under offload, C8 must be "
-                f"enabled uniformly across all sparse layers."
-            )
 
         self.num_offload_layers = len(self.offload_layer_names)
         self.num_layers = self.num_offload_layers
@@ -333,34 +306,11 @@ class SFAKVOffloadWorker:
             self.topk_buffers_v: list[torch.Tensor] = []
             for layer_name in self.offload_layer_names:
                 cache_or_caches = self._as_cache_tuple(kv_caches[layer_name])
-                tuple_len = len(cache_or_caches)
-                if tuple_len not in (OFFLOAD_TUPLE_LEN, OFFLOAD_C8_TUPLE_LEN):
-                    raise ValueError(
-                        f"SFA KV offload layer {layer_name}: expected tuple length "
-                        f"{OFFLOAD_TUPLE_LEN} or {OFFLOAD_C8_TUPLE_LEN}, got {tuple_len}"
-                    )
-                self.k_caches_npu.append(cache_or_caches[OFFLOAD_MAIN_K])
-                self.v_caches_npu.append(cache_or_caches[OFFLOAD_MAIN_V])
-                self.topk_buffers_k.append(cache_or_caches[OFFLOAD_RESIDENT_K])
-                self.topk_buffers_v.append(cache_or_caches[OFFLOAD_RESIDENT_V])
-                if is_offload_c8_kv_cache(cache_or_caches):
-                    # Guard against the LIC8 scale tensor aliasing a resident
-                    # top-K buffer. Compare storage identity (data_ptr), NOT
-                    # `in`/`==`: those do element-wise comparison and raise a
-                    # shape-mismatch RuntimeError on the legitimate difference
-                    # (scale dim1 = dsa_block_size, resident dim1 =
-                    # resident_capacity).
-                    scale_storage_ptr = cache_or_caches[
-                        OFFLOAD_INDEXER_S].untyped_storage().data_ptr()
-                    if scale_storage_ptr in (
-                        cache_or_caches[OFFLOAD_RESIDENT_K]
-                        .untyped_storage().data_ptr(),
-                        cache_or_caches[OFFLOAD_RESIDENT_V]
-                        .untyped_storage().data_ptr(),
-                    ):
-                        raise ValueError(
-                            f"LIC8 scale tensor must not alias resident buffer: {layer_name}"
-                        )
+                assert len(cache_or_caches) == 5
+                self.k_caches_npu.append(cache_or_caches[0])
+                self.v_caches_npu.append(cache_or_caches[1])
+                self.topk_buffers_k.append(cache_or_caches[3])
+                self.topk_buffers_v.append(cache_or_caches[4])
 
             if self.use_layerwise:
                 ready_event = threading.Event()

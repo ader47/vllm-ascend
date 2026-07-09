@@ -12,7 +12,6 @@ disaggregated_prefill
 eplb_swift_balancer
 ACL_Graph
 KV_Cache_Pool_Guide
-sparse_c8_kv_offload_guide
 add_custom_aclnn_op
 context_parallel
 dynamic_chunked_pipeline_parallel

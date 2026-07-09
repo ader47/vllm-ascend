@@ -1780,15 +1780,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if kv_cache is not None and self.has_indexer:
             assert k_li is not None
-            if self.use_offload:
-                # Under offload, C8-ness is per-layer: six-tuple ([5]=scale) vs
-                # five-tuple. dsa_k_scale_cache_idx is only read when k_li_scale
-                # is not None (C8 layers), so one offload branch covers both;
-                # uniformity across layers is enforced by
-                # SFAKVOffloadWorker._register_offload_layers.
-                dsa_k_cache_idx = 2
-                dsa_k_scale_cache_idx = 5
-            elif self.use_sparse_c8_indexer and get_ascend_device_type() == AscendDeviceType.A5:
+            if self.use_sparse_c8_indexer and get_ascend_device_type() == AscendDeviceType.A5:
                 dsa_k_cache_idx = 1
                 dsa_k_scale_cache_idx = 2
             else:
@@ -1812,20 +1804,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                     k_li.view(-1, k_li.shape[-1]),
                 )  # b, s, n, d
             if self.use_sparse_c8_indexer:
-                if self.use_offload:
-                    # six-tuple (C8) or five-tuple (non-C8); uniformity across
-                    # layers is enforced by SFAKVOffloadWorker._register_offload_layers.
-                    assert len(kv_cache) in (5, 6)
-                elif get_ascend_device_type() == AscendDeviceType.A5:
+                if get_ascend_device_type() == AscendDeviceType.A5:
                     assert len(kv_cache) == 3
                 else:
                     assert len(kv_cache) == 4
                 if k_li_scale is not None:
-                    scale_slot_mapping = (
-                        attn_metadata.indexer_slot_mapping
-                        if self.use_offload
-                        else attn_metadata.slot_mapping
-                    )
                     if self.is_kv_producer and get_ascend_config().c8_enable_reshape_optim:
                         torch.ops._C_ascend.store_kv_block(
                             k_li_scale,
@@ -1838,7 +1821,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     else:
                         torch_npu.npu_scatter_nd_update_(
                             kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
-                            scale_slot_mapping.view(-1, 1),
+                            slot_mapping.view(-1, 1),
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
 
