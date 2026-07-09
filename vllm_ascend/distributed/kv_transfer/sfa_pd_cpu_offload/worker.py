@@ -1112,6 +1112,14 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         asynchronously by ``_drain_read_replies`` in the event loop, not waited
         on here. This lets P proceed to the next layer immediately.
         """
+        if os.getenv("VLLM_ASCEND_PD_REUSE_DEBUG", "0") == "1" and not getattr(self, "_waitprobe_logged", False):
+            _we = send_task.wait_event
+            logger.info(
+                "[WAIT-PROBE] layer=%d wait_event=%s (None => no pre-notify sync runs)",
+                send_task.layer_idx,
+                "None" if _we is None else f"{type(_we).__name__}@{id(_we)}",
+            )
+            self._waitprobe_logged = True
         _syncfix = os.getenv("VLLM_ASCEND_PD_REUSE_SYNCFIX", "0")
         if _syncfix == "sendfull":
             # Full sync on the SEND thread (non-blocking for the compute thread):
