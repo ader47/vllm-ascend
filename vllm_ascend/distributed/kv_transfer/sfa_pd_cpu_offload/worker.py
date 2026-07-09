@@ -42,6 +42,7 @@ from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
     get_external_request_id,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.read_thread import (
+    ConsumerReadState,
     MembPullReadThread,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.send_thread import (
@@ -394,12 +395,23 @@ class SFAPDCpuOffloadConsumerWorker:
 
         # Create memfabric engine (no registration)
         self._ensure_engine()
+        assert self.sfa_worker is not None
+        read_state = ConsumerReadState(
+            layer_metadata=self.layer_metadata,
+            main_name_to_idx=self._main_name_to_idx,
+            cpu_pools=self._cpu_pools,
+            hbm_kv=self._hbm_kv,
+            indexer_tensors=self._indexer_tensors,
+            indexer_scale_tensors=self._indexer_scale_tensors,
+            dest_blocks_by_req=self._dest_blocks_by_req,
+            get_offload_layer_id=self.sfa_worker._get_offload_layer_id,
+        )
         # Start MembPullReadThread (ZMQ ROUTER + memfabric read)
         self._mf_read_thread = MembPullReadThread(
             tp_rank=self.tp_rank,
             side_channel_port=self.side_channel_port,
             engine=self.engine,
-            worker=self,
+            state=read_state,
         )
         self._mf_read_thread.start()
         self._mf_read_thread.ready_event.wait()

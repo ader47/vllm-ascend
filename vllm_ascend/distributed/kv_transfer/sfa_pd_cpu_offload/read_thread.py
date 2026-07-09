@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import math
 import threading
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import msgspec
@@ -22,6 +24,18 @@ from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
     READ_READY_BATCH,
     SfaPDAgentMetadata,
 )
+
+
+@dataclass
+class ConsumerReadState:
+    layer_metadata: dict[str, Any]
+    main_name_to_idx: dict[str, int]
+    cpu_pools: list[tuple[Any, Any]]
+    hbm_kv: dict[str, tuple[Any, Any]]
+    indexer_tensors: list[Any]
+    indexer_scale_tensors: list[Any | None]
+    dest_blocks_by_req: dict[str, tuple[list[int], list[int], int, int | None]]
+    get_offload_layer_id: Callable[[str], int]
 
 
 def _coalesce_desc(
@@ -54,13 +68,13 @@ class MembPullReadThread(threading.Thread):
         tp_rank: int,
         side_channel_port: int,
         engine: Any,
-        worker: Any,
+        state: ConsumerReadState,
     ):
         super().__init__(daemon=True, name=f"MembPullReadThread-TP{tp_rank}")
         self.tp_rank = tp_rank
         self.side_channel_port = side_channel_port
         self.engine = engine
-        self._worker = worker
+        self._state = state
         self.ready_event = threading.Event()
         self._p_session: str | None = None
         self._p_layer_meta: dict[str, Any] = {}
@@ -159,7 +173,7 @@ class MembPullReadThread(threading.Thread):
                         meta_bytes = encoder.encode(
                             SfaPDAgentMetadata(
                                 te_rpc_port=0,
-                                layer_metadata=self._worker.layer_metadata,
+                                layer_metadata=self._state.layer_metadata,
                             )
                         )
                         sock.send_multipart((identity, b"", meta_bytes))
@@ -171,12 +185,12 @@ class MembPullReadThread(threading.Thread):
             ctx.destroy(linger=0)
 
     def _resolve_read_layer(self, layer_name: str) -> dict[str, Any] | None:
-        w = self._worker
-        pool_idx = w._main_name_to_idx.get(layer_name)
+        state = self._state
+        pool_idx = state.main_name_to_idx.get(layer_name)
         if pool_idx is None:
             logger.warning("MembPull _do_read: layer %s not in main names, skip", layer_name)
             return None
-        offload_id = w.sfa_worker._get_offload_layer_id(layer_name)
+        offload_id = state.get_offload_layer_id(layer_name)
         if pool_idx != offload_id and envs.VLLM_ASCEND_SFA_DEBUG:
             logger.warning(
                 "MembPull _do_read: layer-order mismatch for %s -- pull _main_names "
@@ -196,8 +210,8 @@ class MembPullReadThread(threading.Thread):
         p_base_addrs = p_meta["base_addrs"]
         p_block_len = p_meta["block_len"]
 
-        k_cpu, v_cpu = w._cpu_pools[offload_id]
-        hbm_kv = w._hbm_kv.get(layer_name)
+        k_cpu, v_cpu = state.cpu_pools[offload_id]
+        hbm_kv = state.hbm_kv.get(layer_name)
         if hbm_kv is None:
             k_hbm_ptr = v_hbm_ptr = None
         else:
@@ -212,7 +226,7 @@ class MembPullReadThread(threading.Thread):
             )
         else:
             p_dsa_len = p_block_len[2]
-            d_indexer = w._indexer_tensors[pool_idx]
+            d_indexer = state.indexer_tensors[pool_idx]
             d_dsa_len = d_indexer.element_size() * math.prod(d_indexer.shape[1:])
             if p_dsa_len <= 0 or d_dsa_len % p_dsa_len != 0:
                 logger.error(
@@ -233,8 +247,8 @@ class MembPullReadThread(threading.Thread):
 
         scale = None
         scale_tensor = (
-            w._indexer_scale_tensors[pool_idx]
-            if pool_idx < len(w._indexer_scale_tensors)
+            state.indexer_scale_tensors[pool_idx]
+            if pool_idx < len(state.indexer_scale_tensors)
             else None
         )
         if scale_tensor is not None:
@@ -284,10 +298,10 @@ class MembPullReadThread(threading.Thread):
         p_block_ids: list[int],
         want_info: bool,
     ) -> tuple[list[int], list[int], list[int], dict[str, Any] | None]:
-        w = self._worker
+        state = self._state
         layer_name = layer["layer_name"]
 
-        dest = w._dest_blocks_by_req.get(ext_req_id)
+        dest = state.dest_blocks_by_req.get(ext_req_id)
         if dest is None:
             logger.warning(
                 "MembPull _do_read: no dest blocks on D for req %s (layer %s), skip",
@@ -450,7 +464,7 @@ class MembPullReadThread(threading.Thread):
         return local_ptrs, peer_ptrs, lengths, info
 
     def _log_read_result(self, read_info: dict[str, Any]) -> None:
-        w = self._worker
+        state = self._state
         layer_name = read_info["layer_name"]
         ext_req_id = read_info["ext_req_id"]
         pool_idx = read_info["pool_idx"]
@@ -460,16 +474,23 @@ class MembPullReadThread(threading.Thread):
         partial_hbm_bid = read_info["partial_hbm_bid"]
         if envs.VLLM_ASCEND_MF_VERIFY:
             try:
-                k_cpu, v_cpu = w._cpu_pools[offload_id]
+                k_cpu, v_cpu = state.cpu_pools[offload_id]
                 mk = k_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
                 mv = v_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
                 if partial_hbm_bid is not None:
-                    hbm_kv = w._hbm_kv.get(layer_name)
+                    hbm_kv = state.hbm_kv.get(layer_name)
                     if hbm_kv is not None:
                         k_hbm, v_hbm = hbm_kv
                         mk += k_hbm[partial_hbm_bid].float().sum().item()
                         mv += v_hbm[partial_hbm_bid].float().sum().item()
-                mi = w._indexer_tensors[pool_idx][d_indexer_ids].float().sum().item() if d_indexer_ids else 0.0
+                mi = (
+                    state.indexer_tensors[pool_idx][d_indexer_ids]
+                    .float()
+                    .sum()
+                    .item()
+                    if d_indexer_ids
+                    else 0.0
+                )
                 logger.info(
                     "MFV D layer %s req %s main_k=%.6f main_v=%.6f idx_post=%.6f",
                     layer_name,
