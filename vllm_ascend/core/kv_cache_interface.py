@@ -483,13 +483,13 @@ class OffloadMLAAttentionSpec(AttentionSpec):
         """
         ktc = vllm_config.kv_transfer_config
         if ktc is not None and ktc.kv_role == "kv_consumer":
-            # PD D-side: the main-MLA prefix is null-padded (no HBM), but with
-            # the in-place decode-block free removed (it raced the connector's
-            # async HBM->CPU copy under high concurrency) decode blocks now stay
-            # resident. The per-req peak is therefore the full max_model_len,
-            # not the ~(2 + num_speculative) resident tail. Size accordingly.
-            max_model_len = vllm_config.model_config.max_model_len
-            return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+            # PD D-side keeps only the MLA resident tail in HBM: the
+            # remote-prefill prefix is null-padded, and completed decode blocks
+            # are freed in-place after save. Reserve current partial + one
+            # handoff block per request for the must-fit check.
+            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+            blocks_per_req = 2
+            return blocks_per_req * max_num_seqs * self.page_size_bytes
         # Producer (P) or local offload (kv_both) or no kv-transfer: the prefix
         # transits HBM during prefill before being offloaded, so the peak is the
         # full max_model_len.

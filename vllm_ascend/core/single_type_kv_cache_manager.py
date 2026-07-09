@@ -547,17 +547,28 @@ class OffloadMLAAttentionManager(FullAttentionManager):
         # paths).
         to_free_blocks: list[KVCacheBlock] = []
         if is_remote_prefilled:
-            # PD remote-prefilled: the null-padded prefix occupies [0:N] of
-            # req_blocks, so the pop(0) free below must NOT run for these reqs
-            # (it would pop the nulls). Decode blocks are intentionally kept
-            # resident in HBM and NOT freed back to the pool after the
-            # connector's async HBM->CPU copy. That one-step-slack free raced
-            # the copy under high concurrency (use-after-free), so it is
-            # removed. The prefix stays null-padded (no HBM) and the block-table
-            # layout [null]*N + resident is exactly what SFA attention expects
-            # (num_offloaded_blocks masks [0:N]); decode HBM is bounded by the
-            # must-fit check (full max_model_len).
-            pass
+            # PD: free real decode blocks IN-PLACE (replace with null_block, do
+            # NOT pop) so the null-padded prefix at [0:N] and the row length
+            # stay intact (the block-table length and the attention
+            # num_offloaded_blocks mask depend on them). The cursor points at
+            # the oldest unfree real block (starts at N at admission).
+            num_allocated_tokens = self.req_to_num_allocated_tokens[request_id]
+            num_offloaded_total = num_allocated_tokens // self.block_size
+            cursor = self.req_to_real_free_cursor[request_id]
+            num_to_free_real = max(
+                min(num_offloaded_total - cursor, len(req_blocks) - cursor), 0
+            )
+            for _ in range(num_to_free_real):
+                blk = req_blocks[cursor]
+                assert blk is not self._null_block, (
+                    f"req {request_id}: PD free cursor hit null_block at index "
+                    f"{cursor} (cursor desync)"
+                )
+                req_blocks[cursor] = self._null_block
+                req_freed_blocks.append(blk)
+                to_free_blocks.append(blk)
+                cursor += 1
+            self.req_to_real_free_cursor[request_id] = cursor
         else:
             num_allocated_tokens = self.req_to_num_allocated_tokens[request_id]
             num_new_tokens_main_model = num_tokens_main_model - num_allocated_tokens
@@ -584,10 +595,10 @@ class OffloadMLAAttentionManager(FullAttentionManager):
             self.block_pool.free_blocks(to_free_blocks)
             logger.info(f'>>>>> kv cache manager, req {request_id} free {len(to_free_blocks)} offloaded blocks: {[block.block_id for block in to_free_blocks]}')
 
-        # allocate new blocks. PD remote-prefilled: decode blocks stay resident
-        # (not freed -- the is_remote_prefilled free branch above is a no-op),
-        # so len(req_blocks) already accounts for both the null prefix and the
-        # real decode blocks -- do NOT subtract len(req_freed_blocks).
+        # allocate new blocks. PD remote-prefilled: freed decode blocks stay in
+        # req_blocks as null_block (in-place, not popped), so len(req_blocks)
+        # already accounts for them -- do NOT subtract len(req_freed_blocks)
+        # (would double-count and starve the resident tail).
         if is_remote_prefilled:
             num_new_blocks = num_required_blocks - len(req_blocks)
         else:
