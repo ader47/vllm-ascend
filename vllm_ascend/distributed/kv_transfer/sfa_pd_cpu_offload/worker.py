@@ -87,7 +87,7 @@ def _resolve_kv_transfer_backend(vllm_config: VllmConfig) -> str:
     """Pick the KV transfer backend.
 
     ``kv_connector_extra_config["transfer_backend"]`` overrides the
-    ``VLLM_ASCEND_KV_TRANSFER_BACKEND`` env var (default ``mooncake``).
+    ``VLLM_ASCEND_KV_TRANSFER_BACKEND`` env var.
     """
     extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
     return extra.get("transfer_backend") or envs.VLLM_ASCEND_KV_TRANSFER_BACKEND
@@ -184,7 +184,7 @@ class SFAPDCpuOffloadConsumerWorker:
             if isinstance(t, (list, tuple)) and len(t) in (5, 6)
         }
 
-        # memfabric pull mode only (the mooncake staging path has been removed).
+        # memfabric pull mode only.
         assert _resolve_kv_transfer_backend(self.vllm_config) == BACKEND_MEMFABRIC, (
             "SFAPDCpuOffloadConnector D side supports memfabric pull only (set transfer_backend=memfabric)."
         )
@@ -509,11 +509,7 @@ class SFAPDCpuOffloadProducerWorker:
         raise RuntimeError("SFAPDCpuOffloadConnector P side supports memfabric pull only.")
 
     def start_load_kv(self, metadata: KVConnectorMetadata) -> None:
-        """Override: in memfabric pull mode, skip the mooncake base producer
-        branch (it builds push transfer mappings, needs ``remote_block_ids``
-        which D no longer sends, and assumes symmetric P/D kv_cache_group
-        structure → IndexError on P's 1 group). But preserve what
-        ``_transfer_kv_cache`` relies on:
+        """Prepare P-side request metadata for memfabric pull mode.
 
         * reset ``self.current_layer`` — the per-step layer counter that
           ``save_kv_layer`` increments; without the reset it drifts to
@@ -566,7 +562,7 @@ class SFAPDCpuOffloadProducerWorker:
         )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        # memfabric pull mode only (mooncake staging path removed).
+        # memfabric pull mode only.
         assert self._backend == BACKEND_MEMFABRIC, "SFAPDCpuOffloadConnector P side supports memfabric pull only."
         layer2group_ids: dict[str, int] = {}
         for group_idx, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
@@ -656,9 +652,8 @@ class SFAPDCpuOffloadProducerWorker:
             pd_pending = getattr(self.kv_send_layer_thread, "layer_transfer_pending_events", None)
             if has_pd_target and pd_pending is not None and 0 <= layer_idx < len(pd_pending):
                 pd_pending[layer_idx].set()
-        # Record a fresh compute-stream event (after the scatter) for the send
-        # thread to wait before notify; replaces mooncake's wait_event, which
-        # does not capture sfa_v1's scatter on this pull path.
+        # Record a fresh compute-stream event after the scatter so the send
+        # thread waits for SFA's KV write before notifying D.
         if self.kv_send_layer_thread is None:
             return
         if not getattr(connector_metadata, "requests", None):

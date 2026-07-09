@@ -8,7 +8,7 @@ RequestTracker, and send a metaserver rendezvous notification to P carrying
 only contact info + ``do_remote_decode`` (NO block ids — D keeps its blocks and
 looks them up by req_id when P's READ_READY arrives).
 
-P (``kv_producer``): send setup handled by the mooncake layerwise base.
+P (``kv_producer``): build metadata for layer-wise READ_READY notifications.
 """
 
 from __future__ import annotations

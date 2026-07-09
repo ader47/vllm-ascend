@@ -6,8 +6,6 @@ On the Decode node (``kv_consumer``), remote Prefill exposes its KV and Decode
 pulls the bulk MLA KV into a CPU pinned offload pool; the indexer KV lands in
 HBM. The D-side load path (LRU-resident H2D) is reused from
 :class:`SFAKVOffloadWorker`.
-
-See ``/Users/liufeng/.claude/plans/luminous-shimmying-wind.md`` for the design.
 """
 
 import re
@@ -48,7 +46,7 @@ _LAYER_IDX_RE = re.compile(r"layers\.(\d+)")
 class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     """One connector class branching on ``role`` and ``kv_role``.
 
-    * SCHEDULER + producer : P-side send setup (reuses mooncake layerwise logic).
+    * SCHEDULER + producer : P-side metadata for memfabric pull notifications.
     * SCHEDULER + consumer : D-side CPU-block allocation / advertisement tracking.
     * WORKER + producer    : P-side layer-wise READ_READY notifications.
     * WORKER + consumer    : D-side : composes ``SFAKVOffloadWorker`` (LRU load +
@@ -83,8 +81,8 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # Guard the asymmetric use_offload assumption (the launch scripts must
         # set it via --additional-config). Fail fast at startup rather than
         # producing confusing mid-run failures.
-        #   P (producer)  : use_offload=false — inherited mooncake register
-        #                    expects standard paged KV, not the offload 5-tuple.
+        #   P (producer)  : use_offload=false — producer exposes standard
+        #                    paged KV, not the offload 5-tuple.
         #   D (consumer)  : use_offload=true  — drives the SFA offload code path
         #                    (5-tuple kv_cache, num_offloaded_blocks, LRU load).
         from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
@@ -107,8 +105,8 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
 
         if role == KVConnectorRole.SCHEDULER:
-            # Producer scheduler reuses mooncake send-setup; consumer scheduler
-            # is the D-side CPU-block allocator/advertiser.
+            # Producer scheduler prepares P-side metadata; consumer scheduler
+            # allocates and advertises D-side CPU blocks.
             if self.is_producer:
                 self.connector_scheduler = SFAPDProducerScheduler(vllm_config, kv_cache_config, str(self.engine_id))
             else:
