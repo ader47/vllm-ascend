@@ -33,6 +33,9 @@ from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.worker import (
     SFAPDCpuOffloadConsumerWorker,
     SFAPDCpuOffloadProducerWorker,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    get_layerwise_config,
+)
 
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -66,6 +69,16 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # SFA path is layer-wise on both sides.
         self.use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", True)
         self.engine_id = vllm_config.kv_transfer_config.engine_id
+        # Layer-reuse mate map. For a layer that time-multiplexes a shared HBM
+        # slot, the "mate" is the slot's previous occupant whose KV D must finish
+        # reading before this layer may overwrite the slot. ``prefetch_layer_map``
+        # maps each reusing layer -> its mate; empty when layer reuse is disabled
+        # (so the gate below becomes a no-op, matching the no-reuse behavior).
+        lw_config = get_layerwise_config(
+            vllm_config.model_config.get_num_layers(vllm_config.parallel_config),
+            vllm_config.kv_transfer_config.kv_connector_extra_config,
+        )
+        self._reuse_mate_map = lw_config.prefetch_layer_map
 
         # Guard the asymmetric use_offload assumption (the launch scripts must
         # set it via --additional-config). Fail fast at startup rather than
@@ -173,13 +186,16 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """Per-layer gate called before each layer's attention computation.
 
         D-side: no-op (SFA loads inside ``prepare_lru_resident_and_load``).
-        P-side: **buffer-reuse gate** — before P overwrites a shared HBM buffer
-        for this layer, ensure D has finished reading it (READ_DONE received).
-        Uses ``wait_for_layer_send(layer_idx)`` internally.
+        P-side: **buffer-reuse gate** — before this layer overwrites a shared HBM
+        slot, ensure D has finished reading the slot's *previous occupant* (the
+        reuse mate) by waiting on the mate's send-done event. Waiting on this
+        layer's OWN event would not protect the slot (that event tracks a
+        different layer), so it must be the mate. Layers that do not reuse a
+        slot (independent layers / first occupant) have no mate and skip.
 
         The per-layer send-done events are cleared when a READ_READY_BATCH is
         sent and set again by the pipelined MembPull send thread when READ_DONE
-        arrives. Events are initially set, so the first cycle does not block.
+        arrives. Events are initially set, so the first occupant does not block.
         """
         if not self.is_producer:
             return
@@ -187,7 +203,10 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if match is None:
             return
         layer_idx = int(match.group(1))
-        self.wait_for_layer_send(layer_idx)
+        mate = self._reuse_mate_map.get(layer_idx)
+        if mate is None:
+            return  # independent / first occupant of its slot: nothing to gate.
+        self.wait_for_layer_send(mate)
 
     def save_kv_layer(
         self,
