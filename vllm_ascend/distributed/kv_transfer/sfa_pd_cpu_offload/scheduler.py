@@ -26,6 +26,8 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorScheduler,
+)
+from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
     get_external_request_id,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (

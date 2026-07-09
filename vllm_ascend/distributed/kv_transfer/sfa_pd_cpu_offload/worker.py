@@ -35,11 +35,17 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_layerwise_connector as _mlc
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
-    GET_META_MSG,
     KVCacheSendingLayerThread,
-    LayerMetadata,
-    MooncakeAgentMetadata,
     MooncakeLayerwiseConnectorWorker,
+)
+from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
+    GET_META_MSG,
+    MF_META,
+    READ_DONE,
+    READ_FAILED,
+    READ_READY_BATCH,
+    LayerMetadata,
+    SfaPDAgentMetadata,
     get_external_request_id,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker import (
@@ -93,14 +99,6 @@ def _coalesce_desc(
     cum = np.cumsum(length)
     merged_len = cum[run_end] - cum[run_start] + length[run_start]
     return peer[run_start], local[run_start], merged_len
-
-
-MF_META = b"mf_meta"  # P→D: (MF_META, p_session, p_layer_meta_serialized)
-# READ_READY_BATCH (pull model): P sends its OWN source block ids + external
-# req_ids for one layer; D looks up its destination blocks by req_id.
-READ_READY_BATCH = b"read_ready_batch"  # P→D: one layer of (ext_req_id, p_block_ids) + done req ids
-READ_DONE = b"read_done"  # D→P: (READ_DONE, layer_idx), successful read only
-READ_FAILED = b"read_failed"  # D→P: (READ_FAILED, layer_idx, error)
 
 
 def _resolve_kv_transfer_backend(vllm_config: VllmConfig) -> str:
@@ -572,7 +570,7 @@ class MembPullReadThread(threading.Thread):
                     elif msg_type == GET_META_MSG:
                         # D responds with its own metadata (for compatibility)
                         meta_bytes = encoder.encode(
-                            MooncakeAgentMetadata(
+                            SfaPDAgentMetadata(
                                 te_rpc_port=0,
                                 layer_metadata=self._worker.layer_metadata,
                             )
