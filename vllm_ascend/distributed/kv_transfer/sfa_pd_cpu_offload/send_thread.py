@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from dataclasses import dataclass
 from typing import Any
 
 import msgspec
@@ -25,6 +26,15 @@ from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
 )
 
 
+@dataclass
+class ProducerSendState:
+    total_layers: int
+    layer_metadata: dict[str, LayerMetadata]
+    p_session: str
+    layer_transfer_finished_events: list[threading.Event] | None
+    layer_transfer_pending_events: list[threading.Event] | None
+
+
 class MembPullSendingThread(threading.Thread):
     """P-side sending thread for memfabric pull mode.
 
@@ -37,26 +47,21 @@ class MembPullSendingThread(threading.Thread):
     def __init__(
         self,
         *,
-        total_layers: int,
         ready_event: threading.Event,
-        layer_metadata: dict[str, LayerMetadata],
-        p_session: str,
-        layer_transfer_finished_events: list[threading.Event] | None,
-        layer_transfer_pending_events: list[threading.Event] | None,
+        state: ProducerSendState,
     ) -> None:
         super().__init__(daemon=True, name="SfaPDMembPullSendingThread")
         self.timeout = 10.0
         self._mf_meta_sent = False
-        self.total_layers = total_layers
+        self._state = state
+        self.total_layers = state.total_layers
         self.ready_event = ready_event
-        self.layer_metadata = layer_metadata
-        self.p_session = p_session
-        self.layer_transfer_finished_events = layer_transfer_finished_events
-        self.layer_transfer_pending_events = layer_transfer_pending_events
+        self.layer_transfer_finished_events = state.layer_transfer_finished_events
+        self.layer_transfer_pending_events = state.layer_transfer_pending_events
         self.send_queue: queue.Queue[SendTask] = queue.Queue()
         # Set means the layer's source buffer has no pending D-side read.
         self.layer_send_done_events: list[threading.Event] = []
-        for _ in range(total_layers):
+        for _ in range(state.total_layers):
             event = threading.Event()
             event.set()
             self.layer_send_done_events.append(event)
@@ -190,20 +195,24 @@ class MembPullSendingThread(threading.Thread):
 
     def _send_mf_meta(self, dealer, encoder: msgspec.msgpack.Encoder) -> None:
         p_meta_dict = {}
-        for ln, meta in self.layer_metadata.items():
+        for ln, meta in self._state.layer_metadata.items():
             p_meta_dict[ln] = {
                 "base_addrs": list(meta.kv_caches_base_addr),
                 "block_len": list(meta.block_len),
                 "block_size_scale": list(meta.block_size_scale),
             }
-        dealer.send(encoder.encode((MF_META, self.p_session, encoder.encode(p_meta_dict))))
+        dealer.send(encoder.encode((MF_META, self._state.p_session, encoder.encode(p_meta_dict))))
         if dealer.poll(timeout=int(self.timeout * 1000)):
             frames = dealer.recv_multipart()
             payload = [f for f in frames if f != b""]
             if payload != [b"ACK"]:
                 raise RuntimeError(f"MembPull P MF_META got unexpected reply: {payload!r}")
             self._mf_meta_sent = True
-            logger.info("MembPull P sent MF_META: session=%s, layers=%d", self.p_session, len(p_meta_dict))
+            logger.info(
+                "MembPull P sent MF_META: session=%s, layers=%d",
+                self._state.p_session,
+                len(p_meta_dict),
+            )
         else:
             raise RuntimeError("MembPull P MF_META timed out (no reply from D)")
 

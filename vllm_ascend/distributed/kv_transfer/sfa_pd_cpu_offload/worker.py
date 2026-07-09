@@ -47,6 +47,7 @@ from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.read_thread import (
 )
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.send_thread import (
     MembPullSendingThread,
+    ProducerSendState,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker import (
     SFAKVOffloadWorker,
@@ -586,13 +587,16 @@ class SFAPDCpuOffloadProducerWorker:
         assert global_te._unique_id is not None, "memfabric unique_id was not initialized before send thread setup"
 
         ready_event = threading.Event()
-        self.kv_send_layer_thread = MembPullSendingThread(
+        send_state = ProducerSendState(
             total_layers=self.total_layers,
-            ready_event=ready_event,
             layer_metadata=self.layer_metadata,
             p_session=global_te._unique_id,
             layer_transfer_finished_events=get_shared_layer_transfer_events(),
             layer_transfer_pending_events=get_shared_layer_transfer_pending_events(),
+        )
+        self.kv_send_layer_thread = MembPullSendingThread(
+            ready_event=ready_event,
+            state=send_state,
         )
         self.kv_send_layer_thread.start()
         ready_event.wait()
