@@ -8,9 +8,9 @@ per layer via READ_READY_BATCH; D reads indexer KV into HBM and main MLA KV into
 CPU pool (the partial last block stays in HBM until decode fills it, then the
 B1 offload path copies it to CPU).
 
-P (``kv_producer``): reuses :class:`MooncakeLayerwiseConnectorWorker` for the
-send setup, but swaps in a pull-mode sending thread that notifies D to read
-(no RDMA push). A per-layer send-completion event gates P's KV buffer reuse.
+P (``kv_producer``): registers its HBM KV with memfabric and runs a pull-mode
+sending thread that notifies D to read (no RDMA push). A per-layer
+send-completion event gates P's KV buffer reuse.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import math
 import queue
 import re
 import threading
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -33,10 +34,11 @@ from vllm.utils.network_utils import get_ip, make_zmq_path
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend import envs
-from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_layerwise_connector as _mlc
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
-    KVCacheSendingLayerThread,
-    MooncakeLayerwiseConnectorWorker,
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+    get_shared_layer_transfer_events,
+    get_shared_layer_transfer_pending_events,
+    set_shared_layer_transfer_events,
+    set_shared_layer_transfer_pending_events,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
     GET_META_MSG,
@@ -45,6 +47,7 @@ from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
     READ_FAILED,
     READ_READY_BATCH,
     LayerMetadata,
+    SendTask,
     SfaPDAgentMetadata,
     get_external_request_id,
 )
@@ -56,6 +59,10 @@ from vllm_ascend.distributed.kv_transfer.utils.transfer_engine_backend import (
     BACKEND_MEMFABRIC,
     MEMFABRIC_ROLE_DECODE,
     MEMFABRIC_ROLE_PREFILL,
+)
+from vllm_ascend.distributed.kv_transfer.utils.utils import (
+    collect_storage_merged_register_regions,
+    validate_register_region_count,
 )
 
 if TYPE_CHECKING:
@@ -1009,7 +1016,7 @@ class MembPullReadThread(threading.Thread):
 # ======================================================================
 # P side (kv_producer) — memfabric pull: notify D to read, per-layer completion
 # ======================================================================
-class _MembPullSendingThread(KVCacheSendingLayerThread):
+class _MembPullSendingThread(threading.Thread):
     """P-side sending thread for memfabric pull mode.
 
     Does NOT push (no batch_transfer_sync_write). Instead, after each layer's
@@ -1018,13 +1025,26 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
     First call sends MF_META (P session + layer addresses) to D.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        total_layers: int = kwargs.get("total_layers")  # type: ignore[assignment]
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        *,
+        total_layers: int,
+        ready_event: threading.Event,
+        layer_metadata: dict[str, LayerMetadata],
+        p_session: str,
+        layer_transfer_finished_events: list[threading.Event] | None,
+        layer_transfer_pending_events: list[threading.Event] | None,
+    ) -> None:
+        super().__init__(daemon=True, name="SfaPDMembPullSendingThread")
         self.timeout = 10.0
         self._mf_meta_sent = False
-        # P's memfabric session (unique_id) — set by producer worker
-        self.p_session: str = ""
+        self.total_layers = total_layers
+        self.ready_event = ready_event
+        self.layer_metadata = layer_metadata
+        self.p_session = p_session
+        self.layer_transfer_finished_events = layer_transfer_finished_events
+        self.layer_transfer_pending_events = layer_transfer_pending_events
+        self.send_queue: queue.Queue[SendTask] = queue.Queue()
         # Buffer-reuse gate: set means the layer's source buffer has no pending
         # D-side read. Initially set because nothing has been sent yet.
         self.layer_send_done_events: list[threading.Event] = []
@@ -1269,13 +1289,12 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             logger.info("MembPull P layer send complete: layer=%d", layer_idx)
 
 
-class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
-    """P-side worker = mooncake layerwise send setup + pull-mode sending thread.
+class SFAPDCpuOffloadProducerWorker:
+    """P-side worker for memfabric pull mode.
 
-    Reuses the mooncake base for send-queue setup, but swaps in
-    :class:`_MembPullSendingThread` (notifies D to read via READ_READY_BATCH, does NOT
-    push). D looks up its own destination blocks by req_id; P sends only its
-    source block ids. A per-layer send-done event gates P's KV buffer reuse.
+    It registers P's local KV tensors with memfabric and runs a pull-mode
+    sending thread. P never pushes KV; it sends READ_READY_BATCH messages so D
+    can read P's source blocks and reply with READ_DONE / READ_FAILED.
     """
 
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, engine_id: str):
@@ -1286,8 +1305,46 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
                 role=MEMFABRIC_ROLE_PREFILL,
                 device_id=torch.npu.current_device(),
             )
-        super().__init__(vllm_config, kv_cache_config, engine_id)
+        self.vllm_config = vllm_config
+        self.kv_cache_config = kv_cache_config
+        self.engine_id = engine_id
+        self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self.side_channel_host = get_ip()
+        self.side_channel_port = (
+            vllm_config.kv_transfer_config.kv_port
+            + self.dp_rank * self.tp_size
+        )
+        self.total_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+        set_shared_layer_transfer_events([threading.Event() for _ in range(self.total_layers)])
+        set_shared_layer_transfer_pending_events([threading.Event() for _ in range(self.total_layers)])
+        self.engine = global_te.get_transfer_engine(self.side_channel_host, device_name=None)
+        self.te_rpc_port = self.engine.get_rpc_port()
+        self.kv_cache_specs = [
+            group_spec.kv_cache_spec
+            for group_spec in self.kv_cache_config.kv_cache_groups
+        ]
+        self.block_size = [spec.block_size for spec in self.kv_cache_specs]
+        self.num_kv_cache_groups = len(self.kv_cache_specs)
+        self.use_mla = self.vllm_config.model_config.use_mla
+        self.layer_metadata: dict[str, LayerMetadata] = {}
+        self.index_to_name: defaultdict[int, list[str]] = defaultdict(list)
+        self.current_layer = 0
+        self.kv_send_layer_thread: _MembPullSendingThread | None = None
         self.layer_send_done_events: list[threading.Event] | None = None
+
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        return set(), set()
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        return set()
+
+    def set_req_ids(self, req_ids: list) -> None:
+        return
+
+    def get_num_cpu_blocks(self, req_ids: list[str]) -> dict[str, int] | None:
+        return None
 
     def update_decoder_info(self, req_id: str, req_meta: Any) -> Any:
         """Override: in memfabric pull mode, P does NOT need D's metadata
@@ -1296,7 +1353,7 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
         delay MF_META / READ_READY_BATCH."""
         if self._backend == BACKEND_MEMFABRIC:
             return req_meta
-        return super().update_decoder_info(req_id, req_meta)
+        raise RuntimeError("SFAPDCpuOffloadConnector P side supports memfabric pull only.")
 
     def start_load_kv(self, metadata: KVConnectorMetadata) -> None:
         """Override: in memfabric pull mode, skip the mooncake base producer
@@ -1341,34 +1398,55 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
                         req_meta.local_transed_tokens,
                     )
             return
-        super().start_load_kv(metadata)
+        raise RuntimeError("SFAPDCpuOffloadConnector P side supports memfabric pull only.")
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         # memfabric pull mode only (mooncake staging path removed).
         assert self._backend == BACKEND_MEMFABRIC, "SFAPDCpuOffloadConnector P side supports memfabric pull only."
-        # Swap in _MembPullSendingThread (notifies D to read, does NOT push).
-        # Set its p_session before the base class constructs it.
-        orig = _mlc.KVCacheSendingLayerThread
-        _mlc.KVCacheSendingLayerThread = _MembPullSendingThread  # type: ignore[assignment]
-        # Patch __init__ to inject p_session (hack: base class doesn't pass it)
-        _orig_init = _MembPullSendingThread.__init__
+        layer2group_ids: dict[str, int] = {}
+        for group_idx, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            for layer_name in kv_cache_group.layer_names:
+                layer2group_ids[layer_name] = group_idx
 
-        def _patched_init(self_inner, *a, **kw):
-            _orig_init(self_inner, *a, **kw)
-            # The sending thread is constructed AFTER the engine is built
-            # (base-class order: register_buffer then create thread), so
-            # global_te._unique_id now holds the unique_id memfabric ACTUALLY
-            # registered under (set in _build_memfabric). It is the session D
-            # must read from.
-            assert global_te._unique_id is not None, "memfabric unique_id was not initialized before send thread setup"
-            self_inner.p_session = global_te._unique_id
+        num_blocks = self.kv_cache_config.num_blocks
+        for layer_name, kv_cache_tuple in kv_caches.items():
+            if not isinstance(kv_cache_tuple, (list, tuple)):
+                kv_cache_tuple = [kv_cache_tuple]
+            group_idx = layer2group_ids[layer_name]
+            layer_meta = LayerMetadata([], [], [], [])
+            for single_kv_cache in kv_cache_tuple:
+                tensor_num_blocks = single_kv_cache.shape[0]
+                assert tensor_num_blocks % num_blocks == 0, (
+                    "The external block size must be an integer multiple of the kernel block size."
+                )
+                block_size_scale = tensor_num_blocks // num_blocks
+                block_shape = single_kv_cache.shape[1:]
+                layer_meta.tensor_group_idx.append(group_idx)
+                layer_meta.kv_caches_base_addr.append(single_kv_cache.data_ptr())
+                layer_meta.block_len.append(single_kv_cache.element_size() * math.prod(block_shape))
+                layer_meta.block_size_scale.append(block_size_scale)
+            self.layer_metadata[layer_name] = layer_meta
+            self.index_to_name[_layer_idx(layer_name)].append(layer_name)
 
-        _MembPullSendingThread.__init__ = _patched_init  # type: ignore[assignment]
-        try:
-            super().register_kv_caches(kv_caches)
-        finally:
-            _mlc.KVCacheSendingLayerThread = orig  # type: ignore[assignment]
-            _MembPullSendingThread.__init__ = _orig_init  # type: ignore[assignment]
+        if self.total_layers < len(self.layer_metadata):
+            self.total_layers = len(self.layer_metadata)
+
+        register_regions = collect_storage_merged_register_regions(kv_caches)
+        validate_register_region_count(register_regions)
+        global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+        assert global_te._unique_id is not None, "memfabric unique_id was not initialized before send thread setup"
+
+        ready_event = threading.Event()
+        self.kv_send_layer_thread = _MembPullSendingThread(
+            total_layers=self.total_layers,
+            ready_event=ready_event,
+            layer_metadata=self.layer_metadata,
+            p_session=global_te._unique_id,
+            layer_transfer_finished_events=get_shared_layer_transfer_events(),
+            layer_transfer_pending_events=get_shared_layer_transfer_pending_events(),
+        )
+        self.kv_send_layer_thread.start()
+        ready_event.wait()
         # Stash source tensors on the sending thread for env-gated verify
         # checksums (VLLM_ASCEND_MF_VERIFY=1): P sums its source blocks so
         # the user can compare against D's destination sums in the logs.
@@ -1399,9 +1477,10 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
         connector_metadata: KVConnectorMetadata,
         **kwargs,
     ) -> None:
+        if self._backend != BACKEND_MEMFABRIC:
+            raise RuntimeError("SFAPDCpuOffloadConnector P side supports memfabric pull only.")
         if (
-            self._backend == BACKEND_MEMFABRIC
-            and getattr(connector_metadata, "requests", None)
+            getattr(connector_metadata, "requests", None)
             and self.current_layer < self.total_layers
         ):
             layer_idx = self.current_layer
@@ -1419,9 +1498,48 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
         # Record a fresh compute-stream event (after the scatter) for the send
         # thread to wait before notify; replaces mooncake's wait_event, which
         # does not capture sfa_v1's scatter on this pull path.
-        if self.kv_send_layer_thread is not None:
-            self.kv_send_layer_thread.record_p_save_event(self.current_layer)
-        super().save_kv_layer(layer_name, kv_layer, attn_metadata, connector_metadata, **kwargs)
+        if self.kv_send_layer_thread is None:
+            return
+        if not getattr(connector_metadata, "requests", None):
+            return
+        if self.current_layer >= self.total_layers:
+            self.current_layer += 1
+            return
+        if layer_name == "":
+            layer_name = self.index_to_name[self.current_layer][0]
+
+        self.kv_send_layer_thread.record_p_save_event(self.current_layer)
+        layer_attn_metadata = None
+        if self.use_mla and hasattr(attn_metadata, "__getitem__"):
+            try:
+                layer_attn_metadata = attn_metadata[layer_name]
+            except Exception:
+                layer_attn_metadata = None
+        if layer_attn_metadata is not None and hasattr(layer_attn_metadata, "reshape_cache_event"):
+            wait_event = layer_attn_metadata.reshape_cache_event
+        elif hasattr(attn_metadata, "reshape_cache_event"):
+            wait_event = attn_metadata.reshape_cache_event
+        else:
+            wait_event = torch.npu.Event()
+            wait_event.record()
+
+        layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
+        layer_send_task = SendTask(
+            send_request={},
+            wait_event=wait_event,
+            layer_idx=self.current_layer,
+            layer_name=layer_name,
+        )
+        for req_id, req_meta in connector_metadata.requests.items():
+            local_block_ids = req_meta.local_block_ids
+            if len(local_block_ids) <= layer_group_idx or not local_block_ids[layer_group_idx]:
+                continue
+            layer_send_task.send_request[req_id] = self.update_decoder_info(req_id, req_meta)
+        if layer_send_task.send_request:
+            self.kv_send_layer_thread.send_queue.put(layer_send_task)
+        else:
+            self.kv_send_layer_thread._signal_layer_done(self.current_layer)
+        self.current_layer += 1
 
     def wait_for_layer_send(self, layer_idx: int) -> None:
         """Block until D has read layer ``layer_idx``'s KV (buffer-reuse gate).

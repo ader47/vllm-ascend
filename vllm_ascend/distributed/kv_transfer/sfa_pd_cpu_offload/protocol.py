@@ -95,6 +95,14 @@ class SfaPDProducerMetadata(KVConnectorMetadata):
         )
 
 
+@dataclass
+class SendTask:
+    send_request: dict[str, SfaPDProducerReqMeta]
+    wait_event: Any | None = None
+    layer_idx: int = 0
+    layer_name: str = ""
+
+
 def get_external_request_id(request_id: str) -> str:
     # vLLM appends a 9-character EngineCore suffix to request IDs.
     return request_id[:-9]
