@@ -1112,7 +1112,18 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         asynchronously by ``_drain_read_replies`` in the event loop, not waited
         on here. This lets P proceed to the next layer immediately.
         """
-        if send_task.wait_event is not None:
+        _syncfix = os.getenv("VLLM_ASCEND_PD_REUSE_SYNCFIX", "0")
+        if _syncfix == "sendfull":
+            # Full sync on the SEND thread (non-blocking for the compute thread):
+            # tests whether the scatter->notify sync belongs here. If this fixes
+            # accuracy, the proper zero-overhead fix is to make wait_event a real
+            # compute-stream post-scatter event (reshape_cache_event) that this
+            # thread waits before notify, instead of a compute-thread sync.
+            if not getattr(self, "_sendfull_logged", False):
+                logger.info("VLLM_ASCEND_PD_REUSE_SYNCFIX=sendfull: torch.npu.synchronize() in send thread")
+                self._sendfull_logged = True
+            torch.npu.synchronize()
+        elif send_task.wait_event is not None:
             send_task.wait_event.synchronize()
         layer_idx = send_task.layer_idx
         layer_name = send_task.layer_name
