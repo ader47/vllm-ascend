@@ -325,6 +325,19 @@ class SFAPDCpuOffloadConsumerWorker:
         result = {rid: self._cpu_blocks_by_req[rid] for rid in req_ids if rid in self._cpu_blocks_by_req}
         return result or None
 
+    def _build_consumer_read_state(self) -> ConsumerReadState:
+        assert self.sfa_worker is not None
+        return ConsumerReadState(
+            layer_metadata=self.layer_metadata,
+            main_name_to_idx=self._main_name_to_idx,
+            cpu_pools=self._cpu_pools,
+            hbm_kv=self._hbm_kv,
+            indexer_tensors=self._indexer_tensors,
+            indexer_scale_tensors=self._indexer_scale_tensors,
+            dest_blocks_by_req=self._dest_blocks_by_req,
+            get_offload_layer_id=self.sfa_worker._get_offload_layer_id,
+        )
+
     def _register_memfabric_pull(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -396,17 +409,7 @@ class SFAPDCpuOffloadConsumerWorker:
 
         # Create memfabric engine (no registration)
         self._ensure_engine()
-        assert self.sfa_worker is not None
-        read_state = ConsumerReadState(
-            layer_metadata=self.layer_metadata,
-            main_name_to_idx=self._main_name_to_idx,
-            cpu_pools=self._cpu_pools,
-            hbm_kv=self._hbm_kv,
-            indexer_tensors=self._indexer_tensors,
-            indexer_scale_tensors=self._indexer_scale_tensors,
-            dest_blocks_by_req=self._dest_blocks_by_req,
-            get_offload_layer_id=self.sfa_worker._get_offload_layer_id,
-        )
+        read_state = self._build_consumer_read_state()
         # Start MembPullReadThread (ZMQ ROUTER + memfabric read)
         self._mf_read_thread = MembPullReadThread(
             tp_rank=self.tp_rank,
@@ -550,6 +553,18 @@ class SFAPDCpuOffloadProducerWorker:
             return
         raise RuntimeError("SFAPDCpuOffloadConnector P side supports memfabric pull only.")
 
+    def _build_producer_send_state(self) -> ProducerSendState:
+        assert global_te._unique_id is not None, (
+            "memfabric unique_id was not initialized before send thread setup"
+        )
+        return ProducerSendState(
+            total_layers=self.total_layers,
+            layer_metadata=self.layer_metadata,
+            p_session=global_te._unique_id,
+            layer_transfer_finished_events=get_shared_layer_transfer_events(),
+            layer_transfer_pending_events=get_shared_layer_transfer_pending_events(),
+        )
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         # memfabric pull mode only (mooncake staging path removed).
         assert self._backend == BACKEND_MEMFABRIC, "SFAPDCpuOffloadConnector P side supports memfabric pull only."
@@ -584,16 +599,9 @@ class SFAPDCpuOffloadProducerWorker:
         register_regions = collect_storage_merged_register_regions(kv_caches)
         validate_register_region_count(register_regions)
         global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
-        assert global_te._unique_id is not None, "memfabric unique_id was not initialized before send thread setup"
 
         ready_event = threading.Event()
-        send_state = ProducerSendState(
-            total_layers=self.total_layers,
-            layer_metadata=self.layer_metadata,
-            p_session=global_te._unique_id,
-            layer_transfer_finished_events=get_shared_layer_transfer_events(),
-            layer_transfer_pending_events=get_shared_layer_transfer_pending_events(),
-        )
+        send_state = self._build_producer_send_state()
         self.kv_send_layer_thread = MembPullSendingThread(
             ready_event=ready_event,
             state=send_state,
