@@ -20,14 +20,13 @@ import httpx
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
+from vllm.utils.math_utils import round_down
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend import envs
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
-    MooncakeLayerwiseConnectorScheduler,
-)
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
+    SfaPDProducerMetadata,
     get_external_request_id,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
@@ -48,25 +47,179 @@ _INDEXER_GROUP_IDX = 0
 _MAIN_GROUP_IDX = 1
 
 
-class SFAPDProducerScheduler(MooncakeLayerwiseConnectorScheduler):
+class _SendReqInfo:
+    def __init__(
+        self,
+        local_block_ids: list[list[int]],
+        local_transferred_tokens: int,
+        local_computed_tokens: int,
+        request: "Request",
+    ) -> None:
+        self.local_block_ids = local_block_ids
+        self.local_transferred_tokens = local_transferred_tokens
+        self.local_computed_tokens = local_computed_tokens
+        self.request = request
+
+    def extend_local_block_ids(self, new_block_ids: list[list[int]]) -> None:
+        for i, new_block_id in enumerate(new_block_ids):
+            self.local_block_ids[i].extend(new_block_id)
+
+    def update_computed_tokens(self, computed_tokens: int) -> None:
+        self.local_computed_tokens = computed_tokens
+
+    def update_transferred_tokens(self, transferred_tokens: int) -> None:
+        self.local_transferred_tokens = transferred_tokens
+
+
+class SFAPDProducerScheduler:
     """P-side scheduler for SFA PD (pull mode).
 
-    No override is needed: D's metaserver rendezvous carries only
-    ``do_remote_decode=True`` + ZMQ contact info (NO block ids — D keeps its own
-    blocks and looks them up by req_id). The mooncake base class's
-    ``do_remote_decode`` branch populates ``_reqs_need_send_layerwise`` with P's
-    own allocated blocks, which is exactly what ``_transfer_kv_cache`` reads to
-    build READ_READY. (An earlier override populated ``_reqs_need_recv`` from
-    D's ``remote_block_ids`` — a push-model leftover, now dead.)
+    D's metaserver rendezvous carries ``do_remote_decode=True`` plus D's ZMQ
+    endpoint. P tracks its own local block ids and emits per-step metadata for
+    the pull-mode sending thread; D looks up its destination blocks by req_id.
     """
 
-    def update_state_after_alloc(self, request, blocks, num_external_tokens):
-        # Pull mode: D's rendezvous sends only do_remote_decode=True + contact
-        # info (no block ids). The mooncake base do_remote_decode branch
-        # populates _reqs_need_send_layerwise with P's own blocks, which is what
-        # _transfer_kv_cache reads to build READ_READY. No P-side override of
-        # _reqs_need_recv is needed (that was a push-model leftover, now dead).
-        super().update_state_after_alloc(request, blocks, num_external_tokens)
+    def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, engine_id: str):
+        self.vllm_config = vllm_config
+        self.kv_cache_config = kv_cache_config
+        self.engine_id = engine_id
+        self.block_size = [
+            group_spec.kv_cache_spec.block_size
+            for group_spec in kv_cache_config.kv_cache_groups
+        ]
+        self._reqs_need_send_layerwise: dict[str, _SendReqInfo] = {}
+
+    @staticmethod
+    def _normalize_block_ids(block_ids: Any) -> list[list[int]]:
+        if block_ids is None:
+            return []
+        if block_ids and isinstance(block_ids[0], int):
+            return [list(block_ids)]
+        if isinstance(block_ids, tuple):
+            return [list(group) for group in block_ids]
+        return [list(group) for group in block_ids]
+
+    def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+        return 0, False
+
+    def update_state_after_alloc(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        num_external_tokens: int,
+    ) -> None:
+        params = request.kv_transfer_params
+        if params is None or not params.get("do_remote_decode"):
+            return
+
+        local_block_ids = self._normalize_block_ids(blocks.get_block_ids())
+        remote_cache_tokens = params["remote_cached_tokens"]
+        send_req_info = _SendReqInfo(
+            local_block_ids=local_block_ids,
+            local_transferred_tokens=remote_cache_tokens,
+            local_computed_tokens=0,
+            request=request,
+        )
+        self._reqs_need_send_layerwise[request.request_id] = send_req_info
+
+        if envs.VLLM_ASCEND_SFA_DEBUG:
+            logger.info(
+                "SFAPD P register remote-decode req %s: local_block_ids=%s, "
+                "remote_host=%s, remote_port=%s, remote_tp_size=%s, "
+                "remote_cached_tokens=%s",
+                request.request_id,
+                local_block_ids,
+                params.get("remote_host"),
+                params.get("remote_port"),
+                params.get("remote_tp_size"),
+                remote_cache_tokens,
+            )
+
+    def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> KVConnectorMetadata:
+        meta = SfaPDProducerMetadata()
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        new_reqs = scheduler_output.scheduled_new_reqs
+        scheduled_spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+
+        for req_id, new_blocks in zip(cached_reqs.req_ids, cached_reqs.new_block_ids):
+            if req_id in self._reqs_need_send_layerwise and new_blocks is not None:
+                normalized = self._normalize_block_ids(new_blocks)
+                self._reqs_need_send_layerwise[req_id].extend_local_block_ids(normalized)
+                if envs.VLLM_ASCEND_SFA_DEBUG:
+                    logger.info(
+                        "SFAPD P extend remote-decode req %s: new_blocks=%s",
+                        req_id,
+                        normalized,
+                    )
+
+        computed_tokens = dict(
+            list(zip(cached_reqs.req_ids, cached_reqs.num_computed_tokens))
+            + [(req.req_id, req.num_computed_tokens) for req in new_reqs]
+        )
+        min_block_size = min(self.block_size)
+        for req_id, scheduled_tokens in scheduler_output.num_scheduled_tokens.items():
+            send_req_info = self._reqs_need_send_layerwise.get(req_id)
+            if send_req_info is None:
+                continue
+
+            send_req_info.update_transferred_tokens(
+                round_down(send_req_info.local_computed_tokens, min_block_size)
+            )
+            spec_decode_tokens = (
+                len(scheduled_spec_decode_tokens[req_id])
+                if req_id in scheduled_spec_decode_tokens
+                else 0
+            )
+            send_req_info.update_computed_tokens(
+                computed_tokens.get(req_id, 0) + scheduled_tokens - spec_decode_tokens
+            )
+            request = send_req_info.request
+            assert request.kv_transfer_params is not None
+            chunk_finish = send_req_info.local_computed_tokens >= len(request.all_token_ids)
+            meta.add_new_req(
+                request_id=req_id,
+                local_block_ids=send_req_info.local_block_ids,
+                kv_transfer_params=request.kv_transfer_params,
+                token_ids=[],
+                chunk_finish=chunk_finish,
+                remote_cache_tokens=request.kv_transfer_params.get("remote_cached_tokens"),
+                prompt_len=len(request.all_token_ids),
+                local_computed_tokens=send_req_info.local_computed_tokens,
+                local_transed_tokens=send_req_info.local_transferred_tokens,
+            )
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                logger.info(
+                    "SFAPD P add transfer task req %s: local_block_ids=%s, "
+                    "local_transed_tokens=%s, local_computed_tokens=%s, "
+                    "remote_cache_tokens=%s, prompt_len=%s, chunk_finish=%s, "
+                    "remote_host=%s, remote_port=%s",
+                    req_id,
+                    send_req_info.local_block_ids,
+                    send_req_info.local_transferred_tokens,
+                    send_req_info.local_computed_tokens,
+                    request.kv_transfer_params.get("remote_cached_tokens"),
+                    len(request.all_token_ids),
+                    chunk_finish,
+                    request.kv_transfer_params.get("remote_host"),
+                    request.kv_transfer_params.get("remote_port"),
+                )
+            if chunk_finish:
+                self._reqs_need_send_layerwise.pop(req_id)
+        return meta
+
+    def request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return False, None
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return False, None
 
 
 class SFAPDCpuOffloadScheduler:
