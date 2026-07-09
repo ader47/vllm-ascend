@@ -1423,16 +1423,21 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
                     _pd_reuse_sample_leg("KVVAL-PSTORE", "V", layer_name, src[1], blen[1], bids, bids)
             except Exception as e:  # noqa: BLE001
                 logger.info("[KVVAL-PSTORE] layer=%s err=%s", layer_name, e)
-        if os.getenv("VLLM_ASCEND_PD_REUSE_SYNCFIX", "0") == "1":
-            # Pure full-device sync (NO printing): isolates whether the
-            # scatter->notify race is fixed by synchronization alone. Run with
-            # VLLM_ASCEND_PD_REUSE_DEBUG=0 + VLLM_ASCEND_PD_REUSE_SYNCFIX=1; if
-            # accuracy is correct, the bug is a missing stream sync at this
-            # boundary (the [KVVAL-*] probes' .item() was acting as this sync).
+        _syncfix = os.getenv("VLLM_ASCEND_PD_REUSE_SYNCFIX", "0")
+        if _syncfix in ("1", "stream"):
+            # Pure sync (NO printing) to isolate the scatter->notify race:
+            #   SYNCFIX=1      -> torch.npu.synchronize() (all streams)
+            #   SYNCFIX=stream -> torch.npu.current_stream().synchronize() (one stream)
+            # If =1 fixes accuracy but =stream does not, the KV scatter lands on a
+            # different stream than this hook (cross-stream race); if =stream also
+            # fixes it, a current-stream sync is the lighter correct fix.
             if not getattr(self, "_syncfix_logged", False):
-                logger.info("VLLM_ASCEND_PD_REUSE_SYNCFIX=1: torch.npu.synchronize() active in save_kv_layer")
+                logger.info("VLLM_ASCEND_PD_REUSE_SYNCFIX=%s active in save_kv_layer", _syncfix)
                 self._syncfix_logged = True
-            torch.npu.synchronize()
+            if _syncfix == "stream":
+                torch.npu.current_stream().synchronize()
+            else:
+                torch.npu.synchronize()
         super().save_kv_layer(layer_name, kv_layer, attn_metadata, connector_metadata, **kwargs)
 
     def wait_for_layer_send(self, layer_idx: int) -> None:
