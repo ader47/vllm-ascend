@@ -1151,19 +1151,19 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         for req_id, rm in send_task.send_request.items():
             p_block_ids = rm.local_block_ids[0] if rm.local_block_ids else []
             ext_id = get_external_request_id(req_id)
+            has_endpoint = bool(rm.remote_host) and bool(rm.remote_port)
             # Gate on remote: a non-migrated chunk_finish req has no D target,
             # would be unmappable on D (leak into _pending_done) and could empty endpoints.
             chunk_done = (
                 layer_idx == self.total_layers - 1
                 and rm.chunk_finish
-                and bool(rm.remote_host)
-                and bool(rm.remote_port)
+                and has_endpoint
             )
-            if p_block_ids:
+            if p_block_ids and has_endpoint:
                 read_reqs.append((ext_id, p_block_ids))
             if chunk_done:
                 done_ext_ids.append(ext_id)
-            if (p_block_ids or chunk_done) and rm.remote_host and rm.remote_port:
+            if (p_block_ids or chunk_done) and has_endpoint:
                 endpoints.add((rm.remote_host, rm.remote_port))
             if envs.VLLM_ASCEND_SFA_DEBUG:
                 logger.info(
@@ -1264,6 +1264,9 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         pd_done = getattr(self, "layer_transfer_finished_events", None)
         if pd_done is not None and 0 <= layer_idx < len(pd_done):
             pd_done[layer_idx].set()
+        pd_pending = getattr(self, "layer_transfer_pending_events", None)
+        if pd_pending is not None and 0 <= layer_idx < len(pd_pending):
+            pd_pending[layer_idx].clear()
         if envs.VLLM_ASCEND_SFA_DEBUG:
             logger.info("MembPull P layer send complete: layer=%d", layer_idx)
 
@@ -1379,6 +1382,17 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
             global_te._unique_id,
         )
 
+    def _has_memfabric_pull_target(self, connector_metadata: KVConnectorMetadata, layer_idx: int) -> bool:
+        for req_meta in getattr(connector_metadata, "requests", {}).values():
+            has_endpoint = bool(req_meta.remote_host) and bool(req_meta.remote_port)
+            if not has_endpoint:
+                continue
+            p_block_ids = req_meta.local_block_ids[0] if req_meta.local_block_ids else []
+            chunk_done = layer_idx == self.total_layers - 1 and req_meta.chunk_finish
+            if p_block_ids or chunk_done:
+                return True
+        return False
+
     def save_kv_layer(
         self,
         layer_name: str,
@@ -1393,11 +1407,17 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
             and self.current_layer < self.total_layers
         ):
             layer_idx = self.current_layer
-            if self.layer_send_done_events is not None and 0 <= layer_idx < len(self.layer_send_done_events):
+            has_pd_target = self._has_memfabric_pull_target(connector_metadata, layer_idx)
+            if has_pd_target and self.layer_send_done_events is not None and 0 <= layer_idx < len(
+                self.layer_send_done_events
+            ):
                 self.layer_send_done_events[layer_idx].clear()
             pd_done = getattr(self.kv_send_layer_thread, "layer_transfer_finished_events", None)
-            if pd_done is not None and 0 <= layer_idx < len(pd_done):
+            if has_pd_target and pd_done is not None and 0 <= layer_idx < len(pd_done):
                 pd_done[layer_idx].clear()
+            pd_pending = getattr(self.kv_send_layer_thread, "layer_transfer_pending_events", None)
+            if has_pd_target and pd_pending is not None and 0 <= layer_idx < len(pd_pending):
+                pd_pending[layer_idx].set()
         # Record a fresh compute-stream event (after the scatter) for the send
         # thread to wait before notify; replaces mooncake's wait_event, which
         # does not capture sfa_v1's scatter on this pull path.

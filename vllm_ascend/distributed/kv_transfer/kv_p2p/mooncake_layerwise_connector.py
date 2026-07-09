@@ -58,7 +58,9 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GET_META_MSG
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
     get_shared_layer_transfer_events,
+    get_shared_layer_transfer_pending_events,
     set_shared_layer_transfer_events,
+    set_shared_layer_transfer_pending_events,
 )
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
@@ -230,6 +232,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         resharding_stream: torch.npu.Stream,
         callback_func: Callable[..., None] = lambda x: None,
         layer_transfer_finished_events: list[threading.Event] | None = None,
+        layer_transfer_pending_events: list[threading.Event] | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheSendingLayerThread")
         self.engine = engine
@@ -269,6 +272,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.ready_event = ready_event
         self.callback_func = callback_func
         self.layer_transfer_finished_events = layer_transfer_finished_events
+        self.layer_transfer_pending_events = layer_transfer_pending_events
 
     def run(self):
         local_rank = get_world_group().local_rank
@@ -447,9 +451,9 @@ class KVCacheSendingLayerThread(threading.Thread):
     def _transfer_kv_cache(self, send_task: SendTask):
         layer_name = send_task.layer_name
         if self.layer_transfer_finished_events is not None:
-            assert not self.layer_transfer_finished_events[send_task.layer_idx].is_set(), (
-                f"layer {send_task.layer_idx} transfer event already set before transfer"
-            )
+            self.layer_transfer_finished_events[send_task.layer_idx].clear()
+        if self.layer_transfer_pending_events is not None and send_task.send_request:
+            self.layer_transfer_pending_events[send_task.layer_idx].set()
         layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
         key = send_task.k_cache
         value = send_task.v_cache
@@ -531,6 +535,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                                 self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
         if self.layer_transfer_finished_events is not None:
             self.layer_transfer_finished_events[send_task.layer_idx].set()
+        if self.layer_transfer_pending_events is not None:
+            self.layer_transfer_pending_events[send_task.layer_idx].clear()
 
 
 class KVCacheRecvingLayerThread(threading.Thread):
@@ -1218,6 +1224,7 @@ class MooncakeLayerwiseConnectorWorker:
         # transfer. Only the producer sends KV, so only it needs events.
         if vllm_config.kv_transfer_config.is_kv_producer:
             set_shared_layer_transfer_events([threading.Event() for _ in range(self.total_layers)])
+            set_shared_layer_transfer_pending_events([threading.Event() for _ in range(self.total_layers)])
         self.use_mla = self.vllm_config.model_config.use_mla
         self.request_map = dict[str, str]()
         self.use_attn_mamba_hybrid = False
@@ -1446,6 +1453,7 @@ class MooncakeLayerwiseConnectorWorker:
                 resharding_stream=self.resharding_stream,
                 callback_func=self.send_done_send_signal,
                 layer_transfer_finished_events=get_shared_layer_transfer_events(),
+                layer_transfer_pending_events=get_shared_layer_transfer_pending_events(),
             )
             self.kv_send_layer_thread.start()
             ready_event.wait()
@@ -1899,6 +1907,13 @@ class MooncakeLayerwiseConnectorWorker:
                 logger.debug("Add request %s to kv send layer thread. req_meta_update=%r", req_id, req_meta_update)
                 layer_send_task.send_request[req_id] = req_meta_update
 
+            if layer_send_task.send_request:
+                pending_events = self.kv_send_layer_thread.layer_transfer_pending_events
+                done_events = self.kv_send_layer_thread.layer_transfer_finished_events
+                if done_events is not None:
+                    done_events[self.current_layer].clear()
+                if pending_events is not None:
+                    pending_events[self.current_layer].set()
             self.kv_send_layer_thread.send_queue.put(layer_send_task)
             self.current_layer += 1
 

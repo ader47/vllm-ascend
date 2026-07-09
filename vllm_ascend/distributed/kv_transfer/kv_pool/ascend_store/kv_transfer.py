@@ -1095,6 +1095,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
         layer_transfer_finished_events: list[threading.Event] | None = None,
+        layer_transfer_pending_events: list[threading.Event] | None = None,
     ):
         super().__init__(
             m_store,
@@ -1113,6 +1114,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.layer_save_finished_events = layer_save_finished_events
         self.sync_save_events = sync_save_events
         self.layer_transfer_finished_events = layer_transfer_finished_events
+        self.layer_transfer_pending_events = layer_transfer_pending_events
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
         self.layer_batch_builder = LayerBatchBuilder(
@@ -1146,6 +1148,17 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
     ) -> torch.Tensor:
         self.request_queue.put(req_meta)
 
+    def _wait_for_pd_transfer(self, layer_id: int) -> None:
+        pending_events = self.layer_transfer_pending_events
+        done_events = self.layer_transfer_finished_events
+        if pending_events is None or done_events is None:
+            return
+        if not pending_events[layer_id].is_set():
+            return
+        if not done_events[layer_id].wait(timeout=30):
+            logger.error("Layerwise %d PD transfer wait timed out", layer_id)
+        pending_events[layer_id].clear()
+
     def _handle_request(  # type: ignore[override]
         self, transfer_tasks: list[LayerTransferTask]
     ):
@@ -1158,11 +1171,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         shared = task.shared_block_data
         if shared is None:
             layer_id = task.layer_id
-            if self.layer_transfer_finished_events is not None:
-                is_finish = self.layer_transfer_finished_events[layer_id].wait(timeout=30)
-                if not is_finish:
-                    logger.error("Layerwise %d PD transfer wait timed out", layer_id)
-                self.layer_transfer_finished_events[layer_id].clear()
+            self._wait_for_pd_transfer(layer_id)
             assert not self.layer_save_finished_events[layer_id].is_set(), f"thread: {layer_id} save failed "
             logger.debug("Layer save event set: layer %d", layer_id)
             self.layer_save_finished_events[layer_id].set()
@@ -1185,12 +1194,11 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             self.max_transfer_blocks,
             self.max_transfer_bytes,
         )
-        # wait for KV transfer (PD)
-        # if self.layer_transfer_finished_events is not None:
-        #     is_finish = self.layer_transfer_finished_events[layer_id].wait(timeout=30)
-        #     if not is_finish:
-        #         logger.error("Layerwise %d PD transfer wait timed out", layer_id)
-        #     self.layer_transfer_finished_events[layer_id].clear()
+        # Wait for the co-located PD send thread to finish exposing this layer
+        # before releasing layer_save_finished_events, which the layer-reuse load
+        # gate consumes. The pending event is set only by a producer that really
+        # starts a PD transfer, so local P-only traffic does not block here.
+        self._wait_for_pd_transfer(layer_id)
         if res != 0:
             logger.error("Layerwise %d save batch_copy failed with return code %d", layer_id, res)
         for req_id in req_meta.req_ids:

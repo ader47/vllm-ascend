@@ -70,6 +70,7 @@ from vllm_ascend.memcache_comm_fence import (
 # save thread to wait for each layer's PD transfer to finish. When mooncake is
 # not running, these stay None and the save thread skips the PD wait.
 _shared_layer_transfer_events: list[threading.Event] | None = None
+_shared_layer_transfer_pending_events: list[threading.Event] | None = None
 
 
 def get_shared_layer_transfer_events() -> list[threading.Event] | None:
@@ -79,6 +80,15 @@ def get_shared_layer_transfer_events() -> list[threading.Event] | None:
 def set_shared_layer_transfer_events(events: list[threading.Event] | None) -> None:
     global _shared_layer_transfer_events
     _shared_layer_transfer_events = events
+
+
+def get_shared_layer_transfer_pending_events() -> list[threading.Event] | None:
+    return _shared_layer_transfer_pending_events
+
+
+def set_shared_layer_transfer_pending_events(events: list[threading.Event] | None) -> None:
+    global _shared_layer_transfer_pending_events
+    _shared_layer_transfer_pending_events = events
 
 
 class KVPoolWorker:
@@ -322,6 +332,7 @@ class KVPoolWorker:
                     self.layerwise_max_transfer_blocks,
                     self.layerwise_max_transfer_bytes,
                     layer_transfer_finished_events=get_shared_layer_transfer_events(),
+                    layer_transfer_pending_events=get_shared_layer_transfer_pending_events(),
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
