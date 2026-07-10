@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import torch
 from typing_extensions import Self
 from vllm.config import VllmConfig
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
@@ -398,7 +399,19 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         # (max_model_len//dcp_world_size) tokens locally.
         if dcp_world_size * pcp_world_size > 1:
             max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
-        return cdiv(max_model_len, self.block_size * self.compress_ratio) * self.page_size_bytes
+        max_memory = cdiv(max_model_len, self.block_size * self.compress_ratio) * self.page_size_bytes
+        logger.info(
+            "[SFA-KV-MEM] indexer spec=%s role=%s max_model_len=%d "
+            "block_size=%d compress_ratio=%d page_size=%d max_memory=%.3f GiB",
+            type(self).__name__,
+            getattr(vllm_config.kv_transfer_config, "kv_role", None),
+            max_model_len,
+            self.block_size,
+            self.compress_ratio,
+            self.page_size_bytes,
+            max_memory / (1 << 30),
+        )
+        return max_memory
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -489,12 +502,37 @@ class OffloadMLAAttentionSpec(AttentionSpec):
             # handoff block per request for the must-fit check.
             max_num_seqs = vllm_config.scheduler_config.max_num_seqs
             blocks_per_req = 2
-            return blocks_per_req * max_num_seqs * self.page_size_bytes
+            max_memory = blocks_per_req * max_num_seqs * self.page_size_bytes
+            logger.info(
+                "[SFA-KV-MEM] main spec=%s role=%s branch=resident-tail "
+                "max_model_len=%d max_num_seqs=%d blocks_per_req=%d "
+                "block_size=%d page_size=%d max_memory=%.3f GiB",
+                type(self).__name__,
+                ktc.kv_role,
+                vllm_config.model_config.max_model_len,
+                max_num_seqs,
+                blocks_per_req,
+                self.block_size,
+                self.page_size_bytes,
+                max_memory / (1 << 30),
+            )
+            return max_memory
         # Producer (P) or local offload (kv_both) or no kv-transfer: the prefix
         # transits HBM during prefill before being offloaded, so the peak is the
         # full max_model_len.
         max_model_len = vllm_config.model_config.max_model_len
-        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+        max_memory = cdiv(max_model_len, self.block_size) * self.page_size_bytes
+        logger.info(
+            "[SFA-KV-MEM] main spec=%s role=%s branch=full-context "
+            "max_model_len=%d block_size=%d page_size=%d max_memory=%.3f GiB",
+            type(self).__name__,
+            getattr(ktc, "kv_role", None),
+            max_model_len,
+            self.block_size,
+            self.page_size_bytes,
+            max_memory / (1 << 30),
+        )
+        return max_memory
 
 
 def make_offload_main_mla_spec(

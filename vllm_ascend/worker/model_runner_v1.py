@@ -5332,6 +5332,32 @@ class NPUModelRunner(GPUModelRunner):
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
 
+        spec_type_counts: dict[str, int] = defaultdict(int)
+        spec_type_samples: dict[str, KVCacheSpec] = {}
+        for spec in kv_cache_spec.values():
+            spec_type = type(spec).__name__
+            spec_type_counts[spec_type] += 1
+            spec_type_samples.setdefault(spec_type, spec)
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        logger.info(
+            "[SFA-KV-MEM] built specs role=%s use_sparse=%s use_offload=%s "
+            "sparse_c8_indexer=%s counts=%s",
+            getattr(kv_transfer_config, "kv_role", None),
+            self.use_sparse,
+            self.use_offload,
+            self.use_sparse_c8_indexer,
+            dict(spec_type_counts),
+        )
+        for spec_type, spec in spec_type_samples.items():
+            logger.info(
+                "[SFA-KV-MEM] spec sample type=%s block_size=%d "
+                "page_size=%d compress_ratio=%s",
+                spec_type,
+                spec.block_size,
+                spec.page_size_bytes,
+                getattr(spec, "compress_ratio", None),
+            )
+
         return kv_cache_spec
 
     def _check_and_update_cudagraph_mode(
