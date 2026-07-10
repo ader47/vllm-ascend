@@ -942,6 +942,10 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         # and a stop flag for the event loop.
         self._dealers: dict[str, Any] = {}  # path -> DEALER socket (never closed until shutdown)
         self._stopped = False
+        # Per-layer fresh compute-stream events recorded by the producer in
+        # save_kv_layer (right after the KV scatter); the send thread waits the
+        # matching one before notifying D. Keyed by layer_idx.
+        self._p_save_events: dict[int, Any] = {}
 
     def _ensure_dealer(self, path: str):
         """Get (or lazy-create) a persistent DEALER socket for the given D endpoint."""
@@ -1009,6 +1013,18 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
                     dealer.close(linger=0)
                 self._dealers.clear()
 
+    def record_p_save_event(self, layer_idx: int) -> None:
+        """Record a fresh event on the CURRENT (compute) stream and stash it for
+        the send thread. Called by the producer in save_kv_layer, which runs on
+        the compute thread right after the KV scatter, so the event captures the
+        scatter. The send thread waits it (event.synchronize(), reliable on CANN
+        >= 8.5.rc1) before notifying D -- replacing mooncake's wait_event
+        (attn_metadata[layer].reshape_cache_event), which on the sfa_v1 pull
+        path does not capture the scatter."""
+        evt = torch.npu.Event()
+        evt.record()
+        self._p_save_events[layer_idx] = evt
+
     def _process_send_task(self, send_task: Any, encoder: msgspec.msgpack.Encoder) -> None:
         """Send READ_READY_BATCH for one layer's reqs (fire-and-forget).
 
@@ -1016,9 +1032,16 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         asynchronously by ``_drain_read_replies`` in the event loop, not waited
         on here. This lets P proceed to the next layer immediately.
         """
-        if send_task.wait_event is not None:
-            send_task.wait_event.synchronize()
         layer_idx = send_task.layer_idx
+        # Wait the fresh compute-stream event the producer recorded in
+        # save_kv_layer (right after the KV scatter). event.synchronize() is
+        # reliable on CANN >= 8.5.rc1 and this replaces mooncake's wait_event,
+        # which on the sfa_v1 pull path does not capture the scatter.
+        _fresh = self._p_save_events.pop(layer_idx, None)
+        if _fresh is not None:
+            _fresh.synchronize()
+        elif send_task.wait_event is not None:
+            send_task.wait_event.synchronize()
         layer_name = send_task.layer_name
 
         # Fire one READ_READY_BATCH for this layer (DEALER async send, no wait).
@@ -1275,6 +1298,11 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
             pd_done = getattr(self.kv_send_layer_thread, "layer_transfer_finished_events", None)
             if pd_done is not None and 0 <= layer_idx < len(pd_done):
                 pd_done[layer_idx].clear()
+        # Record a fresh compute-stream event (after the scatter) for the send
+        # thread to wait before notify; replaces mooncake's wait_event, which
+        # does not capture sfa_v1's scatter on this pull path.
+        if self.kv_send_layer_thread is not None:
+            self.kv_send_layer_thread.record_p_save_event(self.current_layer)
         super().save_kv_layer(layer_name, kv_layer, attn_metadata, connector_metadata, **kwargs)
 
     def wait_for_layer_send(self, layer_idx: int) -> None:
