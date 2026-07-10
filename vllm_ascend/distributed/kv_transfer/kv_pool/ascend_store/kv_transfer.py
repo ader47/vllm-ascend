@@ -1185,12 +1185,17 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             self.max_transfer_blocks,
             self.max_transfer_bytes,
         )
-        # wait for KV transfer (PD)
-        # if self.layer_transfer_finished_events is not None:
-        #     is_finish = self.layer_transfer_finished_events[layer_id].wait(timeout=30)
-        #     if not is_finish:
-        #         logger.error("Layerwise %d PD transfer wait timed out", layer_id)
-        #     self.layer_transfer_finished_events[layer_id].clear()
+        # wait for KV transfer (PD): the co-located PD send thread (mooncake push
+        # or sfa_pd pull) sets layer_transfer_finished_events[layer_id] once D has
+        # read this layer. Waiting here couples layer_save_finished_events (which
+        # the recv reuse gate consumes via wait_for_save=mate) to PD completion, so
+        # the reuse gate protects the PD read too -- without this, under layer reuse
+        # L+num_shared_buffers overwrites the shared buffer while D is still reading L.
+        if self.layer_transfer_finished_events is not None:
+            is_finish = self.layer_transfer_finished_events[layer_id].wait(timeout=30)
+            if not is_finish:
+                logger.error("Layerwise %d PD transfer wait timed out", layer_id)
+            self.layer_transfer_finished_events[layer_id].clear()
         if res != 0:
             logger.error("Layerwise %d save batch_copy failed with return code %d", layer_id, res)
         for req_id in req_meta.req_ids:
