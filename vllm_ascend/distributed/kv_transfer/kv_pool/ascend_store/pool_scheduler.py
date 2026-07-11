@@ -825,7 +825,16 @@ class KVPoolScheduler:
                 )
         if new_block_ids is not None:
             request_tracker.update(new_block_ids)
-        load_spec = None
+        # Layer reuse: shared HBM buffers are overwritten by sibling layers each
+        # pass, so running/decode must reload the prefix from the pool every step.
+        if self.layerwise_offload and prev_token_count > 0:
+            load_spec = LoadSpec(
+                vllm_cached_tokens=prev_token_count,
+                kvpool_cached_tokens=prev_token_count,
+                can_load=True,
+            )
+        else:
+            load_spec = None
         return self._build_req_meta(
             request_tracker,
             request.block_hashes,
