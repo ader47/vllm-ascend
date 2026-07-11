@@ -129,7 +129,9 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    get_layerwise_config,
     get_layerwise_kv_cache_reuse_layers,
+    get_layerwise_layout_class_grouping,
     get_layerwise_storage_indices,
 )
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
@@ -4065,6 +4067,41 @@ class NPUModelRunner(GPUModelRunner):
 
         self.debugger.step(**kwargs)
 
+    def get_layerwise_num_tensors(self, extra_config: dict) -> int | None:
+        """Layout-class-aware buffer count for layer-reuse memory inflation.
+
+        Returns ``len(independent_layers) + num_layout_classes *
+        num_shared_buffers`` -- a safe upper bound on the buffer count the
+        layout-class-aware merge will actually produce (equal to it when every
+        layout class has >= num_shared_buffers layers). The worker uses this to
+        size the available-memory inflation so it matches the merged tensor
+        count; a mismatch would allocate more memory than budgeted (OOM).
+
+        Returns ``None`` when layer reuse is disabled. On any failure to
+        inspect the specs (e.g. producer whose get_kv_cache_spec is empty at
+        profiling time), returns ``total_layers`` so the worker does NOT
+        over-inflate (safe, just no inflation benefit).
+        """
+        total_layers = self.model_config.get_num_layers(self.parallel_config)
+        config = get_layerwise_config(total_layers, extra_config)
+        if not config.has_layer_reuse:
+            return None
+        try:
+            specs = self.get_kv_cache_spec()
+            classes = {
+                (
+                    type(s).__name__,
+                    kv_cache_spec_uses_sparse_c8(s),
+                    sparse_kv_cache_has_indexer(s),
+                )
+                for s in specs.values()
+            }
+            if not classes:
+                return total_layers
+            return len(config.independent_layers) + len(classes) * config.num_shared_buffers
+        except Exception:
+            return total_layers
+
     def _merge_kv_cache_tensors_for_layer_reuse(self, kv_cache_config: KVCacheConfig) -> None:
         """Merge KV cache tensor entries so that reused layers share one buffer.
 
@@ -4099,47 +4136,42 @@ class NPUModelRunner(GPUModelRunner):
             )
             return
 
-        storage_indices = get_layerwise_storage_indices(total_layers, extra_config)
+        # Classify each layer by its kv_cache tuple-layout and apply the reuse
+        # WITHIN each layout class. Layers with different layouts (e.g. main MLA
+        # 2-tuple (k,v) vs sparse indexer 3-tuple (k,dsa_k,dsa_k_scale)) cannot
+        # share one buffer; the old global round-robin mixed them and crashed
+        # _reshape_kv_cache_tensors on the producer (P) node.
+        layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
 
-        # [DIAGNOSTIC] classify each layer by its kv_cache tuple-layout and show
-        # whether any reuse slot mixes incompatible layouts. main MLA layers are
-        # a 2-tuple (k,v) while sparse_c8 indexer layers are a 3-tuple
-        # (k, dsa_k, dsa_k_scale); they cannot share one buffer. Temporary --
-        # remove once type-aware grouping lands.
-        try:
-            _layer_spec = self._get_layer_kv_cache_specs(kv_cache_config)
-
-            def _layout_class(ln: str) -> str:
-                s = _layer_spec.get(ln)
-                if s is None:
-                    return "<none>"
-                return (
-                    f"{type(s).__name__}|c8={kv_cache_spec_uses_sparse_c8(s)}"
-                    f"|idx={sparse_kv_cache_has_indexer(s)}"
-                )
-
-            _mixed = 0
-            for _si, _slot in enumerate(storage_indices):
-                _names = [layer_names[i] for i in _slot]
-                _classes = sorted({_layout_class(n) for n in _names})
-                if len(_classes) > 1:
-                    _mixed += 1
-                logger.info(
-                    "LayerReuse diag slot %d: %d layers, layouts=%s%s members[:6]=%s",
-                    _si,
-                    len(_names),
-                    _classes,
-                    "  <-- MIXED" if len(_classes) > 1 else "",
-                    _names[:6],
-                )
-            logger.info(
-                "LayerReuse diag: %d/%d slots mix layouts; first 12 layouts=%s",
-                _mixed,
-                len(storage_indices),
-                [_layout_class(n) for n in layer_names[:12]],
+        def _layout_class(name: str):
+            s = layer_kv_cache_spec.get(name)
+            if s is None:
+                return ("__none__", False, False)
+            return (
+                type(s).__name__,
+                kv_cache_spec_uses_sparse_c8(s),
+                sparse_kv_cache_has_indexer(s),
             )
-        except Exception as _e:  # noqa: BLE001
-            logger.warning("LayerReuse diag failed: %s: %s", type(_e).__name__, _e)
+
+        layer_class_list = [_layout_class(n) for n in layer_names]
+        storage_indices, prefetch_map, _num_tensors = get_layerwise_layout_class_grouping(
+            total_layers, layer_class_list, extra_config
+        )
+
+        # Propagate the class-aware reuse-mate map to the connector / pool_worker
+        # for buffer-reuse gating (P-side wait_for_layer_send / D-side prefetch).
+        # Keyed by flattened layer index, which equals the transformer layer
+        # index for standard "...model.layers.N..." naming.
+        kv_transfer_config._layerwise_reuse_mate_map = prefetch_map
+
+        if envs.VLLM_ASCEND_SFA_DEBUG:
+            logger.info(
+                "Layerwise KV cache reuse (layout-class aware): %d layers, "
+                "%d classes -> %d buffers",
+                total_layers,
+                len(set(layer_class_list)),
+                len(storage_indices),
+            )
 
         # Build merged tensors: each slot's layers share ONE buffer.
         # Each buffer's size stays the same as a single layer's (time-multiplexed).

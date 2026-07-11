@@ -61,6 +61,9 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     ):
         super().__init__(vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
+        # Same object the model_runner merge annotates with the layout-class-aware
+        # reuse-mate map (_layerwise_reuse_mate_map); read it lazily at forward time.
+        self._kv_transfer_config = vllm_config.kv_transfer_config
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.is_producer = vllm_config.kv_transfer_config.is_kv_producer
         self.is_consumer = vllm_config.kv_transfer_config.is_kv_consumer
@@ -201,7 +204,12 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if match is None:
             return
         layer_idx = int(match.group(1))
-        mate = self._reuse_mate_map.get(layer_idx)
+        # Prefer the layout-class-aware mate map (set by the model_runner merge
+        # so a buffer's reuse-mate is always within its own layout class); fall
+        # back to the global map computed at init if the merge hasn't annotated
+        # the config yet.
+        _class_aware = getattr(self._kv_transfer_config, "_layerwise_reuse_mate_map", None)
+        mate = (_class_aware or self._reuse_mate_map).get(layer_idx)
         if mate is None:
             return  # independent / first occupant of its slot: nothing to gate.
         self.wait_for_layer_send(mate)

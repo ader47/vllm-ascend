@@ -106,6 +106,9 @@ class KVPoolWorker:
     ):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
+        # The model_runner merge annotates this object with the layout-class-aware
+        # reuse-mate map (_layerwise_reuse_mate_map); read it lazily at load time.
+        self._kv_transfer_config = vllm_config.kv_transfer_config
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.kv_cache_config = kv_cache_config
         hf_text_config = getattr(model_config, "hf_text_config", None)
@@ -309,6 +312,14 @@ class KVPoolWorker:
 
         self.next_layer_to_submit = 0
         self.sync_save_events: list[torch.npu.Event] | None = None
+
+    def _get_reuse_mate_map(self) -> dict:
+        # Prefer the layout-class-aware map the model_runner merge annotated on
+        # the kv_transfer_config (so a buffer's reuse-mate is within its own
+        # layout class); fall back to the global map from _init_layerwise_config
+        # if the merge hasn't run yet.
+        _class_aware = getattr(self._kv_transfer_config, "_layerwise_reuse_mate_map", None)
+        return _class_aware if _class_aware is not None else self.prefetch_layer_map
 
     def _start_kv_transfer_threads(self) -> None:
         if self._transfer_threads_started:
@@ -914,7 +925,7 @@ class KVPoolWorker:
         recv_thread = self.kv_recv_thread
 
         def submit_layer_load(layer_id: int) -> bool:
-            reuse_mate = self.prefetch_layer_map.get(layer_id)
+            reuse_mate = self._get_reuse_mate_map().get(layer_id)
             has_load = bool(self.layer_load_tasks[layer_id])
             if not has_load and reuse_mate is None:
                 return False  # independent / first-occupant with no load
@@ -950,7 +961,7 @@ class KVPoolWorker:
         self._submit_ready_layer_loads()
         needs_wait = (
             bool(self.layer_load_tasks[self.current_layer])
-            or self.prefetch_layer_map.get(self.current_layer) is not None
+            or self._get_reuse_mate_map().get(self.current_layer) is not None
         )
         if not needs_wait:
             # Independent / first-occupant with no load: no gate, no H2D.

@@ -611,7 +611,10 @@ class NPUWorker(WorkerBase):
             return available
         extra_config = kv_transfer_config.kv_connector_extra_config
         total_layers = self.model_config.get_num_layers(self.parallel_config)
-        num_tensors = get_layerwise_kv_cache_num_tensors(total_layers, extra_config)
+        # Layout-class aware: the merge creates one set of shared buffers per
+        # kv_cache tuple-layout class, so the inflation must account for all
+        # classes (else it under-counts buffers -> OOM).
+        num_tensors = self.model_runner.get_layerwise_num_tensors(extra_config)
         if num_tensors is not None and num_tensors < total_layers:
             factor = total_layers / num_tensors
             available = int(available * factor)
