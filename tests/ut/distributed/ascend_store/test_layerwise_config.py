@@ -9,6 +9,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config i
     get_layerwise_independent_layers,
     get_layerwise_kv_cache_num_tensors,
     get_layerwise_kv_cache_reuse_layers,
+    get_layerwise_layout_class_grouping,
     get_layerwise_num_prefetch_layers,
     get_layerwise_num_shared_buffers,
     get_layerwise_storage_indices,
@@ -173,3 +174,73 @@ class TestGetLayerLoadStartBlock:
     def test_no_reuse_all_layers_skip_hbm(self):
         # without layer reuse, even a shared layer skips HBM-cached blocks
         assert get_layer_load_start_block(5, self.INDEPENDENT, 32, self.BLOCK_SIZE, False) == 2
+
+
+class TestLayoutClassGrouping:
+    """Layout-class-aware reuse: layers of different kv_cache tuple-layouts
+    (e.g. main MLA 2-tuple vs sparse indexer 3-tuple) must never share a
+    buffer. Reproduces the P-node reshape crash from mixing classes."""
+
+    @staticmethod
+    def _no_mixed_slots(storage_indices, layer_class_list):
+        for slot in storage_indices:
+            classes = {layer_class_list[i] for i in slot}
+            assert len(classes) == 1, f"mixed-layout slot {slot}: " \
+                f"{[(i, layer_class_list[i]) for i in slot]}"
+
+    def test_single_class_matches_global_grouping(self):
+        extra = {"layerwise_num_shared_buffers": "2"}
+        classes = ["M"] * 8
+        si, pm, nt = get_layerwise_layout_class_grouping(8, classes, extra)
+        # independent [0,7] + 2 shared slots for reused [1..6] -> 4 buffers
+        assert nt == 4
+        self._no_mixed_slots(si, classes)
+        # matches the old global storage_indices
+        assert sorted(si) == sorted(get_layerwise_storage_indices(8, extra))
+        # prefetch within class (trivially, single class)
+        for layer, mate in pm.items():
+            assert classes[layer] == classes[mate]
+
+    def test_grouped_classes_never_mix(self):
+        # [M,M,M,M, I,I,I,I] grouped, nsb=2 -- the crash scenario
+        extra = {"layerwise_num_shared_buffers": "2"}
+        classes = ["M"] * 4 + ["I"] * 4
+        si, pm, nt = get_layerwise_layout_class_grouping(8, classes, extra)
+        self._no_mixed_slots(si, classes)
+        # independent [0,7]; M reused [1,2] -> 2 slots; I reused [3,4,5,6] -> 2 slots
+        # num_tensors = 2 (independent) + 2 (M) + 2 (I) = 6
+        assert nt == 6
+        for layer, mate in pm.items():
+            assert classes[layer] == classes[mate], f"cross-class mate {layer}->{mate}"
+
+    def test_interleaved_classes_never_mix(self):
+        # [M,I,M,I,...] interleaved, nsb=2
+        extra = {"layerwise_num_shared_buffers": "2"}
+        classes = ["M", "I"] * 6  # 12 layers
+        si, pm, nt = get_layerwise_layout_class_grouping(12, classes, extra)
+        self._no_mixed_slots(si, classes)
+        for layer, mate in pm.items():
+            assert classes[layer] == classes[mate]
+
+    def test_irregular_indexer_pattern_like_glm(self):
+        # Mirrors the diagnosed GLM case: irregular idx=True/False, 12 layers,
+        # nsb=2. Old global grouping would mix; layout-class grouping must not.
+        extra = {"layerwise_num_shared_buffers": "2"}
+        classes = ["T", "T", "T", "F", "F", "F", "T", "F", "F", "F", "T", "F"]
+        si, pm, nt = get_layerwise_layout_class_grouping(12, classes, extra)
+        self._no_mixed_slots(si, classes)
+        for layer, mate in pm.items():
+            assert classes[layer] == classes[mate]
+        # num_tensors == number of buffers actually produced
+        assert nt == len(si)
+
+    def test_small_class_no_reuse_within_it(self):
+        # A class with <= num_shared_buffers members reuses nothing.
+        extra = {"layerwise_num_shared_buffers": "4"}
+        classes = ["M"] * 3 + ["I"] * 10  # M has 3 < nsb=4 -> no M reuse
+        si, pm, nt = get_layerwise_layout_class_grouping(13, classes, extra)
+        self._no_mixed_slots(si, classes)
+        # M layers (0,1,2) -- 0 independent, 1,2 reused but only 2 < nsb=4 -> each own buffer
+        for layer, mate in pm.items():
+            assert classes[layer] == classes[mate]
+

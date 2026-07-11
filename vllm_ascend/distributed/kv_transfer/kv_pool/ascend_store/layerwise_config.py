@@ -181,6 +181,68 @@ def get_layerwise_storage_indices(
     return storage_indices
 
 
+def get_layerwise_layout_class_grouping(
+    num_layers: int,
+    layer_class_list: list[Any],
+    extra_config: dict[str, Any] | None = None,
+) -> tuple[list[list[int]], dict[int, int | None], int]:
+    """Layout-class-aware layer-reuse grouping.
+
+    Layers with different kv_cache tuple-layouts (e.g. main MLA 2-tuple vs
+    sparse indexer 3-tuple) cannot share one buffer. This partitions layers by
+    ``layer_class_list[i]`` and applies the round-robin reuse WITHIN each class,
+    so every shared buffer holds a single layout.
+
+    Args:
+        num_layers: total number of layers.
+        layer_class_list: ``layer_class_list[i]`` is a hashable layout-class key
+            for layer ``i`` (e.g. ``(spec_type, c8, has_indexer)``). Layers with
+            equal keys may share a buffer.
+        extra_config: the connector extra_config (carries num_shared_buffers,
+            prefetch_layers, independent_layers).
+
+    Returns:
+        (storage_indices, prefetch_map, num_tensors):
+          * storage_indices: each inner list = global layer indices sharing one
+            buffer (independent layers are singletons).
+          * prefetch_map: reused layer idx -> the layer idx that previously
+            occupied the same buffer (its within-class mate
+            ``num_shared_buffers`` positions back), for buffer-reuse gating.
+            Absent for layers with no mate.
+          * num_tensors: ``len(storage_indices)`` — the actual buffer count,
+            for memory-inflation sizing.
+    """
+    config = get_layerwise_config(num_layers, extra_config)
+    independent_set = set(config.independent_layers)
+    nsb = config.num_shared_buffers
+
+    # Partition REUSED layers by class, preserving global order within a class.
+    reused_by_class: dict[Any, list[int]] = {}
+    class_order: list[Any] = []
+    for layer in range(num_layers):
+        if layer in independent_set:
+            continue
+        key = layer_class_list[layer]
+        if key not in reused_by_class:
+            reused_by_class[key] = []
+            class_order.append(key)
+        reused_by_class[key].append(layer)
+
+    storage_indices: list[list[int]] = [[layer] for layer in config.independent_layers]
+    prefetch_map: dict[int, int | None] = {}
+    for key in class_order:
+        members = reused_by_class[key]
+        for slot in range(nsb):
+            idxs = list(range(slot, len(members), nsb))
+            if idxs:
+                storage_indices.append([members[i] for i in idxs])
+        # member[j]'s buffer was previously occupied by member[j - nsb].
+        for j in range(nsb, len(members)):
+            prefetch_map[members[j]] = members[j - nsb]
+
+    return storage_indices, prefetch_map, len(storage_indices)
+
+
 def get_layer_load_start_block(
     layer_id: int,
     independent_layers: list[int],
