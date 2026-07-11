@@ -582,6 +582,42 @@ class KVPoolWorker:
         first_kv_cache_tuple = self._as_cache_tuple(first_kv_cache_tuple)
         first_kv_cache = first_kv_cache_tuple[0]
 
+        # [DIAGNOSTIC] AscendStore address-calc structure probe. Confirms
+        # whether main MLA and sparse indexer layers share one kv_cache_group
+        # / spec (-> needs per-layer variable layout) or are separate groups
+        # (-> uniform per group). Temporary.
+        try:
+            from collections import Counter
+            _tpl_lens = Counter(
+                len(self._as_cache_tuple(c)) for c in kv_caches.values()
+            )
+            _n_groups = -1
+            _group_info = []
+            if self.kv_cache_config is not None:
+                _groups = self.kv_cache_config.kv_cache_groups
+                _n_groups = len(_groups)
+                for _g in _groups:
+                    _spec = _g.kv_cache_spec
+                    _psb = "n/a"
+                    try:
+                        _psb = _spec.page_size_bytes
+                    except Exception:
+                        pass
+                    _group_info.append(
+                        f"<{type(_spec).__name__} n_layers={len(_g.layer_names)} "
+                        f"page_size_bytes={_psb}>"
+                    )
+            logger.info(
+                "AscendStore diag: kv_caches=%d layers, tpl_lens=%s, "
+                "kv_cache_groups=%d %s",
+                len(kv_caches),
+                dict(_tpl_lens),
+                _n_groups,
+                _group_info,
+            )
+        except Exception as _e:  # noqa: BLE001
+            logger.warning("AscendStore diag failed: %s: %s", type(_e).__name__, _e)
+
         self.num_blocks = (
             self.kv_cache_config.num_blocks if self.kv_cache_config is not None else first_kv_cache.shape[0]
         )
