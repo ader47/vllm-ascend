@@ -8,7 +8,10 @@ from typing_extensions import Self
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    SlidingWindowManager,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, MLAAttentionSpec, SlidingWindowMLASpec
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
@@ -216,38 +219,21 @@ def offload_c8_indexer_page_size_bytes(
 
 @dataclass(frozen=True, kw_only=True)
 class AscendMLAAttentionSpec(MLAAttentionSpec):
-    """MLAAttentionSpec extended to support DSA models, with optional Sparse C8 support.
+    """MLA cache spec with Ascend-specific layout metadata.
 
-    When Sparse C8 is enabled, the KV cache tuple changes from
-    (kv_cache[0]: bfloat16, kv_cache[1]: bfloat16, kv_cache[2]: bfloat16)
-    to
-    (kv_cache[0]: bfloat16, kv_cache[1]: bfloat16, kv_cache[2]: int8, kv_cache[3]: float16).
-
-    The semantic meaning of each native KV cache entry is as follows:
-    1. kv_cache[0] stores kv_lora.
-    2. kv_cache[1] stores k_rope.
-    3. kv_cache[2] stores the key tensor from the indexer module.
-    4. kv_cache[3] stores the key scale tensor from the indexer module,
-       and exists only when Sparse C8 is enabled.
-
-    With SFA KV-quant sparse attention, kv_lora, k_rope, and per-tile
-    quantization scales are packed into kv_cache[0]. The resulting cache is
-    (packed_kv, indexer_k) or (packed_kv, indexer_k, indexer_scale) when
-    Sparse C8 indexer cache is enabled.
-
-    The main changes are as follows:
-    1. The key tensor from the indexer module stored in kv_cache[2] is
-       converted from bf16 to int8 to reduce memory usage. It is then
-       processed with int8 precision in Lightning_indexer computation
-       to improve computational efficiency.
-    2. The quantization scale of the key tensor in the indexer module
-       must also be stored for the Lightning_indexer_quant operator,
-       and is therefore saved in kv_cache[3].
+    For SFA, this spec describes only the main MLA cache. The indexer K
+    tensor, its quantization scale, and DCP replication are described by a
+    separate :class:`AscendSFAIndexerCacheSpec`.
     """
 
     scale_dim: int = 0
     scale_dtype: torch.dtype = torch.int8
+    # Legacy offload indexer specs still use this field until that path adopts
+    # a dedicated split-cache specification.
     sparse_head_dim: tuple[int, ...] | None = None
+    # Sparse C8 changes the main cache into one packed byte tensor. Keep that
+    # main-cache property here; indexer-specific C8 properties belong to the
+    # indexer spec.
     cache_sparse_c8: bool = False
     # SFA offload + LIC8 unified pool: precomputed bytes/token for page_size.
     # When set, page_size_bytes = block_size * num_kv_heads * page_bytes_per_token.
@@ -281,59 +267,10 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
                 else 0
             )
             return ckv_bytes + qli_bytes + qli_scale_bytes
-
         return (
             self.block_size
             * self.num_kv_heads
             * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
-        )
-
-    @property
-    def sparse_kv_cache_ratio(self) -> tuple[float, float | None, float | None, float | None]:
-        """
-        Compute the relative byte share of each KV cache entry.
-
-        Returns:
-            A tuple containing the ratios for:
-            - kv_cache[0]
-            - kv_cache[1]
-            - kv_cache[2]
-            - kv_cache[3] (None if Sparse C8 is disabled or Sparse C8 on A5 device)
-        """
-
-        assert self.sparse_head_dim is not None
-
-        if self.cache_sparse_c8:
-            ckv_head_dim, qk_rope_head_dim, index_k_head_dim = self.sparse_head_dim
-            assert qk_rope_head_dim == 0
-
-            ckv_virtual = ckv_head_dim * get_dtype_size(self.c8_k_cache_dtype)
-            if index_k_head_dim == 0:
-                return (
-                    1.0,  # kv_cache[0]: ckv / packed_kv
-                    None,  # kv_cache[1] does not exist without indexer cache
-                    None,  # kv_cache[2] does not exist without indexer cache
-                    None,  # kv_cache[3] does not exist for Sparse C8
-                )
-
-            qli_virtual = index_k_head_dim * get_dtype_size(self.c8_k_cache_dtype)
-            scale_virtual = self.sfa_dcp_replicated_indexer_size * get_dtype_size(self.c8_k_scale_cache_dtype)
-            total_virtual_head_dim = ckv_virtual + qli_virtual + scale_virtual
-
-            return (
-                total_virtual_head_dim / ckv_virtual,  # kv_cache[0]: ckv / packed_kv
-                total_virtual_head_dim / qli_virtual,  # kv_cache[1]: qli
-                total_virtual_head_dim / scale_virtual,  # kv_cache[2]: qli_scale
-                None,  # kv_cache[3] does not exist for Sparse C8
-            )
-
-        return (
-            self.head_size / self.sparse_head_dim[0],  # kv_cache[0]
-            self.head_size / self.sparse_head_dim[1],  # kv_cache[1]
-            (
-                self.head_size / self.sparse_head_dim[2] if self.sparse_head_dim[2] > 0 else None
-            ),  # kv_cache[2]  # kv_cache[2]
-            None,  # kv_cache[3] does not exist
         )
 
     @classmethod
@@ -399,6 +336,70 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         if dcp_world_size * pcp_world_size > 1:
             max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
         return cdiv(max_model_len, self.block_size * self.compress_ratio) * self.page_size_bytes
+
+
+@dataclass(frozen=True, kw_only=True)
+class AscendSFAIndexerCacheSpec(FullAttentionSpec):
+    """KV cache spec for SFA indexer K/scale cache.
+
+    The scheduler should treat this as a full-attention-compatible cache so it
+    can share block ids with the MLA cache in the same UniformType group. The
+    model runner still allocates it as an independent physical cache tensor.
+    """
+
+    scale_dim: int = 0
+    scale_dtype: torch.dtype = torch.int8
+    cache_sparse_c8: bool = False
+    cache_dtype_str: str | None = None
+    sfa_dcp_replicated_indexer_size: int = 1
+
+    @property
+    def page_size_bytes(self) -> int:
+        return self.real_page_size_bytes
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        num_heads_per_page = self.block_size * self.num_kv_heads
+        return (
+            self.sfa_dcp_replicated_indexer_size
+            * num_heads_per_page
+            * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
+        )
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, AscendSFAIndexerCacheSpec) for spec in specs), (
+            "All attention layers in the same KV cache group must be AscendSFAIndexerCacheSpec."
+        )
+        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        dtype_set = set(spec.dtype for spec in specs)
+        scale_dim_set = set(spec.scale_dim for spec in specs)
+        scale_dtype_set = set(spec.scale_dtype for spec in specs)
+        cache_sparse_c8_set = set(spec.cache_sparse_c8 for spec in specs)
+        sfa_dcp_replicated_indexer_size_set = set(spec.sfa_dcp_replicated_indexer_size for spec in specs)
+        assert (
+            len(cache_dtype_str_set) == 1
+            and len(dtype_set) == 1
+            and len(scale_dim_set) == 1
+            and len(scale_dtype_set) == 1
+            and len(cache_sparse_c8_set) == 1
+            and len(sfa_dcp_replicated_indexer_size_set) == 1
+        ), (
+            "All SFA indexer cache layers in the same KV cache group must use "
+            "the same dtype, scale layout, quantization method, sparse C8 "
+            "setting and DCP replication size."
+        )
+        return cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            dtype=dtype_set.pop(),
+            cache_dtype_str=cache_dtype_str_set.pop(),
+            scale_dim=scale_dim_set.pop(),
+            scale_dtype=scale_dtype_set.pop(),
+            cache_sparse_c8=cache_sparse_c8_set.pop(),
+            sfa_dcp_replicated_indexer_size=sfa_dcp_replicated_indexer_size_set.pop(),
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -588,6 +589,11 @@ def register_ascend_kv_cache_specs() -> None:
     KVCacheSpecRegistry.register(
         kvcache_spec_cls=AscendMLAAttentionSpec,
         manager_class=CompressAttentionManager,
+        uniform_type_base_spec=FullAttentionSpec,
+    )
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=AscendSFAIndexerCacheSpec,
+        manager_class=FullAttentionManager,
         uniform_type_base_spec=FullAttentionSpec,
     )
     KVCacheSpecRegistry.register(
