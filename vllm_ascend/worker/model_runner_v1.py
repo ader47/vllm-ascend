@@ -131,7 +131,6 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
     get_layerwise_config,
     get_layerwise_kv_cache_reuse_layers,
-    get_layerwise_layout_class_grouping,
     get_layerwise_storage_indices,
 )
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
@@ -4070,12 +4069,12 @@ class NPUModelRunner(GPUModelRunner):
     def get_layerwise_num_tensors(self, extra_config: dict) -> int | None:
         """Layout-class-aware buffer count for layer-reuse memory inflation.
 
-        Returns ``len(independent_layers) + num_layout_classes *
-        num_shared_buffers`` -- a safe upper bound on the buffer count the
-        layout-class-aware merge will actually produce (equal to it when every
-        layout class has >= num_shared_buffers layers). The worker uses this to
-        size the available-memory inflation so it matches the merged tensor
-        count; a mismatch would allocate more memory than budgeted (OOM).
+        Returns ``num_layout_classes * (len(independent_layers) +
+        num_shared_buffers)`` -- the buffer count the layout-class-aware merge
+        produces when every layout class has >= num_shared_buffers layers (each
+        class gets its own independent buffers + nsb shared buffers). The worker
+        uses this to size the available-memory inflation so it matches the merged
+        tensor count; a mismatch would allocate more memory than budgeted (OOM).
 
         Returns ``None`` when layer reuse is disabled. On any failure to
         inspect the specs (e.g. producer whose get_kv_cache_spec is empty at
@@ -4098,7 +4097,9 @@ class NPUModelRunner(GPUModelRunner):
             }
             if not classes:
                 return total_layers
-            return len(config.independent_layers) + len(classes) * config.num_shared_buffers
+            return len(classes) * (
+                len(config.independent_layers) + config.num_shared_buffers
+            )
         except Exception:
             return total_layers
 
@@ -4128,19 +4129,12 @@ class NPUModelRunner(GPUModelRunner):
         layer_names: list[str] = []
         for t in old_tensors:
             layer_names.extend(t.shared_by)
-        if len(layer_names) != total_layers:
-            logger.warning(
-                "Layer reuse: expected %d layers, got %d; skipping tensor merge.",
-                total_layers,
-                len(old_tensors),
-            )
-            return
-
-        # Classify each layer by its kv_cache tuple-layout and apply the reuse
-        # WITHIN each layout class. Layers with different layouts (e.g. main MLA
-        # 2-tuple (k,v) vs sparse indexer 3-tuple (k,dsa_k,dsa_k_scale)) cannot
-        # share one buffer; the old global round-robin mixed them and crashed
-        # _reshape_kv_cache_tensors on the producer (P) node.
+        # With the separated indexer there are 2N entries (N MLA + N indexer);
+        # accept that and apply reuse WITHIN each layout class (a shared buffer
+        # holds a single layout). Each class has N members, one per transformer
+        # layer, so the independent/reused pattern uses num_layers = N.
+        config_lc = get_layerwise_config(total_layers, extra_config)
+        nsb = config_lc.num_shared_buffers
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
 
         def _layout_class(name: str):
@@ -4153,23 +4147,44 @@ class NPUModelRunner(GPUModelRunner):
                 sparse_kv_cache_has_indexer(s),
             )
 
-        layer_class_list = [_layout_class(n) for n in layer_names]
-        storage_indices, prefetch_map, _num_tensors = get_layerwise_layout_class_grouping(
-            total_layers, layer_class_list, extra_config
-        )
+        # Partition entries by layout class, preserving global order.
+        class_to_members: dict[Any, list[int]] = {}
+        class_order: list[Any] = []
+        for i, name in enumerate(layer_names):
+            key = _layout_class(name)
+            if key not in class_to_members:
+                class_to_members[key] = []
+                class_order.append(key)
+            class_to_members[key].append(i)
 
-        # Propagate the class-aware reuse-mate map to the connector / pool_worker
-        # for buffer-reuse gating (P-side wait_for_layer_send / D-side prefetch).
-        # Keyed by flattened layer index, which equals the transformer layer
-        # index for standard "...model.layers.N..." naming.
-        kv_transfer_config._layerwise_reuse_mate_map = prefetch_map
+        storage_indices: list[list[int]] = []
+        for key in class_order:
+            members = class_to_members[key]
+            n = len(members)
+            # Independent = first and last of this class; middle round-robined
+            # into nsb shared slots (mirrors independent_layers=[0, n-1]).
+            storage_indices.append([members[0]])
+            if n > 1:
+                storage_indices.append([members[-1]])
+            reused = members[1:-1] if n > 2 else []
+            for slot in range(nsb):
+                slot_idxs = list(range(slot, len(reused), nsb))
+                if slot_idxs:
+                    storage_indices.append([reused[i] for i in slot_idxs])
+
+        # Reuse-mate map keyed by TRANSFORMER layer (0..N-1): MLA(L) and
+        # indexer(L) are bundled as one AscendStore layer, and both reuse the
+        # buffer of transformer layer L - nsb within their own class.
+        kv_transfer_config._layerwise_reuse_mate_map = {
+            L: L - nsb for L in range(nsb, total_layers)
+        }
 
         if envs.VLLM_ASCEND_SFA_DEBUG:
             logger.info(
-                "Layerwise KV cache reuse (layout-class aware): %d layers, "
+                "Layerwise KV cache reuse (layout-class aware): %d entries, "
                 "%d classes -> %d buffers",
-                total_layers,
-                len(set(layer_class_list)),
+                len(layer_names),
+                len(class_order),
                 len(storage_indices),
             )
 
@@ -4182,6 +4197,15 @@ class NPUModelRunner(GPUModelRunner):
             slot_size = old_tensors[slot[0]].size
             new_tensors.append(KVCacheTensor(shared_by=slot_names, size=slot_size))
 
+        # The memory-inflation factor (worker.py) divides by get_layerwise_num_tensors,
+        # so the merged buffer count must match it exactly or memory is mis-budgeted.
+        expected_tensors = self.get_layerwise_num_tensors(extra_config)
+        if expected_tensors is not None:
+            assert len(new_tensors) == expected_tensors, (
+                f"Layer reuse buffer count mismatch: merged {len(new_tensors)} "
+                f"tensors != get_layerwise_num_tensors {expected_tensors}; memory "
+                f"inflation will be wrong (OOM or under-use)."
+            )
         kv_cache_config.kv_cache_tensors = new_tensors
         logger.info(
             "Layerwise KV cache reuse: merged %d tensors → %d (num_blocks=%d unchanged)",
@@ -4530,13 +4554,10 @@ class NPUModelRunner(GPUModelRunner):
             self.hybrid_with_attn_and_mamba = self.hybrid_with_attn_and_mamba or (use_mamba and use_attn)
             for idx in range(len(kv_cache_tensor.shared_by)):
                 layer_name = kv_cache_tensor.shared_by[idx]
-                # In the offload path the indexer KV is packed into the MLA
-                # tensor (allocated by the MLA branch below and shared via
-                # shared_by), so skip it as a primary here. In the non-offload
-                # path (pr-11647) the indexer is a separate spec with its own
-                # tensor and must be allocated in this loop.
-                if self.use_offload and 'indexer' in layer_name:
-                    continue
+                # The SFA indexer is now a separated AscendSFAIndexerCacheSpec in
+                # both the offload and non-offload paths; it is allocated by its
+                # own branch below (isinstance AscendSFAIndexerCacheSpec). No
+                # skip needed -- the MLA branch only sees MLA layers.
                 # Single tensor path for: mamba, hybrid attn-mamba, or cache_only_layers
                 if (
                     "linear_attn" in layer_name
@@ -4799,7 +4820,9 @@ class NPUModelRunner(GPUModelRunner):
 
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
                 # encounter OOM issue
-                if self.use_sparse and self.use_offload:
+                if self.use_sparse and self.use_offload and not isinstance(
+                    current_kv_cache_spec, AscendSFAIndexerCacheSpec
+                ):
                     raw_entry = kv_cache_raw_tensors[layer_name]  # type: ignore
                     hf_cfg = self.model_config.hf_text_config
                     c8_layout = None
@@ -4842,12 +4865,32 @@ class NPUModelRunner(GPUModelRunner):
                     v_cache = raw_v_tensor.view(dtype).view(v_shape)
 
                     indexer_dim = hf_cfg.index_head_dim
-                    dsa_num_blocks = mla_num_blocks
+                    # Indexer K/scale now live in the separately-allocated
+                    # AscendSFAIndexerCacheSpec tensor (pr-11647 separated
+                    # structure). Fetch it cross-layer by name convention and
+                    # view it into tuple position 2 (and 5 for the C8 scale).
+                    indexer_layer_name = layer_name.replace(
+                        ".self_attn.attn", ".self_attn.indexer.k_cache"
+                    )
+                    assert indexer_layer_name in kv_cache_raw_tensors, (
+                        f"Offload indexer tensor not found for MLA layer "
+                        f"{layer_name} (looked for {indexer_layer_name})."
+                    )
+                    indexer_raw = kv_cache_raw_tensors[indexer_layer_name]
                     dsa_block_size = offload_indexer_kernel_block_size(
                         mla_block_size,
                         hf_cfg.kv_lora_rank,
                         indexer_dim,
                         c8_layout=c8_layout,
+                    )
+                    indexer_k_dtype = (
+                        self.c8_k_cache_dtype if c8_layout is not None else dtype
+                    )
+                    indexer_k_view = indexer_raw[0].view(indexer_k_dtype)
+                    # Derive the indexer block count from its own raw tensor so
+                    # the view stays consistent with the separated allocation.
+                    dsa_num_blocks = indexer_k_view.numel() // (
+                        dsa_block_size * num_kv_heads * indexer_dim
                     )
                     dsa_k_cache_shape = [
                         dsa_num_blocks,
@@ -4855,6 +4898,7 @@ class NPUModelRunner(GPUModelRunner):
                         num_kv_heads,
                         indexer_dim,
                     ]
+                    dsa_k_cache = indexer_k_view.view(dsa_k_cache_shape)
 
                     decode_width = 1
                     if self.vllm_config.speculative_config is not None:
@@ -4877,12 +4921,6 @@ class NPUModelRunner(GPUModelRunner):
                         device='npu',
                     )
 
-                    indexer_k_dtype = (
-                        self.c8_k_cache_dtype if c8_layout is not None else dtype
-                    )
-                    dsa_k_cache = raw_k_tensor.view(indexer_k_dtype).view(
-                        dsa_k_cache_shape
-                    )
                     kv_cache_entries: list = [
                         k_cache,
                         v_cache,
@@ -4891,10 +4929,9 @@ class NPUModelRunner(GPUModelRunner):
                         topk_buffer_v,
                     ]
                     if c8_layout is not None:
-                        assert raw_scale_tensor is not None
-                        # Index page reuses the raw_k byte span as int8 dsa_k and the
-                        # spec_0 pad region (raw_scale) as fp16 scale. A physical
-                        # page is either main or index, never both at once.
+                        assert len(indexer_raw) > 1 and indexer_raw[1] is not None, (
+                            "C8 offload indexer scale tensor missing"
+                        )
                         dsa_k_scale_cache_shape = [
                             dsa_num_blocks,
                             dsa_block_size,
@@ -4902,12 +4939,23 @@ class NPUModelRunner(GPUModelRunner):
                             1,
                         ]
                         dsa_k_scale_cache = (
-                            raw_scale_tensor
+                            indexer_raw[1]
                             .view(self.c8_k_scale_cache_dtype)
                             .view(dsa_k_scale_cache_shape)
                         )
                         kv_cache_entries.append(dsa_k_scale_cache)
                     kv_caches[layer_name] = tuple(kv_cache_entries)
+                    # The indexer group is skipped during backend selection
+                    # (initialize_attn_backend: 'indexer' in layer_names[0]),
+                    # so the separated reshape branch may never run for it. The
+                    # indexer K is read inline from MLA tuple position 2, but
+                    # vLLM still expects a kv_caches entry per grouped layer --
+                    # build one from the same indexer views if it's missing.
+                    if indexer_layer_name not in kv_caches:
+                        indexer_entry: list = [dsa_k_cache]
+                        if c8_layout is not None:
+                            indexer_entry.append(dsa_k_scale_cache)
+                        kv_caches[indexer_layer_name] = tuple(indexer_entry)
                 elif self.use_compress and isinstance(current_kv_cache_spec,
                                                     (AscendMLAAttentionSpec, AscendSlidingWindowMLASpec)):
                     kv_tensor = kv_cache_raw_tensors[layer_name]
@@ -5387,8 +5435,11 @@ class NPUModelRunner(GPUModelRunner):
         attention_backend_maps = []
         attention_backend_list = []
         for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
-            if 'indexer' in kv_cache_group_spec.layer_names[0]:
-                continue
+            # No group-skip: get_attn_backends_for_group routes each layer to its
+            # backend by spec type (indexer layers -> AscendSFAIndexerBackend),
+            # so mixed MLA+indexer uniform groups are handled per-layer. Skipping
+            # by layer_names[0] was ordering-dependent and could drop the whole
+            # mixed group (-> empty kv_caches).
             attn_backends = get_attn_backends_for_group(kv_cache_group_spec)
             attention_backend_maps.append(attn_backends[0])
             attention_backend_list.append(attn_backends[1])
@@ -5484,12 +5535,16 @@ class NPUModelRunner(GPUModelRunner):
                             hf_cfg.qk_rope_head_dim,
                             hf_cfg.kv_lora_rank,
                         ),
-                        dtype=self.kv_cache_dtype,
+                        dtype=(
+                            self.c8_k_cache_dtype
+                            if self.use_sparse_c8_indexer
+                            else self.kv_cache_dtype
+                        ),
                         cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                         index_head_dim=hf_cfg.index_head_dim,
                         kv_lora_rank=hf_cfg.kv_lora_rank,
                         qk_rope_head_dim=hf_cfg.qk_rope_head_dim,
-                        sparse_head_dim=self.sparse_head_dim,
+                        sfa_dcp_replicated_indexer_size=self.sfa_dcp_replicated_indexer_size,
                         c8_unified_pool=self.use_sparse_c8_indexer,
                         scale_dtype=(
                             self.c8_k_scale_cache_dtype

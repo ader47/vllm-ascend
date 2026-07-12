@@ -577,6 +577,98 @@ class KVPoolWorker:
         self.group_block_stride[group_id] = group_block_strides
         self.group_num_layers[group_id] = len(layer_names)
 
+    def _infer_transformer_layer_group_metadata(
+        self,
+        group_id: int,
+        kv_caches: dict[str, torch.Tensor],
+    ) -> tuple[list[int], list[int], int]:
+        """Build a transformer-layer flat layout for one uniform group, with
+        SPARSE indexer support.
+
+        With the separated SFA indexer (pr-11647), each transformer layer L
+        contributes its MLA cache tuple, and indexer-LAYERS additionally
+        contribute an indexer cache tuple (``...self_attn.attn`` and
+        ``...self_attn.indexer.k_cache``). The indexer is sparse -- only some
+        transformer layers have one -- so the per-layer leg count is NOT
+        uniform. Emit legs grouped by transformer layer L
+        ([MLA(L=0) legs..., idx(L=0) legs..., MLA(L=1) legs..., ...]) and return
+        per-layer offset/leg tables so ``LayerBatchBuilder`` can slice a variable
+        window per ``layer_id``. ``num_layers`` stays at the transformer-layer
+        count N (set in ``_init_key_head_config``); indexer legs are bundled into
+        their layer's slot, not counted as extra layers.
+
+        One save/load of layer L then touches MLA(L) and (if present) indexer(L)
+        together -- the indexer has no attention forward / save hook of its own.
+        Non-indexer layers simply save/load their MLA legs; the indexer region of
+        their uniform GVA page is left untouched (never read by a non-indexer
+        layer's attention).
+
+        Returns ``(layer_offsets, layer_legs, page_size_bytes)``:
+          * ``layer_offsets[L]`` -- flat-array start index for transformer layer L.
+          * ``layer_legs[L]`` -- number of cache legs in transformer layer L.
+          * ``page_size_bytes`` -- the uniform GVA page size = the largest
+            layer's leg-byte sum (MLA+indexer), matching the scheduler's merged
+            uniform-group ``page_size_bytes`` so ``rank_layer_offset`` lines up
+            with the GVA pool allocation.
+        """
+        # Parse transformer-layer index from each kv_caches key; flag indexer legs.
+        by_layer: dict[int, list[tuple[int, str]]] = {}
+        for name in kv_caches:
+            parts = name.split(".")
+            try:
+                layer_idx = int(parts[parts.index("layers") + 1])
+            except (ValueError, IndexError) as err:
+                raise NotImplementedError(
+                    f"AscendStore transformer-layer layout: cannot parse a layer "
+                    f"index from kv_caches key {name!r}."
+                ) from err
+            # is_indexer sort key: MLA legs (0) before indexer legs (1) within a layer.
+            by_layer.setdefault(layer_idx, []).append((1 if "indexer" in name else 0, name))
+
+        transformer_layers = sorted(by_layer)
+        max_layer = transformer_layers[-1]
+        layer_offsets = [0] * (max_layer + 1)
+        layer_legs = [0] * (max_layer + 1)
+
+        group_addrs: list[int] = []
+        group_block_lens: list[int] = []
+        group_block_strides: list[int] = []
+        page_size_bytes = 0
+        flat_pos = 0
+        for L in transformer_layers:
+            legs = by_layer[L]
+            # Stable per-layer order: MLA legs first, then indexer legs.
+            legs.sort(key=lambda t: t[0])
+            layer_offsets[L] = flat_pos
+            legs_this_layer = 0
+            bytes_this_layer = 0
+            for _is_indexer, name in legs:
+                for cache in self._as_cache_tuple(kv_caches[name]):
+                    base_addr = cache.data_ptr()
+                    block_len, block_stride, _, _ = self._get_cache_block_metadata(cache)
+                    group_addrs.append(base_addr)
+                    group_block_lens.append(block_len)
+                    group_block_strides.append(block_stride)
+                    legs_this_layer += 1
+                    bytes_this_layer += block_len
+                    flat_pos += 1
+            if legs_this_layer == 0:
+                raise NotImplementedError(
+                    f"AscendStore transformer-layer layout: transformer layer "
+                    f"{L} has no cache legs."
+                )
+            layer_legs[L] = legs_this_layer
+            # The uniform GVA page must fit the largest layer (MLA+indexer).
+            page_size_bytes = max(page_size_bytes, bytes_this_layer)
+
+        self.group_kv_caches_base_addr[group_id] = group_addrs
+        self.group_block_len[group_id] = group_block_lens
+        self.group_block_stride[group_id] = group_block_strides
+        self.group_num_layers[group_id] = len(transformer_layers)
+        self.group_layer_offsets[group_id] = layer_offsets
+        self.group_layer_legs[group_id] = layer_legs
+        return layer_offsets, layer_legs, page_size_bytes
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
         first_kv_cache_tuple = self._as_cache_tuple(first_kv_cache_tuple)
@@ -633,6 +725,8 @@ class KVPoolWorker:
         self.group_kv_caches_base_addr: dict[int, list[int]] = {}
         self.group_block_len: dict[int, list[int]] = {}
         self.group_block_stride: dict[int, list[int]] = {}
+        self.group_layer_offsets: dict[int, list[int]] = {}
+        self.group_layer_legs: dict[int, list[int]] = {}
         self.kv_caches = kv_caches
         self.group_kv_cache_families: dict[int, str] = {
             group_id: self._get_group_family(self.kv_cache_group_families, group_id)
@@ -672,26 +766,31 @@ class KVPoolWorker:
         if self.kv_cache_config is not None and self.use_hybrid:
             for group_id, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
                 self._infer_cache_group_metadata(group_id, group_spec.layer_names)
+            self.page_size_bytes = sum(self.block_len)
         else:
-            self._infer_cache_group_metadata(0, list(kv_caches.keys()))
-
-        # group_num_layers is computed from the actual kv_caches dict which
-        # includes ALL attention layers (main + MTP), so it is the authoritative
-        # layer count for this worker.
-        original_num_layers = self.num_layers
-        self.num_layers = sum(self.group_num_layers.values())
-        if self.num_layers != original_num_layers:
-            logger.info(
-                "KVPoolWorker: updated num_layers %d -> %d (includes MTP/spec-decode draft layers).",
-                original_num_layers,
-                self.num_layers,
+            # Uniform single group (the prefill-offload MLA+indexer path). The
+            # indexer is sparse -- only some transformer layers have one -- so
+            # the per-layer leg count is variable. Build per-layer offset/leg
+            # tables and use the largest layer's byte sum (MLA+indexer) as the
+            # uniform GVA page (== the scheduler's merged uniform-group
+            # page_size_bytes, so rank_layer_offset lines up with the GVA pool).
+            _layer_offsets, _layer_legs, page_size_bytes = (
+                self._infer_transformer_layer_group_metadata(0, kv_caches)
             )
-            # Re-size the per-layer task lists (created in _init_layerwise_config
-            # from the pre-recalc count) so layer_id indexing stays in-bounds.
-            self.layer_load_tasks = [[] for _ in range(self.num_layers)]
-            self.layer_save_tasks = [[] for _ in range(self.num_layers)]
+            self.page_size_bytes = page_size_bytes
 
-        self.page_size_bytes = sum(self.block_len)
+        # num_layers stays at the transformer-layer count N (set in
+        # _init_key_head_config). Do NOT overwrite it from sum(group_num_layers):
+        # with the separated indexer that re-inflates to 2N (N MLA + N indexer)
+        # and breaks the flat per-layer addressing and the step-end save drain.
+        # Warn if the bundled group count disagrees.
+        if self.num_layers != self.group_num_layers.get(0, self.num_layers):
+            logger.warning(
+                "KVPoolWorker: num_layers %d != bundled group_num_layers[0] %d; "
+                "the transformer-layer-bundled layout assumes they match.",
+                self.num_layers,
+                self.group_num_layers.get(0, self.num_layers),
+            )
         self.token_database.set_group_buffers(
             self.group_kv_caches_base_addr,
             self.group_block_len,
@@ -699,6 +798,8 @@ class KVPoolWorker:
             cache_role="kv",
             group_cache_families=self.group_kv_cache_families,
             group_num_layers=self.group_num_layers,
+            group_layer_offsets=self.group_layer_offsets,
+            group_layer_legs=self.group_layer_legs,
         )
         # Initialize store, register buffers, and start transfer threads
         # directly here (like main) — no separate init_backend handshake.

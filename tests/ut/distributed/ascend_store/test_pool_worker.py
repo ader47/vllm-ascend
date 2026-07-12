@@ -19,6 +19,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+import torch  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
     LoadSpec,
@@ -105,6 +106,98 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         cls = self._make_worker_class()
         hits = [[16, 32, 48], [32, 48], [16, 32], [32, 48, 64]]
         self.assertEqual(32, cls._max_intersection_hit_position(hits))
+
+    def test_infer_transformer_layer_group_metadata_bundles_indexer(self):
+        """MLA + indexer legs are bundled per transformer layer in flat order,
+        with per-layer offset/leg tables and a uniform GVA page size."""
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.num_blocks = 4
+        worker.group_kv_caches_base_addr = {}
+        worker.group_block_len = {}
+        worker.group_block_stride = {}
+        worker.group_num_layers = {}
+        worker.group_layer_offsets = {}
+        worker.group_layer_legs = {}
+        mla_k = torch.zeros([4, 16, 1, 512], dtype=torch.bfloat16)
+        mla_v = torch.zeros([4, 16, 1, 64], dtype=torch.bfloat16)
+        idx_k = torch.zeros([4, 16, 1, 128], dtype=torch.bfloat16)
+        kv_caches = {
+            "model.layers.1.self_attn.indexer.k_cache": (idx_k,),
+            "model.layers.0.self_attn.indexer.k_cache": (idx_k,),
+            "model.layers.1.self_attn.attn": (mla_k, mla_v),
+            "model.layers.0.self_attn.attn": (mla_k, mla_v),
+        }
+        layer_offsets, layer_legs, page_size_bytes = (
+            worker._infer_transformer_layer_group_metadata(0, kv_caches)
+        )
+        # MLA(k,v) + indexer(k) = 3 legs per transformer layer; uniform here.
+        self.assertEqual(layer_legs, [3, 3])
+        self.assertEqual(layer_offsets, [0, 3])
+        # page_size_bytes = MLA(k+v) + indexer k = the largest layer's byte sum.
+        self.assertEqual(
+            page_size_bytes,
+            sum(worker.group_block_len[0][:3]),
+        )
+        # 2 transformer layers (indexer bundled, not counted separately).
+        self.assertEqual(worker.group_num_layers[0], 2)
+        self.assertEqual(len(worker.group_kv_caches_base_addr[0]), 6)
+        # Flat order: layer0 MLA k,v, idx k; layer1 MLA k,v, idx k
+        # (MLA before indexer within a layer, regardless of dict order).
+        self.assertEqual(
+            worker.group_kv_caches_base_addr[0],
+            [
+                mla_k.data_ptr(), mla_v.data_ptr(), idx_k.data_ptr(),
+                mla_k.data_ptr(), mla_v.data_ptr(), idx_k.data_ptr(),
+            ],
+        )
+
+    def test_infer_transformer_layer_group_metadata_sparse_indexer(self):
+        """Sparse indexer: layers 0,1 have an indexer, layer 2 does not. The
+        per-layer leg count is variable (3, 3, 2) and must NOT raise -- this is
+        the GLM-5.2 prefill-offload layout that crashed the old uniform assertion."""
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.num_blocks = 4
+        worker.group_kv_caches_base_addr = {}
+        worker.group_block_len = {}
+        worker.group_block_stride = {}
+        worker.group_num_layers = {}
+        worker.group_layer_offsets = {}
+        worker.group_layer_legs = {}
+        mla_k = torch.zeros([4, 16, 1, 512], dtype=torch.bfloat16)
+        mla_v = torch.zeros([4, 16, 1, 64], dtype=torch.bfloat16)
+        idx_k = torch.zeros([4, 16, 1, 128], dtype=torch.bfloat16)
+        kv_caches = {
+            "model.layers.0.self_attn.attn": (mla_k, mla_v),
+            "model.layers.1.self_attn.attn": (mla_k, mla_v),
+            "model.layers.2.self_attn.attn": (mla_k, mla_v),
+            "model.layers.0.self_attn.indexer.k_cache": (idx_k,),
+            "model.layers.1.self_attn.indexer.k_cache": (idx_k,),
+            # layer 2 has NO indexer -> only MLA legs.
+        }
+        layer_offsets, layer_legs, page_size_bytes = (
+            worker._infer_transformer_layer_group_metadata(0, kv_caches)
+        )
+        # Variable legs per transformer layer: [3, 3, 2].
+        self.assertEqual(layer_legs, [3, 3, 2])
+        self.assertEqual(layer_offsets, [0, 3, 6])
+        # page_size_bytes still = MLA + indexer (the largest layer's byte sum),
+        # i.e. an indexer-layer's leg bytes, not layer 2's MLA-only bytes.
+        self.assertEqual(
+            page_size_bytes,
+            sum(worker.group_block_len[0][:3]),
+        )
+        self.assertEqual(worker.group_num_layers[0], 3)
+        # Flat order: layer0 MLA k,v + idx; layer1 MLA k,v + idx; layer2 MLA k,v.
+        self.assertEqual(
+            worker.group_kv_caches_base_addr[0],
+            [
+                mla_k.data_ptr(), mla_v.data_ptr(), idx_k.data_ptr(),
+                mla_k.data_ptr(), mla_v.data_ptr(), idx_k.data_ptr(),
+                mla_k.data_ptr(), mla_v.data_ptr(),
+            ],
+        )
 
     def test_external_coordinator_lookup_disables_eagle_drop(self):
         cls = self._make_worker_class()
@@ -554,7 +647,7 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         fake_cache.shape = [100, 16, 8, 64]
         fake_cache.element_size.return_value = 2
         fake_cache.data_ptr.return_value = 10000
-        kv_caches = {"layer.0": (fake_cache, fake_cache)}
+        kv_caches = {"model.layers.0.self_attn.attn": (fake_cache, fake_cache)}
         worker.register_kv_caches(kv_caches)
         self.assertEqual(len(worker.group_kv_caches_base_addr[0]), 2)
         worker.m_store.register_buffer.assert_called_once()

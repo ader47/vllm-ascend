@@ -1,6 +1,7 @@
 import torch
 
 from vllm_ascend.core.kv_cache_interface import (
+    AscendSFAIndexerCacheSpec,
     compute_offload_sparse_c8_layout,
     make_offload_indexer_mla_spec,
     make_offload_main_mla_spec,
@@ -105,10 +106,12 @@ def test_ascend_mla_offload_c8_page_bytes_per_token():
         index_head_dim=INDEX_HEAD_DIM,
         kv_lora_rank=KV_LORA_RANK,
         qk_rope_head_dim=QK_ROPE_HEAD_DIM,
-        sparse_head_dim=(KV_LORA_RANK, QK_ROPE_HEAD_DIM, INDEX_HEAD_DIM),
         c8_unified_pool=True,
         scale_dtype=torch.float16,
     )
+    # The offload indexer is now a separated AscendSFAIndexerCacheSpec; its C8
+    # page size still equals the spec_1 byte-mix page (8:1 with the main spec).
+    assert isinstance(spec, AscendSFAIndexerCacheSpec)
     assert spec.page_size_bytes == offload_c8_indexer_page_size_bytes(
         MLA_BLOCK_SIZE,
         INDEX_HEAD_DIM,

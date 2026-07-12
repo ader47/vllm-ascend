@@ -1719,10 +1719,9 @@ def kv_cache_spec_uses_sparse_c8(kv_cache_spec) -> bool:
 
 
 def sparse_kv_cache_has_indexer(kv_cache_spec) -> bool:
-    # An SFA indexer cache takes one of two forms depending on the offload path:
-    #   * non-offload (pr-11647 refactor): a separate AscendSFAIndexerCacheSpec.
-    #   * offload (AscendMLAAttentionSpec built by make_offload_indexer_mla_spec):
-    #     the indexer is packed into the MLA spec via sparse_head_dim[2] > 0.
+    # Both the offload and non-offload SFA indexer caches are now separated
+    # AscendSFAIndexerCacheSpec (pr-11647 structure). The sparse_head_dim
+    # fallback below is retained for any legacy packed-indexer spec.
     from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
 
     if isinstance(kv_cache_spec, AscendSFAIndexerCacheSpec):

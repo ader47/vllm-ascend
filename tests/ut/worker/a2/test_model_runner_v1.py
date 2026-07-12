@@ -346,6 +346,58 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(indexer_spec.scale_dtype, torch.float32)
         self.assertEqual(indexer_spec.page_size_bytes, 16 * (128 + 4))
 
+    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+    def test_offload_indexer_uses_separated_sfa_indexer_spec(
+        self,
+        mock_get_layers,
+        _mock_has_ec_transfer,
+    ):
+        # use_offload path: the indexer must be a separated AscendSFAIndexerCacheSpec
+        # (pr-11647 structure) carrying the C8 unified-pool page_bytes_per_token so
+        # the 8:1 main:indexer page ratio holds for unify_kv_cache_spec_page_size.
+        runner = self._build_runner()
+        runner.use_sparse = True
+        runner.use_offload = True
+        runner.use_sparse_c8_indexer = True
+        runner.block_size = 16
+        runner.kv_cache_dtype = torch.bfloat16
+        runner.c8_k_cache_dtype = torch.float8_e4m3fn
+        runner.c8_k_scale_cache_dtype = torch.float32
+        runner.sfa_dcp_replicated_indexer_size = 1
+        runner.shared_kv_cache_layers = {}
+        runner.ascend_config = MagicMock()
+        runner.ascend_config.is_sparse_c8_layer.return_value = True
+        runner.vllm_config.model_config = runner.model_config
+        runner.model_config.hf_text_config = SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+        )
+        runner.model_config.hf_config = SimpleNamespace(num_hidden_layers=1)
+        runner.vllm_config.cache_config.cache_dtype = "auto"
+
+        attn_module = MLAAttention.__new__(MLAAttention)
+        torch.nn.Module.__init__(attn_module)
+        attn_module.head_size = 512 + 64
+        indexer_module = DeepseekV32IndexerCache.__new__(DeepseekV32IndexerCache)
+        torch.nn.Module.__init__(indexer_module)
+        attn_layer_name = "model.layers.0.self_attn.attn"
+        indexer_layer_name = "model.layers.0.self_attn.indexer.k_cache"
+        mock_get_layers.return_value = {
+            indexer_layer_name: indexer_module,
+            attn_layer_name: attn_module,
+        }
+
+        specs = runner.get_kv_cache_spec()
+        main_spec = specs[attn_layer_name]
+        indexer_spec = specs[indexer_layer_name]
+
+        # The offload indexer is now a separated AscendSFAIndexerCacheSpec...
+        self.assertIsInstance(indexer_spec, AscendSFAIndexerCacheSpec)
+        # ...and the 8:1 unified-pool page ratio is preserved.
+        self.assertEqual(main_spec.page_size_bytes, indexer_spec.page_size_bytes * 8)
+
     def test_deepseek_v4_indexer_keeps_compressed_mla_layout(self):
         runner = self._build_runner()
         runner.use_compress = True

@@ -216,6 +216,13 @@ class ChunkedTokenDatabase:
         self.group_kv_caches_base_addr: dict[int, list[int]] = {}
         self.group_block_len: dict[int, list[int]] = {}
         self.group_block_stride: dict[int, list[int]] = {}
+        # Per-transformer-layer variable layout (sparse SFA indexer): for group g,
+        # group_layer_offsets[g][L] is the flat-array start of transformer layer L's
+        # cache legs and group_layer_legs[g][L] is how many legs it has. Empty when
+        # the layout is uniform (non-offload / legacy); LayerBatchBuilder falls
+        # back to a uniform stride in that case.
+        self.group_layer_offsets: dict[int, list[int]] = {}
+        self.group_layer_legs: dict[int, list[int]] = {}
         self.group_cache_families: dict[str, dict[int, str]] = {
             "kv": {},
             "state": {},
@@ -301,6 +308,8 @@ class ChunkedTokenDatabase:
         cache_role: str = "kv",
         group_cache_families: dict[int, str] | None = None,
         group_num_layers: dict[int, int] | None = None,
+        group_layer_offsets: dict[int, list[int]] | None = None,
+        group_layer_legs: dict[int, list[int]] | None = None,
     ) -> None:
         if cache_role == "state":
             # Keep the interface for future explicit state groups, but this
@@ -310,6 +319,10 @@ class ChunkedTokenDatabase:
             self.group_kv_caches_base_addr = group_kv_caches_base_addr
             self.group_block_len = group_block_len
             self.group_block_stride = group_block_stride or {}
+            if group_layer_offsets is not None:
+                self.group_layer_offsets = group_layer_offsets
+            if group_layer_legs is not None:
+                self.group_layer_legs = group_layer_legs
         if group_cache_families is not None:
             self.group_cache_families[cache_role] = group_cache_families.copy()
         if group_num_layers is not None:

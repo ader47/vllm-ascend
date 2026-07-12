@@ -66,11 +66,35 @@ class LayerBatchBuilder:
         )
         group_block_stride = token_database.group_block_stride.get(0, token_database.group_block_len[0])
         self._block_stride_np = np.asarray(group_block_stride, dtype=np.int64)
-        # group_block_len[0] / kv_caches_base_addr[0] are laid out flat as
-        # [layer0_caches..., layer1_caches..., ...]; the per-layer stride is the
-        # total length divided by the number of layers (mirrors
-        # ChunkedTokenDatabase caches_per_layer computation).
-        self._caches_per_layer = max(1, self._block_len_np.shape[0] // max(1, num_layers))
+        # Per-transformer-layer variable layout (sparse SFA indexer): each layer L
+        # owns a variable number of cache legs starting at layer_offsets[L]. When
+        # the offload path populated group_layer_offsets/legs (variable layout),
+        # slice a per-layer window; otherwise fall back to a uniform stride
+        # (non-offload / legacy / UTs).
+        layer_offsets = getattr(token_database, "group_layer_offsets", {}).get(0)
+        layer_legs = getattr(token_database, "group_layer_legs", {}).get(0)
+        if (
+            layer_offsets is not None
+            and layer_legs is not None
+            and len(layer_offsets) >= num_layers > 0
+        ):
+            self._layer_offsets = np.asarray(layer_offsets[:num_layers], dtype=np.int64)
+            self._layer_legs = np.asarray(layer_legs[:num_layers], dtype=np.int64)
+        else:
+            cpl = max(1, self._block_len_np.shape[0] // max(1, num_layers))
+            self._layer_offsets = np.arange(num_layers, dtype=np.int64) * cpl
+            self._layer_legs = np.full(num_layers, cpl, dtype=np.int64)
+        # The per-layer windows must stay within the flat layout.
+        if self.num_layers > 0:
+            max_end = int(self._layer_offsets[-1]) + int(self._layer_legs[-1])
+            for L in range(self.num_layers):
+                end = int(self._layer_offsets[L]) + int(self._layer_legs[L])
+                if end > max_end:
+                    max_end = end
+            assert max_end <= self._block_len_np.shape[0], (
+                f"LayerBatchBuilder per-layer windows overrun the flat layout: "
+                f"need {max_end}, have {self._block_len_np.shape[0]}."
+            )
         self._block_ids_buf: np.ndarray | None = None
         self._block_gvas_buf: np.ndarray | None = None
 
@@ -109,12 +133,11 @@ class LayerBatchBuilder:
         base_gvas_arr: np.ndarray,
         layer_id: int,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        caches_per_layer = self._caches_per_layer
-        # group_* arrays are laid out flat as [layer0_caches..., layer1_caches...];
-        # slice the per-layer window for ``layer_id``. Using the full length as the
-        # stride (the old behaviour) overshoots for layer_id >= 1 and yields empty
-        # slices -> broadcast errors.
-        base_offset = layer_id * caches_per_layer
+        # group_* arrays are laid out flat as [layer0_legs..., layer1_legs...]
+        # with a VARIABLE number of legs per transformer layer (sparse indexer);
+        # slice this layer's window from the per-layer offset/leg tables.
+        base_offset = int(self._layer_offsets[layer_id])
+        caches_per_layer = int(self._layer_legs[layer_id])
         layer_base_addrs = self._kv_caches_base_addr_np[base_offset : base_offset + caches_per_layer]
         layer_block_len = self._block_len_np[base_offset : base_offset + caches_per_layer]
         layer_block_stride = self._block_stride_np[base_offset : base_offset + caches_per_layer]

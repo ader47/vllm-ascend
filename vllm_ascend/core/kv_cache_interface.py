@@ -473,16 +473,22 @@ def make_offload_indexer_mla_spec(
     cache_dtype_str: str,
     index_head_dim: int,
     indexer_pad_dim: int | None = None,
-    sparse_head_dim: tuple[int, ...] | None = None,
+    sfa_dcp_replicated_indexer_size: int = 1,
     c8_unified_pool: bool = False,
     scale_dtype: torch.dtype | None = None,
     kv_lora_rank: int | None = None,
     qk_rope_head_dim: int | None = None,
-) -> AscendMLAAttentionSpec:
-    """Build indexer offload spec (spec_1).
+) -> "AscendSFAIndexerCacheSpec":
+    """Build the offload indexer spec as a separated ``AscendSFAIndexerCacheSpec``.
 
-    Non-C8 uses nominal ``head_size`` (index + pad) with bf16 page accounting.
-    C8 unified pool sets ``page_bytes_per_token`` to the spec_1 byte-mix layout.
+    Mirrors pr-11647's non-offload indexer spec, plus the offload C8 unified-pool
+    ``page_bytes_per_token`` (int8 index + raw pad + one scale element) so
+    ``unify_kv_cache_spec_page_size`` still sees the 8:1 main:indexer page ratio.
+
+    Non-C8 uses the nominal ``head_size`` (index + pad) with bf16 page accounting.
+    C8 uses the truthful physical ``head_size = index_head_dim`` and ``scale_dim
+    = 1``; page accounting goes through ``page_bytes_per_token`` and no longer
+    depends on ``head_size``/``scale_dim``.
     """
     if indexer_pad_dim is None:
         assert kv_lora_rank is not None and qk_rope_head_dim is not None
@@ -492,23 +498,27 @@ def make_offload_indexer_mla_spec(
     page_bytes_per_token = None
     cache_sparse_c8 = False
     scale_dim = 0
+    resolved_scale_dtype: torch.dtype = torch.int8
+    resolved_head_size = head_size
     if c8_unified_pool:
-        assert sparse_head_dim is not None
         scale_dtype = scale_dtype or _get_c8_k_scale_cache_dtype()
         page_bytes_per_token = offload_c8_indexer_bytes_per_token(
             index_head_dim, indexer_pad_dim, scale_dtype
         )
         cache_sparse_c8 = True
-        scale_dim = indexer_pad_dim
-    return AscendMLAAttentionSpec(
+        scale_dim = 1
+        resolved_scale_dtype = scale_dtype
+        resolved_head_size = index_head_dim
+    return AscendSFAIndexerCacheSpec(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
-        head_size=head_size,
+        head_size=resolved_head_size,
         dtype=dtype,
         cache_dtype_str=cache_dtype_str,
-        sparse_head_dim=sparse_head_dim,
         scale_dim=scale_dim,
+        scale_dtype=resolved_scale_dtype,
         cache_sparse_c8=cache_sparse_c8,
+        sfa_dcp_replicated_indexer_size=sfa_dcp_replicated_indexer_size,
         page_bytes_per_token=page_bytes_per_token,
     )
 
@@ -527,9 +537,21 @@ class AscendSFAIndexerCacheSpec(FullAttentionSpec):
     cache_sparse_c8: bool = False
     cache_dtype_str: str | None = None
     sfa_dcp_replicated_indexer_size: int = 1
+    # SFA offload + LIC8 unified pool: precomputed bytes/token for page_size.
+    # When set, page_size_bytes = block_size * num_kv_heads * page_bytes_per_token,
+    # overriding real_page_size_bytes so the indexer can carry the C8 byte-mix
+    # layout (int8 index + raw pad + one scale element) that the uniform
+    # real_page_size_bytes formula cannot express. Offload path only.
+    page_bytes_per_token: int | None = None
 
     @property
     def page_size_bytes(self) -> int:
+        if self.page_bytes_per_token is not None:
+            return _offload_page_size_bytes(
+                self.block_size,
+                self.num_kv_heads,
+                self.page_bytes_per_token,
+            )
         return self.real_page_size_bytes
 
     @property
@@ -552,6 +574,7 @@ class AscendSFAIndexerCacheSpec(FullAttentionSpec):
         scale_dtype_set = set(spec.scale_dtype for spec in specs)
         cache_sparse_c8_set = set(spec.cache_sparse_c8 for spec in specs)
         sfa_dcp_replicated_indexer_size_set = set(spec.sfa_dcp_replicated_indexer_size for spec in specs)
+        page_bytes_per_token_set = set(spec.page_bytes_per_token for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(dtype_set) == 1
@@ -559,10 +582,11 @@ class AscendSFAIndexerCacheSpec(FullAttentionSpec):
             and len(scale_dtype_set) == 1
             and len(cache_sparse_c8_set) == 1
             and len(sfa_dcp_replicated_indexer_size_set) == 1
+            and len(page_bytes_per_token_set) == 1
         ), (
             "All SFA indexer cache layers in the same KV cache group must use "
             "the same dtype, scale layout, quantization method, sparse C8 "
-            "setting and DCP replication size."
+            "setting, DCP replication size and offload page_bytes_per_token."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -574,6 +598,7 @@ class AscendSFAIndexerCacheSpec(FullAttentionSpec):
             scale_dtype=scale_dtype_set.pop(),
             cache_sparse_c8=cache_sparse_c8_set.pop(),
             sfa_dcp_replicated_indexer_size=sfa_dcp_replicated_indexer_size_set.pop(),
+            page_bytes_per_token=specs[0].page_bytes_per_token,
         )
 
 
