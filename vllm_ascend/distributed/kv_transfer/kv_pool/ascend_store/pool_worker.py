@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+import vllm_ascend.envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
 )
@@ -735,6 +736,12 @@ class KVPoolWorker:
                     partial_block_index=partial_block_index,
                 )
             )
+        if ascend_envs.VLLM_ASCEND_LAYER_REUSE_DEBUG:
+            logger.info(
+                "LayerReuseDbg save layer=%d ranges=%s",
+                layer_id,
+                [(r.request.req_id, r.start_block, r.end_block, r.partial_block_index) for r in request_block_ranges],
+            )
         if request_block_ranges:
             self.layer_save_tasks[layer_id].append(
                 LayerTransferTask(
@@ -784,6 +791,12 @@ class KVPoolWorker:
                     end_block=full_blocks,
                     partial_block_index=partial_block_index,
                 )
+            )
+        if ascend_envs.VLLM_ASCEND_LAYER_REUSE_DEBUG:
+            logger.info(
+                "LayerReuseDbg load layer=%d ranges=%s",
+                layer_id,
+                [(r.request.req_id, r.start_block, r.end_block, r.partial_block_index) for r in request_block_ranges],
             )
         if request_block_ranges:
             self.layer_load_tasks[layer_id].append(
@@ -935,9 +948,7 @@ class KVPoolWorker:
             # Step-end drain: send thread is FIFO, so save_finished[last] means
             # all saves landed -> buffers/GVAs safe to reuse next step.
             while not self.layer_save_finished_events[self.num_layers - 1].wait(timeout=30):
-                logger.warning(
-                    "Layerwise %d save drain not done, keep waiting", self.current_layer
-                )
+                logger.warning("Layerwise %d save drain not done, keep waiting", self.current_layer)
             for layer_id in range(self.num_layers):
                 if self.layer_save_finished_events[layer_id].is_set():
                     logger.debug(">>>>>>>>>>>>>>>>>>>> clear save layer %d", layer_id)

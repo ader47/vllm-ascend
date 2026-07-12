@@ -129,6 +129,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # VLLM_ASCEND_SFA_DEBUG so verbose logs can be enabled without the device
     # sync cost.
     "VLLM_ASCEND_MF_VERIFY": lambda: bool(int(os.getenv("VLLM_ASCEND_MF_VERIFY", "0"))),
+    # AscendStore layerwise-KV-pool layer-reuse verbose diagnostic logging
+    # (running/decode reload path: per-req load_spec, per-layer load/save
+    # ranges, batch_copy direction+counts). 0 = off (default, production --
+    # avoids hot-loop log spam), 1 = on (debugging reload/save correctness).
+    "VLLM_ASCEND_LAYER_REUSE_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_LAYER_REUSE_DEBUG", "0"))),
 }
 
 # end-env-vars-definition

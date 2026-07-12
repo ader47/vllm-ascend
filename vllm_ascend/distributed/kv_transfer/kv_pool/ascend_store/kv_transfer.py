@@ -13,6 +13,7 @@ from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
+import vllm_ascend.envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
 
 # isort: off
@@ -1186,6 +1187,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         for req_id in req_meta.req_ids:
             self.dec_stored_request(req_id)
         self.sync_save_events[layer_id].synchronize()
+        if ascend_envs.VLLM_ASCEND_LAYER_REUSE_DEBUG:
+            logger.info(
+                "LayerReuseDbg copy layer=%d dir=save(l2g) addrs=%d",
+                layer_id,
+                len(gvas_array),
+            )
         res = self._batch_copy_with_limits(
             gvas_array,
             addr_array,
@@ -1339,6 +1346,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             (self.tp_rank * len(req_meta.size_array)) // self.tp_size,
         )
         self._stagger_h2d_submit(layer_id)
+        if ascend_envs.VLLM_ASCEND_LAYER_REUSE_DEBUG:
+            logger.info(
+                "LayerReuseDbg copy layer=%d dir=load(g2l) addrs=%d",
+                layer_id,
+                len(gvas_array),
+            )
         res = self._batch_copy_with_limits(
             gvas_array,
             addr_array,

@@ -24,6 +24,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackEncoder
 
+import vllm_ascend.envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
 )
@@ -835,6 +836,17 @@ class KVPoolScheduler:
             )
         else:
             load_spec = None
+        if ascend_envs.VLLM_ASCEND_LAYER_REUSE_DEBUG:
+            load_desc = f"reload[0,{prev_token_count}]" if load_spec is not None else "none"
+            logger.info(
+                "LayerReuseDbg running req=%s new_tok=%d token_len=%d prev=%d has_last=%s load=%s",
+                req_id,
+                num_new_tokens,
+                request_tracker.token_len,
+                prev_token_count,
+                has_last_block,
+                load_desc,
+            )
         return self._build_req_meta(
             request_tracker,
             request.block_hashes,
