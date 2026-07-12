@@ -927,7 +927,9 @@ class KVPoolScheduler:
         if not force_skip_save:
             for i, req_id in enumerate(cached_reqs.req_ids):
                 new_block_ids = cached_reqs.new_block_ids[i]
-                if not new_block_ids:
+                # Layer reuse: decode steps allocate no new block but still need a
+                # prefix reload (shared layers) + partial-block save, so don't skip.
+                if not new_block_ids and not self.layerwise_offload:
                     continue
                 if req_id in self._preempted_req_ids:
                     req_meta = self._process_preempted_cached_request(
