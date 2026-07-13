@@ -128,6 +128,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    build_sfa_layerwise_cache_plan,
     get_gva_layerwise_config,
     get_layerwise_kv_cache_reuse_layers,
     get_layerwise_storage_indices,
@@ -4084,6 +4085,75 @@ class NPUModelRunner(GPUModelRunner):
 
         old_tensors = kv_cache_config.kv_cache_tensors
         if len(old_tensors) <= 1:
+            return
+
+        layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        sfa_plan = build_sfa_layerwise_cache_plan(
+            layer_kv_cache_spec,
+            extra_config,
+        )
+        if sfa_plan is not None:
+            if sfa_plan.logical_page_bytes == sfa_plan.physical_page_bytes:
+                return
+
+            # Split SFA has more cache owners than forward callbacks: a main
+            # attention owner for every transformer layer and indexer owners
+            # only where the model really materializes indexer K.  Rewriting
+            # the combined owner list as one round-robin sequence would mix
+            # different page sizes and would make the callback/reuse cadence
+            # diverge.  Keep separate main and indexer scratch pools, but map
+            # both through the main layer's storage schedule.
+            old_tensor_by_owner: dict[str, KVCacheTensor] = {}
+            for tensor in old_tensors:
+                if len(tensor.shared_by) != 1:
+                    raise ValueError(
+                        "Split SFA layerwise cache planning expects one cache "
+                        "owner per tensor before physical reuse"
+                    )
+                owner = tensor.shared_by[0]
+                if owner in old_tensor_by_owner:
+                    raise ValueError(f"Duplicate KV cache tensor owner {owner!r}")
+                old_tensor_by_owner[owner] = tensor
+
+            planned_owners = {
+                owner
+                for pool in (*sfa_plan.main_pools, *sfa_plan.indexer_pools)
+                for owner in pool
+            }
+            if planned_owners != set(old_tensor_by_owner):
+                missing = sorted(set(old_tensor_by_owner) - planned_owners)
+                extra = sorted(planned_owners - set(old_tensor_by_owner))
+                raise ValueError(
+                    "Split SFA layerwise cache plan does not cover every "
+                    f"cache owner exactly once: missing={missing}, extra={extra}"
+                )
+
+            new_tensors: list[KVCacheTensor] = []
+            for pool in (*sfa_plan.main_pools, *sfa_plan.indexer_pools):
+                tensor_sizes = {old_tensor_by_owner[owner].size for owner in pool}
+                if len(tensor_sizes) != 1:
+                    raise ValueError(
+                        "Split SFA physical pool contains incompatible tensor "
+                        f"sizes for owners {list(pool)}: sizes={sorted(tensor_sizes)}"
+                    )
+                new_tensors.append(
+                    KVCacheTensor(
+                        size=tensor_sizes.pop(),
+                        shared_by=list(pool),
+                    )
+                )
+
+            kv_cache_config.kv_cache_tensors = new_tensors
+            logger.info(
+                "Split SFA layerwise cache reuse: main_layers=%d, "
+                "real_indexers=%d, main_pools=%d, indexer_pools=%d, "
+                "num_blocks=%d",
+                len(sfa_plan.entries),
+                sum(entry.indexer_layer_name is not None for entry in sfa_plan.entries),
+                len(sfa_plan.main_pools),
+                len(sfa_plan.indexer_pools),
+                kv_cache_config.num_blocks,
+            )
             return
 
         # GVA layerwise currently supports one uniform KV cache group, whose

@@ -235,6 +235,26 @@ class TestChunkedTokenDatabase(unittest.TestCase):
         self.assertEqual(addr[0], 1000 + 5 * 160)
         self.assertEqual(addr[1], 2000 + 5 * 320)
 
+    def test_prepare_value_layer_with_variable_cache_ranges(self):
+        self.db.set_group_buffers(
+            {0: [1000, 2000, 3000, 4000, 5000]},
+            {0: [160, 320, 80, 160, 320]},
+            group_num_layers={0: 2},
+            group_layer_cache_ranges={0: [(0, 3), (3, 5)]},
+        )
+
+        first_addrs, first_sizes, _ = self.db.prepare_value_layer(
+            0, 16, [5], layer_id=0
+        )
+        second_addrs, second_sizes, _ = self.db.prepare_value_layer(
+            0, 16, [5], layer_id=1
+        )
+
+        self.assertEqual(first_addrs, [1800, 3600, 3400])
+        self.assertEqual(first_sizes, [160, 320, 80])
+        self.assertEqual(second_addrs, [4800, 6600])
+        self.assertEqual(second_sizes, [160, 320])
+
     def test_decode_adaptor_prefill_pp_no_partitions(self):
         key, addr, size = self.db.decode_adaptor_prefill_pp(["k1"], [[1, 2]], [[10, 20]])
         self.assertEqual(key, ["k1"])

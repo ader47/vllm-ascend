@@ -29,6 +29,9 @@ from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackDecoder
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import AscendStoreKVConnectorWorkerMetadata
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    build_sfa_layerwise_cache_plan_from_group,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
     KVPoolScheduler,
     get_zmq_rpc_path_lookup,
@@ -104,6 +107,18 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         if role == KVConnectorRole.SCHEDULER:
             assert kv_cache_config is not None
             page_size_bytes = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+            group = kv_cache_config.kv_cache_groups[0]
+            if self.use_gva_layerwise:
+                sfa_plan = build_sfa_layerwise_cache_plan_from_group(
+                    group,
+                    vllm_config.kv_transfer_config.kv_connector_extra_config,
+                )
+                if sfa_plan is not None:
+                    # UniformType.page_size_bytes is the sum across every
+                    # cache owner in the model.  GVA allocates one fixed host
+                    # page per transformer-layer key, so use the largest
+                    # main-plus-optional-indexer transfer instead.
+                    page_size_bytes = sfa_plan.host_page_bytes
             self.connector_scheduler = KVPoolScheduler(
                 vllm_config, self.use_layerwise, kv_cache_config, page_size_bytes=page_size_bytes
             )

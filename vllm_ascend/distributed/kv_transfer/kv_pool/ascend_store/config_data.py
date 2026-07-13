@@ -216,6 +216,10 @@ class ChunkedTokenDatabase:
         self.group_kv_caches_base_addr: dict[int, list[int]] = {}
         self.group_block_len: dict[int, list[int]] = {}
         self.group_block_stride: dict[int, list[int]] = {}
+        # Optional flattened [start, end) cache-entry ranges for each runtime
+        # layer callback. Split SFA layers have two main cache tensors and an
+        # indexer sidecar only on real indexer owners, so their width varies.
+        self.group_layer_cache_ranges: dict[int, list[tuple[int, int]]] = {}
         self.group_cache_families: dict[str, dict[int, str]] = {
             "kv": {},
             "state": {},
@@ -301,6 +305,7 @@ class ChunkedTokenDatabase:
         cache_role: str = "kv",
         group_cache_families: dict[int, str] | None = None,
         group_num_layers: dict[int, int] | None = None,
+        group_layer_cache_ranges: dict[int, list[tuple[int, int]]] | None = None,
     ) -> None:
         if cache_role == "state":
             # Keep the interface for future explicit state groups, but this
@@ -314,6 +319,11 @@ class ChunkedTokenDatabase:
             self.group_cache_families[cache_role] = group_cache_families.copy()
         if group_num_layers is not None:
             self.group_num_layers[cache_role] = group_num_layers.copy()
+        if cache_role == "kv" and group_layer_cache_ranges is not None:
+            self.group_layer_cache_ranges = {
+                group_id: ranges.copy()
+                for group_id, ranges in group_layer_cache_ranges.items()
+            }
 
     def _get_group_buffers(
         self, kv_cache_group_id: int, cache_role: str = "kv"
@@ -376,12 +386,22 @@ class ChunkedTokenDatabase:
         size_list: list[int] = []
         group_addrs, group_block_len, group_block_stride = self._get_group_buffers(0)
         num_layers = self.group_num_layers.get("kv", {}).get(0, 1)
-        entries_per_layer = len(group_addrs) // num_layers if num_layers else 0
-        if layer_id >= num_layers or entries_per_layer == 0:
+        layer_ranges = self.group_layer_cache_ranges.get(0)
+        if layer_ranges is not None:
+            if layer_id >= len(layer_ranges):
+                return [], [], 0
+            start_idx, end_idx = layer_ranges[layer_id]
+        else:
+            # Legacy layouts have the same number of cache tensors on every
+            # layer. Keep their compact representation as a fallback.
+            entries_per_layer = len(group_addrs) // num_layers if num_layers else 0
+            if layer_id >= num_layers or entries_per_layer == 0:
+                return [], [], 0
+            start_idx = layer_id * entries_per_layer
+            end_idx = start_idx + entries_per_layer
+        if start_idx < 0 or end_idx > len(group_addrs) or start_idx >= end_idx:
             return [], [], 0
-        start_idx = layer_id * entries_per_layer
-        for i in range(entries_per_layer):
-            idx = start_idx + i
+        for idx in range(start_idx, end_idx):
             block_stride = group_block_stride[idx] if group_block_stride else group_block_len[idx]
             addr = group_addrs[idx] + block_id * block_stride
             size = int(group_block_len[idx] / group_block_size * (end - start))

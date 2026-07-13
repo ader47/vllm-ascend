@@ -66,11 +66,22 @@ class LayerBatchBuilder:
         )
         group_block_stride = token_database.group_block_stride.get(0, token_database.group_block_len[0])
         self._block_stride_np = np.asarray(group_block_stride, dtype=np.int64)
-        # group_block_len[0] / kv_caches_base_addr[0] are laid out flat as
-        # [layer0_caches..., layer1_caches..., ...]; the per-layer stride is the
-        # total length divided by the number of layers (mirrors
-        # ChunkedTokenDatabase caches_per_layer computation).
-        self._caches_per_layer = max(1, self._block_len_np.shape[0] // max(1, num_layers))
+        layer_ranges = token_database.group_layer_cache_ranges.get(0)
+        if layer_ranges is None:
+            # Legacy layouts are rectangular: every layer owns the same number
+            # of tensors. Split SFA supplies explicit ranges because only real
+            # indexer owners carry the additional sidecar tensor.
+            caches_per_layer = max(1, self._block_len_np.shape[0] // max(1, num_layers))
+            layer_ranges = [
+                (layer_id * caches_per_layer, (layer_id + 1) * caches_per_layer)
+                for layer_id in range(num_layers)
+            ]
+        if len(layer_ranges) != num_layers:
+            raise ValueError(
+                "Layer cache range count does not match GVA layer count: "
+                f"ranges={len(layer_ranges)}, layers={num_layers}"
+            )
+        self._layer_cache_ranges = tuple(layer_ranges)
         self._block_ids_buf: np.ndarray | None = None
         self._block_gvas_buf: np.ndarray | None = None
 
@@ -109,15 +120,18 @@ class LayerBatchBuilder:
         base_gvas_arr: np.ndarray,
         layer_id: int,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        caches_per_layer = self._caches_per_layer
-        # group_* arrays are laid out flat as [layer0_caches..., layer1_caches...];
-        # slice the per-layer window for ``layer_id``. Using the full length as the
-        # stride (the old behaviour) overshoots for layer_id >= 1 and yields empty
-        # slices -> broadcast errors.
-        base_offset = layer_id * caches_per_layer
-        layer_base_addrs = self._kv_caches_base_addr_np[base_offset : base_offset + caches_per_layer]
-        layer_block_len = self._block_len_np[base_offset : base_offset + caches_per_layer]
-        layer_block_stride = self._block_stride_np[base_offset : base_offset + caches_per_layer]
+        if layer_id >= len(self._layer_cache_ranges):
+            raise IndexError(f"Invalid layer_id {layer_id} for {len(self._layer_cache_ranges)} layer ranges")
+        start_idx, end_idx = self._layer_cache_ranges[layer_id]
+        layer_base_addrs = self._kv_caches_base_addr_np[start_idx:end_idx]
+        layer_block_len = self._block_len_np[start_idx:end_idx]
+        layer_block_stride = self._block_stride_np[start_idx:end_idx]
+        layer_page_bytes = int(layer_block_len.sum())
+        if layer_page_bytes > self.page_size_bytes:
+            raise ValueError(
+                "Layer cache payload exceeds the configured GVA page: "
+                f"layer={layer_id}, payload={layer_page_bytes}, page={self.page_size_bytes}"
+            )
         # Per-cache inner offsets within one layer's page: [0, len0, len0+len1, ...].
         layer_inner_offsets = np.concatenate(
             (np.zeros(1, dtype=np.int64), np.cumsum(layer_block_len[:-1], dtype=np.int64))

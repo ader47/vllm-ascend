@@ -62,6 +62,7 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    build_sfa_layerwise_cache_plan,
     get_gva_layerwise_config,
     get_layerwise_kv_cache_num_tensors,
 )
@@ -613,6 +614,28 @@ class NPUWorker(WorkerBase):
         extra_config = get_gva_layerwise_config(kv_transfer_config)
         if extra_config is None:
             return available
+        sfa_plan = getattr(self, "_gva_sfa_layerwise_cache_plan", None)
+        if (
+            sfa_plan is not None
+            and sfa_plan.physical_page_bytes < sfa_plan.logical_page_bytes
+        ):
+            # UniformType computes num_blocks from the sum of every logical
+            # owner page.  Split SFA later replaces those tensors with a small
+            # main scratch pool plus a small indexer scratch pool, so count
+            # bytes rather than owners: main and indexer pages are different
+            # sizes and a simple layer-count ratio would over-allocate HBM.
+            factor = sfa_plan.logical_page_bytes / sfa_plan.physical_page_bytes
+            available = int(available * factor)
+            logger.info(
+                "Split SFA layerwise KV cache reuse: inflating available "
+                "memory by %.2fx (logical_page_bytes=%d, "
+                "physical_page_bytes=%d)",
+                factor,
+                sfa_plan.logical_page_bytes,
+                sfa_plan.physical_page_bytes,
+            )
+            return available
+
         total_layers = getattr(
             self,
             "_gva_layerwise_num_layers",
@@ -931,10 +954,16 @@ class NPUWorker(WorkerBase):
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         kv_cache_spec = self.model_runner.get_kv_cache_spec()
-        if get_gva_layerwise_config(self.vllm_config.kv_transfer_config) is not None:
-            # GVA layerwise supports one KV cache group, so the cache-spec count
-            # is also the actual layer count (including MTP/draft layers).
-            self._gva_layerwise_num_layers = len(kv_cache_spec)
+        extra_config = get_gva_layerwise_config(self.vllm_config.kv_transfer_config)
+        if extra_config is not None:
+            sfa_plan = build_sfa_layerwise_cache_plan(kv_cache_spec, extra_config)
+            self._gva_sfa_layerwise_cache_plan = sfa_plan
+            # Split indexer owners do not produce connector callbacks.  Keep
+            # the main execution count for fallback layerwise accounting and
+            # use the byte-weighted SFA plan in determine_available_memory().
+            self._gva_layerwise_num_layers = (
+                len(sfa_plan.entries) if sfa_plan is not None else len(kv_cache_spec)
+            )
         return kv_cache_spec
 
     def update_max_model_len(self, max_model_len: int) -> None:

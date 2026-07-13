@@ -6,6 +6,8 @@ import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
     _DEFAULT_MAX_PREFETCH_LAYERS,
+    build_sfa_layerwise_cache_plan,
+    build_sfa_layerwise_cache_plan_from_group,
     get_gva_layerwise_config,
     get_layer_load_start_block,
     get_layerwise_config,
@@ -16,6 +18,75 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config i
     get_layerwise_num_shared_buffers,
     get_layerwise_storage_indices,
 )
+
+
+def _sfa_name(layer_id: int, suffix: str) -> str:
+    return f"model.layers.{layer_id}.self_attn.{suffix}"
+
+
+class TestSFALayerwiseCachePlan:
+    def test_real_indexers_follow_main_layer_storage_schedule(self):
+        specs = {
+            **{
+                _sfa_name(layer_id, "attn"): SimpleNamespace(page_size_bytes=100)
+                for layer_id in range(6)
+            },
+            **{
+                _sfa_name(layer_id, "indexer.k_cache"): SimpleNamespace(
+                    page_size_bytes=20
+                )
+                for layer_id in (0, 2, 4)
+            },
+        }
+
+        plan = build_sfa_layerwise_cache_plan(
+            specs,
+            {"layerwise_num_shared_buffers": 2},
+        )
+
+        assert plan is not None
+        assert len(plan.entries) == 6
+        assert [
+            index
+            for index, entry in enumerate(plan.entries)
+            if entry.indexer_layer_name is not None
+        ] == [0, 2, 4]
+        assert plan.main_pools == (
+            (_sfa_name(0, "attn"),),
+            (_sfa_name(5, "attn"),),
+            (_sfa_name(1, "attn"), _sfa_name(3, "attn")),
+            (_sfa_name(2, "attn"), _sfa_name(4, "attn")),
+        )
+        assert plan.indexer_pools == (
+            (_sfa_name(0, "indexer.k_cache"),),
+            (
+                _sfa_name(2, "indexer.k_cache"),
+                _sfa_name(4, "indexer.k_cache"),
+            ),
+        )
+        assert plan.logical_page_bytes == 660
+        assert plan.physical_page_bytes == 440
+        assert plan.host_page_bytes == 120
+
+    def test_non_sfa_layout_is_not_claimed(self):
+        specs = {"model.layers.0.self_attn.attn": SimpleNamespace(page_size_bytes=100)}
+        assert build_sfa_layerwise_cache_plan(specs) is None
+
+    def test_collapsed_scheduler_group_uses_preserved_specs(self):
+        specs = {
+            _sfa_name(0, "attn"): SimpleNamespace(page_size_bytes=100),
+            _sfa_name(0, "indexer.k_cache"): SimpleNamespace(page_size_bytes=20),
+        }
+        group = SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(page_size_bytes=20),
+            _ascend_sfa_layerwise_cache_specs=specs,
+        )
+
+        plan = build_sfa_layerwise_cache_plan_from_group(group)
+
+        assert plan is not None
+        assert len(plan.entries) == 1
+        assert plan.host_page_bytes == 120
 
 
 class TestNumSharedBuffers:

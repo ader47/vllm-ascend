@@ -57,6 +57,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     record_failed_blocks,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    SFALayerwiseCachePlan,
+    build_sfa_layerwise_cache_plan,
     get_layer_load_start_block,
     get_layerwise_config,
 )
@@ -587,6 +589,46 @@ class KVPoolWorker:
         self.group_block_stride[group_id] = group_block_strides
         self.group_num_layers[group_id] = len(layer_names)
 
+    def _infer_sfa_layerwise_group_metadata(
+        self,
+        group_id: int,
+        plan: SFALayerwiseCachePlan,
+    ) -> None:
+        """Flatten main KV and optional indexer sidecars by forward layer."""
+
+        group_addrs: list[int] = []
+        group_block_lens: list[int] = []
+        group_block_strides: list[int] = []
+        layer_ranges: list[tuple[int, int]] = []
+
+        for entry in plan.entries:
+            start_idx = len(group_addrs)
+            owner_names = [entry.main_layer_name]
+            if entry.indexer_layer_name is not None:
+                owner_names.append(entry.indexer_layer_name)
+            for owner_name in owner_names:
+                for cache in self._as_cache_tuple(self.kv_caches[owner_name]):
+                    block_len, block_stride, _, _ = self._get_cache_block_metadata(cache)
+                    group_addrs.append(cache.data_ptr())
+                    group_block_lens.append(block_len)
+                    group_block_strides.append(block_stride)
+            layer_ranges.append((start_idx, len(group_addrs)))
+
+        self.group_kv_caches_base_addr[group_id] = group_addrs
+        self.group_block_len[group_id] = group_block_lens
+        self.group_block_stride[group_id] = group_block_strides
+        self.group_layer_cache_ranges[group_id] = layer_ranges
+        self.group_num_layers[group_id] = len(plan.entries)
+
+        logger.info(
+            "Registered split SFA AscendStore manifest: main_layers=%d, "
+            "real_indexers=%d, cache_entries=%d, host_page_bytes=%d",
+            len(plan.entries),
+            sum(entry.indexer_layer_name is not None for entry in plan.entries),
+            len(group_addrs),
+            plan.host_page_bytes,
+        )
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
         first_kv_cache_tuple = self._as_cache_tuple(first_kv_cache_tuple)
@@ -607,6 +649,7 @@ class KVPoolWorker:
         self.group_kv_caches_base_addr: dict[int, list[int]] = {}
         self.group_block_len: dict[int, list[int]] = {}
         self.group_block_stride: dict[int, list[int]] = {}
+        self.group_layer_cache_ranges: dict[int, list[tuple[int, int]]] = {}
         self.kv_caches = kv_caches
         self.group_kv_cache_families: dict[int, str] = {
             group_id: self._get_group_family(self.kv_cache_group_families, group_id)
@@ -643,7 +686,26 @@ class KVPoolWorker:
         ptrs = [start for start, _ in registered_regions.values()]
         lengths = [end - start for start, end in registered_regions.values()]
 
-        if self.kv_cache_config is not None and self.use_hybrid:
+        sfa_plan: SFALayerwiseCachePlan | None = None
+        if self.use_gva_layerwise and self.kv_cache_config is not None:
+            if len(self.kv_cache_config.kv_cache_groups) != 1:
+                raise NotImplementedError(
+                    "Split SFA AscendStore layerwise transfer requires one KV cache group."
+                )
+            group_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+            if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                sfa_plan = build_sfa_layerwise_cache_plan(
+                    group_spec.kv_cache_specs,
+                    self._extra_config,
+                )
+
+        if sfa_plan is not None:
+            # Runtime emits one connector callback per main attention layer.
+            # Flatten the separately allocated real indexer cache immediately
+            # after that layer's main K/V entries so one callback transfers all
+            # state produced by the transformer layer.
+            self._infer_sfa_layerwise_group_metadata(0, sfa_plan)
+        elif self.kv_cache_config is not None and self.use_hybrid:
             for group_id, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
                 self._infer_cache_group_metadata(group_id, group_spec.layer_names)
         else:
@@ -676,7 +738,11 @@ class KVPoolWorker:
                 len(self.independent_layers),
             )
 
-        self.page_size_bytes = sum(self.block_len)
+        self.page_size_bytes = (
+            sfa_plan.host_page_bytes
+            if sfa_plan is not None
+            else sum(self.block_len)
+        )
         self.token_database.set_group_buffers(
             self.group_kv_caches_base_addr,
             self.group_block_len,
@@ -684,6 +750,7 @@ class KVPoolWorker:
             cache_role="kv",
             group_cache_families=self.group_kv_cache_families,
             group_num_layers=self.group_num_layers,
+            group_layer_cache_ranges=self.group_layer_cache_ranges,
         )
         # Initialize store, register buffers, and start transfer threads
         # directly here (like main) — no separate init_backend handshake.

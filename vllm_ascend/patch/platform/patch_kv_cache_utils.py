@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
+import copy
 import math
 from collections import defaultdict
 
@@ -20,6 +21,46 @@ from vllm.v1.kv_cache_interface import (
 from vllm_ascend.utils import vllm_version_is
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
+_orig_generate_scheduler_kv_cache_config = (
+    vllm.v1.core.kv_cache_utils.generate_scheduler_kv_cache_config
+)
+
+_SFA_LAYERWISE_SCHEDULER_SPECS_ATTR = "_ascend_sfa_layerwise_cache_specs"
+
+
+def _ascend_generate_scheduler_kv_cache_config(
+    kv_cache_configs: list[KVCacheConfig],
+) -> KVCacheConfig:
+    """Retain split-SFA layer specs after vLLM collapses scheduler specs.
+
+    vLLM replaces a UniformType group with one arbitrary representative spec
+    before constructing the scheduler. That is sufficient for block-table
+    management, but AscendStore also needs every main/indexer page size to
+    allocate its fixed GVA transfer pages. Attach the original mapping as
+    Ascend-only metadata instead of changing the representative manager spec.
+    """
+
+    scheduler_config = _orig_generate_scheduler_kv_cache_config(kv_cache_configs)
+    worker_config = kv_cache_configs[0]
+    for scheduler_group, worker_group in zip(
+        scheduler_config.kv_cache_groups,
+        worker_config.kv_cache_groups,
+    ):
+        worker_spec = worker_group.kv_cache_spec
+        if not isinstance(worker_spec, UniformTypeKVCacheSpecs):
+            continue
+        layer_specs = worker_spec.kv_cache_specs
+        if not any(
+            layer_name.endswith(".self_attn.indexer.k_cache")
+            for layer_name in layer_specs
+        ):
+            continue
+        setattr(
+            scheduler_group,
+            _SFA_LAYERWISE_SCHEDULER_SPECS_ATTR,
+            copy.deepcopy(layer_specs),
+        )
+    return scheduler_config
 
 
 def _ascend_resolve_kv_cache_block_sizes(
@@ -250,6 +291,9 @@ def _get_kv_cache_config_deepseek_v4(
 
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+vllm.v1.core.kv_cache_utils.generate_scheduler_kv_cache_config = (
+    _ascend_generate_scheduler_kv_cache_config
+)
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
 # vllm v0.24.0 renamed _get_kv_cache_config_deepseek_v4 to _get_kv_cache_config_packed and
@@ -264,3 +308,6 @@ else:
 import vllm.v1.engine.core  # noqa: E402
 
 vllm.v1.engine.core.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+vllm.v1.engine.core.generate_scheduler_kv_cache_config = (
+    _ascend_generate_scheduler_kv_cache_config
+)

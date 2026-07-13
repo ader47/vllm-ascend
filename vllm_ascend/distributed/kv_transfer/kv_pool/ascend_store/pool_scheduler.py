@@ -40,6 +40,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     normalize_block_ids_by_group,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    build_sfa_layerwise_cache_plan_from_group,
     get_layerwise_config,
 )
 
@@ -172,8 +173,29 @@ class KVPoolScheduler:
         if self.use_gva_layerwise:
             if len(kv_cache_config.kv_cache_groups) != 1:
                 raise NotImplementedError("AscendStore layerwise mode does not yet support hybrid KV cache groups.")
-            # The cache group is authoritative and includes MTP/draft layers.
-            self.num_layers = len(kv_cache_config.kv_cache_groups[0].layer_names)
+            group = kv_cache_config.kv_cache_groups[0]
+            sfa_plan = build_sfa_layerwise_cache_plan_from_group(
+                group,
+                vllm_config.kv_transfer_config.kv_connector_extra_config,
+            )
+            # A split indexer spec is a cache owner, not another model forward
+            # callback.  Scheduler keys and GVA layer offsets must follow the
+            # main execution layers or worker events will never line up.
+            self.num_layers = (
+                len(sfa_plan.entries) if sfa_plan is not None else len(group.layer_names)
+            )
+            if sfa_plan is not None:
+                self.page_size_bytes = sfa_plan.host_page_bytes
+                logger.info(
+                    "Split SFA scheduler GVA layout: main_layers=%d, "
+                    "real_indexers=%d, page_size_bytes=%d",
+                    len(sfa_plan.entries),
+                    sum(
+                        entry.indexer_layer_name is not None
+                        for entry in sfa_plan.entries
+                    ),
+                    self.page_size_bytes,
+                )
         self.model_name = model_config.model.split("/")[-1]
 
         if self.use_gva_layerwise:

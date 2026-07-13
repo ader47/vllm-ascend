@@ -19,6 +19,8 @@ import threading
 import unittest
 from unittest.mock import MagicMock
 
+import numpy as np
+
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm.distributed.kv_events import BlockStored
@@ -39,7 +41,44 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     KVCacheStoreRecvingThread,
     KVCacheStoreSendingThread,
     KVTransferThread,
+    LayerBatchBuilder,
 )
+
+
+class TestLayerBatchBuilder(unittest.TestCase):
+    def test_variable_layer_cache_ranges_share_fixed_gva_page(self):
+        database = MagicMock()
+        database.group_block_len = {0: [10, 20, 5, 10, 20]}
+        database.group_kv_caches_base_addr = {
+            0: [1000, 2000, 3000, 4000, 5000]
+        }
+        database.group_block_stride = {0: [10, 20, 5, 10, 20]}
+        database.group_layer_cache_ranges = {0: [(0, 3), (3, 5)]}
+        builder = LayerBatchBuilder(
+            database,
+            my_key_index=0,
+            num_ranks_per_layer=1,
+            page_size_bytes=35,
+            num_layers=2,
+        )
+
+        layer0 = builder._build_transfer_arrays(
+            np.asarray([2], dtype=np.int64),
+            np.asarray([10000], dtype=np.int64),
+            layer_id=0,
+        )
+        layer1 = builder._build_transfer_arrays(
+            np.asarray([2], dtype=np.int64),
+            np.asarray([10000], dtype=np.int64),
+            layer_id=1,
+        )
+
+        np.testing.assert_array_equal(layer0[0], [1020, 2040, 3010])
+        np.testing.assert_array_equal(layer0[1], [10, 20, 5])
+        np.testing.assert_array_equal(layer0[2], [10000, 10010, 10030])
+        np.testing.assert_array_equal(layer1[0], [4020, 5040])
+        np.testing.assert_array_equal(layer1[1], [10, 20])
+        np.testing.assert_array_equal(layer1[2], [10035, 10045])
 
 
 class FakeStore:
