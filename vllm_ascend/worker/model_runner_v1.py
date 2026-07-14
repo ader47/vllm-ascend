@@ -4464,21 +4464,19 @@ class NPUModelRunner(GPUModelRunner):
                 "SFA true hybrid physical slot cannot mix unrelated cache "
                 f"layers: {sorted(unclassified_layer_names)}."
             )
-        # Uneven group sizes (for example an extra MTP main layer) can leave a
-        # valid main-only tail slot. Let the existing main allocator handle it.
+        # Uneven group sizes can leave a valid tail slot owned by only one
+        # cache family. Let the existing type-specific allocator handle it.
+        # GLM-5.2 has 78 main layers but only 21 real indexer layers, so its
+        # generic hybrid layout naturally contains an indexer-only tail slot.
         if main_layer_names and not indexer_layer_names:
             return None
-        if not main_layer_names:
-            raise ValueError(
-                "Every SFA indexer physical slot must contain a main MLA "
-                "layer, got shared_by="
-                f"{kv_cache_tensor.shared_by}."
-            )
         if len(indexer_layer_names) != 1:
             raise ValueError(
                 "SFA true hybrid physical slot requires exactly one indexer "
                 f"layer, got {indexer_layer_names}."
             )
+        if not main_layer_names:
+            return None
         if len(main_layer_names) > len(self.sfa_main_kv_cache_group_ids):
             raise ValueError(
                 "SFA true hybrid physical slot has more main MLA layers than "

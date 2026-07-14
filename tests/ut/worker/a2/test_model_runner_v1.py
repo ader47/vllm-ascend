@@ -153,23 +153,50 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertIs(main_k, indexer_k)
         self.assertIs(main_padding, indexer_scale)
 
-    def test_offload_hybrid_rejects_physically_separate_indexer_slot(self):
-        runner = self._build_runner()
-        runner.use_sparse = True
-        runner.use_offload = True
-        runner.sfa_main_kv_cache_group_ids = [0, 1]
-        runner.model_config.hf_text_config = SimpleNamespace(
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-            index_head_dim=128,
-        )
-        config, _, indexer_layer_name = self._build_offload_hybrid_config(
-            use_c8=False
-        )
-        config.kv_cache_tensors[0].shared_by = [indexer_layer_name]
+    def test_offload_hybrid_allocates_indexer_only_tail_slot(self):
+        for use_c8 in (False, True):
+            with self.subTest(use_c8=use_c8):
+                runner = self._build_runner()
+                runner.use_sparse = True
+                runner.use_offload = True
+                runner.use_sparse_c8_indexer = use_c8
+                runner.sfa_main_kv_cache_group_ids = [0, 1]
+                runner.model_config.hf_text_config = SimpleNamespace(
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=64,
+                    index_head_dim=128,
+                )
+                config, _, indexer_layer_name = (
+                    self._build_offload_hybrid_config(use_c8=use_c8)
+                )
+                indexer_group = config.kv_cache_groups[-1]
+                indexer_spec = indexer_group.kv_cache_spec
+                config.kv_cache_groups = [indexer_group]
+                config.kv_cache_tensors[0].shared_by = [indexer_layer_name]
 
-        with self.assertRaisesRegex(ValueError, "must contain a main MLA"):
-            runner._allocate_kv_cache_tensors(config)
+                raw_caches = runner._allocate_kv_cache_tensors(config)
+
+                raw_indexer_cache = raw_caches[indexer_layer_name]
+                self.assertEqual(len(raw_indexer_cache), 2 if use_c8 else 1)
+                expected_k_bytes = (
+                    config.num_blocks
+                    * indexer_spec.block_size
+                    * indexer_spec.num_kv_heads
+                    * indexer_spec.head_size
+                    * indexer_spec.dtype.itemsize
+                )
+                self.assertEqual(raw_indexer_cache[0].numel(), expected_k_bytes)
+                if use_c8:
+                    expected_scale_bytes = (
+                        config.num_blocks
+                        * indexer_spec.block_size
+                        * indexer_spec.num_kv_heads
+                        * indexer_spec.scale_dim
+                        * indexer_spec.scale_dtype.itemsize
+                    )
+                    self.assertEqual(
+                        raw_indexer_cache[1].numel(), expected_scale_bytes
+                    )
 
     def test_allocate_kv_cache_uses_layer_spec_for_draft_gqa(self):
         runner = self._build_runner()
