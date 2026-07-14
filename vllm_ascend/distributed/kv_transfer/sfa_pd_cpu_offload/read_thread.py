@@ -223,13 +223,7 @@ class MembPullReadThread(threading.Thread):
             k_hbm_ptr, v_hbm_ptr = hbm_kv[0].data_ptr(), hbm_kv[1].data_ptr()
 
         indexer = None
-        if len(p_base_addrs) < 3:
-            logger.error(
-                "MembPull indexer: P layer_meta for %s has %d tensors, need >=3; skip indexer leg",
-                layer_name,
-                len(p_base_addrs),
-            )
-        else:
+        if len(p_base_addrs) >= 3:
             p_dsa_len = p_block_len[2]
             d_indexer = state.indexer_tensors[pool_idx]
             d_dsa_len = d_indexer.element_size() * math.prod(d_indexer.shape[1:])

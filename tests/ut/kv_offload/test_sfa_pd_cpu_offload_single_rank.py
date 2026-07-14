@@ -15,6 +15,7 @@ memfabric_hybrid = pytest.importorskip("memfabric_hybrid")
 if not hasattr(memfabric_hybrid, "offload"):
     memfabric_hybrid.offload = MagicMock()
 
+from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload import read_thread as read_thread_module  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload import worker as worker_module  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.read_thread import (  # noqa: E402
     ConsumerReadState,
@@ -92,6 +93,35 @@ def test_non_owner_resolves_layer_without_cpu_destination():
     assert layer["k_cpu_ptr"] is None
     assert layer["v_cpu_ptr"] is None
     assert layer["indexer"]["d_base"] == 8000
+
+
+def test_reuse_layer_accepts_two_tensor_producer_metadata():
+    layer_name = "model.layers.1.self_attn.attn"
+    thread = MembPullReadThread.__new__(MembPullReadThread)
+    thread._state = ConsumerReadState(
+        layer_metadata={},
+        main_name_to_idx={layer_name: 0},
+        cpu_pools=[None],
+        hbm_kv={},
+        indexer_tensors=[],
+        indexer_scale_tensors=[],
+        dest_blocks_by_req={},
+        get_offload_layer_id=lambda _: 0,
+    )
+    thread._p_layer_meta = {
+        layer_name: {
+            "base_addrs": [1000, 2000],
+            "block_len": [10, 20],
+        }
+    }
+
+    with patch.object(read_thread_module.logger, "error") as error_log:
+        layer = thread._resolve_read_layer(layer_name)
+
+    assert layer is not None
+    assert layer["indexer"] is None
+    assert layer["scale"] is None
+    error_log.assert_not_called()
 
 
 def _make_layer(
