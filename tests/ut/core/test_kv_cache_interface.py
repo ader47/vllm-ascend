@@ -224,6 +224,38 @@ def test_get_sfa_hybrid_group_ids_rejects_mixed_group():
         get_sfa_hybrid_group_ids(groups)
 
 
+def test_get_sfa_hybrid_group_ids_rejects_unrelated_cache_group():
+    main_spec = make_offload_main_mla_spec(
+        block_size=MLA_BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=KV_LORA_RANK + QK_ROPE_HEAD_DIM,
+        dtype=torch.bfloat16,
+    )
+    indexer_spec = make_offload_indexer_mla_spec(
+        block_size=MLA_BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=INDEX_HEAD_DIM + INDEXER_PAD_DIM,
+        dtype=torch.bfloat16,
+        cache_dtype_str="auto",
+        index_head_dim=INDEX_HEAD_DIM,
+        indexer_pad_dim=INDEXER_PAD_DIM,
+    )
+    groups = [
+        SimpleNamespace(layer_names=["model.layers.0.self_attn.attn"], kv_cache_spec=main_spec),
+        SimpleNamespace(
+            layer_names=["model.layers.0.self_attn.indexer.k_cache"],
+            kv_cache_spec=indexer_spec,
+        ),
+        SimpleNamespace(
+            layer_names=["cache_only_layers.0"],
+            kv_cache_spec=SimpleNamespace(),
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="only supports"):
+        get_sfa_hybrid_group_ids(groups)
+
+
 def test_offload_c8_pool_three_way_split_matches_main_page():
     """C8 offload allocates raw_k/raw_v/raw_scale from one pool page."""
     k_dim, v_dim = KV_LORA_RANK, QK_ROPE_HEAD_DIM

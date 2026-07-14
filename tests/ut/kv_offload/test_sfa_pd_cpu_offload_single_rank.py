@@ -53,15 +53,21 @@ def test_non_owner_still_registers_memfabric_pull():
         ),
     )
     consumer.use_layerwise = True
-    consumer.kv_cache_config = MagicMock()
+    main_layer_name = "model.layers.0.self_attn.attn"
+    consumer.main_group_ids = [0]
+    consumer.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(layer_names=[main_layer_name])]
+    )
     consumer._register_memfabric_pull = MagicMock()
     sfa_worker = SimpleNamespace(register_kv_caches=MagicMock())
-    kv_caches = {"model.layers.0.self_attn.attn": tuple(MagicMock() for _ in range(5))}
+    main_cache = tuple(MagicMock() for _ in range(4))
+    kv_caches = {main_layer_name: main_cache}
 
     with patch.object(worker_module, "SFAKVOffloadWorker", return_value=sfa_worker):
         consumer.register_kv_caches(kv_caches)
 
     consumer._register_memfabric_pull.assert_called_once_with(kv_caches, None, None)
+    assert consumer._hbm_kv[main_layer_name] == main_cache[:2]
 
 
 def test_non_owner_resolves_layer_without_cpu_destination():
@@ -308,6 +314,7 @@ def test_producer_worker_preserves_transfer_timeout_setup(monkeypatch):
         ),
         patch.object(worker_module.global_te, "configure"),
         patch.object(worker_module.global_te, "get_transfer_engine", return_value=engine),
+        patch.object(worker_module, "get_sfa_hybrid_group_ids", return_value=([0], 1)),
         patch.object(worker_module, "set_shared_layer_transfer_events"),
         patch.object(worker_module, "set_shared_layer_transfer_pending_events"),
     ):

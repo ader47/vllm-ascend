@@ -27,6 +27,7 @@ from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.core.kv_cache_interface import get_sfa_hybrid_group_ids
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
     LayerMultiBlockReqMeta,
     ReqMeta,
@@ -161,7 +162,20 @@ class SFAKVOffloadWorker:
 
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.group_block_sizes = self._infer_group_block_sizes(vllm_config, kv_cache_config)
-        self.block_size = self.group_block_sizes[-1] # only offload kv cache
+        if kv_cache_config is None:
+            raise ValueError("SFA KV offload worker requires a KV cache config.")
+        self.main_group_ids, self.indexer_group_id = get_sfa_hybrid_group_ids(
+            kv_cache_config.kv_cache_groups
+        )
+        main_block_sizes = {
+            self.group_block_sizes[group_id] for group_id in self.main_group_ids
+        }
+        if len(main_block_sizes) != 1:
+            raise ValueError(
+                "All SFA main MLA groups must use the same block size, got "
+                f"{sorted(main_block_sizes)}."
+            )
+        self.block_size = main_block_sizes.pop()
 
         self.current_layer_save = 0
         self.current_layer_load = 0
@@ -253,14 +267,29 @@ class SFAKVOffloadWorker:
 
     def _register_offload_layers(self, kv_caches: dict[str, torch.Tensor]) -> None:
         split_offload_tuple_len = 4
+        main_layer_names = {
+            layer_name
+            for group_id in self.main_group_ids
+            for layer_name in self.kv_cache_config.kv_cache_groups[group_id].layer_names
+        }
         self.offload_layer_names = [
             layer_name
-            for layer_name, cache_or_caches in kv_caches.items()
-            if len(self._as_cache_tuple(cache_or_caches))
-            == split_offload_tuple_len
+            for layer_name in kv_caches
+            if layer_name in main_layer_names
         ]
-        if not self.offload_layer_names:
-            raise ValueError("SFA KV Offload did not find SFA KV cache layers.")
+        missing_layer_names = main_layer_names.difference(self.offload_layer_names)
+        if missing_layer_names:
+            raise ValueError(
+                "SFA KV offload is missing main MLA cache layers: "
+                f"{sorted(missing_layer_names)}"
+            )
+        for layer_name in self.offload_layer_names:
+            tuple_len = len(self._as_cache_tuple(kv_caches[layer_name]))
+            if tuple_len != split_offload_tuple_len:
+                raise ValueError(
+                    f"SFA KV offload main layer {layer_name}: expected split "
+                    f"main tuple length {split_offload_tuple_len}, got {tuple_len}"
+                )
 
         self.num_offload_layers = len(self.offload_layer_names)
         self.num_layers = self.num_offload_layers

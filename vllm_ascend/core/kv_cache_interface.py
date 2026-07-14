@@ -149,13 +149,26 @@ def get_sfa_hybrid_group_ids(
         group_spec = group.kv_cache_spec
         specs = getattr(group_spec, "kv_cache_specs", None)
         layer_specs = list(specs.values()) if specs is not None else [group_spec]
+        if not layer_specs:
+            raise ValueError(
+                f"SFA KV cache group {group_id} has no layer specs: "
+                f"{group.layer_names}"
+            )
         is_indexer_spec = [isinstance(spec, AscendSFAIndexerCacheSpec) for spec in layer_specs]
-        if any(is_indexer_spec) and not all(is_indexer_spec):
-            raise ValueError(f"An SFA KV cache group cannot mix main MLA and indexer specs: {group.layer_names}")
-        if is_indexer_spec and all(is_indexer_spec):
+        is_main_spec = [isinstance(spec, OffloadMLAAttentionSpec) for spec in layer_specs]
+        if all(is_indexer_spec):
             indexer_group_ids.append(group_id)
-        else:
+        elif all(is_main_spec):
             main_group_ids.append(group_id)
+        elif any(is_indexer_spec) or any(is_main_spec):
+            raise ValueError(f"An SFA KV cache group cannot mix main MLA and indexer specs: {group.layer_names}")
+        else:
+            spec_types = sorted({type(spec).__name__ for spec in layer_specs})
+            raise ValueError(
+                "SFA true hybrid KV cache only supports "
+                "OffloadMLAAttentionSpec and AscendSFAIndexerCacheSpec groups; "
+                f"group {group_id} has {spec_types}: {group.layer_names}"
+            )
 
     if len(indexer_group_ids) != 1:
         raise ValueError(f"SFA true hybrid KV cache requires exactly one indexer group, got {indexer_group_ids}.")

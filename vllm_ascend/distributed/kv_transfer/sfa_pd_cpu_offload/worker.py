@@ -193,12 +193,23 @@ class SFAPDCpuOffloadConsumerWorker:
         k_caches_cpu = getattr(self.sfa_worker, "k_caches_cpu", None)
         v_caches_cpu = getattr(self.sfa_worker, "v_caches_cpu", None)
 
-        # Part A: D's main MLA HBM k/v tensors (group1 paged cache) — the partial
+        # Part A: D's main MLA HBM k/v tensors — the partial
         # last block lands here instead of the CPU pool. Keyed by main layer name
-        # (the 5-tuple layers); tuple[0]=k_nope, tuple[1]=v_rope.
-        self._hbm_kv = {
-            n: (t[0], t[1]) for n, t in kv_caches.items() if isinstance(t, (list, tuple)) and len(t) in (5, 6)
+        # from the true-hybrid main groups; tuple[0]=k_nope, tuple[1]=v_rope.
+        main_layer_names = {
+            layer_name
+            for group_id in self.main_group_ids
+            for layer_name in self.kv_cache_config.kv_cache_groups[group_id].layer_names
         }
+        self._hbm_kv = {}
+        for layer_name in main_layer_names:
+            cache_tuple = kv_caches.get(layer_name)
+            if not isinstance(cache_tuple, (list, tuple)) or len(cache_tuple) != 4:
+                raise ValueError(
+                    f"SFA PD offload main layer {layer_name}: expected split "
+                    "main tuple length 4."
+                )
+            self._hbm_kv[layer_name] = (cache_tuple[0], cache_tuple[1])
 
         # memfabric pull mode only.
         assert _resolve_kv_transfer_backend(self.vllm_config) == BACKEND_MEMFABRIC, (
@@ -382,10 +393,25 @@ class SFAPDCpuOffloadConsumerWorker:
             ].layer_names
         )
 
-        def _offload_tuple_len(v: object) -> int:
-            return len(v) if isinstance(v, (list, tuple)) else 1
-
-        main_names = [n for n, v in kv_caches.items() if _offload_tuple_len(v) == 4]
+        main_layer_names = {
+            layer_name
+            for group_id in self.main_group_ids
+            for layer_name in self.kv_cache_config.kv_cache_groups[group_id].layer_names
+        }
+        main_names = [name for name in kv_caches if name in main_layer_names]
+        missing_main_names = main_layer_names.difference(main_names)
+        if missing_main_names:
+            raise ValueError(
+                "SFA PD offload is missing main MLA cache layers: "
+                f"{sorted(missing_main_names)}"
+            )
+        for main_name in main_names:
+            cache_tuple = kv_caches[main_name]
+            if not isinstance(cache_tuple, (list, tuple)) or len(cache_tuple) != 4:
+                raise ValueError(
+                    f"SFA PD offload main layer {main_name}: expected split "
+                    "main tuple length 4."
+                )
         main_names.sort(key=_layer_idx)
 
         # Store layer info for MembPullReadThread
@@ -536,6 +562,9 @@ class SFAPDCpuOffloadProducerWorker:
         self.kv_cache_specs = [group_spec.kv_cache_spec for group_spec in self.kv_cache_config.kv_cache_groups]
         self.block_size = [spec.block_size for spec in self.kv_cache_specs]
         self.num_kv_cache_groups = len(self.kv_cache_specs)
+        self.main_group_ids, self.indexer_group_id = get_sfa_hybrid_group_ids(
+            kv_cache_config.kv_cache_groups
+        )
         self.use_mla = self.vllm_config.model_config.use_mla
         self.layer_metadata: dict[str, LayerMetadata] = {}
         self.index_to_name: defaultdict[int, list[str]] = defaultdict(list)
@@ -643,17 +672,34 @@ class SFAPDCpuOffloadProducerWorker:
             self.layer_metadata[layer_name] = layer_meta
             self.index_to_name[_layer_idx(layer_name)].append(layer_name)
 
+        indexer_names = set(
+            self.kv_cache_config.kv_cache_groups[
+                self.indexer_group_id
+            ].layer_names
+        )
         indexer_name_by_layer = {
-            _layer_idx(name): name
-            for name in kv_caches
-            if name.endswith(".indexer.k_cache")
+            _layer_idx(name): name for name in indexer_names
         }
-        for layer_name, kv_cache_tuple in kv_caches.items():
-            if not (
-                isinstance(kv_cache_tuple, (list, tuple))
-                and len(kv_cache_tuple) == 4
-            ):
+        main_layer_names = {
+            layer_name
+            for group_id in self.main_group_ids
+            for layer_name in self.kv_cache_config.kv_cache_groups[group_id].layer_names
+        }
+        missing_main_names = main_layer_names.difference(kv_caches)
+        if missing_main_names:
+            raise ValueError(
+                "SFA PD producer is missing main MLA cache layers: "
+                f"{sorted(missing_main_names)}"
+            )
+        for layer_name in kv_caches:
+            if layer_name not in main_layer_names:
                 continue
+            kv_cache_tuple = kv_caches[layer_name]
+            if not isinstance(kv_cache_tuple, (list, tuple)) or len(kv_cache_tuple) != 4:
+                raise ValueError(
+                    f"SFA PD producer main layer {layer_name}: expected split "
+                    "main tuple length 4."
+                )
             indexer_name = indexer_name_by_layer.get(_layer_idx(layer_name))
             if indexer_name is None:
                 main_meta = self.layer_metadata[layer_name]
