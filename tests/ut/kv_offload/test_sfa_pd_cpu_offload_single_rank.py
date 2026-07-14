@@ -94,6 +94,106 @@ def test_non_owner_resolves_layer_without_cpu_destination():
     assert layer["indexer"]["d_base"] == 8000
 
 
+def test_resolve_read_layer_accepts_main_only_prefill_manifest():
+    layer_name = "model.layers.0.self_attn.attn"
+    thread = MembPullReadThread.__new__(MembPullReadThread)
+    thread._state = ConsumerReadState(
+        layer_metadata={},
+        main_name_to_idx={layer_name: 0},
+        cpu_pools=[None],
+        hbm_kv={},
+        indexer_tensors=[],
+        indexer_scale_tensors=[],
+        dest_blocks_by_req={},
+        get_offload_layer_id=lambda _: 0,
+    )
+    thread._p_layer_meta = {
+        layer_name: {
+            "base_addrs": [1000, 2000],
+            "block_len": [10, 20],
+        }
+    }
+
+    layer = thread._resolve_read_layer(layer_name)
+
+    assert layer is not None
+    assert layer["p_k_base"] == 1000
+    assert layer["p_v_base"] == 2000
+    assert layer["indexer"] is None
+    assert layer["scale"] is None
+
+
+def _fake_contiguous_cache(base_addr: int, num_blocks: int = 8):
+    cache = MagicMock()
+    cache.shape = (num_blocks, 4, 1, 8)
+    cache.element_size.return_value = 2
+    cache.stride.side_effect = lambda dim: (32, 8, 8, 1)[dim]
+    cache.data_ptr.return_value = base_addr
+    return cache
+
+
+def test_producer_composes_split_prefill_manifest_by_main_layer():
+    main_0 = "model.layers.0.self_attn.attn"
+    main_1 = "model.layers.1.self_attn.attn"
+    indexer_0 = "model.layers.0.self_attn.indexer.k_cache"
+    layer_specs = {
+        main_0: SimpleNamespace(page_size_bytes=128),
+        main_1: SimpleNamespace(page_size_bytes=128),
+        indexer_0: SimpleNamespace(page_size_bytes=64),
+    }
+    group = SimpleNamespace(
+        layer_names=list(layer_specs),
+        kv_cache_spec=SimpleNamespace(kv_cache_specs=layer_specs),
+    )
+    worker = SFAPDCpuOffloadProducerWorker.__new__(
+        SFAPDCpuOffloadProducerWorker
+    )
+    worker.kv_cache_config = SimpleNamespace(kv_cache_groups=[group])
+    worker.vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MultiConnector",
+            kv_connector_extra_config={
+                "connectors": [
+                    {
+                        "kv_connector": "AscendStoreConnector",
+                        "kv_connector_extra_config": {
+                            "backend": "memcache",
+                            "use_layerwise": True,
+                            "layerwise_num_shared_buffers": 1,
+                        },
+                    }
+                ]
+            },
+        )
+    )
+    kv_caches = {
+        main_0: (
+            _fake_contiguous_cache(1000),
+            _fake_contiguous_cache(2000),
+        ),
+        main_1: (
+            _fake_contiguous_cache(3000),
+            _fake_contiguous_cache(4000),
+        ),
+        indexer_0: (_fake_contiguous_cache(5000),),
+    }
+
+    result = worker._build_split_prefill_layer_metadata(
+        kv_caches,
+        {name: 0 for name in layer_specs},
+        num_blocks=8,
+    )
+
+    assert result is not None
+    metadata, ordered_names = result
+    assert ordered_names == [main_0, main_1]
+    assert set(metadata) == {main_0, main_1}
+    assert metadata[main_0].kv_caches_base_addr == [1000, 2000, 5000]
+    assert metadata[main_0].tensor_group_idx == [0, 0, 0]
+    assert metadata[main_0].block_size_scale == [1, 1, 1]
+    assert metadata[main_1].kv_caches_base_addr == [3000, 4000]
+
+
 def _make_layer(
     k_cpu_ptr: int | None,
     v_cpu_ptr: int | None,

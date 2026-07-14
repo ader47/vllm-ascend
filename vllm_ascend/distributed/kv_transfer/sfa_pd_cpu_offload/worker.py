@@ -32,6 +32,10 @@ from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend import envs
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    build_sfa_layerwise_cache_plan_from_group,
+    get_gva_layerwise_config,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
     get_shared_layer_transfer_events,
     get_shared_layer_transfer_pending_events,
@@ -486,6 +490,7 @@ class SFAPDCpuOffloadProducerWorker:
         self.use_mla = self.vllm_config.model_config.use_mla
         self.layer_metadata: dict[str, LayerMetadata] = {}
         self.index_to_name: defaultdict[int, list[str]] = defaultdict(list)
+        self._ordered_main_layer_names: list[str] = []
         self.current_layer = 0
         self.kv_send_layer_thread: MembPullSendingThread | None = None
         self.layer_send_done_events: list[threading.Event] | None = None
@@ -562,6 +567,114 @@ class SFAPDCpuOffloadProducerWorker:
             layer_transfer_pending_events=get_shared_layer_transfer_pending_events(),
         )
 
+    @staticmethod
+    def _as_cache_tuple(cache_or_caches: Any) -> tuple[torch.Tensor, ...]:
+        if isinstance(cache_or_caches, torch.Tensor):
+            return (cache_or_caches,)
+        return tuple(cache_or_caches)
+
+    @staticmethod
+    def _append_tensor_metadata(
+        layer_meta: LayerMetadata,
+        cache_tensors: tuple[torch.Tensor, ...],
+        group_idx: int,
+        num_blocks: int,
+        *,
+        require_unit_scale: bool = False,
+    ) -> None:
+        for cache in cache_tensors:
+            tensor_num_blocks = cache.shape[0]
+            if tensor_num_blocks % num_blocks != 0:
+                raise ValueError(
+                    "The external block size must be an integer multiple of "
+                    "the kernel block size."
+                )
+            block_size_scale = tensor_num_blocks // num_blocks
+            block_len = cache.element_size() * math.prod(cache.shape[1:])
+            if require_unit_scale and block_size_scale != 1:
+                raise ValueError(
+                    "Split SFA PD producer expects one kernel block per P "
+                    f"manager block, got scale={block_size_scale}."
+                )
+            if require_unit_scale and cache.stride(0) * cache.element_size() != block_len:
+                raise ValueError(
+                    "Split SFA PD producer requires contiguous cache blocks "
+                    "because the pull protocol derives source strides from "
+                    "block lengths."
+                )
+            layer_meta.tensor_group_idx.append(group_idx)
+            layer_meta.kv_caches_base_addr.append(cache.data_ptr())
+            layer_meta.block_len.append(block_len)
+            layer_meta.block_size_scale.append(block_size_scale)
+
+    def _build_split_prefill_layer_metadata(
+        self,
+        kv_caches: dict[str, Any],
+        layer2group_ids: dict[str, int],
+        num_blocks: int,
+    ) -> tuple[dict[str, LayerMetadata], list[str]] | None:
+        if len(self.kv_cache_config.kv_cache_groups) != 1:
+            return None
+
+        group = self.kv_cache_config.kv_cache_groups[0]
+        plan = build_sfa_layerwise_cache_plan_from_group(
+            group,
+            get_gva_layerwise_config(self.vllm_config.kv_transfer_config),
+        )
+        if plan is None:
+            return None
+
+        # P now binds main and real-indexer caches separately. The PD wire
+        # protocol remains main-layer based, so compose one positional manifest
+        # as (main_k, main_v[, indexer_k]) for each forward callback.
+        layer_metadata: dict[str, LayerMetadata] = {}
+        ordered_main_names: list[str] = []
+        for entry in plan.entries:
+            main_name = entry.main_layer_name
+            main_caches = self._as_cache_tuple(kv_caches[main_name])
+            if len(main_caches) != 2:
+                raise ValueError(
+                    "Split SFA PD producer expects BF16 main cache "
+                    f"(k, v), got {len(main_caches)} tensors for {main_name}."
+                )
+            group_idx = layer2group_ids[main_name]
+            layer_meta = LayerMetadata([], [], [], [])
+            self._append_tensor_metadata(
+                layer_meta,
+                main_caches,
+                group_idx,
+                num_blocks,
+                require_unit_scale=True,
+            )
+
+            indexer_name = entry.indexer_layer_name
+            if indexer_name is not None:
+                indexer_caches = self._as_cache_tuple(kv_caches[indexer_name])
+                if len(indexer_caches) != 1:
+                    raise ValueError(
+                        "Split SFA PD producer expects one BF16 indexer cache "
+                        f"tensor, got {len(indexer_caches)} for {indexer_name}."
+                    )
+                indexer_group_idx = layer2group_ids[indexer_name]
+                if indexer_group_idx != group_idx:
+                    raise ValueError(
+                        "Split SFA PD producer expects main and indexer owners "
+                        f"in one P cache group, got main={group_idx}, "
+                        f"indexer={indexer_group_idx}."
+                    )
+                self._append_tensor_metadata(
+                    layer_meta,
+                    indexer_caches,
+                    group_idx,
+                    num_blocks,
+                    require_unit_scale=True,
+                )
+
+            layer_metadata[main_name] = layer_meta
+            ordered_main_names.append(main_name)
+
+        return layer_metadata, ordered_main_names
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         # memfabric pull mode only.
         assert self._backend == BACKEND_MEMFABRIC, "SFAPDCpuOffloadConnector P side supports memfabric pull only."
@@ -571,30 +684,38 @@ class SFAPDCpuOffloadProducerWorker:
                 layer2group_ids[layer_name] = group_idx
 
         num_blocks = self.kv_cache_config.num_blocks
-        for layer_name, kv_cache_tuple in kv_caches.items():
-            if not isinstance(kv_cache_tuple, (list, tuple)):
-                kv_cache_tuple = [kv_cache_tuple]
-            group_idx = layer2group_ids[layer_name]
-            layer_meta = LayerMetadata([], [], [], [])
-            for single_kv_cache in kv_cache_tuple:
-                tensor_num_blocks = single_kv_cache.shape[0]
-                assert tensor_num_blocks % num_blocks == 0, (
-                    "The external block size must be an integer multiple of the kernel block size."
-                )
-                block_size_scale = tensor_num_blocks // num_blocks
-                block_shape = single_kv_cache.shape[1:]
-                layer_meta.tensor_group_idx.append(group_idx)
-                layer_meta.kv_caches_base_addr.append(single_kv_cache.data_ptr())
-                layer_meta.block_len.append(single_kv_cache.element_size() * math.prod(block_shape))
-                layer_meta.block_size_scale.append(block_size_scale)
-            self.layer_metadata[layer_name] = layer_meta
-            self.index_to_name[_layer_idx(layer_name)].append(layer_name)
-
-        if self.total_layers < len(self.layer_metadata):
-            self.total_layers = len(self.layer_metadata)
-            # Resize in place so a connector that already captured the shared
-            # list keeps observing the same event objects.
+        split_metadata = self._build_split_prefill_layer_metadata(
+            kv_caches,
+            layer2group_ids,
+            num_blocks,
+        )
+        self.layer_metadata.clear()
+        self.index_to_name.clear()
+        self._ordered_main_layer_names = []
+        if split_metadata is not None:
+            self.layer_metadata, self._ordered_main_layer_names = split_metadata
+            for layer_name in self._ordered_main_layer_names:
+                self.index_to_name[_layer_idx(layer_name)].append(layer_name)
+            self.total_layers = len(self._ordered_main_layer_names)
             resize_shared_layer_transfer_events(self.total_layers)
+        else:
+            for layer_name, kv_cache_tuple in kv_caches.items():
+                group_idx = layer2group_ids[layer_name]
+                layer_meta = LayerMetadata([], [], [], [])
+                self._append_tensor_metadata(
+                    layer_meta,
+                    self._as_cache_tuple(kv_cache_tuple),
+                    group_idx,
+                    num_blocks,
+                )
+                self.layer_metadata[layer_name] = layer_meta
+                self.index_to_name[_layer_idx(layer_name)].append(layer_name)
+
+            if self.total_layers < len(self.layer_metadata):
+                self.total_layers = len(self.layer_metadata)
+                # Resize in place so a connector that already captured the shared
+                # list keeps observing the same event objects.
+                resize_shared_layer_transfer_events(self.total_layers)
 
         register_regions = collect_storage_merged_register_regions(kv_caches)
         validate_register_region_count(register_regions)
@@ -614,7 +735,9 @@ class SFAPDCpuOffloadProducerWorker:
         self.kv_send_layer_thread._source_kv_caches = kv_caches
         self.layer_send_done_events = self.kv_send_layer_thread.layer_send_done_events
         logger.info(
-            "MembPull P registered kv caches: layers=%d, p_session=%s",
+            "MembPull P registered kv caches: transfer_layers=%d, "
+            "cache_owners=%d, p_session=%s",
+            len(self.layer_metadata),
             len(kv_caches),
             global_te._unique_id,
         )
@@ -655,7 +778,11 @@ class SFAPDCpuOffloadProducerWorker:
             layer_idx = self.current_layer
             # Resolve THIS layer's tensor group so the pull-target gate inspects
             # the right group's block ids (was implicitly group 0 / indexer).
-            _gate_layer_name = layer_name if layer_name else self.index_to_name[layer_idx][0]
+            _gate_layer_name = layer_name
+            if not _gate_layer_name and self._ordered_main_layer_names:
+                _gate_layer_name = self._ordered_main_layer_names[layer_idx]
+            if not _gate_layer_name:
+                _gate_layer_name = self.index_to_name[layer_idx][0]
             layer_group_idx = self.layer_metadata[_gate_layer_name].tensor_group_idx[0]
             has_pd_target = self._has_memfabric_pull_target(connector_metadata, layer_idx, layer_group_idx)
             if (
@@ -680,7 +807,10 @@ class SFAPDCpuOffloadProducerWorker:
             self.current_layer += 1
             return
         if layer_name == "":
-            layer_name = self.index_to_name[self.current_layer][0]
+            if self._ordered_main_layer_names:
+                layer_name = self._ordered_main_layer_names[self.current_layer]
+            else:
+                layer_name = self.index_to_name[self.current_layer][0]
 
         self.kv_send_layer_thread.record_p_save_event(self.current_layer)
         layer_attn_metadata = None

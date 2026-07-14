@@ -69,10 +69,25 @@ def test_configures_sibling_with_ascend_store_gva_reuse_plan():
             ]
         },
     )
+    main_names = [f"model.layers.{i}.self_attn.attn" for i in range(6)]
+    indexer_names = [
+        "model.layers.0.self_attn.indexer.k_cache",
+        "model.layers.4.self_attn.indexer.k_cache",
+    ]
+    layer_specs = {
+        **{name: SimpleNamespace(page_size_bytes=128) for name in main_names},
+        **{name: SimpleNamespace(page_size_bytes=64) for name in indexer_names},
+    }
     kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(layer_names=[f"model.layers.{i}.attn" for i in range(6)])]
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=[*main_names, *indexer_names],
+                kv_cache_spec=SimpleNamespace(kv_cache_specs=layer_specs),
+            )
+        ]
     )
 
     connector._configure_gva_layerwise_reuse(kv_transfer_config, kv_cache_config)
 
+    # Indexer owners share the scheduler group but do not add callbacks.
     sibling.set_gva_layerwise_reuse_plan.assert_called_once_with({3: 1, 4: 2})

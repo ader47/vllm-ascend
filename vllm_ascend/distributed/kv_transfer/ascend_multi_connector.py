@@ -12,6 +12,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
     MooncakeLayerwiseConnectorScheduler,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    build_sfa_layerwise_cache_plan_from_group,
     get_gva_layerwise_config,
     get_layerwise_config,
 )
@@ -43,7 +44,18 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         extra_config = get_gva_layerwise_config(kv_transfer_config)
         if extra_config is None or len(kv_cache_config.kv_cache_groups) != 1:
             return
-        num_layers = len(kv_cache_config.kv_cache_groups[0].layer_names)
+        group = kv_cache_config.kv_cache_groups[0]
+        sfa_plan = build_sfa_layerwise_cache_plan_from_group(
+            group,
+            extra_config,
+        )
+        # Split indexer owners share the cache group but do not produce forward
+        # callbacks. Reuse gates must therefore follow the main-layer schedule.
+        num_layers = (
+            len(sfa_plan.entries)
+            if sfa_plan is not None
+            else len(group.layer_names)
+        )
         layerwise_config = get_layerwise_config(num_layers, extra_config)
         if not layerwise_config.has_layer_reuse:
             return

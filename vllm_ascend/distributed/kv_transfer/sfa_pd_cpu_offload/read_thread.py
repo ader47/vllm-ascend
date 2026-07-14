@@ -209,6 +209,12 @@ class MembPullReadThread(threading.Thread):
             return None
         p_base_addrs = p_meta["base_addrs"]
         p_block_len = p_meta["block_len"]
+        if len(p_base_addrs) != len(p_block_len) or len(p_base_addrs) < 2:
+            raise ValueError(
+                "MembPull P metadata must contain matching main K/V address "
+                f"and length entries for {layer_name}, got "
+                f"base_addrs={len(p_base_addrs)}, block_len={len(p_block_len)}."
+            )
 
         cpu_pool = state.cpu_pools[offload_id]
         if cpu_pool is None:
@@ -222,14 +228,11 @@ class MembPullReadThread(threading.Thread):
         else:
             k_hbm_ptr, v_hbm_ptr = hbm_kv[0].data_ptr(), hbm_kv[1].data_ptr()
 
+        # Split prefill exposes only real indexer owners. Two entries therefore
+        # mean main K/V only; a third entry adds the indexer transfer leg.
+        has_p_indexer = len(p_base_addrs) >= 3
         indexer = None
-        if len(p_base_addrs) < 3:
-            logger.error(
-                "MembPull indexer: P layer_meta for %s has %d tensors, need >=3; skip indexer leg",
-                layer_name,
-                len(p_base_addrs),
-            )
-        else:
+        if has_p_indexer:
             p_dsa_len = p_block_len[2]
             d_indexer = state.indexer_tensors[pool_idx]
             d_dsa_len = d_indexer.element_size() * math.prod(d_indexer.shape[1:])
@@ -252,7 +255,7 @@ class MembPullReadThread(threading.Thread):
 
         scale = None
         scale_tensor = state.indexer_scale_tensors[pool_idx] if pool_idx < len(state.indexer_scale_tensors) else None
-        if scale_tensor is not None:
+        if has_p_indexer and scale_tensor is not None:
             if len(p_base_addrs) < 4:
                 scale = {"error": "p_addr_mismatch", "p_n": len(p_base_addrs)}
             else:
