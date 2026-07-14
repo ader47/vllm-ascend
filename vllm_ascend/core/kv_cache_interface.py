@@ -319,9 +319,9 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
 class AscendSFAIndexerCacheSpec(FullAttentionSpec):
     """KV cache spec for SFA indexer K/scale cache.
 
-    The scheduler should treat this as a full-attention-compatible cache so it
-    can share block ids with the MLA cache in the same UniformType group. The
-    model runner still allocates it as an independent physical cache tensor.
+    The scheduler treats this as a full-attention-compatible cache with its own
+    block table. Under SFA offload, the worker aliases its physical K storage
+    with the main MLA K storage in the same hybrid ``KVCacheTensor`` slot.
     """
 
     scale_dim: int = 0

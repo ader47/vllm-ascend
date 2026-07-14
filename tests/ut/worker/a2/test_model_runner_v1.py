@@ -14,7 +14,13 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
+from vllm_ascend.core.kv_cache_interface import (
+    AscendMLAAttentionSpec,
+    AscendSFAIndexerCacheSpec,
+    make_offload_indexer_mla_spec,
+    make_offload_main_mla_spec,
+    offload_indexer_pad_dim,
+)
 from vllm_ascend.utils import AscendDeviceType
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -25,10 +31,13 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         runner.device = torch.device("cpu")
         runner.use_sparse = False
         runner.use_sparse_c8 = False
+        runner.use_sparse_c8_indexer = False
+        runner.use_offload = False
         runner.use_compress = False
         runner.use_hybrid_blocks = False
         runner.hybrid_with_attn_and_mamba = False
         runner.sfa_dcp_replicated_indexer_size = 1
+        runner.sfa_main_kv_cache_group_ids = []
         runner.runner_only_attn_layers = set()
         runner.is_kv_consumer = False
         runner.vllm_config = MagicMock()
@@ -45,6 +54,122 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         )
         runner.attn_backend = backend
         return runner
+
+    def _build_offload_hybrid_config(self, *, use_c8: bool):
+        main_block_size = 16
+        indexer_block_size = main_block_size * (8 if use_c8 else 4)
+        indexer_pad_dim = offload_indexer_pad_dim(128, 64, 512)
+        main_spec = make_offload_main_mla_spec(
+            block_size=main_block_size,
+            num_kv_heads=1,
+            head_size=512 + 64,
+            dtype=torch.bfloat16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            c8_unified_pool=use_c8,
+            scale_dtype=torch.float16 if use_c8 else None,
+        )
+        indexer_spec = make_offload_indexer_mla_spec(
+            block_size=indexer_block_size,
+            num_kv_heads=1,
+            head_size=128 + indexer_pad_dim,
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+            index_head_dim=128,
+            indexer_pad_dim=indexer_pad_dim,
+            c8_unified_pool=use_c8,
+            scale_dtype=torch.float16 if use_c8 else None,
+        )
+        self.assertEqual(main_spec.page_size_bytes, indexer_spec.page_size_bytes)
+        main_layer_names = [
+            "model.layers.0.self_attn.attn",
+            "model.layers.1.self_attn.attn",
+        ]
+        indexer_layer_name = "model.layers.0.self_attn.indexer.k_cache"
+        num_blocks = 2
+        config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=main_spec.page_size_bytes * num_blocks,
+                    shared_by=[*main_layer_names, indexer_layer_name],
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec([main_layer_names[0]], main_spec),
+                KVCacheGroupSpec([main_layer_names[1]], main_spec),
+                KVCacheGroupSpec([indexer_layer_name], indexer_spec),
+            ],
+        )
+        return config, main_layer_names, indexer_layer_name
+
+    def test_non_c8_offload_hybrid_slot_aliases_main_and_indexer_k(self):
+        runner = self._build_runner()
+        runner.use_sparse = True
+        runner.use_offload = True
+        runner.use_sparse_c8_indexer = False
+        runner.sfa_main_kv_cache_group_ids = [0, 1]
+        runner.model_config.hf_text_config = SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+        )
+        config, main_layer_names, indexer_layer_name = (
+            self._build_offload_hybrid_config(use_c8=False)
+        )
+
+        raw_caches = runner._allocate_kv_cache_tensors(config)
+
+        main_k, main_v = raw_caches[main_layer_names[0]]
+        second_main_k, second_main_v = raw_caches[main_layer_names[1]]
+        (indexer_k,) = raw_caches[indexer_layer_name]
+        self.assertIs(main_k, second_main_k)
+        self.assertIs(main_v, second_main_v)
+        self.assertIs(main_k, indexer_k)
+        self.assertNotEqual(main_k.data_ptr(), main_v.data_ptr())
+
+    def test_c8_offload_hybrid_slot_aliases_indexer_scale_with_main_padding(self):
+        runner = self._build_runner()
+        runner.use_sparse = True
+        runner.use_offload = True
+        runner.use_sparse_c8_indexer = True
+        runner.sfa_main_kv_cache_group_ids = [0, 1]
+        runner.kv_cache_dtype = torch.bfloat16
+        runner.c8_k_scale_cache_dtype = torch.float16
+        runner.model_config.hf_text_config = SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+        )
+        config, main_layer_names, indexer_layer_name = (
+            self._build_offload_hybrid_config(use_c8=True)
+        )
+
+        raw_caches = runner._allocate_kv_cache_tensors(config)
+
+        main_k, _, main_padding = raw_caches[main_layer_names[0]]
+        indexer_k, indexer_scale = raw_caches[indexer_layer_name]
+        self.assertIs(main_k, indexer_k)
+        self.assertIs(main_padding, indexer_scale)
+
+    def test_offload_hybrid_rejects_physically_separate_indexer_slot(self):
+        runner = self._build_runner()
+        runner.use_sparse = True
+        runner.use_offload = True
+        runner.sfa_main_kv_cache_group_ids = [0, 1]
+        runner.model_config.hf_text_config = SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+        )
+        config, _, indexer_layer_name = self._build_offload_hybrid_config(
+            use_c8=False
+        )
+        config.kv_cache_tensors[0].shared_by = [indexer_layer_name]
+
+        with self.assertRaisesRegex(ValueError, "must contain a main MLA"):
+            runner._allocate_kv_cache_tensors(config)
 
     def test_allocate_kv_cache_uses_layer_spec_for_draft_gqa(self):
         runner = self._build_runner()

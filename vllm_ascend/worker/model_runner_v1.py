@@ -4419,6 +4419,180 @@ class NPUModelRunner(GPUModelRunner):
 
         return dsa_k_tensor, dsa_k_scale_tensor
 
+    def _allocate_sfa_hybrid_slot(
+        self,
+        kv_cache_tensor: KVCacheTensor,
+        layer_kv_cache_spec: dict[str, KVCacheSpec],
+        alignment: int,
+    ) -> dict[str, tuple[torch.Tensor, ...]] | None:
+        """Allocate one true-hybrid SFA physical slot.
+
+        A hybrid ``KVCacheTensor`` is shared by one layer from every main MLA
+        group and one indexer layer. The managers own independent block tables,
+        but all those groups draw block IDs from one BlockPool. Therefore one
+        physical slot must be allocated once and exposed through two layouts:
+
+        * main MLA: ``(k_nope, v_rope[, c8_padding])``;
+        * indexer: ``(k_nope_alias[, c8_padding_alias])``.
+
+        The indexer page's virtual padding accounts for the main V bytes. It is
+        intentionally not exposed to the indexer kernel. For C8, the main
+        padding span is reinterpreted as the indexer scale cache.
+        """
+        slot_specs = {
+            layer_name: layer_kv_cache_spec[layer_name]
+            for layer_name in kv_cache_tensor.shared_by
+        }
+        main_layer_names = [
+            name
+            for name, spec in slot_specs.items()
+            if isinstance(spec, OffloadMLAAttentionSpec)
+        ]
+        indexer_layer_names = [
+            name
+            for name, spec in slot_specs.items()
+            if isinstance(spec, AscendSFAIndexerCacheSpec)
+        ]
+        if not main_layer_names and not indexer_layer_names:
+            return None
+        classified_layer_names = set(main_layer_names) | set(indexer_layer_names)
+        unclassified_layer_names = set(slot_specs).difference(
+            classified_layer_names
+        )
+        if unclassified_layer_names:
+            raise ValueError(
+                "SFA true hybrid physical slot cannot mix unrelated cache "
+                f"layers: {sorted(unclassified_layer_names)}."
+            )
+        # Uneven group sizes (for example an extra MTP main layer) can leave a
+        # valid main-only tail slot. Let the existing main allocator handle it.
+        if main_layer_names and not indexer_layer_names:
+            return None
+        if not main_layer_names:
+            raise ValueError(
+                "Every SFA indexer physical slot must contain a main MLA "
+                "layer, got shared_by="
+                f"{kv_cache_tensor.shared_by}."
+            )
+        if len(indexer_layer_names) != 1:
+            raise ValueError(
+                "SFA true hybrid physical slot requires exactly one indexer "
+                f"layer, got {indexer_layer_names}."
+            )
+        if len(main_layer_names) > len(self.sfa_main_kv_cache_group_ids):
+            raise ValueError(
+                "SFA true hybrid physical slot has more main MLA layers than "
+                f"main groups ({len(self.sfa_main_kv_cache_group_ids)}), got "
+                f"{main_layer_names}."
+            )
+
+        main_specs = [slot_specs[name] for name in main_layer_names]
+        indexer_spec = slot_specs[indexer_layer_names[0]]
+        assert isinstance(indexer_spec, AscendSFAIndexerCacheSpec)
+        main_layouts = {
+            (
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                spec.dtype,
+                spec.page_bytes_per_token,
+            )
+            for spec in main_specs
+            if isinstance(spec, OffloadMLAAttentionSpec)
+        }
+        if len(main_layouts) != 1:
+            raise ValueError(
+                "All main MLA layers sharing an SFA physical slot must use "
+                f"the same layout, got {sorted(map(str, main_layouts))}."
+            )
+        page_sizes = {
+            spec.page_size_bytes for spec in [*main_specs, indexer_spec]
+        }
+        if len(page_sizes) != 1:
+            raise ValueError(
+                "SFA true hybrid physical slot requires equal page bytes, got "
+                f"{sorted(page_sizes)} for shared_by={kv_cache_tensor.shared_by}."
+            )
+        page_size = page_sizes.pop()
+        if kv_cache_tensor.size % page_size != 0:
+            raise ValueError(
+                f"SFA hybrid tensor size {kv_cache_tensor.size} is not divisible "
+                f"by page size {page_size}."
+            )
+
+        hf_cfg = self.model_config.hf_text_config
+        c8_layout = (
+            self._get_offload_sparse_c8_layout()
+            if indexer_spec.cache_sparse_c8
+            else None
+        )
+        split_factors = calc_split_factor(
+            offload_main_kv_head_dims_for_pool_split(
+                hf_cfg.kv_lora_rank,
+                hf_cfg.qk_rope_head_dim,
+                c8_layout=c8_layout,
+            )
+        )
+        raw_sizes = [
+            int(kv_cache_tensor.size // split_factor)
+            for split_factor in split_factors
+        ]
+        if sum(raw_sizes) != kv_cache_tensor.size:
+            raise ValueError(
+                "SFA main K/V/padding split does not cover the physical slot: "
+                f"slot={kv_cache_tensor.size}, parts={raw_sizes}."
+            )
+        raw_k_tensor = self._allocate_int8_cache_tensor(raw_sizes[0], alignment)
+        raw_v_tensor = self._allocate_int8_cache_tensor(raw_sizes[1], alignment)
+        raw_padding_tensor = (
+            self._allocate_int8_cache_tensor(raw_sizes[2], alignment)
+            if c8_layout is not None
+            else None
+        )
+
+        num_blocks = kv_cache_tensor.size // page_size
+        indexer_k_size = (
+            num_blocks
+            * indexer_spec.sfa_dcp_replicated_indexer_size
+            * indexer_spec.block_size
+            * indexer_spec.num_kv_heads
+            * indexer_spec.head_size
+            * get_dtype_size(indexer_spec.dtype)
+        )
+        if raw_k_tensor.numel() != indexer_k_size:
+            raise ValueError(
+                "SFA indexer K does not alias the complete main K backing: "
+                f"main_k={raw_k_tensor.numel()}, indexer_k={indexer_k_size}."
+            )
+
+        main_raw_cache = [raw_k_tensor, raw_v_tensor]
+        indexer_raw_cache = [raw_k_tensor]
+        if raw_padding_tensor is not None:
+            indexer_scale_size = (
+                num_blocks
+                * indexer_spec.sfa_dcp_replicated_indexer_size
+                * indexer_spec.block_size
+                * indexer_spec.num_kv_heads
+                * indexer_spec.scale_dim
+                * get_dtype_size(indexer_spec.scale_dtype)
+            )
+            if raw_padding_tensor.numel() != indexer_scale_size:
+                raise ValueError(
+                    "SFA C8 indexer scale does not alias the complete main "
+                    f"padding backing: main_pad={raw_padding_tensor.numel()}, "
+                    f"indexer_scale={indexer_scale_size}."
+                )
+            main_raw_cache.append(raw_padding_tensor)
+            indexer_raw_cache.append(raw_padding_tensor)
+
+        return {
+            **{
+                layer_name: tuple(main_raw_cache)
+                for layer_name in main_layer_names
+            },
+            indexer_layer_names[0]: tuple(indexer_raw_cache),
+        }
+
     def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
         Initializes the KV cache buffer with the correct size. The buffer needs
@@ -4452,6 +4626,15 @@ class NPUModelRunner(GPUModelRunner):
             else None
         )
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            if self.use_sparse and self.use_offload:
+                hybrid_slot = self._allocate_sfa_hybrid_slot(
+                    kv_cache_tensor,
+                    layer_kv_cache_spec,
+                    alignment,
+                )
+                if hybrid_slot is not None:
+                    kv_cache_raw_tensors.update(hybrid_slot)
+                    continue
             use_mamba, use_attn = False, False
             for layer_name in kv_cache_tensor.shared_by:
                 if isinstance(layer_kv_cache_spec[layer_name], MambaSpec):

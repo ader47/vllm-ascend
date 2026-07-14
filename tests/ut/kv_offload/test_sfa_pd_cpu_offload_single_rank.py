@@ -109,8 +109,8 @@ def test_reuse_layer_accepts_two_tensor_producer_metadata():
         main_name_to_idx={layer_name: 0},
         cpu_pools=[None],
         hbm_kv={},
-        indexer_tensors=[],
-        indexer_scale_tensors=[],
+        indexer_tensors=[None],
+        indexer_scale_tensors=[None],
         dest_blocks_by_req={},
         get_offload_layer_id=lambda _: 0,
     )
@@ -128,6 +128,35 @@ def test_reuse_layer_accepts_two_tensor_producer_metadata():
     assert layer["indexer"] is None
     assert layer["scale"] is None
     error_log.assert_not_called()
+
+
+def test_indexer_owner_logs_two_tensor_producer_metadata():
+    layer_name = "model.layers.0.self_attn.attn"
+    indexer = MagicMock()
+    thread = MembPullReadThread.__new__(MembPullReadThread)
+    thread._state = ConsumerReadState(
+        layer_metadata={},
+        main_name_to_idx={layer_name: 0},
+        cpu_pools=[None],
+        hbm_kv={},
+        indexer_tensors=[indexer],
+        indexer_scale_tensors=[None],
+        dest_blocks_by_req={},
+        get_offload_layer_id=lambda _: 0,
+    )
+    thread._p_layer_meta = {
+        layer_name: {
+            "base_addrs": [1000, 2000],
+            "block_len": [10, 20],
+        }
+    }
+
+    with patch.object(read_thread_module.logger, "error") as error_log:
+        layer = thread._resolve_read_layer(layer_name)
+
+    assert layer is not None
+    assert layer["indexer"] is None
+    error_log.assert_called_once()
 
 
 def _make_layer(

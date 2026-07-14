@@ -227,32 +227,34 @@ class MembPullReadThread(threading.Thread):
             k_hbm_ptr, v_hbm_ptr = hbm_kv[0].data_ptr(), hbm_kv[1].data_ptr()
 
         indexer = None
-        if len(p_base_addrs) >= 3:
-            p_dsa_len = p_block_len[2]
-            d_indexer = state.indexer_tensors[pool_idx]
-            if d_indexer is None:
+        d_indexer = state.indexer_tensors[pool_idx]
+        if d_indexer is not None:
+            if len(p_base_addrs) < 3:
                 logger.error(
-                    "MembPull indexer: no D indexer tensor for owner layer %s",
+                    "MembPull indexer: P layer_meta for %s has %d tensors, "
+                    "need >=3; skip indexer leg",
                     layer_name,
-                )
-                return None
-            d_dsa_len = d_indexer.element_size() * math.prod(d_indexer.shape[1:])
-            if p_dsa_len <= 0 or d_dsa_len % p_dsa_len != 0:
-                logger.error(
-                    "MembPull indexer %s: D dsa_k block_len=%d not a multiple of P=%d; skip indexer leg",
-                    layer_name,
-                    d_dsa_len,
-                    p_dsa_len,
+                    len(p_base_addrs),
                 )
             else:
-                indexer = {
-                    "p_dsa_base": p_base_addrs[2],
-                    "p_dsa_len": p_dsa_len,
-                    "d_base": d_indexer.data_ptr(),
-                    "d_dsa_len": d_dsa_len,
-                    "scale": d_dsa_len // p_dsa_len,
-                    "shape": tuple(d_indexer.shape),
-                }
+                p_dsa_len = p_block_len[2]
+                d_dsa_len = d_indexer.element_size() * math.prod(d_indexer.shape[1:])
+                if p_dsa_len <= 0 or d_dsa_len % p_dsa_len != 0:
+                    logger.error(
+                        "MembPull indexer %s: D dsa_k block_len=%d not a multiple of P=%d; skip indexer leg",
+                        layer_name,
+                        d_dsa_len,
+                        p_dsa_len,
+                    )
+                else:
+                    indexer = {
+                        "p_dsa_base": p_base_addrs[2],
+                        "p_dsa_len": p_dsa_len,
+                        "d_base": d_indexer.data_ptr(),
+                        "d_dsa_len": d_dsa_len,
+                        "scale": d_dsa_len // p_dsa_len,
+                        "shape": tuple(d_indexer.shape),
+                    }
 
         scale = None
         scale_tensor = state.indexer_scale_tensors[pool_idx] if pool_idx < len(state.indexer_scale_tensors) else None
