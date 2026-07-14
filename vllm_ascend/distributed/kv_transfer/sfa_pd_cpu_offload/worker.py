@@ -32,6 +32,7 @@ from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend import envs
+from vllm_ascend.core.kv_cache_interface import get_sfa_hybrid_group_ids
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
     get_shared_layer_transfer_events,
     get_shared_layer_transfer_pending_events,
@@ -70,10 +71,6 @@ from vllm_ascend.distributed.kv_transfer.utils.utils import (
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import AttentionMetadata
 
-# kv_cache_group convention for DeepSeek-V3.2 sparse offload:
-# group 0 = indexer (block_size 512), group 1 = main MLA (block_size 128).
-_INDEXER_GROUP_IDX = 0
-_MAIN_GROUP_IDX = 1
 # Matches the transformer-layer index in a kv-cache layer name, e.g.
 # "model.layers.5.self_attn" / "model.layers.5.self_attn.indexer" -> 5. Prefer
 # this over extract_layer_index(), which asserts the name holds exactly one
@@ -107,6 +104,14 @@ class SFAPDCpuOffloadConsumerWorker:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.use_layerwise = use_layerwise
+        self.main_group_ids, self.indexer_group_id = get_sfa_hybrid_group_ids(
+            kv_cache_config.kv_cache_groups
+        )
+        self.layer_name_to_group_id = {
+            layer_name: group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            for layer_name in group.layer_names
+        }
         self.tp_rank = get_tensor_model_parallel_rank()  # TP-local rank for the per-rank ZMQ port
         self.side_channel_host = get_ip()
         # D-side ZMQ control-plane base port; each TP rank listens on base + tp_rank.
@@ -133,7 +138,16 @@ class SFAPDCpuOffloadConsumerWorker:
         # start_load_kv from connector_meta. Part A: the first num_full main
         # blocks → CPU pool; the optional partial last block → D HBM at
         # partial_hbm_bid (None ⇒ no partial).
-        self._dest_blocks_by_req: dict[str, tuple[list[int], list[int], int, int | None]] = {}
+        self._dest_blocks_by_req: dict[
+            str,
+            tuple[
+                list[int],
+                list[int],
+                int,
+                int | None,
+                dict[int, int],
+            ],
+        ] = {}
         # main layer name -> (k_nope HBM, v_rope HBM); the partial block's HBM
         # dest. Populated in register_kv_caches.
         self._hbm_kv: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -210,7 +224,16 @@ class SFAPDCpuOffloadConsumerWorker:
                 main_ids = list(getattr(req, "block_ids_cpu", []) or [])
                 num_full = getattr(req, "num_full", 0) or 0
                 partial_hbm_bid = getattr(req, "partial_hbm_bid", None)
-                self._dest_blocks_by_req[ext_id] = (indexer_ids, main_ids, num_full, partial_hbm_bid)
+                partial_by_group = dict(
+                    getattr(req, "partial_hbm_bid_by_group", {}) or {}
+                )
+                self._dest_blocks_by_req[ext_id] = (
+                    indexer_ids,
+                    main_ids,
+                    num_full,
+                    partial_hbm_bid,
+                    partial_by_group,
+                )
                 if envs.VLLM_ASCEND_SFA_DEBUG:
                     logger.info(
                         "MembPull D stored dest blocks req %s: indexer_hbm_ids=%s, "
@@ -337,6 +360,10 @@ class SFAPDCpuOffloadConsumerWorker:
             indexer_scale_tensors=self._indexer_scale_tensors,
             dest_blocks_by_req=self._dest_blocks_by_req,
             get_offload_layer_id=self.sfa_worker._get_offload_layer_id,
+            main_name_to_group_id={
+                name: self.layer_name_to_group_id[name]
+                for name in self._main_names
+            },
         )
 
     def _register_memfabric_pull(
@@ -349,14 +376,17 @@ class SFAPDCpuOffloadConsumerWorker:
         its HBM. Every D rank reads local HBM legs; TP0 also reads full Main KV
         into the shared CPU pool."""
         num_blocks = self.kv_cache_config.num_blocks
-        indexer_names = list(self.kv_cache_config.kv_cache_groups[_INDEXER_GROUP_IDX].layer_names)
+        indexer_names = list(
+            self.kv_cache_config.kv_cache_groups[
+                self.indexer_group_id
+            ].layer_names
+        )
 
         def _offload_tuple_len(v: object) -> int:
             return len(v) if isinstance(v, (list, tuple)) else 1
 
-        main_names = [n for n, v in kv_caches.items() if _offload_tuple_len(v) in (5, 6)]
-        main_by_layer_idx = {_layer_idx(name): name for name in main_names}
-        main_names = [main_by_layer_idx[_layer_idx(name)] for name in indexer_names]
+        main_names = [n for n, v in kv_caches.items() if _offload_tuple_len(v) == 4]
+        main_names.sort(key=_layer_idx)
 
         # Store layer info for MembPullReadThread
         self._indexer_names = indexer_names
@@ -368,30 +398,50 @@ class SFAPDCpuOffloadConsumerWorker:
         self._cpu_pools: list[tuple[torch.Tensor, torch.Tensor] | None] = (
             list(zip(k_caches_cpu, v_caches_cpu)) if has_cpu_pool else [None] * len(main_names)
         )
-        self._indexer_tensors = []
+        self._indexer_tensors: list[torch.Tensor | None] = []
         self._indexer_scale_tensors: list[torch.Tensor | None] = []
+        indexer_name_by_layer = {
+            _layer_idx(name): name for name in indexer_names
+        }
         for main_name in main_names:
-            main_tuple = list(kv_caches[main_name])
-            self._indexer_tensors.append(main_tuple[2])  # dsa_k_indexer
-            self._indexer_scale_tensors.append(main_tuple[5] if len(main_tuple) >= 6 else None)
+            indexer_name = indexer_name_by_layer.get(_layer_idx(main_name))
+            if indexer_name is None:
+                self._indexer_tensors.append(None)
+                self._indexer_scale_tensors.append(None)
+                continue
+            indexer_tuple = list(kv_caches[indexer_name])
+            self._indexer_tensors.append(indexer_tuple[0])
+            self._indexer_scale_tensors.append(
+                indexer_tuple[1] if len(indexer_tuple) == 2 else None
+            )
 
         # Build layer_metadata (D's local addresses, for compatibility)
-        for pool_idx, (iname, mname) in enumerate(zip(indexer_names, main_names)):
+        for pool_idx, mname in enumerate(main_names):
+            iname = indexer_name_by_layer.get(_layer_idx(mname))
             indexer_t = self._indexer_tensors[pool_idx]
             indexer_scale_t = self._indexer_scale_tensors[pool_idx]
-            indexer_addrs = [indexer_t.data_ptr()]
-            indexer_block_lens = [indexer_t.element_size() * math.prod(indexer_t.shape[1:])]
-            indexer_block_scales = [indexer_t.shape[0] // num_blocks if num_blocks else 1]
+            indexer_addrs = []
+            indexer_block_lens = []
+            indexer_block_scales = []
+            if indexer_t is not None:
+                indexer_addrs.append(indexer_t.data_ptr())
+                indexer_block_lens.append(
+                    indexer_t.element_size() * math.prod(indexer_t.shape[1:])
+                )
+                indexer_block_scales.append(
+                    indexer_t.shape[0] // num_blocks if num_blocks else 1
+                )
             if indexer_scale_t is not None:
                 indexer_addrs.append(indexer_scale_t.data_ptr())
                 indexer_block_lens.append(indexer_scale_t.element_size() * math.prod(indexer_scale_t.shape[1:]))
                 indexer_block_scales.append(indexer_scale_t.shape[0] // num_blocks if num_blocks else 1)
-            self.layer_metadata[iname] = LayerMetadata(
-                tensor_group_idx=[_INDEXER_GROUP_IDX],
-                kv_caches_base_addr=indexer_addrs,
-                block_len=indexer_block_lens,
-                block_size_scale=indexer_block_scales,
-            )
+            if iname is not None and indexer_t is not None:
+                self.layer_metadata[iname] = LayerMetadata(
+                    tensor_group_idx=[self.indexer_group_id],
+                    kv_caches_base_addr=indexer_addrs,
+                    block_len=indexer_block_lens,
+                    block_size_scale=indexer_block_scales,
+                )
             # cpu_pools follows the SFA offload-layer order (it is zipped from
             # sfa_worker.k_caches_cpu), which may differ from main_names order
             # -> index by mname's offload id, not pool_idx (matches read_thread).
@@ -400,7 +450,10 @@ class SFAPDCpuOffloadConsumerWorker:
             if cpu_pool is not None:
                 k_cpu, v_cpu = cpu_pool
                 self.layer_metadata[mname] = LayerMetadata(
-                    tensor_group_idx=[_MAIN_GROUP_IDX, _MAIN_GROUP_IDX],
+                    tensor_group_idx=[
+                        self.layer_name_to_group_id[mname],
+                        self.layer_name_to_group_id[mname],
+                    ],
                     kv_caches_base_addr=[k_cpu.data_ptr(), v_cpu.data_ptr()],
                     block_len=[
                         k_cpu.element_size() * math.prod(k_cpu.shape[1:]),
@@ -589,6 +642,45 @@ class SFAPDCpuOffloadProducerWorker:
                 layer_meta.block_size_scale.append(block_size_scale)
             self.layer_metadata[layer_name] = layer_meta
             self.index_to_name[_layer_idx(layer_name)].append(layer_name)
+
+        indexer_name_by_layer = {
+            _layer_idx(name): name
+            for name in kv_caches
+            if name.endswith(".indexer.k_cache")
+        }
+        for layer_name, kv_cache_tuple in kv_caches.items():
+            if not (
+                isinstance(kv_cache_tuple, (list, tuple))
+                and len(kv_cache_tuple) == 4
+            ):
+                continue
+            indexer_name = indexer_name_by_layer.get(_layer_idx(layer_name))
+            if indexer_name is None:
+                main_meta = self.layer_metadata[layer_name]
+                del main_meta.tensor_group_idx[2:]
+                del main_meta.kv_caches_base_addr[2:]
+                del main_meta.block_len[2:]
+                del main_meta.block_size_scale[2:]
+                continue
+            main_meta = self.layer_metadata[layer_name]
+            indexer_meta = self.layer_metadata[indexer_name]
+            # Present the legacy offload order to the pull protocol without
+            # changing physical ownership: main K/V, indexer K, residents,
+            # and optional indexer scale.
+            main_meta.tensor_group_idx[2:2] = indexer_meta.tensor_group_idx
+            main_meta.kv_caches_base_addr[2:2] = indexer_meta.kv_caches_base_addr
+            main_meta.block_len[2:2] = indexer_meta.block_len
+            main_meta.block_size_scale[2:2] = indexer_meta.block_size_scale
+
+        # Indexer tensors are transferred as legs of their owning main layer.
+        # Keeping standalone entries would inflate total_layers and make the
+        # layerwise send thread wait for callbacks that cache-only layers never
+        # emit.
+        for indexer_name in indexer_name_by_layer.values():
+            self.layer_metadata.pop(indexer_name, None)
+            layer_names = self.index_to_name[_layer_idx(indexer_name)]
+            if indexer_name in layer_names:
+                layer_names.remove(indexer_name)
 
         if self.total_layers < len(self.layer_metadata):
             self.total_layers = len(self.layer_metadata)

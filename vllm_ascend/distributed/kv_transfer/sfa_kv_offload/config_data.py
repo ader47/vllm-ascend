@@ -23,15 +23,22 @@ class RequestTracker:
     # step. The decode-filled range [num_offloaded:num_blocks_after_step] is the
     # offload source. (num_offloaded == len(allocated_block_ids_cpu).)
     main_hbm_ids: list[int] = field(default_factory=list)
+    # True-hybrid SFA has multiple main MLA groups.  Each group owns an
+    # independent block table even though all groups share one BlockPool.
+    main_block_ids_by_group: dict[int, list[int]] = field(default_factory=dict)
+    partial_hbm_bid_by_group: dict[int, int] = field(default_factory=dict)
 
     def update(
         self,
         new_block_ids_npu: list[int],
         new_block_ids_cpu: list[int],
+        new_main_block_ids_by_group: dict[int, list[int]] | None = None,
     ) -> None:
         """Update the request tracker when a running request is scheduled again."""
         self.allocated_block_ids_npu.extend(new_block_ids_npu)
         self.allocated_block_ids_cpu.extend(new_block_ids_cpu)
+        for group_id, block_ids in (new_main_block_ids_by_group or {}).items():
+            self.main_block_ids_by_group.setdefault(group_id, []).extend(block_ids)
 
 
 @dataclass
@@ -54,6 +61,16 @@ class ReqMeta:
     # num_new_offload_blocks + sfa_worker.process_layer_data.
     offload_src_hbm_ids: list[int] = field(default_factory=list)
     offload_dst_cpu_ids: list[int] = field(default_factory=list)
+    main_block_ids_by_group: dict[int, list[int]] = field(default_factory=dict)
+    partial_hbm_bid_by_group: dict[int, int] = field(default_factory=dict)
+    offload_src_hbm_ids_by_group: dict[int, list[int]] = field(default_factory=dict)
+
+    def get_main_block_ids(self, group_id: int) -> list[int]:
+        """Resolve the main-MLA source blocks for one true-hybrid group."""
+        return self.offload_src_hbm_ids_by_group.get(
+            group_id,
+            self.main_block_ids_by_group.get(group_id, self.block_ids_npu),
+        )
 
     @staticmethod
     def from_request_tracker(
@@ -68,6 +85,8 @@ class ReqMeta:
             num_new_offload_blocks=num_new_offload_blocks,
             num_full=tracker.num_full,
             partial_hbm_bid=tracker.partial_hbm_bid,
+            main_block_ids_by_group=tracker.main_block_ids_by_group,
+            partial_hbm_bid_by_group=tracker.partial_hbm_bid_by_group,
         )
 
 

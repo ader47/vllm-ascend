@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Tuple
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import scipy  # type: ignore
 import torch
@@ -1595,9 +1595,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             topk_indices_prefill = topk_indices[num_decode_tokens:]
             actual_seq_lengths_query_decode = actual_seq_lengths_query[:num_decodes]
             actual_seq_lengths_query_prefill = actual_seq_lengths_query[num_decodes:]
-            actual_seq_lengths_key_decode = actual_seq_lengths_key[:num_decodes]
             actual_seq_lengths_key_prefill = actual_seq_lengths_key[num_decodes:]
-            block_table_decode = block_table[:num_decodes]
             block_table_prefill = block_table[num_decodes:]
 
             if num_decodes > 0:
@@ -1741,12 +1739,57 @@ class AscendSFAImpl(MLAAttentionImpl):
         # separate cache specs, while the current kernel path still expects the
         # legacy combined tuple layout.
         main_cache = kv_cache
-        if main_cache is None or not self.has_indexer:
+        if main_cache is None:
+            return main_cache
+
+        if self.use_offload and not self.has_indexer:
+            if len(main_cache) != 4:
+                raise RuntimeError(
+                    "SFA offload main cache expects "
+                    "(k_cache, v_cache, topk_k, topk_v), "
+                    f"got {len(main_cache)} tensors for layer_name={self.layer_name}."
+                )
+            # Reuse layers do not write an indexer cache. Keep the historical
+            # five-entry ABI for the offload decode path; entry 2 is never read
+            # when has_indexer is false.
+            return (
+                main_cache[0],
+                main_cache[1],
+                main_cache[0],
+                main_cache[2],
+                main_cache[3],
+            )
+
+        if not self.has_indexer:
             return main_cache
 
         indexer_cache = self.indexer.k_cache.kv_cache
         if indexer_cache is None:
             raise RuntimeError(f"SFA indexer cache is not initialized or bound. layer_name={self.layer_name}.")
+
+        if self.use_offload:
+            if len(main_cache) != 4:
+                raise RuntimeError(
+                    "SFA offload main cache expects "
+                    "(k_cache, v_cache, topk_k, topk_v), "
+                    f"got {len(main_cache)} tensors for layer_name={self.layer_name}."
+                )
+            if len(indexer_cache) not in (1, 2):
+                raise RuntimeError(
+                    "SFA offload indexer cache expects (k_cache,) or "
+                    "(k_cache, scale_cache), "
+                    f"got {len(indexer_cache)} tensors for layer_name={self.layer_name}."
+                )
+            composed_cache = (
+                main_cache[0],
+                main_cache[1],
+                indexer_cache[0],
+                main_cache[2],
+                main_cache[3],
+            )
+            if len(indexer_cache) == 2:
+                composed_cache += (indexer_cache[1],)
+            return composed_cache
 
         if self.use_sparse_c8_indexer:
             if len(indexer_cache) != 2:

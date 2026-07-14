@@ -183,6 +183,32 @@ def test_cpu_pool_owner_reads_full_main_partial_and_indexer():
     assert 8070 in local
 
 
+def test_true_hybrid_uses_partial_block_from_layer_main_group():
+    thread = _make_read_thread()
+    thread._state.main_name_to_group_id = {
+        "model.layers.0.self_attn.attn": 2,
+    }
+    thread._state.dest_blocks_by_req["req-0"] = (
+        [7],
+        [3, 4],
+        2,
+        9,
+        {0: 9, 2: 13},
+    )
+
+    local, _, _, info = thread._build_req_descriptors(
+        _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000),
+        "req-0",
+        [1, 2, 3],
+        want_info=True,
+    )
+
+    assert info is not None
+    assert info["partial_hbm_bid"] == 13
+    assert 5130 in local
+    assert 6260 in local
+
+
 def test_non_owner_reads_only_partial_and_indexer_hbm():
     thread = _make_read_thread()
 

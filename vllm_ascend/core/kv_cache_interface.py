@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from typing_extensions import Self
@@ -70,19 +72,13 @@ def compute_offload_sparse_c8_layout(
     its per-token byte count fills that ratio against the spec_1 byte-mix layout.
     """
     scale_dtype = scale_dtype or _get_c8_k_scale_cache_dtype()
-    indexer_pad_dim = offload_indexer_pad_dim(
-        index_head_dim, qk_rope_head_dim, kv_lora_rank
-    )
-    indexer_bytes_per_token = offload_c8_indexer_bytes_per_token(
-        index_head_dim, indexer_pad_dim, scale_dtype
-    )
+    indexer_pad_dim = offload_indexer_pad_dim(index_head_dim, qk_rope_head_dim, kv_lora_rank)
+    indexer_bytes_per_token = offload_c8_indexer_bytes_per_token(index_head_dim, indexer_pad_dim, scale_dtype)
     dtype_size = get_dtype_size(main_dtype)
     non_c8_main_bytes = (kv_lora_rank + qk_rope_head_dim) * dtype_size
     page_block_multiplier = 2 * kv_lora_rank // index_head_dim
     main_bytes_per_token = page_block_multiplier * indexer_bytes_per_token
-    kv_pad_dim_bf16_slots = (
-        main_bytes_per_token - non_c8_main_bytes
-    ) // dtype_size
+    kv_pad_dim_bf16_slots = (main_bytes_per_token - non_c8_main_bytes) // dtype_size
     assert kv_pad_dim_bf16_slots >= 0
     assert main_bytes_per_token == offload_c8_main_bytes_per_token(
         kv_lora_rank,
@@ -91,10 +87,7 @@ def compute_offload_sparse_c8_layout(
         kv_pad_dim_bf16_slots=kv_pad_dim_bf16_slots,
     )
     assert main_bytes_per_token % indexer_bytes_per_token == 0
-    assert (
-        main_bytes_per_token // indexer_bytes_per_token
-        == page_block_multiplier
-    )
+    assert main_bytes_per_token // indexer_bytes_per_token == page_block_multiplier
     return OffloadSparseC8Layout(
         indexer_pad_dim=indexer_pad_dim,
         kv_pad_dim_bf16_slots=kv_pad_dim_bf16_slots,
@@ -112,11 +105,7 @@ def offload_c8_main_bytes_per_token(
     kv_pad_dim_bf16_slots: int,
 ) -> int:
     dtype_size = get_dtype_size(dtype)
-    return (
-        kv_lora_rank * dtype_size
-        + qk_rope_head_dim * dtype_size
-        + kv_pad_dim_bf16_slots * dtype_size
-    )
+    return kv_lora_rank * dtype_size + qk_rope_head_dim * dtype_size + kv_pad_dim_bf16_slots * dtype_size
 
 
 def offload_main_kv_head_dims_for_pool_split(
@@ -143,16 +132,44 @@ def offload_indexer_kernel_block_size(
     return mla_block_size * kv_lora_rank // index_head_dim
 
 
+def get_sfa_hybrid_group_ids(
+    kv_cache_groups: Sequence[Any],
+) -> tuple[list[int], int]:
+    """Return the main-MLA group ids and the single indexer group id.
+
+    SFA IndexShare models expose indexer cache layers only at the layers that
+    build a new index.  True hybrid grouping therefore produces multiple main
+    MLA groups and one (smaller-token/larger-block) indexer group.  Keep this
+    classification independent of group ordering: vLLM preserves spec
+    insertion order, which is not a stable contract for assigning roles.
+    """
+    main_group_ids: list[int] = []
+    indexer_group_ids: list[int] = []
+    for group_id, group in enumerate(kv_cache_groups):
+        group_spec = group.kv_cache_spec
+        specs = getattr(group_spec, "kv_cache_specs", None)
+        layer_specs = list(specs.values()) if specs is not None else [group_spec]
+        is_indexer_spec = [isinstance(spec, AscendSFAIndexerCacheSpec) for spec in layer_specs]
+        if any(is_indexer_spec) and not all(is_indexer_spec):
+            raise ValueError(f"An SFA KV cache group cannot mix main MLA and indexer specs: {group.layer_names}")
+        if is_indexer_spec and all(is_indexer_spec):
+            indexer_group_ids.append(group_id)
+        else:
+            main_group_ids.append(group_id)
+
+    if len(indexer_group_ids) != 1:
+        raise ValueError(f"SFA true hybrid KV cache requires exactly one indexer group, got {indexer_group_ids}.")
+    if not main_group_ids:
+        raise ValueError("SFA true hybrid KV cache requires at least one main MLA group.")
+    return main_group_ids, indexer_group_ids[0]
+
+
 def offload_c8_indexer_bytes_per_token(
     index_head_dim: int,
     indexer_pad_dim: int,
     scale_dtype: torch.dtype,
 ) -> int:
-    return (
-        index_head_dim * get_dtype_size(torch.int8)
-        + indexer_pad_dim
-        + get_dtype_size(scale_dtype)
-    )
+    return index_head_dim * get_dtype_size(torch.int8) + indexer_pad_dim + get_dtype_size(scale_dtype)
 
 
 def _offload_page_size_bytes(
@@ -208,9 +225,7 @@ def offload_c8_indexer_page_size_bytes(
     return _offload_page_size_bytes(
         block_size,
         num_kv_heads,
-        offload_c8_indexer_bytes_per_token(
-            index_head_dim, indexer_pad_dim, scale_dtype
-        ),
+        offload_c8_indexer_bytes_per_token(index_head_dim, indexer_pad_dim, scale_dtype),
     )
 
 
@@ -428,12 +443,7 @@ class OffloadMLAAttentionSpec(AttentionSpec):
                 self.num_kv_heads,
                 self.page_bytes_per_token,
             )
-        return (
-            self.block_size
-            * self.num_kv_heads
-            * self.head_size
-            * get_dtype_size(self.dtype)
-        )
+        return self.block_size * self.num_kv_heads * self.head_size * get_dtype_size(self.dtype)
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """The maximum possible memory usage of this KV cache in bytes.
@@ -518,24 +528,24 @@ def make_offload_indexer_mla_spec(
     """
     if indexer_pad_dim is None:
         assert kv_lora_rank is not None and qk_rope_head_dim is not None
-        indexer_pad_dim = offload_indexer_pad_dim(
-            index_head_dim, qk_rope_head_dim, kv_lora_rank
-        )
-    page_bytes_per_token = None
+        indexer_pad_dim = offload_indexer_pad_dim(index_head_dim, qk_rope_head_dim, kv_lora_rank)
+    # The planner includes the alignment padding in each indexer page, while
+    # the physical cache exposed to the SFA kernel remains index_head_dim wide.
+    page_bytes_per_token = head_size * get_dtype_size(dtype)
     cache_sparse_c8 = False
     scale_dim = 0
+    cache_dtype = dtype
     if c8_unified_pool:
         scale_dtype = scale_dtype or _get_c8_k_scale_cache_dtype()
-        page_bytes_per_token = offload_c8_indexer_bytes_per_token(
-            index_head_dim, indexer_pad_dim, scale_dtype
-        )
+        page_bytes_per_token = offload_c8_indexer_bytes_per_token(index_head_dim, indexer_pad_dim, scale_dtype)
         cache_sparse_c8 = True
-        scale_dim = indexer_pad_dim
+        cache_dtype = _get_c8_k_cache_dtype()
+        scale_dim = 1
     return AscendSFAIndexerCacheSpec(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        dtype=dtype,
+        head_size=index_head_dim,
+        dtype=cache_dtype,
         cache_dtype_str=cache_dtype_str,
         scale_dim=scale_dim,
         scale_dtype=scale_dtype or torch.int8,

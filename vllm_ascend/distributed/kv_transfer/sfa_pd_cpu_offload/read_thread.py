@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import msgspec
@@ -32,10 +32,14 @@ class ConsumerReadState:
     main_name_to_idx: dict[str, int]
     cpu_pools: list[tuple[Any, Any] | None]
     hbm_kv: dict[str, tuple[Any, Any]]
-    indexer_tensors: list[Any]
+    indexer_tensors: list[Any | None]
     indexer_scale_tensors: list[Any | None]
-    dest_blocks_by_req: dict[str, tuple[list[int], list[int], int, int | None]]
+    dest_blocks_by_req: dict[
+        str,
+        tuple[list[int], list[int], int, int | None, dict[int, int]],
+    ]
     get_offload_layer_id: Callable[[str], int]
+    main_name_to_group_id: dict[str, int] = field(default_factory=dict)
 
 
 def _coalesce_desc(
@@ -226,6 +230,12 @@ class MembPullReadThread(threading.Thread):
         if len(p_base_addrs) >= 3:
             p_dsa_len = p_block_len[2]
             d_indexer = state.indexer_tensors[pool_idx]
+            if d_indexer is None:
+                logger.error(
+                    "MembPull indexer: no D indexer tensor for owner layer %s",
+                    layer_name,
+                )
+                return None
             d_dsa_len = d_indexer.element_size() * math.prod(d_indexer.shape[1:])
             if p_dsa_len <= 0 or d_dsa_len % p_dsa_len != 0:
                 logger.error(
@@ -301,7 +311,22 @@ class MembPullReadThread(threading.Thread):
                 layer_name,
             )
             return [], [], [], None
-        d_indexer_ids, d_main_ids, num_full, partial_hbm_bid = dest
+        if len(dest) == 4:
+            d_indexer_ids, d_main_ids, num_full, partial_hbm_bid = dest
+            partial_hbm_bid_by_group = {}
+        else:
+            (
+                d_indexer_ids,
+                d_main_ids,
+                num_full,
+                partial_hbm_bid,
+                partial_hbm_bid_by_group,
+            ) = dest
+        main_group_id = state.main_name_to_group_id.get(layer_name, 0)
+        partial_hbm_bid = partial_hbm_bid_by_group.get(
+            main_group_id,
+            partial_hbm_bid,
+        )
         if envs.VLLM_ASCEND_SFA_DEBUG:
             logger.info(
                 "MembPull D resolve dest: layer=%s, req=%s, p_block_ids=%s, "

@@ -140,8 +140,10 @@ class MembPullSendingThread(threading.Thread):
         read_reqs: list[tuple[str, list[int]]] = []
         done_ext_ids: list[str] = []
         endpoints: set[tuple[str, int]] = set()
+        layer_meta = self._state.layer_metadata[layer_name]
+        layer_group_idx = layer_meta.tensor_group_idx[0]
         for req_id, rm in send_task.send_request.items():
-            p_block_ids = rm.local_block_ids[0] if rm.local_block_ids else []
+            p_block_ids = rm.local_block_ids[layer_group_idx] if len(rm.local_block_ids) > layer_group_idx else []
             ext_id = get_external_request_id(req_id)
             has_endpoint = bool(rm.remote_host) and bool(rm.remote_port)
             chunk_done = layer_idx == self.total_layers - 1 and rm.chunk_finish and has_endpoint

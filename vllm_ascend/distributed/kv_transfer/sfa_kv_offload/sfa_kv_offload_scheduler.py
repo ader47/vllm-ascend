@@ -1,10 +1,8 @@
-from abc import ABC
 from collections import deque
 from typing import Any
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
-from vllm.logger import logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -14,10 +12,11 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.core.kv_cache_interface import get_sfa_hybrid_group_ids
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
-    SFAKVOffloadConnectorMetadata,
     ReqMeta,
     RequestTracker,
+    SFAKVOffloadConnectorMetadata,
 )
 
 
@@ -27,7 +26,7 @@ def _num_finalized_scheduled_tokens(scheduler_output: SchedulerOutput, req_id: s
     return max(num_scheduled_tokens - len(draft_tokens), 0)
 
 
-class CPUBlockManager(ABC):
+class CPUBlockManager:
     def __init__(self, block_num: int) -> None:
         self.block_num = block_num
         self.block_pool = deque(range(1, block_num))
@@ -40,7 +39,7 @@ class CPUBlockManager(ABC):
         for _ in range(new_block_num):
             allocated_blocks.append(self.block_pool.popleft())
         return allocated_blocks
-    
+
     def free(self, to_free_blocks: list[int]):
         self.block_pool.extend(to_free_blocks)
 
@@ -64,7 +63,12 @@ class SFAKVOffloadlScheduler:
         self.pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
         self.dcp_size = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
         self.group_block_sizes = self._infer_group_block_sizes(vllm_config, kv_cache_config)
-        self._block_size = self.group_block_sizes[-1] # only offload kv cache
+        self.main_group_ids, self.indexer_group_id = get_sfa_hybrid_group_ids(kv_cache_config.kv_cache_groups)
+        main_block_sizes = {self.group_block_sizes[group_id] for group_id in self.main_group_ids}
+        assert len(main_block_sizes) == 1, (
+            f"All SFA main MLA groups must use the same block size, got {main_block_sizes}."
+        )
+        self._block_size = main_block_sizes.pop()
 
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
@@ -95,8 +99,7 @@ class SFAKVOffloadlScheduler:
         return block_sizes
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
-        """
-        """
+        """ """
         local_block_ids: list[list[int]] = []
 
         # TODO check whether these are useless now, delete them if so.
@@ -126,15 +129,18 @@ class SFAKVOffloadlScheduler:
         meta = SFAKVOffloadConnectorMetadata(self._unfinished_request_ids, scheduler_output.preempted_req_ids)
 
         for request in scheduler_output.scheduled_new_reqs:
-            block_ids_npu = request.block_ids[-1].copy() # NOTE dskv32 sparse offload, 0 for indexer and 1 for ori kv_cache
+            main_block_ids_by_group = {group_id: request.block_ids[group_id].copy() for group_id in self.main_group_ids}
+            block_ids_npu = main_block_ids_by_group[self.main_group_ids[0]]
             num_tokens_to_compute = request.num_computed_tokens + _num_finalized_scheduled_tokens(
-                scheduler_output, request.req_id)
+                scheduler_output, request.req_id
+            )
             num_new_offload_blocks = num_tokens_to_compute // self._block_size
             block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_offload_blocks)
             request_tracker = RequestTracker(
                 req_id=request.req_id,
-                allocated_block_ids_npu=block_ids_npu,
+                allocated_block_ids_npu=list(block_ids_npu),
                 allocated_block_ids_cpu=block_ids_cpu,
+                main_block_ids_by_group=main_block_ids_by_group,
             )
             self._request_trackers[request.req_id] = request_tracker
 
@@ -148,12 +154,15 @@ class SFAKVOffloadlScheduler:
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(cached_reqs.req_ids):
             # resumed request
-            new_block_ids_npu = cached_reqs.new_block_ids[i]
-            if isinstance(new_block_ids_npu, tuple):
-                # NOTE dskv32 sparse offload, 0 for indexer and 1 for ori kv_cache
-                new_block_ids_npu = new_block_ids_npu[-1]
-            elif new_block_ids_npu is None:
-                new_block_ids_npu = []
+            new_block_ids = cached_reqs.new_block_ids[i]
+            if isinstance(new_block_ids, tuple):
+                new_main_block_ids_by_group = {
+                    group_id: list(new_block_ids[group_id]) for group_id in self.main_group_ids
+                }
+            else:
+                canonical = [] if new_block_ids is None else list(new_block_ids)
+                new_main_block_ids_by_group = {self.main_group_ids[0]: canonical}
+            new_block_ids_npu = new_main_block_ids_by_group.get(self.main_group_ids[0], [])
             if req_id in self._preempted_req_ids:
                 # treat as a new request
                 num_computed_tokens = cached_reqs.num_computed_tokens[i]
@@ -163,8 +172,9 @@ class SFAKVOffloadlScheduler:
                 block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_offload_blocks)
                 request_tracker = RequestTracker(
                     req_id=req_id,
-                    allocated_block_ids_npu=new_block_ids_npu,
+                    allocated_block_ids_npu=list(new_block_ids_npu),
                     allocated_block_ids_cpu=block_ids_cpu,
+                    main_block_ids_by_group=new_main_block_ids_by_group,
                 )
                 self._request_trackers[req_id] = request_tracker
                 self._preempted_req_ids.discard(req_id)
@@ -181,11 +191,15 @@ class SFAKVOffloadlScheduler:
                     )
                 num_computed_token = cached_reqs.num_computed_tokens[i]
                 num_tokens_after_step = num_computed_token + num_new_tokens
-                num_blocks_after_step = num_tokens_after_step // self._block_size # pcp/dcp not considered now
+                num_blocks_after_step = num_tokens_after_step // self._block_size  # pcp/dcp not considered now
                 num_offloaded_blocks = len(request_tracker.allocated_block_ids_cpu)
                 num_new_offload_blocks = max(num_blocks_after_step - num_offloaded_blocks, 0)
                 new_block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_offload_blocks)
-                request_tracker.update(new_block_ids_npu, new_block_ids_cpu)
+                request_tracker.update(
+                    new_block_ids_npu,
+                    new_block_ids_cpu,
+                    new_main_block_ids_by_group,
+                )
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
@@ -206,7 +220,7 @@ class SFAKVOffloadlScheduler:
         """
         self._free_request_cpu_blocks(request.request_id)
         return False, None
-    
+
     def _free_request_cpu_blocks(
         self,
         request_id: str,

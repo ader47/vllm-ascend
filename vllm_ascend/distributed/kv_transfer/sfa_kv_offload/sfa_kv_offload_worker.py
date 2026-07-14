@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Optional
 from collections.abc import Generator
+from typing import Optional
 
 import numpy as np
 import torch
-from torch.utils.cpp_extension import load
 import torch_npu
+from memfabric_hybrid import offload
+from torch.utils.cpp_extension import load
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pcp_group,
@@ -23,28 +24,21 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.utils import CpuGpuBuffer
-from memfabric_hybrid import offload
 
 from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
-    SFAKVOffloadConnectorMetadata,
     LayerMultiBlockReqMeta,
     ReqMeta,
+    SFAKVOffloadConnectorMetadata,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.kv_transfer import (
     KVCacheStoreLayerSendingThread,
     KVTransferThread,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.offload_kv_cache_layout import (
-    OFFLOAD_C8_TUPLE_LEN,
-    OFFLOAD_INDEXER_S,
     OFFLOAD_MAIN_K,
     OFFLOAD_MAIN_V,
-    OFFLOAD_RESIDENT_K,
-    OFFLOAD_RESIDENT_V,
-    OFFLOAD_TUPLE_LEN,
-    is_offload_c8_kv_cache,
 )
 
 _SUBSCRIBED_COMPUTE_STREAMS = set()
@@ -258,36 +252,27 @@ class SFAKVOffloadWorker:
         return tuple(cache_or_caches)
 
     def _register_offload_layers(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        split_offload_tuple_len = 4
         self.offload_layer_names = [
             layer_name
             for layer_name, cache_or_caches in kv_caches.items()
             if len(self._as_cache_tuple(cache_or_caches))
-            in (OFFLOAD_TUPLE_LEN, OFFLOAD_C8_TUPLE_LEN)
+            == split_offload_tuple_len
         ]
         if not self.offload_layer_names:
             raise ValueError("SFA KV Offload did not find SFA KV cache layers.")
-
-        # Under offload, the attention path (sfa_v1.py / device_op.py) gates the
-        # C8 indexer read on the GLOBAL use_sparse_c8_indexer flag, not per-layer.
-        # Mixed five/six-tuple layers would therefore route a non-C8 layer through
-        # the quant indexer (or vice versa). Forbid it here so the global gate
-        # stays sound; C8 must be all-or-nothing across sparse offload layers.
-        tuple_lens = {
-            len(self._as_cache_tuple(kv_caches[name])) for name in self.offload_layer_names
-        }
-        if len(tuple_lens) > 1:
-            raise ValueError(
-                "SFA KV offload does not support mixed LIC8 / non-LIC8 layers: "
-                f"found tuple lengths {sorted(tuple_lens)} "
-                f"(five-tuple and six-tuple coexist). Under offload, C8 must be "
-                f"enabled uniformly across all sparse layers."
-            )
 
         self.num_offload_layers = len(self.offload_layer_names)
         self.num_layers = self.num_offload_layers
         self.layer_name_to_offload_id = {
             layer_name: layer_id
             for layer_id, layer_name in enumerate(self.offload_layer_names)
+        }
+        self.layer_name_to_kv_cache_group_id = {
+            layer_name: group_id
+            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            for layer_name in group.layer_names
+            if layer_name in self.layer_name_to_offload_id
         }
         self.layer_save_tasks = [[] for _ in range(self.num_layers)]
         self.pending_save_layer_ids.clear()
@@ -342,33 +327,15 @@ class SFAKVOffloadWorker:
             for layer_name in self.offload_layer_names:
                 cache_or_caches = self._as_cache_tuple(kv_caches[layer_name])
                 tuple_len = len(cache_or_caches)
-                if tuple_len not in (OFFLOAD_TUPLE_LEN, OFFLOAD_C8_TUPLE_LEN):
+                if tuple_len != 4:
                     raise ValueError(
-                        f"SFA KV offload layer {layer_name}: expected tuple length "
-                        f"{OFFLOAD_TUPLE_LEN} or {OFFLOAD_C8_TUPLE_LEN}, got {tuple_len}"
+                        f"SFA KV offload layer {layer_name}: expected split "
+                        f"main tuple length 4, got {tuple_len}"
                     )
                 self.k_caches_npu.append(cache_or_caches[OFFLOAD_MAIN_K])
                 self.v_caches_npu.append(cache_or_caches[OFFLOAD_MAIN_V])
-                self.topk_buffers_k.append(cache_or_caches[OFFLOAD_RESIDENT_K])
-                self.topk_buffers_v.append(cache_or_caches[OFFLOAD_RESIDENT_V])
-                if is_offload_c8_kv_cache(cache_or_caches):
-                    # Guard against the LIC8 scale tensor aliasing a resident
-                    # top-K buffer. Compare storage identity (data_ptr), NOT
-                    # `in`/`==`: those do element-wise comparison and raise a
-                    # shape-mismatch RuntimeError on the legitimate difference
-                    # (scale dim1 = dsa_block_size, resident dim1 =
-                    # resident_capacity).
-                    scale_storage_ptr = cache_or_caches[
-                        OFFLOAD_INDEXER_S].untyped_storage().data_ptr()
-                    if scale_storage_ptr in (
-                        cache_or_caches[OFFLOAD_RESIDENT_K]
-                        .untyped_storage().data_ptr(),
-                        cache_or_caches[OFFLOAD_RESIDENT_V]
-                        .untyped_storage().data_ptr(),
-                    ):
-                        raise ValueError(
-                            f"LIC8 scale tensor must not alias resident buffer: {layer_name}"
-                        )
+                self.topk_buffers_k.append(cache_or_caches[2])
+                self.topk_buffers_v.append(cache_or_caches[3])
 
             if self.use_layerwise:
                 ready_event = threading.Event()
@@ -835,16 +802,18 @@ class SFAKVOffloadWorker:
         Generate kv offload related metadata.
         """
         num_new_offload_blocks = request.num_new_offload_blocks
-        block_ids_npu = request.block_ids_npu
         block_ids_cpu = request.block_ids_cpu
-        if len(block_ids_npu) > len(block_ids_cpu):
-            # in most cases block_ids_npu has one more unfull block, remove it
-            block_ids_npu = block_ids_npu[:-1]
-        assert len(block_ids_npu) == len(block_ids_cpu)
-        block_ids_npu = block_ids_npu[-num_new_offload_blocks:]
         block_ids_cpu = block_ids_cpu[-num_new_offload_blocks:]
 
         for layer_id in range(self.num_layers):
+            layer_name = self.offload_layer_names[layer_id]
+            group_id = self.layer_name_to_kv_cache_group_id[layer_name]
+            block_ids_npu = request.get_main_block_ids(group_id)
+            if len(block_ids_npu) > len(request.block_ids_cpu):
+                # The logical last block is still partial and remains in HBM.
+                block_ids_npu = block_ids_npu[:-1]
+            assert len(block_ids_npu) >= len(block_ids_cpu)
+            block_ids_npu = block_ids_npu[-num_new_offload_blocks:]
             req_meta_save = LayerMultiBlockReqMeta(
                 request.req_id,
                 layer_id,

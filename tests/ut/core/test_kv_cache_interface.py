@@ -1,7 +1,11 @@
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from vllm_ascend.core.kv_cache_interface import (
     compute_offload_sparse_c8_layout,
+    get_sfa_hybrid_group_ids,
     make_offload_indexer_mla_spec,
     make_offload_main_mla_spec,
     offload_c8_indexer_page_size_bytes,
@@ -15,9 +19,7 @@ from vllm_ascend.utils import calc_split_factor
 KV_LORA_RANK = 512
 QK_ROPE_HEAD_DIM = 64
 INDEX_HEAD_DIM = 128
-INDEXER_PAD_DIM = offload_indexer_pad_dim(
-    INDEX_HEAD_DIM, QK_ROPE_HEAD_DIM, KV_LORA_RANK
-)  # 16
+INDEXER_PAD_DIM = offload_indexer_pad_dim(INDEX_HEAD_DIM, QK_ROPE_HEAD_DIM, KV_LORA_RANK)  # 16
 MLA_BLOCK_SIZE = 128
 MAIN_BYTES_PER_TOKEN = (KV_LORA_RANK + QK_ROPE_HEAD_DIM) * 2  # bf16 main MLA: 1152
 DSV32_C8_LAYOUT = compute_offload_sparse_c8_layout(
@@ -38,9 +40,7 @@ def test_offload_c8_main_page_size_bytes():
         c8_layout=DSV32_C8_LAYOUT,
     )
     # spec_0: 128 * (512 + 64 + 8) * 2 bytes (bf16)
-    assert page == MLA_BLOCK_SIZE * (
-        KV_LORA_RANK + QK_ROPE_HEAD_DIM + DSV32_C8_LAYOUT.kv_pad_dim_bf16_slots
-    ) * 2
+    assert page == MLA_BLOCK_SIZE * (KV_LORA_RANK + QK_ROPE_HEAD_DIM + DSV32_C8_LAYOUT.kv_pad_dim_bf16_slots) * 2
 
 
 def test_offload_c8_indexer_page_size_bytes():
@@ -68,10 +68,7 @@ def test_offload_c8_page_ratio_is_eight_to_one():
         INDEXER_PAD_DIM,
         torch.float16,
     )
-    assert (
-        main_page
-        == indexer_page * DSV32_C8_LAYOUT.page_block_multiplier
-    )
+    assert main_page == indexer_page * DSV32_C8_LAYOUT.page_block_multiplier
 
 
 def test_offload_mla_spec_c8_page_bytes_per_token():
@@ -119,12 +116,112 @@ def test_ascend_mla_offload_c8_page_bytes_per_token():
 
 def test_offload_c8_indexer_block_multiplier_matches_token_ratio():
     # 8 main blocks (128 tokens each) == 1 indexer block (1024 tokens)
-    assert offload_indexer_kernel_block_size(
-        MLA_BLOCK_SIZE,
-        KV_LORA_RANK,
-        INDEX_HEAD_DIM,
-        c8_layout=DSV32_C8_LAYOUT,
-    ) == MLA_BLOCK_SIZE * KV_LORA_RANK // INDEX_HEAD_DIM * 2
+    assert (
+        offload_indexer_kernel_block_size(
+            MLA_BLOCK_SIZE,
+            KV_LORA_RANK,
+            INDEX_HEAD_DIM,
+            c8_layout=DSV32_C8_LAYOUT,
+        )
+        == MLA_BLOCK_SIZE * KV_LORA_RANK // INDEX_HEAD_DIM * 2
+    )
+
+
+def test_offload_non_c8_indexer_block_multiplier_matches_token_ratio():
+    # Main MLA is 512+64 BF16 values/token.  The indexer allocation keeps
+    # 128+16 BF16 values/token, so unifying physical page bytes enlarges the
+    # indexer block from 128 to 512 tokens (4x).
+    main_spec = make_offload_main_mla_spec(
+        block_size=MLA_BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=KV_LORA_RANK + QK_ROPE_HEAD_DIM,
+        dtype=torch.bfloat16,
+    )
+    indexer_spec = make_offload_indexer_mla_spec(
+        block_size=MLA_BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=INDEX_HEAD_DIM + INDEXER_PAD_DIM,
+        dtype=torch.bfloat16,
+        cache_dtype_str="auto",
+        index_head_dim=INDEX_HEAD_DIM,
+        indexer_pad_dim=INDEXER_PAD_DIM,
+    )
+    assert main_spec.page_size_bytes == indexer_spec.page_size_bytes * 4
+    assert (
+        offload_indexer_kernel_block_size(
+            MLA_BLOCK_SIZE,
+            KV_LORA_RANK,
+            INDEX_HEAD_DIM,
+        )
+        == 512
+    )
+
+
+def test_get_sfa_hybrid_group_ids_glm52_true_hybrid():
+    main_spec = make_offload_main_mla_spec(
+        block_size=MLA_BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=KV_LORA_RANK + QK_ROPE_HEAD_DIM,
+        dtype=torch.bfloat16,
+    )
+    indexer_spec = make_offload_indexer_mla_spec(
+        block_size=MLA_BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=INDEX_HEAD_DIM + INDEXER_PAD_DIM,
+        dtype=torch.bfloat16,
+        cache_dtype_str="auto",
+        index_head_dim=INDEX_HEAD_DIM,
+        indexer_pad_dim=INDEXER_PAD_DIM,
+    )
+    groups = [
+        SimpleNamespace(
+            layer_names=[f"model.layers.{i}.self_attn.attn"],
+            kv_cache_spec=main_spec,
+        )
+        for i in range(4)
+    ]
+    # Do not rely on the indexer being group 0; group order follows upstream
+    # spec insertion order and can change with model registration details.
+    groups.insert(
+        2,
+        SimpleNamespace(
+            layer_names=[
+                "model.layers.0.self_attn.indexer.k_cache",
+                "model.layers.4.self_attn.indexer.k_cache",
+            ],
+            kv_cache_spec=indexer_spec,
+        ),
+    )
+    assert get_sfa_hybrid_group_ids(groups) == ([0, 1, 3, 4], 2)
+
+
+def test_get_sfa_hybrid_group_ids_rejects_mixed_group():
+    main_spec = make_offload_main_mla_spec(
+        block_size=MLA_BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=KV_LORA_RANK + QK_ROPE_HEAD_DIM,
+        dtype=torch.bfloat16,
+    )
+    indexer_spec = make_offload_indexer_mla_spec(
+        block_size=MLA_BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=INDEX_HEAD_DIM + INDEXER_PAD_DIM,
+        dtype=torch.bfloat16,
+        cache_dtype_str="auto",
+        index_head_dim=INDEX_HEAD_DIM,
+        indexer_pad_dim=INDEXER_PAD_DIM,
+    )
+    groups = [
+        SimpleNamespace(
+            layer_names=[
+                "model.layers.0.self_attn.attn",
+                "model.layers.0.self_attn.indexer.k_cache",
+            ],
+            kv_cache_spec=SimpleNamespace(kv_cache_specs={"main": main_spec, "indexer": indexer_spec}),
+        )
+    ]
+    with pytest.raises(ValueError, match="cannot mix"):
+        get_sfa_hybrid_group_ids(groups)
 
 
 def test_offload_c8_pool_three_way_split_matches_main_page():

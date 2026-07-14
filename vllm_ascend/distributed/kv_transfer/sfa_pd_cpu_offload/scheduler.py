@@ -25,6 +25,7 @@ from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend import envs
+from vllm_ascend.core.kv_cache_interface import get_sfa_hybrid_group_ids
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
     ReqMeta,
     RequestTracker,
@@ -42,9 +43,6 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
-
-_INDEXER_GROUP_IDX = 0
-_MAIN_GROUP_IDX = 1
 
 
 class _SendReqInfo:
@@ -231,7 +229,8 @@ class SFAPDCpuOffloadScheduler:
             group_spec.kv_cache_spec.block_size
             for group_spec in (kv_cache_config.kv_cache_groups if kv_cache_config else [])
         ]
-        # main MLA group block size (group 1) — the CPU offload granularity.
+        self.main_group_ids, self.indexer_group_id = get_sfa_hybrid_group_ids(kv_cache_config.kv_cache_groups)
+        # Main MLA group block size — the CPU offload granularity.
         # The manager uses its self.block_size to size the null-padded prefix
         # and the SFA kernel uses _main_block_size (via cpu_blocks_map) as the
         # num_offloaded_blocks mask threshold; divergence silently over/under-
@@ -242,10 +241,12 @@ class SFAPDCpuOffloadScheduler:
         # spec value — so under DCP/PCP > 1 the two diverge and this connector's
         # null-pad/mask coupling is NOT supported without extra work. Assert the
         # group exists rather than silently falling back to 128.
-        assert len(self.block_size) > _MAIN_GROUP_IDX, (
-            f"PD offload expects a main-MLA group at index {_MAIN_GROUP_IDX}; got groups={self.block_size}"
+        main_block_sizes = {self.block_size[group_id] for group_id in self.main_group_ids}
+        assert len(main_block_sizes) == 1, (
+            "PD offload expects all main-MLA groups to have the same block "
+            f"size; got groups={self.block_size}, main={self.main_group_ids}."
         )
-        self._main_block_size = self.block_size[_MAIN_GROUP_IDX]
+        self._main_block_size = main_block_sizes.pop()
 
         # Hard-fail the unsupported DCP/PCP>1 config instead of silently
         # mis-masking: under DCP*PCP>1 vLLM core scales the manager's
@@ -308,10 +309,9 @@ class SFAPDCpuOffloadScheduler:
 
         # vLLM-allocated NPU block ids per group (indexer + main MLA).
         npu_block_ids_by_group = list(blocks.get_block_ids())
-        indexer_npu_ids = (
-            npu_block_ids_by_group[_INDEXER_GROUP_IDX] if len(npu_block_ids_by_group) > _INDEXER_GROUP_IDX else []
-        )
-        main_hbm_ids = npu_block_ids_by_group[_MAIN_GROUP_IDX] if len(npu_block_ids_by_group) > _MAIN_GROUP_IDX else []
+        indexer_npu_ids = npu_block_ids_by_group[self.indexer_group_id]
+        main_hbm_ids_by_group = {group_id: list(npu_block_ids_by_group[group_id]) for group_id in self.main_group_ids}
+        main_hbm_ids = main_hbm_ids_by_group[self.main_group_ids[0]]
 
         # Part A: the CPU pool stores only FULL main MLA blocks (floor division).
         # The optional partial last block stays in HBM — D's logical-last group1
@@ -323,7 +323,12 @@ class SFAPDCpuOffloadScheduler:
         num_main_cpu_blocks = prompt_len // self._main_block_size
         has_partial = (prompt_len % self._main_block_size) != 0
         main_cpu_ids = self.cpu_block_manager.allocate_block(num_main_cpu_blocks) if num_main_cpu_blocks > 0 else []
-        partial_hbm_bid = main_hbm_ids[-1] if (has_partial and main_hbm_ids) else None
+        partial_hbm_bid_by_group = {
+            group_id: block_ids[-1]
+            for group_id, block_ids in main_hbm_ids_by_group.items()
+            if has_partial and block_ids
+        }
+        partial_hbm_bid = partial_hbm_bid_by_group.get(self.main_group_ids[0])
 
         tracker = RequestTracker(
             req_id=request.request_id,
@@ -332,6 +337,8 @@ class SFAPDCpuOffloadScheduler:
             num_full=num_main_cpu_blocks,
             partial_hbm_bid=partial_hbm_bid,
             main_hbm_ids=list(main_hbm_ids),
+            main_block_ids_by_group=main_hbm_ids_by_group,
+            partial_hbm_bid_by_group=partial_hbm_bid_by_group,
         )
         self._request_trackers[request.request_id] = tracker
         self._reqs_need_recv.add(request.request_id)
@@ -382,24 +389,24 @@ class SFAPDCpuOffloadScheduler:
         # B1: maps from scheduled_cached_reqs for decode offload computation.
         cached_reqs = scheduler_output.scheduled_cached_reqs
         num_computed_by_req: dict[str, int] = dict(zip(cached_reqs.req_ids, cached_reqs.num_computed_tokens))
-        new_main_hbm_by_req: dict[str, list[int]] = {}
+        new_main_hbm_by_req: dict[str, dict[int, list[int]]] = {}
         for i, rid in enumerate(cached_reqs.req_ids):
             nbi = cached_reqs.new_block_ids[i]
             if nbi is None:
                 nbi = []
-            elif isinstance(nbi, tuple):
-                # multi-group: tuple of per-group lists; last = main MLA (group1)
-                nbi = nbi[-1] if len(nbi) > 0 else []
-            new_main_hbm_by_req[rid] = list(nbi)
+            if isinstance(nbi, tuple):
+                new_main_hbm_by_req[rid] = {group_id: list(nbi[group_id]) for group_id in self.main_group_ids}
+            else:
+                new_main_hbm_by_req[rid] = {self.main_group_ids[0]: list(nbi)}
 
         def _add_req(
             req_id: str,
             offload_src: list[int] | None = None,
             offload_dst: list[int] | None = None,
-        ) -> None:
+        ) -> ReqMeta | None:
             tracker = self._request_trackers.get(req_id)
             if tracker is None:
-                return
+                return None
             if envs.VLLM_ASCEND_SFA_DEBUG:
                 logger.info(
                     "SFAPDCpuOffload D build meta req %s: main_hbm_ids=%s, "
@@ -414,19 +421,21 @@ class SFAPDCpuOffloadScheduler:
                     offload_src or [],
                     offload_dst or [],
                 )
-            meta.add_request(
-                ReqMeta(
-                    req_id=tracker.req_id,
-                    block_ids_npu=tracker.main_hbm_ids,
-                    block_ids_cpu=tracker.allocated_block_ids_cpu,
-                    block_ids_indexer=tracker.allocated_block_ids_npu,
-                    num_new_offload_blocks=len(offload_src) if offload_src else 0,
-                    num_full=tracker.num_full,
-                    partial_hbm_bid=tracker.partial_hbm_bid,
-                    offload_src_hbm_ids=offload_src or [],
-                    offload_dst_cpu_ids=offload_dst or [],
-                )
+            req_meta = ReqMeta(
+                req_id=tracker.req_id,
+                block_ids_npu=tracker.main_hbm_ids,
+                block_ids_cpu=tracker.allocated_block_ids_cpu,
+                block_ids_indexer=tracker.allocated_block_ids_npu,
+                num_new_offload_blocks=len(offload_src) if offload_src else 0,
+                num_full=tracker.num_full,
+                partial_hbm_bid=tracker.partial_hbm_bid,
+                offload_src_hbm_ids=offload_src or [],
+                offload_dst_cpu_ids=offload_dst or [],
+                main_block_ids_by_group=tracker.main_block_ids_by_group,
+                partial_hbm_bid_by_group=tracker.partial_hbm_bid_by_group,
             )
+            meta.add_request(req_meta)
+            return req_meta
 
         # Seed every newly-allocated remote-prefill request ONCE (prefill: no
         # decode offload). The worker needs this to build request_map so
@@ -448,7 +457,10 @@ class SFAPDCpuOffloadScheduler:
             if req_id not in scheduler_output.num_scheduled_tokens:
                 continue
             tracker = self._request_trackers[req_id]
-            tracker.main_hbm_ids.extend(new_main_hbm_by_req.get(req_id, []))
+            new_by_group = new_main_hbm_by_req.get(req_id, {})
+            for group_id, block_ids in new_by_group.items():
+                tracker.main_block_ids_by_group.setdefault(group_id, []).extend(block_ids)
+            tracker.main_hbm_ids = tracker.main_block_ids_by_group[self.main_group_ids[0]]
             # Use finalized (committed) tokens: exclude spec-decode draft
             # tokens, which may be rejected, so we don't offload blocks that
             # still hold uncommitted KV. Matches SFAKVOffloadlScheduler.
@@ -459,7 +471,12 @@ class SFAPDCpuOffloadScheduler:
             num_blocks_after_step = (num_computed + num_new_tokens) // self._main_block_size
             num_offloaded = len(tracker.allocated_block_ids_cpu)
             end = min(num_blocks_after_step, len(tracker.main_hbm_ids))
-            offload_src = tracker.main_hbm_ids[num_offloaded:end] if end > num_offloaded else []
+            offload_src_by_group = {
+                group_id: block_ids[num_offloaded:end]
+                for group_id, block_ids in tracker.main_block_ids_by_group.items()
+                if end > num_offloaded
+            }
+            offload_src = offload_src_by_group.get(self.main_group_ids[0], [])
             offload_dst = self.cpu_block_manager.allocate_block(len(offload_src)) if offload_src else []
             if envs.VLLM_ASCEND_SFA_DEBUG:
                 # Show the slice arithmetic so a hardware run can confirm the
@@ -488,7 +505,9 @@ class SFAPDCpuOffloadScheduler:
                         num_offloaded,
                         num_offloaded + len(offload_src),
                     )
-            _add_req(req_id, offload_src, offload_dst)
+            req_meta = _add_req(req_id, offload_src, offload_dst)
+            if req_meta is not None:
+                req_meta.offload_src_hbm_ids_by_group = offload_src_by_group
         return meta
 
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
