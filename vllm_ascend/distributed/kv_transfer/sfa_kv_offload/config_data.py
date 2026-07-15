@@ -54,11 +54,20 @@ class ReqMeta:
     # num_new_offload_blocks + sfa_worker.process_layer_data.
     offload_src_hbm_ids: list[int] = field(default_factory=list)
     offload_dst_cpu_ids: list[int] = field(default_factory=list)
+    # Token range produced by this scheduler step. The CPU cache is
+    # authoritative at token granularity, so the final partial page is also
+    # allocated and updated instead of waiting for a full block.
+    write_start: int = 0
+    write_count: int = 0
+    is_prefill: bool = False
 
     @staticmethod
     def from_request_tracker(
         tracker: RequestTracker,
         num_new_offload_blocks: int = 0,
+        write_start: int = 0,
+        write_count: int = 0,
+        is_prefill: bool = False,
     ) -> ReqMeta | None:
         """Create the request metadata from a request tracker."""
         return ReqMeta(
@@ -68,6 +77,9 @@ class ReqMeta:
             num_new_offload_blocks=num_new_offload_blocks,
             num_full=tracker.num_full,
             partial_hbm_bid=tracker.partial_hbm_bid,
+            write_start=write_start,
+            write_count=write_count,
+            is_prefill=is_prefill,
         )
 
 
@@ -93,3 +105,14 @@ class LayerMultiBlockReqMeta:
     block_ids_cpu: list[int] | None = None
     cache_npu: tuple[torch.Tensor, torch.Tensor] | None = None
     cache_cpu: tuple[torch.Tensor, torch.Tensor] | None = None
+    token_start: int = 0
+    token_count: int = 0
+    # Decode copies read layer-private resident rows. Prefill copies leave
+    # these unset and read the normal paged K/V tensors via block_ids_npu.
+    source_rows: list[int] | None = None
+    source_slots: list[int] | None = None
+    ready_event: object | None = None
+
+    @property
+    def uses_resident(self) -> bool:
+        return self.source_rows is not None

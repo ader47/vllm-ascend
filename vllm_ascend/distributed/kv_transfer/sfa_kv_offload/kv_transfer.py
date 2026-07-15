@@ -80,12 +80,55 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         layer_id = req_metas[0].layer_id
 
         with torch_npu.npu.stream(self.save_stream):
+            ready_event = req_metas[0].ready_event
+            if ready_event is not None:
+                self.save_stream.wait_event(ready_event)
             for req_meta in req_metas:
                 req_id = req_meta.req_id
                 block_ids_npu = req_meta.block_ids_npu
                 block_ids_cpu = req_meta.block_ids_cpu
                 (k_cache_npu, v_cache_npu) = req_meta.cache_npu
                 (k_cache_cpu, v_cache_cpu) = req_meta.cache_cpu
+                if req_meta.token_count > 0:
+                    if req_meta.uses_resident:
+                        assert req_meta.source_rows is not None
+                        assert req_meta.source_slots is not None
+                        for offset, (source_row, source_slot) in enumerate(
+                            zip(req_meta.source_rows, req_meta.source_slots)
+                        ):
+                            token_position = req_meta.token_start + offset
+                            logical_block = token_position // self.block_size
+                            block_offset = token_position % self.block_size
+                            cpu_block = block_ids_cpu[logical_block]
+                            k_cache_cpu[cpu_block, block_offset].copy_(
+                                k_cache_npu[source_row, source_slot]
+                            )
+                            v_cache_cpu[cpu_block, block_offset].copy_(
+                                v_cache_npu[source_row, source_slot]
+                            )
+                    else:
+                        # One-shot local prefill may end in a partial page. Copy
+                        # contiguous ranges from each touched normal cache page.
+                        remaining = req_meta.token_count
+                        token_position = req_meta.token_start
+                        while remaining > 0:
+                            logical_block = token_position // self.block_size
+                            block_offset = token_position % self.block_size
+                            copy_count = min(
+                                remaining, self.block_size - block_offset
+                            )
+                            npu_block = block_ids_npu[logical_block]
+                            cpu_block = block_ids_cpu[logical_block]
+                            end = block_offset + copy_count
+                            k_cache_cpu[cpu_block, block_offset:end].copy_(
+                                k_cache_npu[npu_block, block_offset:end]
+                            )
+                            v_cache_cpu[cpu_block, block_offset:end].copy_(
+                                v_cache_npu[npu_block, block_offset:end]
+                            )
+                            token_position += copy_count
+                            remaining -= copy_count
+                    continue
                 if len(block_ids_npu) != len(block_ids_cpu):
                     logger.error(
                         f'Offload req {req_id} fail! '
@@ -99,6 +142,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                     k_cache_cpu[block_ids_cpu] = k_cache_npu[block_ids_npu].to('cpu')
                     v_cache_cpu[block_ids_cpu] = v_cache_npu[block_ids_npu].to('cpu')
                 else:
+                    if not block_ids_npu:
+                        continue
                     k_cache_cpu[block_ids_cpu[0]].copy_(k_cache_npu[block_ids_npu[0]])
                     v_cache_cpu[block_ids_cpu[0]].copy_(v_cache_npu[block_ids_npu[0]])
         self.save_stream.synchronize()

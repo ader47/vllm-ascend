@@ -5,6 +5,7 @@ from typing import Any
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
+from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -14,6 +15,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.core.kv_cache_interface import is_direct_sfa_host_offload
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
     SFAKVOffloadConnectorMetadata,
     ReqMeta,
@@ -21,10 +23,16 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
 )
 
 
-def _num_finalized_scheduled_tokens(scheduler_output: SchedulerOutput, req_id: str) -> int:
-    num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-    draft_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
-    return max(num_scheduled_tokens - len(draft_tokens), 0)
+def _num_touched_blocks(num_tokens: int, block_size: int) -> int:
+    return (num_tokens + block_size - 1) // block_size
+
+
+def _new_request_prompt_tokens(request: Any) -> int:
+    """Read prompt length from the current scheduler-output contract."""
+    return length_from_prompt_token_ids_or_embeds(
+        request.prompt_token_ids,
+        request.prompt_embeds,
+    )
 
 
 class CPUBlockManager(ABC):
@@ -60,11 +68,25 @@ class SFAKVOffloadlScheduler:
         init_ascend_config(vllm_config)
         ascend_config = get_ascend_config()
         self.use_offload = ascend_config.use_offload
+        self.use_direct_sfa_host_offload = is_direct_sfa_host_offload(
+            vllm_config
+        )
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
         self.dcp_size = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
         self.group_block_sizes = self._infer_group_block_sizes(vllm_config, kv_cache_config)
-        self._block_size = self.group_block_sizes[-1] # only offload kv cache
+        if self.use_direct_sfa_host_offload:
+            # vLLM collapses UniformTypeKVCacheSpecs to a representative spec
+            # in the scheduler copy. One group is therefore the durable
+            # scheduler-side invariant; the worker validates the Uniform type.
+            if len(kv_cache_config.kv_cache_groups) != 1:
+                raise ValueError(
+                    "Direct SFA host offload scheduler requires one "
+                    "logical KV cache group."
+                )
+            self._block_size = self.group_block_sizes[0]
+        else:
+            self._block_size = self.group_block_sizes[-1] # only offload kv cache
 
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
@@ -77,7 +99,9 @@ class SFAKVOffloadlScheduler:
         # we need 4 * npu_blocks of cpu_blocks to fully store all offload blocks (dskv32, 512/128)
         # but you may want to set this to 1 in debug case in case of allocating to much dram
         # TODO remove this and directly compute from model config before merge
-        cpu_block_num_multiple = 4
+        cpu_block_num_multiple = (
+            1 if self.use_direct_sfa_host_offload else 4
+        )
         cpu_block_num = npu_block_num * cpu_block_num_multiple
         self.cpu_block_manager = CPUBlockManager(cpu_block_num)
 
@@ -126,10 +150,31 @@ class SFAKVOffloadlScheduler:
         meta = SFAKVOffloadConnectorMetadata(self._unfinished_request_ids, scheduler_output.preempted_req_ids)
 
         for request in scheduler_output.scheduled_new_reqs:
-            block_ids_npu = request.block_ids[-1].copy() # NOTE dskv32 sparse offload, 0 for indexer and 1 for ori kv_cache
-            num_tokens_to_compute = request.num_computed_tokens + _num_finalized_scheduled_tokens(
-                scheduler_output, request.req_id)
-            num_new_offload_blocks = num_tokens_to_compute // self._block_size
+            block_ids_npu = request.block_ids[
+                0 if self.use_direct_sfa_host_offload else -1
+            ].copy()
+            write_start = request.num_computed_tokens
+            write_count = scheduler_output.num_scheduled_tokens[request.req_id]
+            is_prefill = write_start < _new_request_prompt_tokens(request)
+            if is_prefill and write_start != 0:
+                raise RuntimeError(
+                    "SFA decode offload only supports one-shot local prefill; "
+                    f"request {request.req_id} resumes at token {write_start}."
+                )
+            if (
+                self.use_direct_sfa_host_offload
+                and is_prefill
+                and write_count > self._block_size
+            ):
+                raise RuntimeError(
+                    "Direct SFA host offload supports one local prefill page; "
+                    f"request {request.req_id} schedules {write_count} tokens "
+                    f"with block_size={self._block_size}."
+                )
+            num_blocks_after_step = _num_touched_blocks(
+                write_start + write_count, self._block_size
+            )
+            num_new_offload_blocks = num_blocks_after_step
             block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_offload_blocks)
             request_tracker = RequestTracker(
                 req_id=request.req_id,
@@ -141,6 +186,9 @@ class SFAKVOffloadlScheduler:
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 num_new_offload_blocks=num_new_offload_blocks,
+                write_start=write_start,
+                write_count=write_count,
+                is_prefill=is_prefill,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -150,16 +198,19 @@ class SFAKVOffloadlScheduler:
             # resumed request
             new_block_ids_npu = cached_reqs.new_block_ids[i]
             if isinstance(new_block_ids_npu, tuple):
-                # NOTE dskv32 sparse offload, 0 for indexer and 1 for ori kv_cache
-                new_block_ids_npu = new_block_ids_npu[-1]
+                new_block_ids_npu = new_block_ids_npu[
+                    0 if self.use_direct_sfa_host_offload else -1
+                ]
             elif new_block_ids_npu is None:
                 new_block_ids_npu = []
             if req_id in self._preempted_req_ids:
                 # treat as a new request
                 num_computed_tokens = cached_reqs.num_computed_tokens[i]
-                num_new_tokens = _num_finalized_scheduled_tokens(scheduler_output, req_id)
+                num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 assert num_computed_tokens == 0
-                num_new_offload_blocks = num_new_tokens // self._block_size
+                num_new_offload_blocks = _num_touched_blocks(
+                    num_new_tokens, self._block_size
+                )
                 block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_offload_blocks)
                 request_tracker = RequestTracker(
                     req_id=req_id,
@@ -168,10 +219,22 @@ class SFAKVOffloadlScheduler:
                 )
                 self._request_trackers[req_id] = request_tracker
                 self._preempted_req_ids.discard(req_id)
+                write_start = 0
+                write_count = num_new_tokens
+                is_prefill = True
+                if (
+                    self.use_direct_sfa_host_offload
+                    and write_count > self._block_size
+                ):
+                    raise RuntimeError(
+                        "Direct SFA host offload supports one local prefill "
+                        f"page; request {req_id} schedules {write_count} "
+                        f"tokens with block_size={self._block_size}."
+                    )
             # decode/chunked request
             else:
                 request_tracker = self._request_trackers[req_id]
-                num_new_tokens = _num_finalized_scheduled_tokens(scheduler_output, req_id)
+                num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 req_tuple = self._unfinished_requests.get(req_id)
                 if req_tuple:
                     request = req_tuple[0]
@@ -180,8 +243,18 @@ class SFAKVOffloadlScheduler:
                         f"Request {req_id} is not in _unfinished_requests, but it is scheduled to be cached"
                     )
                 num_computed_token = cached_reqs.num_computed_tokens[i]
+                write_start = num_computed_token
+                write_count = num_new_tokens
+                is_prefill = num_computed_token < request.num_prompt_tokens
+                if is_prefill:
+                    raise RuntimeError(
+                        "SFA decode offload does not support chunked or resumed "
+                        f"prefill for request {req_id}."
+                    )
                 num_tokens_after_step = num_computed_token + num_new_tokens
-                num_blocks_after_step = num_tokens_after_step // self._block_size # pcp/dcp not considered now
+                num_blocks_after_step = _num_touched_blocks(
+                    num_tokens_after_step, self._block_size
+                ) # pcp/dcp not considered now
                 num_offloaded_blocks = len(request_tracker.allocated_block_ids_cpu)
                 num_new_offload_blocks = max(num_blocks_after_step - num_offloaded_blocks, 0)
                 new_block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_offload_blocks)
@@ -190,9 +263,21 @@ class SFAKVOffloadlScheduler:
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 num_new_offload_blocks=num_new_offload_blocks,
+                write_start=write_start,
+                write_count=write_count,
+                is_prefill=is_prefill,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
+        if self.use_direct_sfa_host_offload:
+            prefill_requests = [
+                request for request in meta.requests if request.is_prefill
+            ]
+            if prefill_requests and len(meta.requests) != 1:
+                raise RuntimeError(
+                    "Direct SFA host offload supports local prefill for one "
+                    "request per batch only."
+                )
         return meta
 
     def request_finished(
@@ -212,4 +297,5 @@ class SFAKVOffloadlScheduler:
         request_id: str,
     ):
         tracker = self._request_trackers.get(request_id)
-        self.cpu_block_manager.free(tracker.allocated_block_ids_cpu)
+        if tracker is not None:
+            self.cpu_block_manager.free(tracker.allocated_block_ids_cpu)

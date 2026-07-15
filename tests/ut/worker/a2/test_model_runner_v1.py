@@ -24,6 +24,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         runner = NPUModelRunner.__new__(NPUModelRunner)
         runner.device = torch.device("cpu")
         runner.use_sparse = False
+        runner.use_offload = False
+        runner.use_direct_sfa_host_offload = False
         runner.use_sparse_c8 = False
         runner.use_compress = False
         runner.use_hybrid_blocks = False
@@ -281,7 +283,90 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         self.assertEqual(main_spec.page_size_bytes, 16 * (512 + 64) * 2)
         self.assertEqual(indexer_spec.page_size_bytes, 2 * 16 * (128 + 2))
-        self.assertFalse(hasattr(main_spec, "sfa_dcp_replicated_indexer_size"))
+        # The direct BF16 path uses the split indexer value. Keep the main
+        # spec's legacy default for sparse-C8 offload, which is intentionally
+        # routed outside this refactor.
+        self.assertEqual(main_spec.sfa_dcp_replicated_indexer_size, 1)
+        self.assertEqual(indexer_spec.sfa_dcp_replicated_indexer_size, 2)
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+    def test_direct_sfa_host_offload_allocates_only_real_indexer_hbm(
+        self,
+        mock_get_layers,
+    ):
+        runner = self._build_runner()
+        runner.use_sparse = True
+        runner.use_offload = True
+        runner.use_direct_sfa_host_offload = True
+        main_name = "model.layers.2.self_attn.attn"
+        indexer_name = "model.layers.2.self_attn.indexer.k_cache"
+        main_spec = AscendMLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+        )
+        indexer_spec = AscendSFAIndexerCacheSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+        uniform_spec = UniformTypeKVCacheSpecs.from_specs(
+            {main_name: main_spec, indexer_name: indexer_spec}
+        )
+        assert uniform_spec is not None
+        config = KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=indexer_spec.page_size_bytes * 2,
+                    shared_by=[indexer_name],
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=[main_name, indexer_name],
+                    kv_cache_spec=uniform_spec,
+                )
+            ],
+        )
+
+        raw_caches = runner._allocate_kv_cache_tensors(config)
+        self.assertEqual(set(raw_caches), {indexer_name})
+
+        runtime_cache = tuple(torch.empty(1) for _ in range(5))
+        main_layer = SimpleNamespace(
+            impl=SimpleNamespace(
+                get_direct_offload_runtime_cache=lambda: runtime_cache
+            )
+        )
+        mock_get_layers.return_value = {main_name: main_layer}
+        backend = MagicMock()
+        backend.get_kv_cache_shape.side_effect = (
+            lambda num_blocks, block_size, num_kv_heads, head_size: (
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_size,
+            )
+        )
+        runner._kv_cache_spec_attn_group_iterator = lambda: [
+            SimpleNamespace(
+                kv_cache_spec=main_spec,
+                backend=backend,
+                layer_names=[main_name],
+            ),
+            SimpleNamespace(
+                kv_cache_spec=indexer_spec,
+                backend=backend,
+                layer_names=[indexer_name],
+            ),
+        ]
+
+        caches = runner._reshape_kv_cache_tensors(config, raw_caches)
+        self.assertIs(caches[main_name], runtime_cache)
+        self.assertEqual(caches[indexer_name][0].shape, (2, 16, 1, 128))
 
     @patch("vllm_ascend.worker.model_runner_v1.get_ascend_device_type", return_value=AscendDeviceType.A5)
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)

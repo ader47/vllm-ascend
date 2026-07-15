@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Optional
-from collections.abc import Generator
 
 import numpy as np
 import torch
@@ -27,6 +25,10 @@ from memfabric_hybrid import offload
 
 from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.core.kv_cache_interface import (
+    DIRECT_SFA_HOST_CACHE_BYTES,
+    is_direct_sfa_host_offload,
+)
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
     SFAKVOffloadConnectorMetadata,
     LayerMultiBlockReqMeta,
@@ -164,10 +166,24 @@ class SFAKVOffloadWorker:
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         ascend_config = get_ascend_config()
         self.use_offload = ascend_config.use_offload
+        self.use_direct_sfa_host_offload = is_direct_sfa_host_offload(
+            vllm_config
+        )
 
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.group_block_sizes = self._infer_group_block_sizes(vllm_config, kv_cache_config)
-        self.block_size = self.group_block_sizes[-1] # only offload kv cache
+        if self.use_direct_sfa_host_offload:
+            if len(kv_cache_config.kv_cache_groups) != 1 or not isinstance(
+                kv_cache_config.kv_cache_groups[0].kv_cache_spec,
+                UniformTypeKVCacheSpecs,
+            ):
+                raise ValueError(
+                    "Direct SFA host offload worker requires one UniformType "
+                    "KV cache group."
+                )
+            self.block_size = self.group_block_sizes[0]
+        else:
+            self.block_size = self.group_block_sizes[-1] # only offload kv cache
 
         self.current_layer_save = 0
         self.current_layer_load = 0
@@ -191,6 +207,7 @@ class SFAKVOffloadWorker:
         decode_width = 1
         if vllm_config.speculative_config is not None:
             decode_width += vllm_config.speculative_config.num_speculative_tokens
+        self.decode_width = decode_width
         self.max_num_topk_rows = min(
             self.max_num_tokens,
             self.max_num_reqs * decode_width,
@@ -198,6 +215,14 @@ class SFAKVOffloadWorker:
         lru_resident_config = ascend_config.lru_resident_cache_config
         self.sfa_sparse_topk = lru_resident_config.topk
         self.lru_resident_capacity = lru_resident_config.buffer_size
+        self.lru_managed_capacity = self.lru_resident_capacity - self.decode_width
+        if self.lru_managed_capacity < self.sfa_sparse_topk:
+            raise ValueError(
+                "LRU resident buffer must reserve one fresh slot per decode "
+                f"token: buffer_size={self.lru_resident_capacity}, "
+                f"topk={self.sfa_sparse_topk}, decode_width={self.decode_width}."
+            )
+        self.current_batch_is_prefill = False
 
         # TODO get from config
         head_num = 1
@@ -224,8 +249,7 @@ class SFAKVOffloadWorker:
         self.load_stream = None
         self.load_stream = torch_npu.npu.Stream()
         self.save_stream = None
-        self.side_compute_stream = torch_npu.npu.Stream()
-        self.allocate_dram_size = 128 * 1024 * 1024 * 1024 # TODO get from config
+        self.allocate_dram_size = DIRECT_SFA_HOST_CACHE_BYTES
         logger.info(
             f"SFAKVOffloadWoker start init CPU KV pool with {self.allocate_dram_size / 1024 / 1024 / 1024} GB dram, "
             "it might be time consuming, please wait."
@@ -390,7 +414,9 @@ class SFAKVOffloadWorker:
                 # we need 4 * npu_blocks of cpu_blocks to fully store all offload blocks (dskv32, 512/128)
                 # but you may want to set this to 1 in debug case in case of allocating to much dram
                 # TODO remove this and directly compute from model config before merge
-                cpu_block_num_multiple = 4
+                cpu_block_num_multiple = (
+                    1 if self.use_direct_sfa_host_offload else 4
+                )
                 cpu_block_num = npu_block_num * cpu_block_num_multiple
                 cpu_cache_size = cpu_block_num * self.block_size * (512 + 64) * torch.bfloat16.itemsize * self.num_layers
                 logger.info(f'KV offload allocate {cpu_block_num} cpu blocks, size = {cpu_cache_size / 1024 / 1024 / 1024} GB')
@@ -424,14 +450,14 @@ class SFAKVOffloadWorker:
                 pin_memory=True,
             )
             self.lru_slot_to_token_cpu_list = [torch.full(
-                [self.max_num_topk_rows, self.lru_resident_capacity],
+                [self.max_num_topk_rows, self.lru_managed_capacity],
                 -1,
                 dtype=torch.int32,
                 device='cpu',
                 pin_memory=True,
             ) for _ in range(self.num_layers)]
             self.lru_slots_cpu_list = [torch.arange(
-                self.lru_resident_capacity,
+                self.lru_managed_capacity,
                 dtype=torch.int32,
                 device='cpu',
             ).view(1, -1).repeat(self.max_num_topk_rows, 1).pin_memory() for _ in range(self.num_layers)]
@@ -481,7 +507,7 @@ class SFAKVOffloadWorker:
                 pin_memory=True,
             )
             self.lru_slot_workspace = torch.empty(
-                [self.lru_workspace_threads, self.lru_resident_capacity * 3],
+                [self.lru_workspace_threads, self.lru_managed_capacity * 3],
                 dtype=torch.int32,
                 device='cpu',
                 pin_memory=True,
@@ -575,11 +601,30 @@ class SFAKVOffloadWorker:
         self.submitted_save_layer_ids.clear()
         for event in getattr(self, "layer_save_finished_events", []):
             event.clear()
+        request_by_id = {request.req_id: request for request in metadata.requests}
+        request_modes = {request.is_prefill for request in metadata.requests}
+        if len(request_modes) > 1:
+            raise RuntimeError(
+                "SFA decode offload does not support mixed prefill/decode batches."
+            )
+        self.current_batch_is_prefill = bool(request_modes and True in request_modes)
+        row_start_by_req: dict[str, int] = {}
+        row_cursor = 0
+        for req_id in self.req_ids:
+            request = request_by_id.get(req_id)
+            if request is None:
+                continue
+            row_start_by_req[req_id] = row_cursor
+            row_cursor += request.write_count
+
         for request in metadata.requests:
             req_id_to_block_ids[request.req_id] = request.block_ids_cpu
-            if self.tp_rank > 0 or request.num_new_offload_blocks <= 0:
-                continue # no new blocks to save
-            self.process_layer_data(request)
+            if self.tp_rank > 0 or request.write_count <= 0:
+                continue
+            self.process_layer_data(
+                request,
+                row_start=row_start_by_req[request.req_id],
+            )
         num_save_layers = sum(1 for layer_save_task in self.layer_save_tasks if layer_save_task)
         self.num_save_tasks = sum(len(layer_save_task) for layer_save_task in self.layer_save_tasks)
         if self.tp_rank == 0:
@@ -600,7 +645,11 @@ class SFAKVOffloadWorker:
             cpu_block_table_np[i][:len(cpu_block_ids)] = np.array([cpu_block_ids], dtype=np.int32)
         self.cpu_block_table.copy_to_gpu(num_reqs)
 
-    def save_cpu(self, layer_id: int | None = None) -> None:
+    def save_cpu(
+        self,
+        layer_id: int | None = None,
+        ready_event: torch.npu.Event | None = None,
+    ) -> None:
         if layer_id is None:
             layer_id = self.current_layer_save
             self.current_layer_save += 1
@@ -615,12 +664,34 @@ class SFAKVOffloadWorker:
         assert self.kv_send_thread is not None
         self.pending_save_layer_ids.add(layer_id)
         self.submitted_save_layer_ids.add(layer_id)
-        self.kv_send_thread.add_request(list(self.layer_save_tasks[layer_id]))
+        tasks = list(self.layer_save_tasks[layer_id])
+        for task in tasks:
+            task.ready_event = ready_event
+        self.kv_send_thread.add_request(tasks)
+
+    def _wait_for_layer_save(self, layer_id: int) -> None:
+        if layer_id not in self.pending_save_layer_ids:
+            return
+        event = self.layer_save_finished_events[layer_id]
+        while not event.wait(timeout=30):
+            logger.warning(
+                ">>>>> layer %d save not finished after 30s, keep waiting",
+                layer_id,
+            )
+        event.clear()
+        self.pending_save_layer_ids.discard(layer_id)
 
     def save_kv_layer(self, layer_name: str) -> None:
         if _is_current_stream_capturing():
             return
-        self.save_cpu(self._get_offload_layer_id(layer_name))
+        layer_id = self._get_offload_layer_id(layer_name)
+        ready_event = torch.npu.Event()
+        ready_event.record()
+        self.save_cpu(layer_id, ready_event=ready_event)
+        if self.current_batch_is_prefill:
+            # Prefill copies read normal cache pages that may be reused by the
+            # next layer, so finish the one-shot initialization before return.
+            self._wait_for_layer_save(layer_id)
 
     def wait_for_save(self):
         assert self.use_layerwise
@@ -628,17 +699,7 @@ class SFAKVOffloadWorker:
             # no save tasks, no need to wait
             return
         for layer_id in sorted(self.pending_save_layer_ids):
-            event = self.layer_save_finished_events[layer_id]
-            # Block until the HBM->CPU copy for this layer has actually landed
-            # before clearing its event; otherwise the buffer-reuse gate could
-            # free the source buffer while the send thread is still copying.
-            # Match pool_worker's drain pattern (30s watchdog + keep waiting).
-            while not event.wait(timeout=30):
-                logger.warning(
-                    ">>>>> layer %d save not finished after 30s, keep waiting",
-                    layer_id,
-                )
-            event.clear()
+            self._wait_for_layer_save(layer_id)
         self.pending_save_layer_ids.clear()
         self.submitted_save_layer_ids.clear()
  
@@ -697,7 +758,7 @@ class SFAKVOffloadWorker:
             lru_epochs_ptr,
             num_reqs,
             self.sfa_sparse_topk,
-            self.lru_resident_capacity,
+            self.lru_managed_capacity,
             self.max_model_len,
             self.lru_workspace_threads,
             self.lru_workspace_threads,
@@ -829,28 +890,59 @@ class SFAKVOffloadWorker:
         current_slots_npu[:num_tokens].copy_(current_slots_cpu, non_blocking=capturing)
         return True
 
-    def process_layer_data(self, request: ReqMeta) -> Generator[
-        Optional[torch.Tensor], None, None]:
+    def process_layer_data(
+        self,
+        request: ReqMeta,
+        row_start: int,
+    ) -> None:
         """
         Generate kv offload related metadata.
         """
-        num_new_offload_blocks = request.num_new_offload_blocks
         block_ids_npu = request.block_ids_npu
         block_ids_cpu = request.block_ids_cpu
-        if len(block_ids_npu) > len(block_ids_cpu):
-            # in most cases block_ids_npu has one more unfull block, remove it
-            block_ids_npu = block_ids_npu[:-1]
-        assert len(block_ids_npu) == len(block_ids_cpu)
-        block_ids_npu = block_ids_npu[-num_new_offload_blocks:]
-        block_ids_cpu = block_ids_cpu[-num_new_offload_blocks:]
+        if request.write_count <= 0:
+            return
+        if not request.is_prefill and request.write_count > self.decode_width:
+            raise RuntimeError(
+                "SFA decode rows exceed reserved resident slots: "
+                f"request={request.req_id}, rows={request.write_count}, "
+                f"decode_width={self.decode_width}."
+            )
 
         for layer_id in range(self.num_layers):
+            if request.is_prefill:
+                cache_npu = (
+                    self.k_caches_npu[layer_id],
+                    self.v_caches_npu[layer_id],
+                )
+                if self.use_direct_sfa_host_offload:
+                    # Main KV is densely staged in page zero. Scheduler block
+                    # ids address the separately resident indexer cache only.
+                    block_ids_npu = [0]
+                source_rows = None
+                source_slots = None
+            else:
+                cache_npu = (
+                    self.topk_buffers_k[layer_id],
+                    self.topk_buffers_v[layer_id],
+                )
+                source_rows = list(
+                    range(row_start, row_start + request.write_count)
+                )
+                source_slots = [
+                    self.lru_managed_capacity + offset
+                    for offset in range(request.write_count)
+                ]
             req_meta_save = LayerMultiBlockReqMeta(
                 request.req_id,
                 layer_id,
                 block_ids_npu=block_ids_npu,
                 block_ids_cpu=block_ids_cpu,
-                cache_npu=(self.k_caches_npu[layer_id], self.v_caches_npu[layer_id]),
+                cache_npu=cache_npu,
                 cache_cpu=(self.k_caches_cpu[layer_id], self.v_caches_cpu[layer_id]),
+                token_start=request.write_start,
+                token_count=request.write_count,
+                source_rows=source_rows,
+                source_slots=source_slots,
             )
             self.layer_save_tasks[layer_id].append(req_meta_save)

@@ -18,6 +18,25 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager, OffloadMLAAttentionManager
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
+DIRECT_SFA_HOST_CACHE_BYTES = 128 * 1024 * 1024 * 1024
+
+
+def is_direct_sfa_host_offload(vllm_config: VllmConfig) -> bool:
+    """Whether this worker uses the tail-free direct SFA host-cache path.
+
+    Keep this predicate deliberately narrow. AscendStore, MultiConnector, PD,
+    and sparse-C8 deployments retain their existing cache layouts and transfer
+    paths; only the BF16 ``SFAKVOffloadConnector`` owns host-only main KV.
+    """
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    return (
+        kv_transfer_config is not None
+        and kv_transfer_config.kv_connector == "SFAKVOffloadConnector"
+        and bool(additional_config.get("use_offload", False))
+        and not bool(additional_config.get("enable_sparse_c8", False))
+    )
+
 
 def _get_c8_k_cache_dtype() -> torch.dtype:
     return torch.float8_e4m3fn if get_ascend_device_type() == AscendDeviceType.A5 else torch.int8
@@ -252,7 +271,16 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             )
 
         if self.cache_sparse_c8:
-            assert self.sparse_head_dim is not None
+            if self.sparse_head_dim is None:
+                # Split non-offload SFA specs already encode the packed C8
+                # width and dtype in head_size/dtype. sparse_head_dim is only
+                # required by the legacy merged offload layout below.
+                return (
+                    self.block_size
+                    * self.num_kv_heads
+                    * self.head_size
+                    * get_dtype_size(self.dtype)
+                )
             assert len(self.sparse_head_dim) == 3
             num_heads_per_page = self.block_size * self.num_kv_heads
 

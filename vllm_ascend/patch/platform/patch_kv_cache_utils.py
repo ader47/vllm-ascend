@@ -18,14 +18,152 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_interface import (
+    AscendMLAAttentionSpec,
+    AscendSFAIndexerCacheSpec,
+    DIRECT_SFA_HOST_CACHE_BYTES,
+    is_direct_sfa_host_offload,
+)
 from vllm_ascend.utils import vllm_version_is
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 _orig_generate_scheduler_kv_cache_config = (
     vllm.v1.core.kv_cache_utils.generate_scheduler_kv_cache_config
 )
+_orig_get_kv_cache_config_from_groups = (
+    vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
+)
+_orig_max_memory_usage_bytes_from_groups = (
+    vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups
+)
 
 _SFA_LAYERWISE_SCHEDULER_SPECS_ATTR = "_ascend_sfa_layerwise_cache_specs"
+
+
+def _get_direct_sfa_indexer_specs(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> dict[str, AscendSFAIndexerCacheSpec] | None:
+    """Return physical indexer specs for the direct host-only main-KV mode."""
+    if not is_direct_sfa_host_offload(vllm_config):
+        return None
+    if len(kv_cache_groups) != 1 or not isinstance(
+        kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
+    ):
+        raise ValueError(
+            "Direct SFA host offload requires one UniformType KV cache group; "
+            f"got {len(kv_cache_groups)} groups."
+        )
+
+    layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
+    main_specs = {
+        name: spec
+        for name, spec in layer_specs.items()
+        if isinstance(spec, AscendMLAAttentionSpec)
+    }
+    indexer_specs = {
+        name: spec
+        for name, spec in layer_specs.items()
+        if isinstance(spec, AscendSFAIndexerCacheSpec)
+    }
+    unsupported = {
+        name: type(spec).__name__
+        for name, spec in layer_specs.items()
+        if name not in main_specs and name not in indexer_specs
+    }
+    if not main_specs or not indexer_specs or unsupported:
+        raise ValueError(
+            "Direct SFA host offload expects main MLA specs and real SFA "
+            "indexer specs only; "
+            f"main={len(main_specs)}, indexer={len(indexer_specs)}, "
+            f"unsupported={unsupported}."
+        )
+    return indexer_specs
+
+
+def _ascend_get_kv_cache_config_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    """Allocate paged HBM only for real indexer owners in direct offload.
+
+    Main SFA specs remain in the logical Uniform group so the scheduler still
+    assigns their token blocks. Their physical K/V bytes live in the connector
+    host cache and use fixed per-layer staging tensors during model execution.
+    """
+    indexer_specs = _get_direct_sfa_indexer_specs(
+        vllm_config, kv_cache_groups
+    )
+    if indexer_specs is None:
+        return _orig_get_kv_cache_config_from_groups(
+            vllm_config, kv_cache_groups, available_memory
+        )
+
+    physical_page_bytes = sum(
+        spec.page_size_bytes for spec in indexer_specs.values()
+    )
+    if physical_page_bytes <= 0:
+        raise ValueError("Direct SFA host offload has no physical indexer pages.")
+    layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
+    host_page_bytes = sum(
+        spec.page_size_bytes
+        for spec in layer_specs.values()
+        if isinstance(spec, AscendMLAAttentionSpec)
+    )
+    if host_page_bytes <= 0:
+        raise ValueError("Direct SFA host offload has no logical main KV pages.")
+    max_hbm_blocks = available_memory // physical_page_bytes
+    max_host_blocks = DIRECT_SFA_HOST_CACHE_BYTES // host_page_bytes
+    num_blocks = min(max_hbm_blocks, max_host_blocks)
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    if num_blocks > max_hbm_blocks or num_blocks > max_host_blocks:
+        raise ValueError(
+            "Direct SFA host-offload block override exceeds physical "
+            "capacity: "
+            f"requested={num_blocks}, hbm_limit={max_hbm_blocks}, "
+            f"host_limit={max_host_blocks}."
+        )
+    required_blocks = cdiv(
+        vllm_config.model_config.max_model_len,
+        kv_cache_groups[0].kv_cache_spec.block_size,
+    )
+    if num_blocks < required_blocks:
+        raise ValueError(
+            "Direct SFA host offload cannot hold one max-length request: "
+            f"num_blocks={num_blocks}, required_blocks={required_blocks}, "
+            f"max_model_len={vllm_config.model_config.max_model_len}."
+        )
+    kv_cache_tensors = [
+        KVCacheTensor(
+            size=spec.page_size_bytes * num_blocks,
+            shared_by=[layer_name],
+        )
+        for layer_name, spec in indexer_specs.items()
+    ]
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=kv_cache_tensors,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+
+def _ascend_max_memory_usage_bytes_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    """Exclude host-only main KV from the startup maximum-length check."""
+    indexer_specs = _get_direct_sfa_indexer_specs(
+        vllm_config, kv_cache_groups
+    )
+    if indexer_specs is None:
+        return _orig_max_memory_usage_bytes_from_groups(
+            vllm_config, kv_cache_groups
+        )
+    return sum(
+        spec.max_memory_usage_bytes(vllm_config)
+        for spec in indexer_specs.values()
+    )
 
 
 def _ascend_generate_scheduler_kv_cache_config(
@@ -291,6 +429,12 @@ def _get_kv_cache_config_deepseek_v4(
 
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = (
+    _ascend_get_kv_cache_config_from_groups
+)
+vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups = (
+    _ascend_max_memory_usage_bytes_from_groups
+)
 vllm.v1.core.kv_cache_utils.generate_scheduler_kv_cache_config = (
     _ascend_generate_scheduler_kv_cache_config
 )

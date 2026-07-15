@@ -3,8 +3,7 @@ import torch
 
 from vllm_ascend.ascend_config import LRUResidentCacheConfig
 from vllm_ascend.attention.sfa_v1 import (
-    _build_cpu_sparse_indices_from_slots,
-    _normalize_sfa_lse,
+    _partition_decode_topk,
 )
 
 
@@ -35,20 +34,58 @@ def test_lru_resident_cache_config_rejects_capacity_smaller_than_topk():
         })
 
 
-def test_build_cpu_sparse_indices_from_slots_static_shape():
-    current_slots = torch.tensor([[5, -1, 2, 9]], dtype=torch.int32)
-    cpu_mask = torch.tensor([[True, False, True, False]])
-    result = _build_cpu_sparse_indices_from_slots(current_slots, cpu_mask)
-    assert result.shape == (1, 1, 4)
-    torch.testing.assert_close(
-        result,
-        torch.tensor([[[5, -1, 2, -1]]], dtype=torch.int32),
+def test_partition_decode_topk_maps_variable_mtp_window_to_fresh_slots():
+    topk_indices = torch.tensor(
+        [
+            [0, 4, -1, 3],
+            [9, 10, 12, -1],
+            [10, 11, 4, -1],
+            [12, 5, 9, -1],
+        ],
+        dtype=torch.int32,
+    )
+    token_to_req = torch.tensor([0, 1, 1, 1], dtype=torch.int32)
+    seq_lens = torch.tensor([5, 13], dtype=torch.int32)
+    tokens_per_req = torch.tensor([1, 3], dtype=torch.int32)
+
+    host_indices, fresh_mask, fresh_slots = _partition_decode_topk(
+        topk_indices,
+        token_to_req,
+        seq_lens,
+        tokens_per_req,
+        fresh_slot_start=4092,
     )
 
-
-def test_normalize_sfa_lse_from_tnd_stats_to_token_head():
-    softmax_max = torch.zeros((1, 2, 64), dtype=torch.float32)
-    softmax_sum = torch.ones((1, 2, 64), dtype=torch.float32)
-    lse = _normalize_sfa_lse(softmax_max, softmax_sum, num_tokens=2, num_heads=64)
-    assert lse.shape == (2, 64)
-    torch.testing.assert_close(lse, torch.zeros((2, 64), dtype=torch.float32))
+    torch.testing.assert_close(
+        host_indices,
+        torch.tensor(
+            [
+                [0, -1, -1, 3],
+                [9, -1, -1, -1],
+                [-1, -1, 4, -1],
+                [-1, 5, 9, -1],
+            ],
+            dtype=torch.int32,
+        ),
+    )
+    torch.testing.assert_close(
+        fresh_mask,
+        torch.tensor(
+            [
+                [False, True, False, False],
+                [False, True, True, False],
+                [True, True, False, False],
+                [True, False, False, False],
+            ]
+        ),
+    )
+    expected_fresh_slots = torch.tensor(
+        [
+            [4088, 4092, 4087, 4091],
+            [4091, 4092, 4094, 4081],
+            [4092, 4093, 4086, 4081],
+            [4094, 4087, 4091, 4081],
+        ],
+        dtype=torch.int32,
+    )
+    torch.testing.assert_close(fresh_slots, expected_fresh_slots)

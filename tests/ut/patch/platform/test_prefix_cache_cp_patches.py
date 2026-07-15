@@ -27,7 +27,13 @@ from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
+    _ascend_get_kv_cache_config_from_groups,
     _ascend_resolve_kv_cache_block_sizes,
+)
+from vllm_ascend.core.kv_cache_interface import (
+    AscendMLAAttentionSpec,
+    AscendSFAIndexerCacheSpec,
+    DIRECT_SFA_HOST_CACHE_BYTES,
 )
 from vllm_ascend.patch.platform.patch_mamba_manager import AscendMambaManager
 
@@ -125,6 +131,62 @@ def _make_coordinator_for_effective_block_size(
     coordinator.pcp_world_size = pcp_world_size
     coordinator.enable_caching = enable_caching
     return coordinator
+
+
+def test_direct_sfa_host_offload_keeps_one_group_and_allocates_real_indexer_only():
+    main_name = "model.layers.0.self_attn.attn"
+    mtp_name = "model.layers.75.self_attn.attn"
+    indexer_name = "model.layers.0.self_attn.indexer.k_cache"
+    main_spec = AscendMLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.bfloat16,
+    )
+    indexer_spec = AscendSFAIndexerCacheSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    uniform_spec = UniformTypeKVCacheSpecs.from_specs(
+        {
+            main_name: main_spec,
+            mtp_name: main_spec,
+            indexer_name: indexer_spec,
+        }
+    )
+    assert uniform_spec is not None
+    group = KVCacheGroupSpec(
+        layer_names=[main_name, mtp_name, indexer_name],
+        kv_cache_spec=uniform_spec,
+    )
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="SFAKVOffloadConnector"
+        ),
+        additional_config={"use_offload": True},
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        model_config=SimpleNamespace(max_model_len=8192),
+    )
+    host_limit = DIRECT_SFA_HOST_CACHE_BYTES // (
+        2 * main_spec.page_size_bytes
+    )
+    available_memory = indexer_spec.page_size_bytes * (host_limit + 10)
+
+    result = _ascend_get_kv_cache_config_from_groups(
+        config,
+        [group],
+        available_memory,
+    )
+
+    assert result.num_blocks == host_limit
+    assert result.kv_cache_groups == [group]
+    assert len(result.kv_cache_tensors) == 1
+    assert result.kv_cache_tensors[0].shared_by == [indexer_name]
+    assert result.kv_cache_tensors[0].size == (
+        indexer_spec.page_size_bytes * host_limit
+    )
 
 
 @pytest.mark.parametrize(
