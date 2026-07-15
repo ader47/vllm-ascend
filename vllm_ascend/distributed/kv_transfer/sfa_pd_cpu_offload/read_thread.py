@@ -31,10 +31,10 @@ class ConsumerReadState:
     layer_metadata: dict[str, Any]
     main_name_to_idx: dict[str, int]
     cpu_pools: list[tuple[Any, Any] | None]
-    hbm_kv: dict[str, tuple[Any, Any]]
-    indexer_tensors: list[Any]
-    indexer_scale_tensors: list[Any | None]
-    dest_blocks_by_req: dict[str, tuple[list[int], list[int], int, int | None]]
+    # Aligned with the main-layer order. Skip-topk layers have no physical
+    # indexer owner and therefore carry None here.
+    indexer_tensors: list[Any | None]
+    dest_blocks_by_req: dict[str, tuple[list[int], list[int]]]
     get_offload_layer_id: Callable[[str], int]
 
 
@@ -115,6 +115,7 @@ class MembPullReadThread(threading.Thread):
                     if msg_type == MF_META:
                         self._p_session = msg[1]
                         self._p_layer_meta = msgspec.msgpack.decode(msg[2])
+                        self._validate_indexer_owners()
                         logger.info(
                             "Received MF_META: P session=%s, %d layers", self._p_session, len(self._p_layer_meta)
                         )
@@ -184,6 +185,26 @@ class MembPullReadThread(threading.Thread):
         finally:
             ctx.destroy(linger=0)
 
+    def _validate_indexer_owners(self) -> None:
+        """Require P and D to expose the same real indexer owner layers."""
+        p_owners = {
+            layer_name
+            for layer_name, layer_meta in self._p_layer_meta.items()
+            if len(layer_meta.get("base_addrs", ())) == 3
+        }
+        d_owners = {
+            layer_name
+            for layer_name, layer_idx in self._state.main_name_to_idx.items()
+            if self._state.indexer_tensors[layer_idx] is not None
+        }
+        missing_on_d = sorted(p_owners - d_owners)
+        extra_on_d = sorted(d_owners - p_owners)
+        if missing_on_d or extra_on_d:
+            raise ValueError(
+                "SFA PD real-indexer owner mismatch: "
+                f"missing_on_d={missing_on_d}, extra_on_d={extra_on_d}."
+            )
+
     def _resolve_read_layer(self, layer_name: str) -> dict[str, Any] | None:
         state = self._state
         pool_idx = state.main_name_to_idx.get(layer_name)
@@ -222,59 +243,34 @@ class MembPullReadThread(threading.Thread):
         else:
             k_cpu, v_cpu = cpu_pool
             k_cpu_ptr, v_cpu_ptr = k_cpu.data_ptr(), v_cpu.data_ptr()
-        hbm_kv = state.hbm_kv.get(layer_name)
-        if hbm_kv is None:
-            k_hbm_ptr = v_hbm_ptr = None
-        else:
-            k_hbm_ptr, v_hbm_ptr = hbm_kv[0].data_ptr(), hbm_kv[1].data_ptr()
-
         # Split prefill exposes only real indexer owners. Two entries therefore
         # mean main K/V only; a third entry adds the indexer transfer leg.
+        if len(p_base_addrs) not in (2, 3):
+            raise ValueError(
+                "SFA PD BF16 manifest expects main K/V plus at most one "
+                f"indexer tensor for {layer_name}, got {len(p_base_addrs)} entries."
+            )
         has_p_indexer = len(p_base_addrs) >= 3
         indexer = None
         if has_p_indexer:
             p_dsa_len = p_block_len[2]
             d_indexer = state.indexer_tensors[pool_idx]
-            d_dsa_len = d_indexer.element_size() * math.prod(d_indexer.shape[1:])
-            if p_dsa_len <= 0 or d_dsa_len % p_dsa_len != 0:
-                logger.error(
-                    "MembPull indexer %s: D dsa_k block_len=%d not a multiple of P=%d; skip indexer leg",
-                    layer_name,
-                    d_dsa_len,
-                    p_dsa_len,
+            if d_indexer is None:
+                raise ValueError(
+                    f"P exposes a real indexer for {layer_name}, but D does not."
                 )
-            else:
-                indexer = {
-                    "p_dsa_base": p_base_addrs[2],
-                    "p_dsa_len": p_dsa_len,
-                    "d_base": d_indexer.data_ptr(),
-                    "d_dsa_len": d_dsa_len,
-                    "scale": d_dsa_len // p_dsa_len,
-                    "shape": tuple(d_indexer.shape),
-                }
-
-        scale = None
-        scale_tensor = state.indexer_scale_tensors[pool_idx] if pool_idx < len(state.indexer_scale_tensors) else None
-        if has_p_indexer and scale_tensor is not None:
-            if len(p_base_addrs) < 4:
-                scale = {"error": "p_addr_mismatch", "p_n": len(p_base_addrs)}
-            else:
-                p_scale_len = p_block_len[3]
-                d_scale_len = scale_tensor.element_size() * math.prod(scale_tensor.shape[1:])
-                if p_scale_len <= 0 or d_scale_len % p_scale_len != 0:
-                    scale = {
-                        "error": "layout_mismatch",
-                        "p_scale_len": p_scale_len,
-                        "d_scale_len": d_scale_len,
-                    }
-                else:
-                    scale = {
-                        "p_scale_base": p_base_addrs[3],
-                        "p_scale_len": p_scale_len,
-                        "d_scale_base": scale_tensor.data_ptr(),
-                        "d_scale_len": d_scale_len,
-                        "scale_factor": d_scale_len // p_scale_len,
-                    }
+            d_dsa_len = d_indexer.element_size() * math.prod(d_indexer.shape[1:])
+            if p_dsa_len <= 0 or d_dsa_len != p_dsa_len:
+                raise ValueError(
+                    "SFA PD indexer manager pages must match exactly for "
+                    f"{layer_name}: P={p_dsa_len}, D={d_dsa_len}."
+                )
+            indexer = {
+                "p_dsa_base": p_base_addrs[2],
+                "p_dsa_len": p_dsa_len,
+                "d_base": d_indexer.data_ptr(),
+                "shape": tuple(d_indexer.shape),
+            }
 
         return {
             "layer_name": layer_name,
@@ -286,10 +282,7 @@ class MembPullReadThread(threading.Thread):
             "p_v_len": p_block_len[1],
             "k_cpu_ptr": k_cpu_ptr,
             "v_cpu_ptr": v_cpu_ptr,
-            "k_hbm_ptr": k_hbm_ptr,
-            "v_hbm_ptr": v_hbm_ptr,
             "indexer": indexer,
-            "scale": scale,
         }
 
     def _build_req_descriptors(
@@ -310,18 +303,16 @@ class MembPullReadThread(threading.Thread):
                 layer_name,
             )
             return [], [], [], None
-        d_indexer_ids, d_main_ids, num_full, partial_hbm_bid = dest
+        d_indexer_ids, d_main_ids = dest
         if envs.VLLM_ASCEND_SFA_DEBUG:
             logger.info(
                 "MembPull D resolve dest: layer=%s, req=%s, p_block_ids=%s, "
-                "d_main_cpu_ids=%s, d_indexer_hbm_ids=%s, num_full=%s, partial_hbm=%s",
+                "d_main_cpu_ids=%s, d_indexer_hbm_ids=%s",
                 layer_name,
                 ext_req_id,
                 p_block_ids,
                 d_main_ids,
                 d_indexer_ids,
-                num_full,
-                partial_hbm_bid,
             )
         if not p_block_ids:
             logger.warning("MembPull _do_read: empty p_block_ids for %s, skip", layer_name)
@@ -336,107 +327,53 @@ class MembPullReadThread(threading.Thread):
         n_main = 0
         n_indexer = 0
 
-        full_p_blocks = p_block_ids[:num_full]
         has_cpu_destination = layer["k_cpu_ptr"] is not None and layer["v_cpu_ptr"] is not None
-        n_full = min(len(full_p_blocks), len(d_main_ids)) if has_cpu_destination else 0
-        if n_full:
-            full_p = np.array(full_p_blocks[:n_full], dtype=np.int64)
-            d_main = np.array(d_main_ids[:n_full], dtype=np.int64)
-            len_k = np.full(n_full, p_k_len, dtype=np.int64)
-            len_v = np.full(n_full, p_v_len, dtype=np.int64)
-            cp, cl, clen = _coalesce_desc(p_k_base + full_p * p_k_len, layer["k_cpu_ptr"] + d_main * p_k_len, len_k)
+        if has_cpu_destination and len(d_main_ids) < len(p_block_ids):
+            raise ValueError(
+                f"D main CPU page table is shorter than P source for {ext_req_id}: "
+                f"P={len(p_block_ids)}, D={len(d_main_ids)}."
+            )
+        n_main = len(p_block_ids) if has_cpu_destination else 0
+        if n_main:
+            p_main = np.array(p_block_ids, dtype=np.int64)
+            d_main = np.array(d_main_ids[:n_main], dtype=np.int64)
+            len_k = np.full(n_main, p_k_len, dtype=np.int64)
+            len_v = np.full(n_main, p_v_len, dtype=np.int64)
+            cp, cl, clen = _coalesce_desc(p_k_base + p_main * p_k_len, layer["k_cpu_ptr"] + d_main * p_k_len, len_k)
             peer_chunks.append(cp)
             local_chunks.append(cl)
             length_chunks.append(clen)
-            cp, cl, clen = _coalesce_desc(p_v_base + full_p * p_v_len, layer["v_cpu_ptr"] + d_main * p_v_len, len_v)
+            cp, cl, clen = _coalesce_desc(p_v_base + p_main * p_v_len, layer["v_cpu_ptr"] + d_main * p_v_len, len_v)
             peer_chunks.append(cp)
             local_chunks.append(cl)
             length_chunks.append(clen)
-            n_main = n_full
-        if partial_hbm_bid is not None and num_full < len(p_block_ids):
-            k_hbm_ptr = layer["k_hbm_ptr"]
-            if k_hbm_ptr is None:
-                logger.warning("MembPull _do_read: no HBM k/v for partial block %s, skip partial", layer_name)
-            else:
-                partial_p_bid = p_block_ids[num_full]
-                peer_chunks.append(
-                    np.array([p_k_base + partial_p_bid * p_k_len, p_v_base + partial_p_bid * p_v_len], dtype=np.int64)
-                )
-                local_chunks.append(
-                    np.array(
-                        [k_hbm_ptr + partial_hbm_bid * p_k_len, layer["v_hbm_ptr"] + partial_hbm_bid * p_v_len],
-                        dtype=np.int64,
-                    )
-                )
-                length_chunks.append(np.array([p_k_len, p_v_len], dtype=np.int64))
-                n_main += 1
 
         idx = layer["indexer"]
         if idx is not None and d_indexer_ids:
             p_dsa_base, p_dsa_len = idx["p_dsa_base"], idx["p_dsa_len"]
-            d_base, d_dsa_len, scale = idx["d_base"], idx["d_dsa_len"], idx["scale"]
-            d_idx_arr = np.array(d_indexer_ids, dtype=np.int64)
-            offs = np.arange(scale, dtype=np.int64)
-            d_sub = (d_base + d_idx_arr[:, None] * d_dsa_len + offs * p_dsa_len).reshape(-1)
-            n_pairs = min(len(p_block_ids), d_sub.shape[0])
-            p_idx = np.array(p_block_ids[:n_pairs], dtype=np.int64)
+            if len(d_indexer_ids) < len(p_block_ids):
+                raise ValueError(
+                    f"D indexer page table is shorter than P source for {ext_req_id}: "
+                    f"P={len(p_block_ids)}, D={len(d_indexer_ids)}."
+                )
+            n_indexer = len(p_block_ids)
+            p_idx = np.array(p_block_ids, dtype=np.int64)
+            d_idx = np.array(d_indexer_ids[:n_indexer], dtype=np.int64)
             logger.debug(
-                "MembPull indexer %s: p_dsa_len=%d d_dsa_len=%d scale=%d, D dsa_k shape=%s, D_sub=%d P_blocks=%d",
+                "MembPull indexer %s: block_len=%d, D dsa_k shape=%s, blocks=%d",
                 layer_name,
                 p_dsa_len,
-                d_dsa_len,
-                scale,
                 idx["shape"],
-                int(d_sub.shape[0]),
-                len(p_block_ids),
+                n_indexer,
             )
             cp, cl, clen = _coalesce_desc(
                 p_dsa_base + p_idx * p_dsa_len,
-                d_sub[:n_pairs],
-                np.full(n_pairs, p_dsa_len, dtype=np.int64),
+                idx["d_base"] + d_idx * p_dsa_len,
+                np.full(n_indexer, p_dsa_len, dtype=np.int64),
             )
             peer_chunks.append(cp)
             local_chunks.append(cl)
             length_chunks.append(clen)
-            n_indexer = n_pairs
-
-        scale = layer.get("scale")
-        if scale is not None and d_indexer_ids:
-            if "error" in scale:
-                if scale["error"] == "p_addr_mismatch":
-                    raise RuntimeError(
-                        f"MembPull indexer scale {layer_name}: D is LIC8 (has scale "
-                        f"tensor) but P exposed only {scale['p_n']} base addrs "
-                        f"(no scale leg) -- P/D LIC8 config mismatch."
-                    )
-                raise RuntimeError(
-                    f"MembPull indexer scale {layer_name}: D scale block_len="
-                    f"{scale['d_scale_len']} not a multiple of P={scale['p_scale_len']} -- "
-                    f"scale layout mismatch; refusing to transfer to avoid silent "
-                    f"stale-scale corruption."
-                )
-            p_scale_base = scale["p_scale_base"]
-            p_scale_len = scale["p_scale_len"]
-            d_scale_base = scale["d_scale_base"]
-            d_scale_len = scale["d_scale_len"]
-            scale_factor = scale["scale_factor"]
-            d_scale_sub_addrs: list[int] = []
-            for d_bid in d_indexer_ids:
-                d_block_base = d_scale_base + d_bid * d_scale_len
-                for off in range(scale_factor):
-                    d_scale_sub_addrs.append(d_block_base + off * p_scale_len)
-            n_scale_pairs = min(len(p_block_ids), len(d_scale_sub_addrs))
-            if n_scale_pairs:
-                p_scale_arr = np.array(p_block_ids[:n_scale_pairs], dtype=np.int64)
-                d_scale_arr = np.array(d_scale_sub_addrs[:n_scale_pairs], dtype=np.int64)
-                cp, cl, clen = _coalesce_desc(
-                    p_scale_base + p_scale_arr * p_scale_len,
-                    d_scale_arr,
-                    np.full(n_scale_pairs, p_scale_len, dtype=np.int64),
-                )
-                peer_chunks.append(cp)
-                local_chunks.append(cl)
-                length_chunks.append(clen)
 
         if not peer_chunks:
             logger.warning(
@@ -458,9 +395,8 @@ class MembPullReadThread(threading.Thread):
                 "ext_req_id": ext_req_id,
                 "pool_idx": layer["pool_idx"],
                 "offload_id": layer["offload_id"],
-                "d_main_ids": d_main_ids,
-                "d_indexer_ids": d_indexer_ids,
-                "partial_hbm_bid": partial_hbm_bid,
+                "d_main_ids": d_main_ids[:n_main],
+                "d_indexer_ids": d_indexer_ids[:n_indexer],
                 "n_main": n_main,
                 "n_indexer": n_indexer,
                 "num_transfers": len(local_ptrs),
@@ -476,7 +412,6 @@ class MembPullReadThread(threading.Thread):
         offload_id = read_info["offload_id"]
         d_main_ids = read_info["d_main_ids"]
         d_indexer_ids = read_info["d_indexer_ids"]
-        partial_hbm_bid = read_info["partial_hbm_bid"]
         if envs.VLLM_ASCEND_MF_VERIFY:
             try:
                 cpu_pool = state.cpu_pools[offload_id]
@@ -486,13 +421,8 @@ class MembPullReadThread(threading.Thread):
                     k_cpu, v_cpu = cpu_pool
                     mk = k_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
                     mv = v_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
-                if partial_hbm_bid is not None:
-                    hbm_kv = state.hbm_kv.get(layer_name)
-                    if hbm_kv is not None:
-                        k_hbm, v_hbm = hbm_kv
-                        mk += k_hbm[partial_hbm_bid].float().sum().item()
-                        mv += v_hbm[partial_hbm_bid].float().sum().item()
-                mi = state.indexer_tensors[pool_idx][d_indexer_ids].float().sum().item() if d_indexer_ids else 0.0
+                indexer = state.indexer_tensors[pool_idx]
+                mi = indexer[d_indexer_ids].float().sum().item() if indexer is not None and d_indexer_ids else 0.0
                 logger.info(
                     "MFV D layer %s req %s main_k=%.6f main_v=%.6f idx_post=%.6f",
                     layer_name,
@@ -506,14 +436,12 @@ class MembPullReadThread(threading.Thread):
         if envs.VLLM_ASCEND_SFA_DEBUG:
             logger.info(
                 "MembPull D finished read: layer=%s, req=%s, pool_idx=%d, "
-                "main=%d/%d blocks, indexer=%d/%d blocks (scale split), transfers=%d",
+                "main=%d blocks, indexer=%d blocks, transfers=%d",
                 layer_name,
                 ext_req_id,
                 pool_idx,
                 read_info["n_main"],
-                len(d_main_ids),
                 read_info["n_indexer"],
-                len(d_indexer_ids),
                 read_info["num_transfers"],
             )
 
@@ -546,7 +474,7 @@ class MembPullReadThread(threading.Thread):
                     ext_req_id,
                     e,
                 )
-                continue
+                raise
             if not local_ptrs:
                 continue
             all_local_ptrs.extend(local_ptrs)

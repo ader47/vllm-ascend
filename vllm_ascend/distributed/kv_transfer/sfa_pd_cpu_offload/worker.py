@@ -4,10 +4,8 @@
 
 D (``kv_consumer``): composes :class:`SFAKVOffloadWorker` for the LRU-resident
 H2D load path + TP-shared CPU pool, and runs one memfabric pull read thread per
-TP rank. Every rank reads Indexer KV and partial Main KV into local HBM; TP0
-also reads full Main MLA KV into the shared CPU pool. P notifies D per layer
-via READ_READY_BATCH. Once a partial block fills during decode, the B1 offload
-path on TP0 copies it to the CPU pool.
+TP rank. Every rank reads real Indexer KV into local HBM; TP0 reads every Main
+MLA page, including the final partial page, into the shared CPU pool.
 
 P (``kv_producer``): registers its HBM KV with memfabric and runs a pull-mode
 sending thread that notifies D to read (no RDMA push). A per-layer
@@ -74,10 +72,7 @@ from vllm_ascend.distributed.kv_transfer.utils.utils import (
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import AttentionMetadata
 
-# kv_cache_group convention for DeepSeek-V3.2 sparse offload:
-# group 0 = indexer (block_size 512), group 1 = main MLA (block_size 128).
-_INDEXER_GROUP_IDX = 0
-_MAIN_GROUP_IDX = 1
+_CACHE_GROUP_IDX = 0
 # Matches the transformer-layer index in a kv-cache layer name, e.g.
 # "model.layers.5.self_attn" / "model.layers.5.self_attn.indexer" -> 5. Prefer
 # this over extract_layer_index(), which asserts the name holds exactly one
@@ -125,22 +120,13 @@ class SFAPDCpuOffloadConsumerWorker:
         # D-side composed SFA worker (LRU load + CPU pool). Lazily built in
         # register_kv_caches once kv_caches are available.
         self.sfa_worker: SFAKVOffloadWorker | None = None
-        # per-req CPU-block count for the solution-1 threshold (Phase 3).
-        self._cpu_blocks_by_req: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
         # external_req_id -> internal_req_id, so get_finished can map the recv
         # thread's done_recving (keyed by external id from P's DONE signal) back
         # to the vLLM-internal id that the scheduler expects.
         self.request_map: dict[str, str] = {}
-        # external_req_id -> (indexer_npu_ids, main_cpu_ids, num_full,
-        # partial_hbm_bid): D's OWN destination blocks per request, populated in
-        # start_load_kv from connector_meta. Part A: the first num_full main
-        # blocks → CPU pool; the optional partial last block → D HBM at
-        # partial_hbm_bid (None ⇒ no partial).
-        self._dest_blocks_by_req: dict[str, tuple[list[int], list[int], int, int | None]] = {}
-        # main layer name -> (k_nope HBM, v_rope HBM); the partial block's HBM
-        # dest. Populated in register_kv_caches.
-        self._hbm_kv: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        # external_req_id -> (indexer_npu_ids, main_cpu_ids).
+        self._dest_blocks_by_req: dict[str, tuple[list[int], list[int]]] = {}
         # External req ids whose DONE signal arrived before request_map
         # was seeded (see get_finished). Retried every step until mapped.
         self._pending_done: set[str] = set()
@@ -178,17 +164,10 @@ class SFAPDCpuOffloadConsumerWorker:
         self.sfa_worker.register_kv_caches(kv_caches)
 
         # The full Main KV CPU pool is TP-shared and allocated only by TP0.
-        # Every rank still runs PD receive because Indexer and partial Main KV
-        # land in rank-local HBM.
+        # Every rank still runs PD receive because real indexer caches land in
+        # rank-local HBM.
         k_caches_cpu = getattr(self.sfa_worker, "k_caches_cpu", None)
         v_caches_cpu = getattr(self.sfa_worker, "v_caches_cpu", None)
-
-        # Part A: D's main MLA HBM k/v tensors (group1 paged cache) — the partial
-        # last block lands here instead of the CPU pool. Keyed by main layer name
-        # (the 5-tuple layers); tuple[0]=k_nope, tuple[1]=v_rope.
-        self._hbm_kv = {
-            n: (t[0], t[1]) for n, t in kv_caches.items() if isinstance(t, (list, tuple)) and len(t) in (5, 6)
-        }
 
         # memfabric pull mode only.
         assert _resolve_kv_transfer_backend(self.vllm_config) == BACKEND_MEMFABRIC, (
@@ -199,8 +178,6 @@ class SFAPDCpuOffloadConsumerWorker:
     # -- D-side forwards to the composed SFA worker (LRU load path) --
     def start_load_kv(self, metadata: KVConnectorMetadata):
         assert self.sfa_worker is not None
-        # B1: reset decode offload — now driven by sfa_worker.process_layer_data
-        # (num_new_offload_blocks > 0 triggers it in sfa_worker.start_load_kv).
         # Seed external->internal request id map for get_finished, and store D's
         # own destination blocks per request (keyed by external id, which is what
         # P sends in READ_READY_BATCH). The scheduler includes remote-prefill requests
@@ -212,23 +189,17 @@ class SFAPDCpuOffloadConsumerWorker:
                 self.request_map[ext_id] = req_id
                 indexer_ids = list(getattr(req, "block_ids_indexer", []) or [])
                 main_ids = list(getattr(req, "block_ids_cpu", []) or [])
-                num_full = getattr(req, "num_full", 0) or 0
-                partial_hbm_bid = getattr(req, "partial_hbm_bid", None)
-                self._dest_blocks_by_req[ext_id] = (indexer_ids, main_ids, num_full, partial_hbm_bid)
+                self._dest_blocks_by_req[ext_id] = (indexer_ids, main_ids)
                 if envs.VLLM_ASCEND_SFA_DEBUG:
                     logger.info(
                         "MembPull D stored dest blocks req %s: indexer_hbm_ids=%s, "
-                        "main_cpu_ids=%s, num_full=%s, partial_hbm=%s",
+                        "main_cpu_ids=%s",
                         ext_id,
                         indexer_ids,
                         main_ids,
-                        num_full,
-                        partial_hbm_bid,
                     )
-        # Refresh the per-req CPU-block count (Phase 3 source of truth) and
-        # forward the load kickoff to the SFA worker (which also builds offload
-        # tasks via process_layer_data when num_new_offload_blocks > 0).
-        self._refresh_cpu_blocks_by_req(metadata)
+        # Forward the load kickoff to the SFA worker. Decode save tasks are
+        # token ranges backed by the resident fresh window.
         self.sfa_worker.start_load_kv(metadata)
 
     def set_req_ids(self, req_ids: list):
@@ -265,9 +236,8 @@ class SFAPDCpuOffloadConsumerWorker:
         attn_metadata: AttentionMetadata,
         connector_metadata: KVConnectorMetadata,
     ) -> None:
-        # B1: offload decode-filled main MLA blocks HBM -> CPU pool via the
-        # composed SFA worker's async background thread (process_layer_data built
-        # the per-layer tasks in start_load_kv from num_new_offload_blocks).
+        # Persist the newly written resident rows into their authoritative host
+        # pages through the composed worker's asynchronous save thread.
         if self.sfa_worker is not None:
             self.sfa_worker.save_kv_layer(layer_name)
 
@@ -278,7 +248,6 @@ class SFAPDCpuOffloadConsumerWorker:
     def _cleanup_request_state(self, req_ids: set[str]) -> None:
         for req_id in req_ids:
             ext_id = get_external_request_id(req_id)
-            self._cpu_blocks_by_req.pop(req_id, None)
             self.request_map.pop(ext_id, None)
             self._dest_blocks_by_req.pop(ext_id, None)
             self._pending_done.discard(ext_id)
@@ -323,22 +292,13 @@ class SFAPDCpuOffloadConsumerWorker:
         self._invalid_block_ids = set()
         return result
 
-    def get_num_cpu_blocks(self, req_ids: list[str]) -> dict[str, int] | None:
-        """Per-req actual main-MLA CPU-block count for the solution-1 threshold."""
-        if self.sfa_worker is None:
-            return None
-        result = {rid: self._cpu_blocks_by_req[rid] for rid in req_ids if rid in self._cpu_blocks_by_req}
-        return result or None
-
     def _build_consumer_read_state(self) -> ConsumerReadState:
         assert self.sfa_worker is not None
         return ConsumerReadState(
             layer_metadata=self.layer_metadata,
             main_name_to_idx=self._main_name_to_idx,
             cpu_pools=self._cpu_pools,
-            hbm_kv=self._hbm_kv,
             indexer_tensors=self._indexer_tensors,
-            indexer_scale_tensors=self._indexer_scale_tensors,
             dest_blocks_by_req=self._dest_blocks_by_req,
             get_offload_layer_id=self.sfa_worker._get_offload_layer_id,
         )
@@ -349,71 +309,116 @@ class SFAPDCpuOffloadConsumerWorker:
         k_caches_cpu: list[torch.Tensor] | None,
         v_caches_cpu: list[torch.Tensor] | None,
     ) -> None:
-        """memfabric pull mode: D does NOT register anything. Only P registers
-        its HBM. Every D rank reads local HBM legs; TP0 also reads full Main KV
-        into the shared CPU pool."""
+        """Bind semantic P transfer roles to D's split physical destinations.
+
+        Main KV is host-only and follows the SFA worker's layer order. Real
+        indexer caches remain separate HBM tensors and are matched to their
+        main layer by transformer-layer id. Skip-topk main layers deliberately
+        have no indexer destination.
+        """
+        assert self.sfa_worker is not None
         num_blocks = self.kv_cache_config.num_blocks
-        indexer_names = list(self.kv_cache_config.kv_cache_groups[_INDEXER_GROUP_IDX].layer_names)
-
-        def _offload_tuple_len(v: object) -> int:
-            return len(v) if isinstance(v, (list, tuple)) else 1
-
-        main_names = [n for n, v in kv_caches.items() if _offload_tuple_len(v) in (5, 6)]
+        main_names = list(self.sfa_worker.offload_layer_names)
         main_by_layer_idx = {_layer_idx(name): name for name in main_names}
-        main_names = [main_by_layer_idx[_layer_idx(name)] for name in indexer_names]
+        if len(main_by_layer_idx) != len(main_names):
+            raise ValueError("SFA PD decode main layers must have unique layer ids.")
+
+        indexer_by_layer_idx: dict[int, tuple[str, torch.Tensor]] = {}
+        for indexer_name, cache_or_caches in kv_caches.items():
+            if not indexer_name.endswith(".indexer.k_cache"):
+                continue
+            indexer_tuple = (
+                (cache_or_caches,)
+                if isinstance(cache_or_caches, torch.Tensor)
+                else tuple(cache_or_caches)
+            )
+            if len(indexer_tuple) != 1:
+                raise ValueError(
+                    "SFA PD decode supports one BF16 tensor per real indexer, "
+                    f"got {len(indexer_tuple)} for {indexer_name}."
+                )
+            layer_idx = _layer_idx(indexer_name)
+            if layer_idx not in main_by_layer_idx:
+                raise ValueError(
+                    f"Real indexer {indexer_name} has no matching main SFA layer."
+                )
+            if layer_idx in indexer_by_layer_idx:
+                raise ValueError(
+                    f"Multiple real indexer caches found for transformer layer {layer_idx}."
+                )
+            indexer_by_layer_idx[layer_idx] = (
+                indexer_name,
+                indexer_tuple[0],
+            )
+        indexer_names = [entry[0] for entry in indexer_by_layer_idx.values()]
 
         # Store layer info for MembPullReadThread
-        self._indexer_names = indexer_names
         self._main_names = main_names
         self._main_name_to_idx = {n: i for i, n in enumerate(main_names)}
         if (k_caches_cpu is None) != (v_caches_cpu is None):
             raise RuntimeError("SFA shared CPU K/V pools must either both exist or both be absent")
         has_cpu_pool = k_caches_cpu is not None
+        if has_cpu_pool and (
+            len(k_caches_cpu) != len(main_names)
+            or len(v_caches_cpu) != len(main_names)
+        ):
+            raise ValueError(
+                "SFA PD CPU pools must align one-to-one with main layers: "
+                f"main={len(main_names)}, k={len(k_caches_cpu)}, "
+                f"v={len(v_caches_cpu)}."
+            )
         self._cpu_pools: list[tuple[torch.Tensor, torch.Tensor] | None] = (
-            list(zip(k_caches_cpu, v_caches_cpu)) if has_cpu_pool else [None] * len(main_names)
+            list(zip(k_caches_cpu, v_caches_cpu))
+            if has_cpu_pool
+            else [None] * len(main_names)
         )
-        self._indexer_tensors = []
-        self._indexer_scale_tensors: list[torch.Tensor | None] = []
-        for main_name in main_names:
-            main_tuple = list(kv_caches[main_name])
-            self._indexer_tensors.append(main_tuple[2])  # dsa_k_indexer
-            self._indexer_scale_tensors.append(main_tuple[5] if len(main_tuple) >= 6 else None)
+        self._indexer_tensors: list[torch.Tensor | None] = [
+            (
+                indexer_by_layer_idx[_layer_idx(main_name)][1]
+                if _layer_idx(main_name) in indexer_by_layer_idx
+                else None
+            )
+            for main_name in main_names
+        ]
 
         # Build layer_metadata (D's local addresses, for compatibility)
-        for pool_idx, (iname, mname) in enumerate(zip(indexer_names, main_names)):
+        for pool_idx, main_name in enumerate(main_names):
             indexer_t = self._indexer_tensors[pool_idx]
-            indexer_scale_t = self._indexer_scale_tensors[pool_idx]
-            indexer_addrs = [indexer_t.data_ptr()]
-            indexer_block_lens = [indexer_t.element_size() * math.prod(indexer_t.shape[1:])]
-            indexer_block_scales = [indexer_t.shape[0] // num_blocks if num_blocks else 1]
-            if indexer_scale_t is not None:
-                indexer_addrs.append(indexer_scale_t.data_ptr())
-                indexer_block_lens.append(indexer_scale_t.element_size() * math.prod(indexer_scale_t.shape[1:]))
-                indexer_block_scales.append(indexer_scale_t.shape[0] // num_blocks if num_blocks else 1)
-            self.layer_metadata[iname] = LayerMetadata(
-                tensor_group_idx=[_INDEXER_GROUP_IDX],
-                kv_caches_base_addr=indexer_addrs,
-                block_len=indexer_block_lens,
-                block_size_scale=indexer_block_scales,
-            )
-            # cpu_pools follows the SFA offload-layer order (it is zipped from
-            # sfa_worker.k_caches_cpu), which may differ from main_names order
-            # -> index by mname's offload id, not pool_idx (matches read_thread).
-            _mname_offload_id = self.sfa_worker.layer_name_to_offload_id.get(mname)
-            cpu_pool = self._cpu_pools[_mname_offload_id] if _mname_offload_id is not None else None
+            if indexer_t is not None:
+                indexer_name = indexer_by_layer_idx[_layer_idx(main_name)][0]
+                scale = indexer_t.shape[0] // num_blocks if num_blocks else 1
+                if scale != 1:
+                    raise ValueError(
+                        "SFA PD indexer must use one physical manager page per "
+                        f"scheduler block, got scale={scale} for {indexer_name}."
+                    )
+                self.layer_metadata[indexer_name] = LayerMetadata(
+                    tensor_group_idx=[_CACHE_GROUP_IDX],
+                    kv_caches_base_addr=[indexer_t.data_ptr()],
+                    block_len=[
+                        indexer_t.element_size()
+                        * math.prod(indexer_t.shape[1:])
+                    ],
+                    block_size_scale=[1],
+                )
+            cpu_pool = self._cpu_pools[pool_idx]
             if cpu_pool is not None:
                 k_cpu, v_cpu = cpu_pool
-                self.layer_metadata[mname] = LayerMetadata(
-                    tensor_group_idx=[_MAIN_GROUP_IDX, _MAIN_GROUP_IDX],
+                k_scale = k_cpu.shape[0] // num_blocks if num_blocks else 1
+                v_scale = v_cpu.shape[0] // num_blocks if num_blocks else 1
+                if k_scale != 1 or v_scale != 1:
+                    raise ValueError(
+                        "SFA PD main CPU cache must use one host page per "
+                        f"scheduler block, got K={k_scale}, V={v_scale}."
+                    )
+                self.layer_metadata[main_name] = LayerMetadata(
+                    tensor_group_idx=[_CACHE_GROUP_IDX, _CACHE_GROUP_IDX],
                     kv_caches_base_addr=[k_cpu.data_ptr(), v_cpu.data_ptr()],
                     block_len=[
                         k_cpu.element_size() * math.prod(k_cpu.shape[1:]),
                         v_cpu.element_size() * math.prod(v_cpu.shape[1:]),
                     ],
-                    block_size_scale=[
-                        k_cpu.shape[0] // num_blocks if num_blocks else 1,
-                        v_cpu.shape[0] // num_blocks if num_blocks else 1,
-                    ],
+                    block_size_scale=[1, 1],
                 )
 
         # Create memfabric engine (no registration)
@@ -430,27 +435,11 @@ class SFAPDCpuOffloadConsumerWorker:
         self._mf_read_thread.ready_event.wait()
         logger.info(
             "SFAPDCpuOffload D-side registered (memfabric pull): "
-            "%d indexer + %d main layers, full-main CPU destination=%s",
+            "%d real indexer owners + %d main layers, all-main CPU destination=%s",
             len(indexer_names),
             len(main_names),
             has_cpu_pool,
         )
-
-    def _refresh_cpu_blocks_by_req(self, metadata: KVConnectorMetadata):
-        # SFAKVOffloadConnectorMetadata.requests is a list[ReqMeta]. For this
-        # connector ReqMeta.block_ids_cpu IS the flat main-MLA CPU block list
-        # (the scheduler stores main CPU ids there), so its length is the
-        # per-req CPU-block count used by the solution-1 threshold.
-        requests = getattr(metadata, "requests", None)
-        if requests is None:
-            return
-        for req in requests:
-            req_id = getattr(req, "req_id", None)
-            block_ids_cpu = getattr(req, "block_ids_cpu", None)
-            if req_id is None or block_ids_cpu is None:
-                continue
-            self._cpu_blocks_by_req[req_id] = len(block_ids_cpu)
-
 
 class SFAPDCpuOffloadProducerWorker:
     """P-side worker for memfabric pull mode.
@@ -503,9 +492,6 @@ class SFAPDCpuOffloadProducerWorker:
 
     def set_req_ids(self, req_ids: list) -> None:
         return
-
-    def get_num_cpu_blocks(self, req_ids: list[str]) -> dict[str, int] | None:
-        return None
 
     def update_decoder_info(self, req_id: str, req_meta: Any) -> Any:
         """Override: in memfabric pull mode, P does NOT need D's metadata

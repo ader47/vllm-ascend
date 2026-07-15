@@ -7,7 +7,6 @@ import torch
 import torch_npu
 from vllm.logger import logger
 
-from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
     LayerMultiBlockReqMeta,
     ReqMeta,
@@ -84,68 +83,22 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             if ready_event is not None:
                 self.save_stream.wait_event(ready_event)
             for req_meta in req_metas:
-                req_id = req_meta.req_id
-                block_ids_npu = req_meta.block_ids_npu
                 block_ids_cpu = req_meta.block_ids_cpu
                 (k_cache_npu, v_cache_npu) = req_meta.cache_npu
                 (k_cache_cpu, v_cache_cpu) = req_meta.cache_cpu
-                if req_meta.token_count > 0:
-                    if req_meta.uses_resident:
-                        assert req_meta.source_rows is not None
-                        assert req_meta.source_slots is not None
-                        for offset, (source_row, source_slot) in enumerate(
-                            zip(req_meta.source_rows, req_meta.source_slots)
-                        ):
-                            token_position = req_meta.token_start + offset
-                            logical_block = token_position // self.block_size
-                            block_offset = token_position % self.block_size
-                            cpu_block = block_ids_cpu[logical_block]
-                            k_cache_cpu[cpu_block, block_offset].copy_(
-                                k_cache_npu[source_row, source_slot]
-                            )
-                            v_cache_cpu[cpu_block, block_offset].copy_(
-                                v_cache_npu[source_row, source_slot]
-                            )
-                    else:
-                        # One-shot local prefill may end in a partial page. Copy
-                        # contiguous ranges from each touched normal cache page.
-                        remaining = req_meta.token_count
-                        token_position = req_meta.token_start
-                        while remaining > 0:
-                            logical_block = token_position // self.block_size
-                            block_offset = token_position % self.block_size
-                            copy_count = min(
-                                remaining, self.block_size - block_offset
-                            )
-                            npu_block = block_ids_npu[logical_block]
-                            cpu_block = block_ids_cpu[logical_block]
-                            end = block_offset + copy_count
-                            k_cache_cpu[cpu_block, block_offset:end].copy_(
-                                k_cache_npu[npu_block, block_offset:end]
-                            )
-                            v_cache_cpu[cpu_block, block_offset:end].copy_(
-                                v_cache_npu[npu_block, block_offset:end]
-                            )
-                            token_position += copy_count
-                            remaining -= copy_count
-                    continue
-                if len(block_ids_npu) != len(block_ids_cpu):
-                    logger.error(
-                        f'Offload req {req_id} fail! '
-                        f'npu block num ({len(block_ids_npu)}) '
-                        f'cpu block num ({len(block_ids_cpu)}) size mismatch'
+                for offset, (source_row, source_slot) in enumerate(
+                    zip(req_meta.source_rows, req_meta.source_slots)
+                ):
+                    token_position = req_meta.token_start + offset
+                    logical_block = token_position // self.block_size
+                    block_offset = token_position % self.block_size
+                    cpu_block = block_ids_cpu[logical_block]
+                    k_cache_cpu[cpu_block, block_offset].copy_(
+                        k_cache_npu[source_row, source_slot]
                     )
-                if self.tp_rank == 0 and layer_id == 0:
-                    if envs.VLLM_ASCEND_SFA_DEBUG:
-                        logger.info(f'>>>>> kv sending thread offload {len(block_ids_npu)} blocks of req {req_id}')
-                if len(block_ids_npu) > 1:
-                    k_cache_cpu[block_ids_cpu] = k_cache_npu[block_ids_npu].to('cpu')
-                    v_cache_cpu[block_ids_cpu] = v_cache_npu[block_ids_npu].to('cpu')
-                else:
-                    if not block_ids_npu:
-                        continue
-                    k_cache_cpu[block_ids_cpu[0]].copy_(k_cache_npu[block_ids_npu[0]])
-                    v_cache_cpu[block_ids_cpu[0]].copy_(v_cache_npu[block_ids_npu[0]])
+                    v_cache_cpu[cpu_block, block_offset].copy_(
+                        v_cache_npu[source_row, source_slot]
+                    )
         self.save_stream.synchronize()
 
         req_metas.clear()

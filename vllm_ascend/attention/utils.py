@@ -321,7 +321,6 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
 
     indexer_block_table_tensor: torch.Tensor | None = None
     indexer_slot_mapping: torch.Tensor | None = None
-    num_offloaded_blocks: torch.Tensor | None = None
     req_ids_tensor: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
     tokens_per_req: torch.Tensor | None = None
@@ -358,7 +357,6 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             indexer_block_table_tensor=self.indexer_block_table_tensor,
             indexer_slot_mapping=self.indexer_slot_mapping,
-            num_offloaded_blocks=_slice_reqs(self.num_offloaded_blocks),
             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
             token_to_req=self.token_to_req[:num_actual_tokens]
             if self.token_to_req is not None
@@ -601,23 +599,6 @@ def maybe_wait_for_layer_send(layer_idx: int) -> None:
     if not hasattr(connector, "wait_for_layer_send"):
         return
     connector.wait_for_layer_send(layer_idx)
-
-
-def maybe_get_num_cpu_blocks(req_ids):
-    """Return {req_id: num_main_mla_cpu_blocks} for remote-prefilled requests.
-
-    Used by the SFA decode threshold (``num_offloaded_blocks``) to mark the
-    entire prefill prefix as CPU-resident, so the NPU-hit attention path never
-    reads D's empty NPU main-MLA cache for remote-prefilled requests (solution
-    1). Returns ``None`` for connectors that don't supply it, in which case the
-    caller falls back to the ``computed // block_size - 1`` heuristic.
-    """
-    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
-        return None
-    connector = get_kv_transfer_group()
-    if not hasattr(connector, "get_num_cpu_blocks"):
-        return None
-    return connector.get_num_cpu_blocks(req_ids)
 
 
 def round_up(val: int, align: int) -> int:

@@ -90,7 +90,7 @@ def _ascend_get_kv_cache_config_from_groups(
 
     Main SFA specs remain in the logical Uniform group so the scheduler still
     assigns their token blocks. Their physical K/V bytes live in the connector
-    host cache and use fixed per-layer staging tensors during model execution.
+    host cache and use fixed per-layer resident tensors during model execution.
     """
     indexer_specs = _get_direct_sfa_indexer_specs(
         vllm_config, kv_cache_groups

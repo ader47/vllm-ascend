@@ -570,8 +570,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             token_to_req = np.pad(token_to_req, (0, num_tokens - token_to_req.shape[0]))
         token_to_req = token_to_req[:num_tokens]
 
-        self.runner.num_offloaded_blocks.np[:num_reqs].fill(0)
-        self.runner.num_offloaded_blocks.copy_to_gpu(num_reqs)
         self.runner.req_ids_tensor.np[:num_reqs] = np.arange(1, num_reqs + 1, dtype=np.int64)
         self.runner.req_ids_tensor.copy_to_gpu(num_reqs)
         self.runner.tokens_per_req.np[:num_reqs] = query_lens
@@ -684,7 +682,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             common_attn_metadata.indexer_block_table_tensor = indexer_block_table_tensor
             common_attn_metadata.indexer_slot_mapping = indexer_slot_mapping
             if self.runner.use_offload:
-                common_attn_metadata.num_offloaded_blocks = self.runner.num_offloaded_blocks.gpu[:num_reqs]
                 common_attn_metadata.req_ids_tensor = self.runner.req_ids_tensor.gpu[:num_reqs]
                 common_attn_metadata.token_to_req = self.runner.token_to_req.gpu[:num_tokens]
                 common_attn_metadata.tokens_per_req = self.runner.tokens_per_req.gpu[:num_reqs]
@@ -2106,7 +2103,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             is_prefilling=common_attn_metadata.is_prefilling,
             indexer_block_table_tensor=common_attn_metadata.indexer_block_table_tensor,
             indexer_slot_mapping=common_attn_metadata.indexer_slot_mapping,
-            num_offloaded_blocks=common_attn_metadata.num_offloaded_blocks,
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
             token_to_req=token_to_req,
             tokens_per_req=common_attn_metadata.tokens_per_req,
@@ -2205,7 +2201,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             is_prefilling=common_attn_metadata.is_prefilling,
             indexer_block_table_tensor=common_attn_metadata.indexer_block_table_tensor,
             indexer_slot_mapping=common_attn_metadata.indexer_slot_mapping,
-            num_offloaded_blocks=common_attn_metadata.num_offloaded_blocks,
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
             token_to_req=common_attn_metadata.token_to_req,
             tokens_per_req=common_attn_metadata.tokens_per_req,

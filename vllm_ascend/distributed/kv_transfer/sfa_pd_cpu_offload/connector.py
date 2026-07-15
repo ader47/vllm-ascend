@@ -76,8 +76,8 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # producing confusing mid-run failures.
         #   P (producer)  : use_offload=false — producer exposes standard
         #                    paged KV, not the offload 5-tuple.
-        #   D (consumer)  : use_offload=true  — drives the SFA offload code path
-        #                    (5-tuple kv_cache, num_offloaded_blocks, LRU load).
+        #   D (consumer)  : use_offload=true  — drives the host-authoritative
+        #                    five-entry resident/LRU cache path.
         from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 
         # AscendConfig may not be initialized yet at connector construction
@@ -95,6 +95,20 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 "SFAPDCpuOffloadConnector consumer (D) must run with "
                 "use_offload=true (set --additional-config "
                 "'{\"use_offload\": true, ...}')."
+            )
+            additional_config = vllm_config.additional_config or {}
+            assert self.use_layerwise, (
+                "SFAPDCpuOffloadConnector consumer requires use_layerwise=true."
+            )
+            assert not additional_config.get("enable_sparse_c8", False), (
+                "SFAPDCpuOffloadConnector decode host offload currently "
+                "supports BF16 KV cache only."
+            )
+            pcp = vllm_config.parallel_config.prefill_context_parallel_size
+            dcp = vllm_config.parallel_config.decode_context_parallel_size
+            assert pcp * dcp == 1, (
+                "SFAPDCpuOffloadConnector decode host offload requires "
+                f"DCP=PCP=1, got dcp={dcp}, pcp={pcp}."
             )
 
         if role == KVConnectorRole.SCHEDULER:
@@ -256,12 +270,6 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             token_to_req,
             capturing,
         )
-
-    # Phase 3: real per-req CPU-block count for the solution-1 threshold.
-    def get_num_cpu_blocks(self, req_ids: list[str]) -> dict[str, int] | None:
-        if self.connector_worker is None:
-            return None
-        return self.connector_worker.get_num_cpu_blocks(req_ids)
 
     # P-side buffer-reuse gate: block until D has read a layer's source KV buffer,
     # so the buffer may be reused by a later layer.

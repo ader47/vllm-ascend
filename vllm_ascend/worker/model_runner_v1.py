@@ -114,7 +114,6 @@ from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     get_sfa_qsfa_packed_head_dim,
-    maybe_get_num_cpu_blocks,
     set_connector_req_ids,
     using_paged_attention,
 )
@@ -207,15 +206,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
-    OffloadMLAAttentionSpec,
-    OffloadSparseC8Layout,
-    compute_offload_sparse_c8_layout,
     is_direct_sfa_host_offload,
-    make_offload_indexer_mla_spec,
-    make_offload_main_mla_spec,
-    offload_indexer_kernel_block_size,
-    offload_indexer_pad_dim,
-    offload_main_kv_head_dims_for_pool_split,
 )
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
@@ -393,6 +384,11 @@ class NPUModelRunner(GPUModelRunner):
         self.use_direct_sfa_host_offload = is_direct_sfa_host_offload(
             self.vllm_config
         )
+        if self.use_offload and not self.use_direct_sfa_host_offload:
+            raise ValueError(
+                "use_offload=true is supported only by an "
+                "SFAPDCpuOffloadConnector decode consumer."
+            )
         if self.use_sparse:
             if get_ascend_device_type() == AscendDeviceType.A5 and self.ascend_config.enable_sparse_c8:
                 # A5 sparse C8 uses the same merged/packed KV layout as SFA QSFA.
@@ -633,7 +629,6 @@ class NPUModelRunner(GPUModelRunner):
                 block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
                 parallel_config=self.parallel_config, dtype=self.dtype)
 
-        self.num_offloaded_blocks = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         self.req_ids_tensor = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.token_to_req = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         self.tokens_per_req = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
@@ -918,37 +913,9 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
-        cpu_blocks_map = None
-        num_offloaded_blocks = None
-        is_prefill = None
-        if self.use_offload:
-            num_offloaded_blocks = self.input_batch.num_computed_tokens_cpu[:num_reqs] // self.block_size
-            # Solution 1: for remote-prefilled requests the main-MLA KV lives in
-            # the CPU pool, so the offload threshold must equal the ACTUAL number
-            # of main-MLA CPU blocks (covering the whole prefill prefix). Falls
-            # back to the heuristic for non-remote connectors (returns None).
-            cpu_blocks_map = maybe_get_num_cpu_blocks(self.input_batch.req_ids[:num_reqs])
-            if cpu_blocks_map is not None:
-                for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-                    if req_id in cpu_blocks_map:
-                        num_offloaded_blocks[i] = cpu_blocks_map[req_id]
-            decode_threshold = 1
-            if self.speculative_config is not None:
-                decode_threshold += self.speculative_config.num_speculative_tokens
-            is_prefill = num_scheduled_tokens > decode_threshold
-            num_offloaded_blocks[is_prefill] = 0
-
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
-        # NOTE: the PD main-MLA block-table offset restore that used to run here
-        # has been removed. With OffloadMLAAttentionManager null-padding the
-        # remote-prefilled prefix, the committed row is already
-        # [null_block]*num_offloaded + resident, which is exactly the layout
-        # attention expects (num_offloaded_blocks masks the null prefix). The
-        # old shift was written for a manager that POPPED the prefix and is now
-        # destructive (it would copy null ids into the resident region).
-
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
         # Get the attention state.
@@ -1486,26 +1453,11 @@ class NPUModelRunner(GPUModelRunner):
                 total_num_scheduled_tokens=total_num_scheduled_tokens,
             )
 
-        if self.use_offload:
+        if self.use_direct_sfa_host_offload:
             def req_id_2_int(req_id: str):
                 # return int(req_id.split('-')[0]) + 1 # for test, '0-94754505' -> 1
                 return zlib.adler32(req_id.encode('utf-8'))
 
-            assert num_offloaded_blocks is not None
-            assert is_prefill is not None
-
-            if envs.VLLM_ASCEND_SFA_DEBUG and torch.distributed.get_rank() == 0:
-                logger.info(
-                    ">>>>> offload threshold: req_ids=%s, num_offloaded_blocks=%s, "
-                    "num_computed=%s, is_prefill=%s",
-                    list(self.input_batch.req_ids[:num_reqs]),
-                    num_offloaded_blocks.tolist(),
-                    self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
-                    is_prefill.tolist(),
-                )
-
-            self.num_offloaded_blocks.np[:num_reqs] = num_offloaded_blocks
-            self.num_offloaded_blocks.copy_to_gpu(num_reqs)
             self.tokens_per_req.np[:num_reqs] = num_scheduled_tokens[:num_reqs]
             self.tokens_per_req.copy_to_gpu(num_reqs)
             self.token_to_req.np[:total_num_scheduled_tokens] = req_indices[:total_num_scheduled_tokens]
@@ -2301,7 +2253,11 @@ class NPUModelRunner(GPUModelRunner):
                     num_tokens_unpadded = self.pcp_manager.total_num_sampled_tokens_pcp
                 cascade_attn_prefix_lens = None
                 # Disable cascade attention when using microbatching (DBO)
-                if self.cascade_attn_enabled and not self.parallel_config.enable_dbo and not self.use_offload:
+                if (
+                    self.cascade_attn_enabled
+                    and not self.parallel_config.enable_dbo
+                    and not self.use_direct_sfa_host_offload
+                ):
                     # Pre-compute cascade attention prefix lengths
                     cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
                         num_scheduled_tokens_np,
@@ -3489,9 +3445,6 @@ class NPUModelRunner(GPUModelRunner):
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
-            if self.use_offload and not self.use_direct_sfa_host_offload:
-                if kv_cache_gid == 0: # indexer
-                    continue
             cm = copy(cm_base)  # shallow copy
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
@@ -3531,17 +3484,10 @@ class NPUModelRunner(GPUModelRunner):
             if self.enable_hamming_sparse is True:
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)
-            if self.use_offload:
-                if not self.use_direct_sfa_host_offload:
-                    indexer_block_table_tensor, indexer_slot_mapping = _get_block_table_and_slot_mapping(0)
-                    cm.indexer_block_table_tensor = indexer_block_table_tensor
-                    cm.indexer_slot_mapping = indexer_slot_mapping
-                cm.num_offloaded_blocks = self.num_offloaded_blocks.gpu[:num_reqs]
+            if self.use_direct_sfa_host_offload:
                 cm.req_ids_tensor = self.req_ids_tensor.gpu[:num_reqs]
                 cm.token_to_req = self.token_to_req.gpu[:num_tokens]
                 cm.tokens_per_req = self.tokens_per_req.gpu[:num_reqs]
-                if not self.use_direct_sfa_host_offload:
-                    kv_cache_gid = 0
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 _build_attn_group_metadata(
                     kv_cache_gid,
@@ -4226,11 +4172,7 @@ class NPUModelRunner(GPUModelRunner):
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
         self.initialize_attn_backend(kv_cache_config)
-        self.use_hybrid_blocks = len(self.attn_groups) > 1 or (
-            self.use_sparse
-            and self.use_offload
-            and not self.use_direct_sfa_host_offload
-        )
+        self.use_hybrid_blocks = len(self.attn_groups) > 1
         # NOTE: Currently, we determine whether we need `num_accepted_tokens` through `MambaSpec`.
         self.need_accepted_tokens = any(
             [isinstance(attn_group[0].kv_cache_spec, MambaSpec) for attn_group in self.attn_groups]
@@ -4388,7 +4330,7 @@ class NPUModelRunner(GPUModelRunner):
         return layer_kv_cache_spec
 
     def _get_attention_kv_cache_dims(self, layer_name: str, kv_cache_spec: AttentionSpec) -> tuple[int, int]:
-        if isinstance(kv_cache_spec, (AscendMLAAttentionSpec, OffloadMLAAttentionSpec)):
+        if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
             attn_layers = get_layers_from_vllm_config(
                 self.vllm_config,
                 AttentionLayerBase,
@@ -4407,20 +4349,6 @@ class NPUModelRunner(GPUModelRunner):
 
         head_size_v = kv_cache_spec.head_size_v if hasattr(kv_cache_spec, "head_size_v") else kv_cache_spec.head_size
         return kv_cache_spec.head_size, head_size_v
-
-    def _get_offload_sparse_c8_layout(self) -> OffloadSparseC8Layout:
-        layout = getattr(self, "_offload_sparse_c8_layout_cache", None)
-        if layout is None:
-            hf_cfg = self.model_config.hf_text_config
-            layout = compute_offload_sparse_c8_layout(
-                hf_cfg.kv_lora_rank,
-                hf_cfg.qk_rope_head_dim,
-                hf_cfg.index_head_dim,
-                self.kv_cache_dtype,
-                scale_dtype=self.c8_k_scale_cache_dtype,
-            )
-            self._offload_sparse_c8_layout_cache = layout
-        return layout
 
     @staticmethod
     def _align_up(value: int, alignment: int) -> int:
@@ -4551,17 +4479,6 @@ class NPUModelRunner(GPUModelRunner):
             self.hybrid_with_attn_and_mamba = self.hybrid_with_attn_and_mamba or (use_mamba and use_attn)
             for idx in range(len(kv_cache_tensor.shared_by)):
                 layer_name = kv_cache_tensor.shared_by[idx]
-                if (
-                    "indexer" in layer_name
-                    and self.use_sparse
-                    and self.use_offload
-                    and not self.use_direct_sfa_host_offload
-                    and not isinstance(
-                        layer_kv_cache_spec[layer_name],
-                        AscendSFAIndexerCacheSpec,
-                    )
-                ):
-                    continue
                 # Single tensor path for: mamba, hybrid attn-mamba, or cache_only_layers
                 if (
                     "linear_attn" in layer_name
@@ -4643,7 +4560,7 @@ class NPUModelRunner(GPUModelRunner):
 
                     scale_tensor_split_factor = None
                     current_sparse_c8 = False
-                    if self.use_sparse and not self.use_offload:
+                    if self.use_sparse and not self.use_direct_sfa_host_offload:
                         current_sparse_c8 = kv_cache_spec_uses_sparse_c8(current_kv_cache_spec)
                         if current_sparse_c8:
                             k_tensor_size = kv_cache_tensor.size
@@ -4659,19 +4576,7 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         k_dim, v_dim = self._get_attention_kv_cache_dims(layer_name, current_kv_cache_spec)
                         assert k_dim > 0 and v_dim > 0
-                        c8_layout = None
-                        if (
-                            self.use_sparse
-                            and self.use_offload
-                            and self.use_sparse_c8_indexer
-                            and self.ascend_config.is_sparse_c8_layer(layer_name)
-                        ):
-                            c8_layout = self._get_offload_sparse_c8_layout()
-                        kv_head_dim_list = offload_main_kv_head_dims_for_pool_split(
-                            k_dim,
-                            v_dim,
-                            c8_layout=c8_layout,
-                        )
+                        kv_head_dim_list = [k_dim, v_dim]
                         if enable_fa_quant(self.vllm_config):
                             k_tensor_split_factor, v_tensor_split_factor = (
                                 self.vllm_config.quant_config.get_kv_quant_split_factor(layer_name, kv_head_dim_list)
@@ -4681,12 +4586,12 @@ class NPUModelRunner(GPUModelRunner):
                             split_factors = calc_split_factor(kv_head_dim_list)
                             k_tensor_split_factor = split_factors[0]
                             v_tensor_split_factor = split_factors[1]
-                            scale_tensor_split_factor = (
-                                split_factors[2] if c8_layout is not None else None
-                            )
+                            scale_tensor_split_factor = None
 
                     scale_tensor_size = None
-                    if not (self.use_sparse and not self.use_offload):
+                    if not (
+                        self.use_sparse and not self.use_direct_sfa_host_offload
+                    ):
                         k_tensor_size = int(kv_cache_tensor.size // k_tensor_split_factor)
                         if v_tensor_split_factor is not None:
                             v_tensor_size = int(kv_cache_tensor.size // v_tensor_split_factor)
@@ -4719,35 +4624,22 @@ class NPUModelRunner(GPUModelRunner):
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the attn kvcache for all shared layers
                         if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
-                            if self.use_sparse and not self.use_offload:
+                            if self.use_sparse and not self.use_direct_sfa_host_offload:
                                 if current_sparse_c8:
                                     kv_cache_raw_tensors[layer_name_inner] = (k_tensor,)
                                 else:
                                     assert v_tensor is not None
                                     kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor)
                             else:
-                                layer_c8_layout = None
-                                if (
-                                    self.use_sparse
-                                    and self.use_offload
-                                    and self.use_sparse_c8_indexer
-                                    and self.ascend_config.is_sparse_c8_layer(
-                                        layer_name_inner
-                                    )
-                                ):
-                                    layer_c8_layout = self._get_offload_sparse_c8_layout()
                                 raw_entry: list = [k_tensor, v_tensor]
-                                if layer_c8_layout is not None:
-                                    assert scale_tensor is not None
-                                    raw_entry.append(scale_tensor)
                                 kv_cache_raw_tensors[layer_name_inner] = tuple(
                                     raw_entry
                                 )
         layer_names = set()
         if self.use_direct_sfa_host_offload:
             # Main SFA layers are logical scheduler entries only. The physical
-            # cache config contains real indexer tensors; main staging and
-            # resident buffers are owned by each attention implementation.
+            # cache config contains real indexer tensors; resident aliases are
+            # owned by each attention implementation.
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
                 layer_names.update(kv_cache_tensor.shared_by)
         else:
@@ -4825,8 +4717,8 @@ class NPUModelRunner(GPUModelRunner):
                     and isinstance(current_kv_cache_spec, AscendMLAAttentionSpec)
                 ):
                     # Direct decode offload keeps main KV in host memory. These
-                    # fixed-address tensors are compact per-layer staging plus
-                    # the resident sparse-attention workspace, not paged HBM.
+                    # fixed-address tensors alias the per-layer resident
+                    # sparse-attention workspace, not paged HBM.
                     attn_layer = get_layers_from_vllm_config(
                         self.vllm_config,
                         AttentionLayerBase,
@@ -4844,125 +4736,7 @@ class NPUModelRunner(GPUModelRunner):
                     kv_caches[layer_name] = runtime_cache
                     continue
 
-                # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
-                # encounter OOM issue
-                if (
-                    self.use_sparse
-                    and self.use_offload
-                    and not self.use_direct_sfa_host_offload
-                ):
-                    raw_entry = kv_cache_raw_tensors[layer_name]  # type: ignore
-                    hf_cfg = self.model_config.hf_text_config
-                    c8_layout = None
-                    if (
-                        self.use_sparse_c8_indexer
-                        and self.ascend_config.is_sparse_c8_layer(layer_name)
-                    ):
-                        c8_layout = self._get_offload_sparse_c8_layout()
-                    raw_k_tensor, raw_v_tensor = raw_entry[0], raw_entry[1]
-                    raw_scale_tensor = (
-                        raw_entry[2] if c8_layout is not None else None
-                    )
-                    sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
-                    if raw_scale_tensor is not None:
-                        sum_page_size_bytes += raw_scale_tensor.numel()
-                    assert raw_k_tensor is not None
-                    assert raw_v_tensor is not None
-                    assert sum_page_size_bytes % current_kv_cache_spec.page_size_bytes == 0
-                    num_blocks = sum_page_size_bytes // current_kv_cache_spec.page_size_bytes
-                    assert num_blocks >= kv_cache_config.num_blocks
-                    kv_cache_shape = self.attn_backend.get_kv_cache_shape(
-                        num_blocks,
-                        current_kv_cache_spec.block_size,
-                        current_kv_cache_spec.num_kv_heads,
-                        current_kv_cache_spec.head_size,
-                    )
-                    dtype = current_kv_cache_spec.dtype
-                    # k_cache: nope_cache    v_cache: rope_cache
-                    mla_num_blocks, mla_block_size, num_kv_heads, _ = kv_cache_shape
-                    k_shape = [
-                        mla_num_blocks,
-                        mla_block_size,
-                        num_kv_heads,
-                        hf_cfg.kv_lora_rank,
-                    ]
-                    v_shape = [
-                        mla_num_blocks,
-                        mla_block_size,
-                        num_kv_heads,
-                        hf_cfg.qk_rope_head_dim,
-                    ]
-                    k_cache = raw_k_tensor.view(dtype).view(k_shape)
-                    v_cache = raw_v_tensor.view(dtype).view(v_shape)
-
-                    indexer_dim = hf_cfg.index_head_dim
-                    dsa_num_blocks = mla_num_blocks
-                    dsa_block_size = offload_indexer_kernel_block_size(
-                        mla_block_size,
-                        hf_cfg.kv_lora_rank,
-                        indexer_dim,
-                        c8_layout=c8_layout,
-                    )
-                    dsa_k_cache_shape = [
-                        dsa_num_blocks,
-                        dsa_block_size,
-                        num_kv_heads,
-                        indexer_dim,
-                    ]
-
-                    decode_width = 1
-                    if self.vllm_config.speculative_config is not None:
-                        decode_width += self.vllm_config.speculative_config.num_speculative_tokens
-                    max_num_topk_rows = min(
-                        self.vllm_config.scheduler_config.max_num_batched_tokens,
-                        self.vllm_config.scheduler_config.max_num_seqs * decode_width,
-                    )
-                    lru_resident_config = self.ascend_config.lru_resident_cache_config
-                    lru_resident_enabled = self.ascend_config.use_offload and lru_resident_config.enabled
-                    resident_capacity = lru_resident_config.buffer_size if lru_resident_enabled else 2048
-                    topk_buffer_k = torch.zeros(
-                        [max_num_topk_rows, resident_capacity, 1, 512],
-                        dtype=torch.bfloat16,
-                        device='npu',
-                    )
-                    topk_buffer_v = torch.zeros(
-                        [max_num_topk_rows, resident_capacity, 1, 64],
-                        dtype=torch.bfloat16,
-                        device='npu',
-                    )
-
-                    indexer_k_dtype = (
-                        self.c8_k_cache_dtype if c8_layout is not None else dtype
-                    )
-                    dsa_k_cache = raw_k_tensor.view(indexer_k_dtype).view(
-                        dsa_k_cache_shape
-                    )
-                    kv_cache_entries: list = [
-                        k_cache,
-                        v_cache,
-                        dsa_k_cache,
-                        topk_buffer_k,
-                        topk_buffer_v,
-                    ]
-                    if c8_layout is not None:
-                        assert raw_scale_tensor is not None
-                        # Index page reuses the raw_k byte span as int8 dsa_k and the
-                        # spec_0 pad region (raw_scale) as fp16 scale. A physical
-                        # page is either main or index, never both at once.
-                        dsa_k_scale_cache_shape = [
-                            dsa_num_blocks,
-                            dsa_block_size,
-                            num_kv_heads,
-                            1,
-                        ]
-                        dsa_k_scale_cache = (
-                            raw_scale_tensor
-                            .view(self.c8_k_scale_cache_dtype)
-                            .view(dsa_k_scale_cache_shape)
-                        )
-                        kv_cache_entries.append(dsa_k_scale_cache)
-                    kv_caches[layer_name] = tuple(kv_cache_entries)
-                elif self.use_compress and isinstance(current_kv_cache_spec,
+                if self.use_compress and isinstance(current_kv_cache_spec,
                                                     (AscendMLAAttentionSpec, AscendSlidingWindowMLASpec)):
                     kv_tensor = kv_cache_raw_tensors[layer_name]
                     sum_page_size_bytes = kv_tensor.numel()
@@ -5287,24 +5061,7 @@ class NPUModelRunner(GPUModelRunner):
         # use the supported block sizes from the backend
         # For other backends (like Mamba), use [0] (no splitting)
         self.kernel_block_sizes = []
-        # TODO try compatible with current compute flow
-        if self.use_offload and not self.use_direct_sfa_host_offload:
-            hf_cfg = self.model_config.hf_text_config
-            if self.use_sparse_c8_indexer:
-                c8_layout = self._get_offload_sparse_c8_layout()
-                indexer_kernel_block = (
-                    self.block_size * c8_layout.page_block_multiplier
-                )
-            else:
-                indexer_kernel_block = offload_indexer_kernel_block_size(
-                    self.block_size,
-                    hf_cfg.kv_lora_rank,
-                    hf_cfg.index_head_dim,
-                )
-            self.kernel_block_sizes = [[indexer_kernel_block], [self.block_size]]
         for kv_cache_group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
-            if self.use_offload and not self.use_direct_sfa_host_offload:
-                continue
             if self.pcp_size > 1:
                 self.pcp_manager.initialize_slot_mapping()
             kv_cache_spec = kv_cache_group.kv_cache_spec
@@ -5511,68 +5268,8 @@ class NPUModelRunner(GPUModelRunner):
         # ordering expected by graph parameter update logic in attention backends.
         mamba_layers: dict[str, MambaBase] = {}
         attn_layer_names = set()
-        # Sparse offload exposes both the per-layer indexer cache and the MLA
-        # attention cache in attn_layers.
-        if self.use_sparse and self.use_offload and not self.use_direct_sfa_host_offload:
-            # glm5.2, pad reused indexer module for kv allocating
-            # TODO change to full hybrid (4 kv + 1 indexer)
-            # Pad an indexer for EVERY main MLA layer (incl MTP/spec-decode extra
-            # layers), not just num_hidden_layers. The D-side sfa_pd consumer
-            # pairs each main with an indexer to pull it; without a padded
-            # indexer the MTP layer is dropped (never pulled to D). MTP is
-            # MLA+sparse (else P-side would have hit a mixed-tuple break), so
-            # treating it as a regular sparse layer here is consistent with the
-            # P-side workaround.
-            num_layers = sum(1 for m in attn_layers.values() if isinstance(m, MLAAttention))
-            indexer_module = attn_layers['model.layers.0.self_attn.indexer.k_cache']
-            for layer_id in range(num_layers):
-                indexer_name = f'model.layers.{layer_id}.self_attn.indexer.k_cache'
-                if indexer_name not in attn_layers:
-                    attn_layers[indexer_name] = deepcopy(indexer_module)
         for layer_name, attn_module in attn_layers.items():
-            if self.use_sparse and self.use_offload and not self.use_direct_sfa_host_offload:
-                if isinstance(attn_module, MLAAttention):
-                    hf_cfg = self.model_config.hf_text_config
-                    kv_cache_spec[layer_name] = make_offload_main_mla_spec(
-                        block_size=self.block_size,
-                        num_kv_heads=1,
-                        head_size=attn_module.head_size,
-                        dtype=self.kv_cache_dtype,
-                        kv_lora_rank=hf_cfg.kv_lora_rank,
-                        qk_rope_head_dim=hf_cfg.qk_rope_head_dim,
-                        index_head_dim=hf_cfg.index_head_dim,
-                        c8_unified_pool=self.use_sparse_c8_indexer,
-                        scale_dtype=(
-                            self.c8_k_scale_cache_dtype
-                            if self.use_sparse_c8_indexer
-                            else None
-                        ),
-                    )
-                else:
-                    hf_cfg = self.model_config.hf_text_config
-                    kv_cache_spec[layer_name] = make_offload_indexer_mla_spec(
-                        block_size=self.block_size,
-                        num_kv_heads=1,
-                        head_size=hf_cfg.index_head_dim
-                        + offload_indexer_pad_dim(
-                            hf_cfg.index_head_dim,
-                            hf_cfg.qk_rope_head_dim,
-                            hf_cfg.kv_lora_rank,
-                        ),
-                        dtype=self.kv_cache_dtype,
-                        cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
-                        index_head_dim=hf_cfg.index_head_dim,
-                        kv_lora_rank=hf_cfg.kv_lora_rank,
-                        qk_rope_head_dim=hf_cfg.qk_rope_head_dim,
-                        sparse_head_dim=self.sparse_head_dim,
-                        c8_unified_pool=self.use_sparse_c8_indexer,
-                        scale_dtype=(
-                            self.c8_k_scale_cache_dtype
-                            if self.use_sparse_c8_indexer
-                            else None
-                        ),
-                    )
-            elif (isinstance(attn_module, Attention)
+            if (isinstance(attn_module, Attention)
                     and (kv_tgt_layer := attn_module.kv_sharing_target_layer_name) is not None):
                 # The layer doesn't need its own KV cache and will use that of
                 # the target layer. We skip creating a KVCacheSpec for it, so

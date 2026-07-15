@@ -272,7 +272,6 @@ class AscendSFAMetadata:
     group_key_cache_idx: torch.Tensor | None = None
     indexer_block_table_tensor: torch.Tensor | None = None
     indexer_slot_mapping: torch.Tensor | None = None
-    num_offloaded_blocks: torch.Tensor | None = None
     req_ids_tensor: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
     positions: torch.Tensor | None = None
@@ -305,8 +304,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             metadata_cls if metadata_cls is not None else AscendSFAMetadata,
             supports_dcp_with_varlen,
         )
-        ascend_config = get_ascend_config()
-        self.use_offload = ascend_config.use_offload
         self.use_direct_sfa_host_offload = is_direct_sfa_host_offload(
             vllm_config
         )
@@ -400,20 +397,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
-        use_separate_indexer_metadata = (
-            self.use_offload and not self.use_direct_sfa_host_offload
-        )
-        indexer_block_table_tensor = (
-            common_attn_metadata.indexer_block_table_tensor[:num_reqs]
-            if use_separate_indexer_metadata
-            else None
-        )
-        indexer_slot_mapping = (
-            common_attn_metadata.indexer_slot_mapping[:num_input_tokens]
-            if use_separate_indexer_metadata
-            else None
-        )
-        num_offloaded_blocks = common_attn_metadata.num_offloaded_blocks
+        indexer_block_table_tensor = None
+        indexer_slot_mapping = None
         req_ids_tensor = common_attn_metadata.req_ids_tensor
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
 
@@ -560,7 +545,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             num_prefills=self.num_prefills,
             indexer_block_table_tensor=indexer_block_table_tensor,
             indexer_slot_mapping=indexer_slot_mapping,
-            num_offloaded_blocks=num_offloaded_blocks,
             req_ids_tensor=req_ids_tensor,
             token_to_req=common_attn_metadata.token_to_req,
             positions=input_positions,
@@ -641,7 +625,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.topk_indices_buffer = kwargs.get("topk_indices_buffer")
 
         ascend_config = get_ascend_config()
-        self.use_offload = ascend_config.use_offload
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
         self.vllm_config = get_current_vllm_config()
         self.use_direct_sfa_host_offload = is_direct_sfa_host_offload(
@@ -729,7 +712,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         if self.use_direct_sfa_host_offload:
             # Host-only main KV uses the native fused projection +
-            # npu_kv_rmsnorm_rope_cache path to target compact staging slots.
+            # npu_kv_rmsnorm_rope_cache path to target resident fresh slots.
             # Fused prolog/MLAPO assume the scheduler's paged main HBM cache.
             self.enable_sfa_prolog_v3 = False
             self.enable_mlapo = False
@@ -763,90 +746,60 @@ class AscendSFAImpl(MLAAttentionImpl):
                         )
                 register_all_layers_to_shard_weight_series(self.layer_sharding_kwargs)
 
-        # sfa offload
-        self.block_size = self.vllm_config.cache_config.block_size
-        max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs
-        decode_width = 1
-        if self.vllm_config.speculative_config is not None:
-            decode_width += self.vllm_config.speculative_config.num_speculative_tokens
-        self.decode_width = decode_width
-        max_num_topk_rows = min(
-            self.vllm_config.scheduler_config.max_num_batched_tokens,
-            max_num_reqs * decode_width,
-        )
-        self.sfa_sparse_topk = self.lru_resident_cache_config.topk
-        self.lru_resident_capacity = self.lru_resident_cache_config.buffer_size
-        self.lru_managed_capacity = self.lru_resident_capacity - self.decode_width
-        if self.lru_managed_capacity < self.sfa_sparse_topk:
-            raise ValueError(
-                "lru_resident_cache_config.buffer_size must leave one fresh "
-                "slot per decode token: "
-                f"buffer_size={self.lru_resident_capacity}, "
-                f"topk={self.sfa_sparse_topk}, decode_width={self.decode_width}."
-            )
-        if self.lru_resident_capacity % self.block_size != 0:
-            raise ValueError(
-                "lru_resident_cache_config.buffer_size must be divisible by "
-                f"cache block_size ({self.block_size}); got {self.lru_resident_capacity}"
-            )
-        self.sparse_block_table = torch.arange(
-            0,
-            max_num_topk_rows * self.lru_resident_capacity // self.block_size,
-            dtype=torch.int32,
-            device='npu',
-        ).reshape([max_num_topk_rows, -1])
-        self.sparse_topk_indices = torch.arange(
-            self.sfa_sparse_topk,
-            dtype=torch.int32,
-            device="npu",
-        ).view(1, -1).repeat(max_num_topk_rows, 1)
-        self.sparse_seq_len_kv = torch.full(
-            [max_num_topk_rows], self.lru_resident_capacity, dtype=torch.int32, device='npu')
-        self.sparse_seq_len_q = torch.arange(1, max_num_topk_rows + 1, dtype=torch.int32, device='npu')
-        self.max_model_len = self.vllm_config.model_config.max_model_len
-        self.lru_current_slots = torch.full(
-            [max_num_topk_rows, self.sfa_sparse_topk],
-            -1,
-            dtype=torch.int32,
-            device='npu',
-        )
-        self.fresh_k_workspace = torch.empty(
-            [max_num_reqs, self.decode_width, 1, self.kv_lora_rank],
-            dtype=self.vllm_config.model_config.dtype,
-            device="npu",
-        )
-        self.fresh_v_workspace = torch.empty(
-            [max_num_reqs, self.decode_width, 1, self.qk_rope_head_dim],
-            dtype=self.vllm_config.model_config.dtype,
-            device="npu",
-        )
         if self.use_direct_sfa_host_offload:
-            # Graph replay must see stable addresses. Size staging for the
-            # largest padded execution batch, while local prefill is limited
-            # to one 128-token page by the connector scheduler.
-            stage_capacity = self.vllm_config.scheduler_config.max_num_batched_tokens
-            stage_num_blocks = (stage_capacity + self.block_size - 1) // self.block_size
-            self.direct_stage_capacity = stage_num_blocks * self.block_size
-            self.direct_stage_k = torch.empty(
-                [stage_num_blocks, self.block_size, 1, self.kv_lora_rank],
-                dtype=self.vllm_config.model_config.dtype,
-                device="npu",
+            # These buffers and their capacity contract belong exclusively to
+            # the SFAPD decode consumer. A producer may contain the connector
+            # inside MultiConnector, but it must retain the normal SFA layout.
+            self.block_size = self.vllm_config.cache_config.block_size
+            max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs
+            decode_width = 1
+            if self.vllm_config.speculative_config is not None:
+                decode_width += self.vllm_config.speculative_config.num_speculative_tokens
+            self.decode_width = decode_width
+            max_num_topk_rows = min(
+                self.vllm_config.scheduler_config.max_num_batched_tokens,
+                max_num_reqs * decode_width,
             )
-            self.direct_stage_v = torch.empty(
-                [stage_num_blocks, self.block_size, 1, self.qk_rope_head_dim],
-                dtype=self.vllm_config.model_config.dtype,
-                device="npu",
-            )
-            self.direct_stage_slots = torch.arange(
-                self.direct_stage_capacity,
-                dtype=torch.int64,
-                device="npu",
-            )
-            self.direct_stage_block_table = torch.arange(
-                stage_num_blocks,
+            self.sfa_sparse_topk = self.lru_resident_cache_config.topk
+            self.lru_resident_capacity = self.lru_resident_cache_config.buffer_size
+            self.lru_managed_capacity = self.lru_resident_capacity - self.decode_width
+            if self.lru_managed_capacity < self.sfa_sparse_topk:
+                raise ValueError(
+                    "lru_resident_cache_config.buffer_size must leave one fresh "
+                    "slot per decode token: "
+                    f"buffer_size={self.lru_resident_capacity}, "
+                    f"topk={self.sfa_sparse_topk}, decode_width={self.decode_width}."
+                )
+            if self.lru_resident_capacity % self.block_size != 0:
+                raise ValueError(
+                    "lru_resident_cache_config.buffer_size must be divisible by "
+                    f"cache block_size ({self.block_size}); got {self.lru_resident_capacity}"
+                )
+            self.sparse_block_table = torch.arange(
+                0,
+                max_num_topk_rows * self.lru_resident_capacity // self.block_size,
+                dtype=torch.int32,
+                device='npu',
+            ).reshape([max_num_topk_rows, -1])
+            self.sparse_topk_indices = torch.arange(
+                self.sfa_sparse_topk,
                 dtype=torch.int32,
                 device="npu",
-            ).view(1, -1).repeat(max_num_reqs, 1)
+            ).view(1, -1).repeat(max_num_topk_rows, 1)
+            self.sparse_seq_len_kv = torch.full(
+                [max_num_topk_rows], self.lru_resident_capacity, dtype=torch.int32, device='npu')
+            self.sparse_seq_len_q = torch.arange(
+                1, max_num_topk_rows + 1, dtype=torch.int32, device='npu')
+            self.lru_current_slots = torch.full(
+                [max_num_topk_rows, self.sfa_sparse_topk],
+                -1,
+                dtype=torch.int32,
+                device='npu',
+            )
+            # Historical top-k tokens occupy the managed prefix. The final
+            # decode_width slots are the current request's decode/MTP window.
+            # New KV is written here directly; there is no separate main-KV
+            # write buffer on a PD decode consumer.
             self.direct_resident_k = torch.empty(
                 [max_num_topk_rows, self.lru_resident_capacity, 1, self.kv_lora_rank],
                 dtype=self.vllm_config.model_config.dtype,
@@ -865,16 +818,64 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "Direct SFA host-offload runtime cache requested outside "
                 f"direct mode for layer {self.layer_name}."
             )
-        # Slot 2 is replaced by the separately bound real indexer cache in
-        # _compose_sfa_kv_cache. Skip-topk layers retain this empty sentinel.
-        indexer_sentinel = self.direct_stage_k[:0]
+        # Slots 0/1 are block-shaped aliases used by the KV writer. Slots 3/4
+        # expose the same storage as row-shaped LRU/SFA workspaces. Slot 2 is
+        # replaced by the separately bound real indexer cache in
+        # _compose_sfa_kv_cache; skip-topk layers retain the empty sentinel.
+        resident_k_pages = self.direct_resident_k.view(
+            -1, self.block_size, 1, self.kv_lora_rank
+        )
+        resident_v_pages = self.direct_resident_v.view(
+            -1, self.block_size, 1, self.qk_rope_head_dim
+        )
+        indexer_sentinel = resident_k_pages[:0]
         return (
-            self.direct_stage_k,
-            self.direct_stage_v,
+            resident_k_pages,
+            resident_v_pages,
             indexer_sentinel,
             self.direct_resident_k,
             self.direct_resident_v,
         )
+
+    def _get_direct_resident_write_slots(
+        self,
+        attn_metadata: M,
+        num_input_tokens: int,
+    ) -> torch.Tensor:
+        """Map graph input rows into the canonical per-request fresh window."""
+        if attn_metadata.num_prefills:
+            raise RuntimeError(
+                "Direct SFA host offload is decode-node only and does not "
+                "support local prefill batches."
+            )
+        num_tokens = attn_metadata.num_actual_tokens
+        num_reqs = attn_metadata.num_decodes
+        if attn_metadata.token_to_req is None:
+            raise RuntimeError("Direct SFA host offload requires token_to_req metadata")
+        if attn_metadata.positions is None:
+            raise RuntimeError("Direct SFA host offload requires token positions")
+        if attn_metadata.tokens_per_req is None:
+            raise RuntimeError("Direct SFA host offload requires tokens_per_req metadata")
+
+        token_to_req = attn_metadata.token_to_req[:num_tokens].to(torch.int64)
+        positions = attn_metadata.positions[:num_tokens]
+        current_starts = (
+            attn_metadata.seq_lens[:num_reqs]
+            - attn_metadata.tokens_per_req[:num_reqs]
+        )
+        fresh_offsets = positions - torch.index_select(
+            current_starts, 0, token_to_req
+        )
+        slots = (
+            token_to_req * self.lru_resident_capacity
+            + self.lru_managed_capacity
+            + fresh_offsets
+        ).to(torch.int64)
+        if num_input_tokens > num_tokens:
+            slots = nn.functional.pad(
+                slots, (0, num_input_tokens - num_tokens), value=-1
+            )
+        return slots
 
     @staticmethod
     def update_graph_params(
@@ -1635,11 +1636,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
 
-        indexer_block_table = (
-            attn_metadata.indexer_block_table_tensor
-            if self.use_offload and not self.use_direct_sfa_host_offload
-            else attn_metadata.block_table
-        )
         return DeviceOperator.indexer_select_post_process(
             self,
             q_li,
@@ -1647,7 +1643,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li_shape_ori,
             weights,
             kv_cache,
-            indexer_block_table,
+            attn_metadata.block_table,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
             self.use_sparse_c8_indexer,
@@ -1681,92 +1677,50 @@ class AscendSFAImpl(MLAAttentionImpl):
         kv = kv_cache[0]
         key_rope = kv_cache[1]
 
-        if self.use_offload:
+        if self.use_direct_sfa_host_offload:
             num_decodes = attn_metadata.num_decodes
             num_prefills = attn_metadata.num_prefills
             num_decode_tokens = attn_metadata.num_decode_tokens
+            if num_prefills or num_decodes <= 0:
+                raise RuntimeError(
+                    "SFA host offload is supported only on a PD decode node; "
+                    f"got num_decodes={num_decodes}, num_prefills={num_prefills}."
+                )
             ql_nope_decode = ql_nope[:num_decode_tokens]
-            ql_nope_prefill = ql_nope[num_decode_tokens:]
-            # key_rope_decode = key_rope[:num_decode_tokens]
-            # key_rope_prefill = key_rope[num_decode_tokens:]
             q_pe_decode = q_pe[:num_decode_tokens]
-            q_pe_prefill = q_pe[num_decode_tokens:]
             topk_indices_decode = topk_indices[:num_decode_tokens]
-            topk_indices_prefill = topk_indices[num_decode_tokens:]
-            actual_seq_lengths_query_decode = actual_seq_lengths_query[:num_decodes]
-            actual_seq_lengths_query_prefill = actual_seq_lengths_query[num_decodes:]
-            actual_seq_lengths_key_decode = actual_seq_lengths_key[:num_decodes]
-            actual_seq_lengths_key_prefill = actual_seq_lengths_key[num_decodes:]
-            block_table_decode = block_table[:num_decodes]
-            block_table_prefill = (
-                self.direct_stage_block_table[:num_prefills]
-                if self.use_direct_sfa_host_offload
-                else block_table[num_decodes:]
+            (
+                topk_buffer,
+                sparse_topk_indices,
+                sparse_block_table,
+                sparse_seq_len_q,
+                sparse_seq_len_kv,
+            ) = self._get_topk_buffer(
+                ql_nope_decode,
+                q_pe_decode,
+                topk_indices_decode,
+                kv_cache,
+                attn_metadata,
+                layer_name,
             )
-
-            if num_decodes > 0:
-                (
-                    topk_buffer,
-                    sparse_topk_indices,
-                    sparse_block_table,
-                    sparse_seq_len_q,
-                    sparse_seq_len_kv,
-                ) = self._get_topk_buffer(
-                    ql_nope_decode,
-                    q_pe_decode,
-                    topk_indices_decode,
-                    kv_cache,
-                    attn_metadata,
-                    layer_name,
-                )
-                attn_output_decode, _, _ = torch.ops._C_ascend.npu_sparse_flash_attention(
-                    query=ql_nope_decode,
-                    key=topk_buffer[0],
-                    value=topk_buffer[0],
-                    sparse_indices=sparse_topk_indices,
-                    scale_value=self.scale,
-                    sparse_block_size=1,
-                    block_table=sparse_block_table,
-                    actual_seq_lengths_query=sparse_seq_len_q,
-                    actual_seq_lengths_kv=sparse_seq_len_kv,
-                    query_rope=q_pe_decode,
-                    key_rope=topk_buffer[1],
-                    layout_query="TND",
-                    layout_kv="PA_BSND",
-                    sparse_mode=3,
-                    attention_mode=2,
-                    sparse_indices_discrete=True,
-                )
-
-            if num_prefills > 0:
-
-                if actual_seq_lengths_query_decode is not None and actual_seq_lengths_query_decode.numel() != 0:
-                    actual_seq_lengths_query_prefill = actual_seq_lengths_query_prefill - actual_seq_lengths_query_decode[-1]
-
-                attn_output_prefill, softmax_max, softmax_sum = torch.ops._C_ascend.npu_sparse_flash_attention(
-                    query=ql_nope_prefill,                                      # [N, 64, 512]
-                    key=kv,                                                     # [block_num, block_size, 1, 512]
-                    value=kv,
-                    sparse_indices=topk_indices_prefill,                        # [N, 1, 2048], int32
-                    scale_value=self.scale,                                     # 0.1352337788608801
-                    sparse_block_size=1,
-                    block_table=block_table_prefill,                            # [num_reqs, block_num], int32
-                    actual_seq_lengths_query=actual_seq_lengths_query_prefill,  # [num_reqs], cumsum, int32
-                    actual_seq_lengths_kv=actual_seq_lengths_key_prefill,       # [num_reqs], int32
-                    query_rope=q_pe_prefill,                                    # [N, 64, 64]
-                    key_rope=key_rope,                                          # [block_num, block_size, 1, 64]
-                    layout_query="TND",
-                    layout_kv="PA_BSND",
-                    sparse_mode=3,
-                    attention_mode=2,
-                )
-
-            if num_decodes <= 0:
-                attn_output = attn_output_prefill
-            elif num_prefills <= 0:
-                attn_output = attn_output_decode
-            else:
-                attn_output = torch.cat([attn_output_decode, attn_output_prefill], dim=0).contiguous()
+            attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
+                query=ql_nope_decode,
+                key=topk_buffer[0],
+                value=topk_buffer[0],
+                sparse_indices=sparse_topk_indices,
+                scale_value=self.scale,
+                sparse_block_size=1,
+                block_table=sparse_block_table,
+                actual_seq_lengths_query=sparse_seq_len_q,
+                actual_seq_lengths_kv=sparse_seq_len_kv,
+                query_rope=q_pe_decode,
+                key_rope=topk_buffer[1],
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                sparse_indices_discrete=True,
+            )[0]
 
             # Align with the non-offload path, which runs sparse attention over
             # the full padded input (ql_nope.shape[0] == num_input_tokens). The
@@ -1829,8 +1783,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.use_direct_sfa_host_offload:
             if len(main_cache) != 5:
                 raise RuntimeError(
-                    "Direct SFA host offload expects the five-entry staging/"
-                    f"resident tuple, got {len(main_cache)} tensors for "
+                    "Direct SFA host offload expects the five-entry resident "
+                    f"tuple, got {len(main_cache)} tensors for "
                     f"layer_name={self.layer_name}."
                 )
             if not self.has_indexer:
@@ -1849,7 +1803,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 main_cache[4],
             )
 
-        if self.use_offload or not self.has_indexer:
+        if not self.has_indexer:
             return main_cache
 
         indexer_cache = self.indexer.k_cache.kv_cache
@@ -2017,18 +1971,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 k_li, k_li_scale = None, None
 
-            if not self.use_offload:
+            if not self.use_direct_sfa_host_offload:
                 # TODO we may need to do kv preload here
                 wait_for_kv_layer_from_connector(layer_name)
 
             if self.use_direct_sfa_host_offload:
-                if kv_no_split.shape[0] > self.direct_stage_capacity:
-                    raise RuntimeError(
-                        "Direct SFA staging capacity exceeded: "
-                        f"tokens={kv_no_split.shape[0]}, "
-                        f"capacity={self.direct_stage_capacity}."
-                    )
-                kv_slots = self.direct_stage_slots[: kv_no_split.shape[0]]
+                kv_slots = self._get_direct_resident_write_slots(
+                    attn_metadata,
+                    kv_no_split.shape[0],
+                )
             elif self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
                 kv_slots = slot_mapping_cp
@@ -2173,14 +2124,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         if kv_cache is not None and self.has_indexer:
             assert k_li is not None
             use_indexer_reshape_optim = self.is_kv_producer and get_ascend_config().c8_enable_reshape_optim
-            if self.use_offload:
-                # Under offload, C8-ness is per-layer: six-tuple ([5]=scale) vs
-                # five-tuple. dsa_k_scale_cache_idx is only read when k_li_scale
-                # is not None (C8 layers), so one offload branch covers both;
-                # uniformity across layers is enforced by
-                # SFAKVOffloadWorker._register_offload_layers.
+            if self.use_direct_sfa_host_offload:
                 dsa_k_cache_idx = 2
-                dsa_k_scale_cache_idx = 5
             elif self.use_sparse_c8_sfa:
                 dsa_k_cache_idx = 1
                 dsa_k_scale_cache_idx = 2
@@ -2198,29 +2143,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_metadata.block_size,
                 )
             else:
-                indexer_slot_mapping = (
-                    attn_metadata.indexer_slot_mapping
-                    if self.use_offload and not self.use_direct_sfa_host_offload
-                    else attn_metadata.slot_mapping
-                )
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
-                    indexer_slot_mapping.view(-1, 1),
+                    attn_metadata.slot_mapping.view(-1, 1),
                     k_li.view(-1, k_li.shape[-1]),
                 )  # b, s, n, d
             if self.use_sparse_c8_indexer:
-                if self.use_offload:
-                    # six-tuple (C8) or five-tuple (non-C8); uniformity across
-                    # layers is enforced by SFAKVOffloadWorker._register_offload_layers.
-                    assert len(kv_cache) in (5, 6)
-                else:
-                    assert len(kv_cache) == (3 if self.use_sparse_c8_sfa else 4)
+                assert not self.use_direct_sfa_host_offload
+                assert len(kv_cache) == (3 if self.use_sparse_c8_sfa else 4)
                 if k_li_scale is not None:
-                    scale_slot_mapping = (
-                        attn_metadata.indexer_slot_mapping
-                        if self.use_offload and not self.use_direct_sfa_host_offload
-                        else attn_metadata.slot_mapping
-                    )
                     if use_indexer_reshape_optim:
                         torch.ops._C_ascend.store_kv_block(
                             k_li_scale,
@@ -2233,7 +2164,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     else:
                         torch_npu.npu_scatter_nd_update_(
                             kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
-                            scale_slot_mapping.view(-1, 1),
+                            attn_metadata.slot_mapping.view(-1, 1),
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
 
@@ -2338,11 +2269,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             token_to_req = torch.arange(num_tokens, dtype=torch.int32, device=topk_indices.device)
         token_to_req_index = token_to_req.long()
-        if attn_metadata.positions is None:
-            raise RuntimeError("Tail-free SFA decode requires token positions")
         if attn_metadata.tokens_per_req is None:
             raise RuntimeError("Tail-free SFA decode requires tokens_per_req")
-        positions = attn_metadata.positions[:num_tokens]
         tokens_per_req = attn_metadata.tokens_per_req[:num_reqs]
         cpu_token_indices, fresh_mask, fresh_slots = _partition_decode_topk(
             topk_indices,
@@ -2352,56 +2280,23 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.lru_managed_capacity,
         )
 
-        # Every query row receives the request's complete current decode
-        # window. This supports MTP causal rows while keeping the source for
-        # token-granular D2H backups layer-private.
-        if self.use_direct_sfa_host_offload:
-            # Native preprocessing writes the current graph batch densely into
-            # compact staging slots. Real decode rows are the leading rows.
-            fresh_k = kv_cache[0].view(
-                -1, 1, kv_cache[0].shape[-1]
-            )[:num_tokens]
-            fresh_v = kv_cache[1].view(
-                -1, 1, kv_cache[1].shape[-1]
-            )[:num_tokens]
-        else:
-            slot_mapping = attn_metadata.slot_mapping[:num_tokens].to(torch.int64)
-            fresh_k = torch.index_select(
-                kv_cache[0].view(-1, 1, kv_cache[0].shape[-1]),
-                0,
-                slot_mapping,
+        # KV preprocessing wrote each token into a canonical per-request fresh
+        # window. MTP has multiple query rows per request, so replicate that
+        # complete window to each query row before sparse attention. Ordinary
+        # decode already has one canonical row per query and needs no copy.
+        if is_mtp_decode:
+            canonical_k = kv_cache[3][
+                :num_reqs, self.lru_managed_capacity :
+            ]
+            canonical_v = kv_cache[4][
+                :num_reqs, self.lru_managed_capacity :
+            ]
+            topk_buffer_k[:, self.lru_managed_capacity :].copy_(
+                torch.index_select(canonical_k, 0, token_to_req_index)
             )
-            fresh_v = torch.index_select(
-                kv_cache[1].view(-1, 1, kv_cache[1].shape[-1]),
-                0,
-                slot_mapping,
+            topk_buffer_v[:, self.lru_managed_capacity :].copy_(
+                torch.index_select(canonical_v, 0, token_to_req_index)
             )
-        current_starts = attn_metadata.seq_lens[:num_reqs] - tokens_per_req
-        fresh_offsets = positions - torch.index_select(
-            current_starts, 0, token_to_req_index
-        )
-        fresh_indices = torch.stack(
-            [token_to_req.to(torch.int64), fresh_offsets.to(torch.int64)],
-            dim=1,
-        )
-        fresh_k_workspace = self.fresh_k_workspace[:num_reqs]
-        fresh_v_workspace = self.fresh_v_workspace[:num_reqs]
-        torch_npu.npu_scatter_nd_update_(
-            fresh_k_workspace,
-            fresh_indices,
-            fresh_k,
-        )
-        torch_npu.npu_scatter_nd_update_(
-            fresh_v_workspace,
-            fresh_indices,
-            fresh_v,
-        )
-        topk_buffer_k[:, self.lru_managed_capacity :].copy_(
-            torch.index_select(fresh_k_workspace, 0, token_to_req_index)
-        )
-        topk_buffer_v[:, self.lru_managed_capacity :].copy_(
-            torch.index_select(fresh_v_workspace, 0, token_to_req_index)
-        )
 
         req_ids_arg = (attn_metadata.req_ids_tensor[:num_reqs][token_to_req_index]
              if is_mtp_decode else attn_metadata.req_ids_tensor[:num_reqs])

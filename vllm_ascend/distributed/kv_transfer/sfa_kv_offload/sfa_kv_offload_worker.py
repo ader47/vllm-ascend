@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 
+from memfabric_hybrid import offload
 import numpy as np
 import torch
 from torch.utils.cpp_extension import load
@@ -21,8 +22,6 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.utils import CpuGpuBuffer
-from memfabric_hybrid import offload
-
 from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.kv_cache_interface import (
@@ -30,23 +29,18 @@ from vllm_ascend.core.kv_cache_interface import (
     is_direct_sfa_host_offload,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
-    SFAKVOffloadConnectorMetadata,
     LayerMultiBlockReqMeta,
     ReqMeta,
+    SFADecodeHostOffloadMetadata,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.kv_transfer import (
     KVCacheStoreLayerSendingThread,
     KVTransferThread,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.offload_kv_cache_layout import (
-    OFFLOAD_C8_TUPLE_LEN,
-    OFFLOAD_INDEXER_S,
-    OFFLOAD_MAIN_K,
-    OFFLOAD_MAIN_V,
     OFFLOAD_RESIDENT_K,
     OFFLOAD_RESIDENT_V,
     OFFLOAD_TUPLE_LEN,
-    is_offload_c8_kv_cache,
 )
 
 _SUBSCRIBED_COMPUTE_STREAMS = set()
@@ -165,25 +159,28 @@ class SFAKVOffloadWorker:
         self.pcp_size = get_pcp_group().world_size
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         ascend_config = get_ascend_config()
-        self.use_offload = ascend_config.use_offload
         self.use_direct_sfa_host_offload = is_direct_sfa_host_offload(
             vllm_config
         )
+        if not self.use_direct_sfa_host_offload:
+            raise ValueError(
+                "SFA host-cache worker is internal to an "
+                "SFAPDCpuOffloadConnector decode consumer."
+            )
+        if not self.use_sparse:
+            raise ValueError("SFA host-cache worker requires a sparse SFA model.")
 
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.group_block_sizes = self._infer_group_block_sizes(vllm_config, kv_cache_config)
-        if self.use_direct_sfa_host_offload:
-            if len(kv_cache_config.kv_cache_groups) != 1 or not isinstance(
-                kv_cache_config.kv_cache_groups[0].kv_cache_spec,
-                UniformTypeKVCacheSpecs,
-            ):
-                raise ValueError(
-                    "Direct SFA host offload worker requires one UniformType "
-                    "KV cache group."
-                )
-            self.block_size = self.group_block_sizes[0]
-        else:
-            self.block_size = self.group_block_sizes[-1] # only offload kv cache
+        if len(kv_cache_config.kv_cache_groups) != 1 or not isinstance(
+            kv_cache_config.kv_cache_groups[0].kv_cache_spec,
+            UniformTypeKVCacheSpecs,
+        ):
+            raise ValueError(
+                "Direct SFA host offload worker requires one UniformType "
+                "KV cache group."
+            )
+        self.block_size = self.group_block_sizes[0]
 
         self.current_layer_save = 0
         self.current_layer_load = 0
@@ -222,7 +219,6 @@ class SFAKVOffloadWorker:
                 f"token: buffer_size={self.lru_resident_capacity}, "
                 f"topk={self.sfa_sparse_topk}, decode_width={self.decode_width}."
             )
-        self.current_batch_is_prefill = False
 
         # TODO get from config
         head_num = 1
@@ -286,25 +282,17 @@ class SFAKVOffloadWorker:
             layer_name
             for layer_name, cache_or_caches in kv_caches.items()
             if len(self._as_cache_tuple(cache_or_caches))
-            in (OFFLOAD_TUPLE_LEN, OFFLOAD_C8_TUPLE_LEN)
+            == OFFLOAD_TUPLE_LEN
         ]
         if not self.offload_layer_names:
             raise ValueError("SFA KV Offload did not find SFA KV cache layers.")
-
-        # Under offload, the attention path (sfa_v1.py / device_op.py) gates the
-        # C8 indexer read on the GLOBAL use_sparse_c8_indexer flag, not per-layer.
-        # Mixed five/six-tuple layers would therefore route a non-C8 layer through
-        # the quant indexer (or vice versa). Forbid it here so the global gate
-        # stays sound; C8 must be all-or-nothing across sparse offload layers.
         tuple_lens = {
             len(self._as_cache_tuple(kv_caches[name])) for name in self.offload_layer_names
         }
-        if len(tuple_lens) > 1:
+        if tuple_lens != {OFFLOAD_TUPLE_LEN}:
             raise ValueError(
-                "SFA KV offload does not support mixed LIC8 / non-LIC8 layers: "
-                f"found tuple lengths {sorted(tuple_lens)} "
-                f"(five-tuple and six-tuple coexist). Under offload, C8 must be "
-                f"enabled uniformly across all sparse layers."
+                "PD decode host offload requires the BF16 five-entry resident "
+                f"tuple for every main layer, got lengths={sorted(tuple_lens)}."
             )
 
         self.num_offload_layers = len(self.offload_layer_names)
@@ -357,42 +345,20 @@ class SFAKVOffloadWorker:
             first_kv_cache.shape,
         )
 
-        if self.use_sparse and self.use_offload:
+        if self.use_direct_sfa_host_offload:
             self._register_offload_layers(kv_caches)
-            self.k_caches_npu: list[torch.Tensor] = []
-            self.v_caches_npu: list[torch.Tensor] = []
             self.topk_buffers_k: list[torch.Tensor] = []
             self.topk_buffers_v: list[torch.Tensor] = []
             for layer_name in self.offload_layer_names:
                 cache_or_caches = self._as_cache_tuple(kv_caches[layer_name])
                 tuple_len = len(cache_or_caches)
-                if tuple_len not in (OFFLOAD_TUPLE_LEN, OFFLOAD_C8_TUPLE_LEN):
+                if tuple_len != OFFLOAD_TUPLE_LEN:
                     raise ValueError(
                         f"SFA KV offload layer {layer_name}: expected tuple length "
-                        f"{OFFLOAD_TUPLE_LEN} or {OFFLOAD_C8_TUPLE_LEN}, got {tuple_len}"
+                        f"{OFFLOAD_TUPLE_LEN}, got {tuple_len}"
                     )
-                self.k_caches_npu.append(cache_or_caches[OFFLOAD_MAIN_K])
-                self.v_caches_npu.append(cache_or_caches[OFFLOAD_MAIN_V])
                 self.topk_buffers_k.append(cache_or_caches[OFFLOAD_RESIDENT_K])
                 self.topk_buffers_v.append(cache_or_caches[OFFLOAD_RESIDENT_V])
-                if is_offload_c8_kv_cache(cache_or_caches):
-                    # Guard against the LIC8 scale tensor aliasing a resident
-                    # top-K buffer. Compare storage identity (data_ptr), NOT
-                    # `in`/`==`: those do element-wise comparison and raise a
-                    # shape-mismatch RuntimeError on the legitimate difference
-                    # (scale dim1 = dsa_block_size, resident dim1 =
-                    # resident_capacity).
-                    scale_storage_ptr = cache_or_caches[
-                        OFFLOAD_INDEXER_S].untyped_storage().data_ptr()
-                    if scale_storage_ptr in (
-                        cache_or_caches[OFFLOAD_RESIDENT_K]
-                        .untyped_storage().data_ptr(),
-                        cache_or_caches[OFFLOAD_RESIDENT_V]
-                        .untyped_storage().data_ptr(),
-                    ):
-                        raise ValueError(
-                            f"LIC8 scale tensor must not alias resident buffer: {layer_name}"
-                        )
 
             if self.use_layerwise:
                 ready_event = threading.Event()
@@ -411,13 +377,7 @@ class SFAKVOffloadWorker:
 
             if self.tp_rank == 0:
                 npu_block_num = self.num_blocks
-                # we need 4 * npu_blocks of cpu_blocks to fully store all offload blocks (dskv32, 512/128)
-                # but you may want to set this to 1 in debug case in case of allocating to much dram
-                # TODO remove this and directly compute from model config before merge
-                cpu_block_num_multiple = (
-                    1 if self.use_direct_sfa_host_offload else 4
-                )
-                cpu_block_num = npu_block_num * cpu_block_num_multiple
+                cpu_block_num = npu_block_num
                 cpu_cache_size = cpu_block_num * self.block_size * (512 + 64) * torch.bfloat16.itemsize * self.num_layers
                 logger.info(f'KV offload allocate {cpu_block_num} cpu blocks, size = {cpu_cache_size / 1024 / 1024 / 1024} GB')
                 if cpu_cache_size > self.allocate_dram_size:
@@ -590,7 +550,7 @@ class SFAKVOffloadWorker:
             assert self.size_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
             assert self.num_tokens_buffer_npu.shape == torch.Size([1])
 
-    def start_load_kv(self, metadata: SFAKVOffloadConnectorMetadata):
+    def start_load_kv(self, metadata: SFADecodeHostOffloadMetadata):
         # return
         self.current_layer_save = 0
         self.current_layer_load = 0
@@ -602,20 +562,11 @@ class SFAKVOffloadWorker:
         for event in getattr(self, "layer_save_finished_events", []):
             event.clear()
         request_by_id = {request.req_id: request for request in metadata.requests}
-        request_modes = {request.is_prefill for request in metadata.requests}
-        if len(request_modes) > 1:
-            raise RuntimeError(
-                "SFA decode offload does not support mixed prefill/decode batches."
-            )
-        self.current_batch_is_prefill = bool(request_modes and True in request_modes)
-        row_start_by_req: dict[str, int] = {}
-        row_cursor = 0
-        for req_id in self.req_ids:
-            request = request_by_id.get(req_id)
-            if request is None:
-                continue
-            row_start_by_req[req_id] = row_cursor
-            row_cursor += request.write_count
+        request_row_by_id = {
+            req_id: request_row
+            for request_row, req_id in enumerate(self.req_ids)
+            if req_id in request_by_id
+        }
 
         for request in metadata.requests:
             req_id_to_block_ids[request.req_id] = request.block_ids_cpu
@@ -623,7 +574,7 @@ class SFAKVOffloadWorker:
                 continue
             self.process_layer_data(
                 request,
-                row_start=row_start_by_req[request.req_id],
+                request_row=request_row_by_id[request.req_id],
             )
         num_save_layers = sum(1 for layer_save_task in self.layer_save_tasks if layer_save_task)
         self.num_save_tasks = sum(len(layer_save_task) for layer_save_task in self.layer_save_tasks)
@@ -688,10 +639,6 @@ class SFAKVOffloadWorker:
         ready_event = torch.npu.Event()
         ready_event.record()
         self.save_cpu(layer_id, ready_event=ready_event)
-        if self.current_batch_is_prefill:
-            # Prefill copies read normal cache pages that may be reused by the
-            # next layer, so finish the one-shot initialization before return.
-            self._wait_for_layer_save(layer_id)
 
     def wait_for_save(self):
         assert self.use_layerwise
@@ -893,16 +840,15 @@ class SFAKVOffloadWorker:
     def process_layer_data(
         self,
         request: ReqMeta,
-        row_start: int,
+        request_row: int,
     ) -> None:
         """
         Generate kv offload related metadata.
         """
-        block_ids_npu = request.block_ids_npu
         block_ids_cpu = request.block_ids_cpu
         if request.write_count <= 0:
             return
-        if not request.is_prefill and request.write_count > self.decode_width:
+        if request.write_count > self.decode_width:
             raise RuntimeError(
                 "SFA decode rows exceed reserved resident slots: "
                 f"request={request.req_id}, rows={request.write_count}, "
@@ -910,33 +856,18 @@ class SFAKVOffloadWorker:
             )
 
         for layer_id in range(self.num_layers):
-            if request.is_prefill:
-                cache_npu = (
-                    self.k_caches_npu[layer_id],
-                    self.v_caches_npu[layer_id],
-                )
-                if self.use_direct_sfa_host_offload:
-                    # Main KV is densely staged in page zero. Scheduler block
-                    # ids address the separately resident indexer cache only.
-                    block_ids_npu = [0]
-                source_rows = None
-                source_slots = None
-            else:
-                cache_npu = (
-                    self.topk_buffers_k[layer_id],
-                    self.topk_buffers_v[layer_id],
-                )
-                source_rows = list(
-                    range(row_start, row_start + request.write_count)
-                )
-                source_slots = [
-                    self.lru_managed_capacity + offset
-                    for offset in range(request.write_count)
-                ]
+            cache_npu = (
+                self.topk_buffers_k[layer_id],
+                self.topk_buffers_v[layer_id],
+            )
+            source_rows = [request_row] * request.write_count
+            source_slots = [
+                self.lru_managed_capacity + offset
+                for offset in range(request.write_count)
+            ]
             req_meta_save = LayerMultiBlockReqMeta(
                 request.req_id,
                 layer_id,
-                block_ids_npu=block_ids_npu,
                 block_ids_cpu=block_ids_cpu,
                 cache_npu=cache_npu,
                 cache_cpu=(self.k_caches_cpu[layer_id], self.v_caches_cpu[layer_id]),

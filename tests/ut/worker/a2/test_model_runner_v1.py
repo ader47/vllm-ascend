@@ -283,9 +283,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         self.assertEqual(main_spec.page_size_bytes, 16 * (512 + 64) * 2)
         self.assertEqual(indexer_spec.page_size_bytes, 2 * 16 * (128 + 2))
-        # The direct BF16 path uses the split indexer value. Keep the main
-        # spec's legacy default for sparse-C8 offload, which is intentionally
-        # routed outside this refactor.
+        # The direct BF16 path uses the split indexer value. The main spec
+        # retains its default because sparse C8 is a non-offload layout.
         self.assertEqual(main_spec.sfa_dcp_replicated_indexer_size, 1)
         self.assertEqual(indexer_spec.sfa_dcp_replicated_indexer_size, 2)
 

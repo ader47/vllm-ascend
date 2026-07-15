@@ -163,7 +163,9 @@ def test_direct_sfa_host_offload_keeps_one_group_and_allocates_real_indexer_only
     )
     config = SimpleNamespace(
         kv_transfer_config=SimpleNamespace(
-            kv_connector="SFAKVOffloadConnector"
+            kv_connector="SFAPDCpuOffloadConnector",
+            is_kv_consumer=True,
+            is_kv_producer=False,
         ),
         additional_config={"use_offload": True},
         cache_config=SimpleNamespace(num_gpu_blocks_override=None),
