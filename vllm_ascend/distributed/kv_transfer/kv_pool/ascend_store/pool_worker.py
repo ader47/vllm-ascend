@@ -1097,6 +1097,7 @@ class KVPoolWorker:
                 continue
 
             all_group_gvas: list[np.ndarray] = []
+            all_group_gva_offsets: list[int] = []
             all_group_block_ids: list[np.ndarray] = []
             for group_id in range(self.num_kv_cache_groups):
                 plan = plans_by_group[group_id][request_index]
@@ -1126,17 +1127,16 @@ class KVPoolWorker:
                     plan.save_block_range.end_block if plan.save_block_range is not None else save_start_block
                 )
 
-                block_gvas: list[int] = []
+                compact_gvas = np.zeros(max(save_end_block - save_start_block, 0), dtype=np.int64)
                 new_keys: list[str] = []
                 new_positions: list[int] = []
-                for key in plan.save_keys:
+                for position, key in enumerate(plan.save_keys):
                     cached = self._allocated_gvas.get(key)
                     if cached is not None:
-                        block_gvas.append(cached)
+                        compact_gvas[position] = cached
                     else:
                         new_keys.append(key)
-                        new_positions.append(len(block_gvas))
-                        block_gvas.append(0)
+                        new_positions.append(position)
 
                 if new_keys:
                     new_gvas = self.m_store.batch_alloc(new_keys, [alloc_size] * len(new_keys))
@@ -1151,7 +1151,7 @@ class KVPoolWorker:
                             sum(1 for g in new_gvas if g <= 0),
                         )
                     for pos, key, gva in zip(new_positions, new_keys, new_gvas):
-                        block_gvas[pos] = gva
+                        compact_gvas[pos] = gva
                         self._allocated_gvas[key] = gva
 
                 logger.info(
@@ -1163,24 +1163,20 @@ class KVPoolWorker:
                     save_start_block,
                     save_end_block,
                     len(new_keys),
-                    len(block_gvas) - len(new_keys),
+                    len(plan.save_keys) - len(new_keys),
                     alloc_size,
                 )
 
-                # Pad block_gvas to match block_ids length (fill 0 for blocks before save_start)
-                full_gvas = [0] * len(block_ids_by_group)
-                for i, gva in enumerate(block_gvas):
-                    if save_start_block + i < len(full_gvas):
-                        full_gvas[save_start_block + i] = gva
-
-                all_group_gvas.append(np.asarray(full_gvas, dtype=np.int64))
+                all_group_gvas.append(compact_gvas)
+                all_group_gva_offsets.append(save_start_block)
                 all_group_block_ids.append(np.asarray(block_ids_by_group, dtype=np.int64))
 
             if all_group_gvas:
                 request.block_gvas_by_group_np = all_group_gvas
+                request.gva_block_offsets_by_group = all_group_gva_offsets
                 request.block_ids_by_group_np = all_group_block_ids
                 request.block_gvas_np = all_group_gvas[0]
-                request.gva_block_offset = 0
+                request.gva_block_offset = all_group_gva_offsets[0]
 
     def _prepare_load_gvas(
         self,
@@ -1203,6 +1199,7 @@ class KVPoolWorker:
                 continue
 
             all_group_load_gvas: list[np.ndarray] = []
+            all_group_load_gva_offsets: list[int] = []
             all_group_load_keys: list[str] = []
             for group_id in range(self.num_kv_cache_groups):
                 plan = plans_by_group[group_id][request_index]
@@ -1214,15 +1211,11 @@ class KVPoolWorker:
                 )
                 full_blocks = plan.load_block_range.end_block if plan.load_block_range is not None else load_start_block
 
-                block_ids_by_group = (
-                    request.block_ids_by_group_np[group_id]
-                    if (request.block_ids_by_group_np is not None and group_id < len(request.block_ids_by_group_np))
-                    else request.block_ids_np
-                )
-                full_len = len(block_ids_by_group) if block_ids_by_group is not None else 0
+                compact_gvas = np.zeros(max(full_blocks - load_start_block, 0), dtype=np.int64)
 
                 if not plan.load_keys:
-                    all_group_load_gvas.append(np.zeros(full_len, dtype=np.int64))
+                    all_group_load_gvas.append(compact_gvas)
+                    all_group_load_gva_offsets.append(load_start_block)
                     continue
 
                 keys = plan.load_keys
@@ -1246,18 +1239,18 @@ class KVPoolWorker:
                     sum(1 for r in lease_results if r != 0),
                 )
 
-                # Pad to match block_ids_by_group length, with 0s before load_start_block
-                full_gvas = [0] * full_len
-                for i, gva in enumerate(gvas):
-                    if load_start_block + i < len(full_gvas):
-                        full_gvas[load_start_block + i] = gva
-                all_group_load_gvas.append(np.asarray(full_gvas, dtype=np.int64))
+                copy_count = min(len(gvas), len(compact_gvas))
+                if copy_count:
+                    compact_gvas[:copy_count] = gvas[:copy_count]
+                all_group_load_gvas.append(compact_gvas)
+                all_group_load_gva_offsets.append(load_start_block)
 
             if all_group_load_gvas:
                 request.load_keys = all_group_load_keys
                 request.load_block_gvas_by_group_np = all_group_load_gvas
+                request.load_gva_block_offsets_by_group = all_group_load_gva_offsets
                 request.load_block_gvas_np = all_group_load_gvas[0]
-                request.load_gva_block_offset = 0
+                request.load_gva_block_offset = all_group_load_gva_offsets[0]
 
     def _build_shared_save_data(self) -> None:
         """Build shared block data once and attach to all layer save tasks.

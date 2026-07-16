@@ -19,14 +19,18 @@ import threading
 import unittest
 from unittest.mock import MagicMock
 
+import numpy as np
+
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm.distributed.kv_events import BlockStored
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     KeyMetadata,
+    LayerBlockRange,
     LayerMultiBlockReqMeta,
     LayerPoolKey,
+    LayerTransferTask,
     LoadSpec,
     PoolKey,
     ReqMeta,
@@ -39,6 +43,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     KVCacheStoreRecvingThread,
     KVCacheStoreSendingThread,
     KVTransferThread,
+    LayerBatchBuilder,
 )
 
 
@@ -115,6 +120,100 @@ class MaskedFakeTokenDatabase(FakeTokenDatabase):
             return True
         block_idx = start // self.block_size
         return block_idx < len(masks[kv_cache_group_id]) and masks[kv_cache_group_id][block_idx]
+
+
+class TestLayerBatchBuilderCompactGvas(unittest.TestCase):
+    def _make_builder(self, group_id=1):
+        db = MagicMock()
+        db.group_block_len = {0: [16], 1: [16]}
+        db.group_kv_caches_base_addr = {0: [1000], 1: [2000]}
+        db.group_block_stride = {0: [16], 1: [16]}
+        return LayerBatchBuilder(
+            token_database=db,
+            my_key_index=0,
+            num_ranks_per_layer=1,
+            page_size_bytes=16,
+            num_layers=1,
+            group_id=group_id,
+        )
+
+    @staticmethod
+    def _make_task(request, start_block, end_block, partial_block_index=None):
+        return LayerTransferTask(
+            layer_id=0,
+            block_ranges=[
+                LayerBlockRange(
+                    request=request,
+                    start_block=start_block,
+                    end_block=end_block,
+                    partial_block_index=partial_block_index,
+                )
+            ],
+            group_id=1,
+        )
+
+    def test_build_shared_uses_save_offset_for_selected_group(self):
+        request = ReqMeta(
+            req_id="r1",
+            block_ids_by_group=[[0, 1, 2, 3], [10, 11, 12, 13]],
+            block_ids_by_group_np=[np.arange(4), np.arange(10, 14)],
+            block_gvas_by_group_np=[np.asarray([500]), np.asarray([900, 901])],
+            gva_block_offsets_by_group=[3, 2],
+        )
+
+        shared = self._make_builder().build_shared(self._make_task(request, 2, 4), is_save=True)
+
+        self.assertIsNotNone(shared)
+        np.testing.assert_array_equal(shared.block_ids_arr, [12, 13])
+        np.testing.assert_array_equal(shared.block_gvas_arr, [900, 901])
+
+    def test_build_shared_uses_load_offset_for_selected_group(self):
+        request = ReqMeta(
+            req_id="r1",
+            block_ids_by_group=[[0, 1, 2, 3], [10, 11, 12, 13]],
+            block_ids_by_group_np=[np.arange(4), np.arange(10, 14)],
+            load_block_gvas_by_group_np=[np.asarray([600]), np.asarray([800, 801])],
+            load_gva_block_offsets_by_group=[3, 2],
+        )
+
+        shared = self._make_builder().build_shared(self._make_task(request, 2, 4), is_save=False)
+
+        self.assertIsNotNone(shared)
+        np.testing.assert_array_equal(shared.block_ids_arr, [12, 13])
+        np.testing.assert_array_equal(shared.block_gvas_arr, [800, 801])
+
+    def test_partial_block_works_with_empty_compact_gvas(self):
+        request = ReqMeta(
+            req_id="r1",
+            block_ids_by_group=[[0, 1, 2, 3, 4], [10, 11, 12, 13, 14]],
+            block_ids_by_group_np=[np.arange(5), np.arange(10, 15)],
+            block_gvas_by_group_np=[np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)],
+            gva_block_offsets_by_group=[4, 4],
+            last_block_gva=999,
+        )
+
+        shared = self._make_builder().build_shared(
+            self._make_task(request, 4, 4, partial_block_index=4),
+            is_save=True,
+        )
+
+        self.assertIsNotNone(shared)
+        np.testing.assert_array_equal(shared.block_ids_arr, [14])
+        np.testing.assert_array_equal(shared.block_gvas_arr, [999])
+
+    def test_group_arrays_fall_back_to_legacy_single_offset(self):
+        request = ReqMeta(
+            req_id="r1",
+            block_ids_by_group=[[0, 1, 2, 3], [10, 11, 12, 13]],
+            block_ids_by_group_np=[np.arange(4), np.arange(10, 14)],
+            block_gvas_by_group_np=[np.asarray([500, 501]), np.asarray([700, 701])],
+            gva_block_offset=2,
+        )
+
+        shared = self._make_builder().build_shared(self._make_task(request, 2, 4), is_save=True)
+
+        self.assertIsNotNone(shared)
+        np.testing.assert_array_equal(shared.block_gvas_arr, [700, 701])
 
 
 class TestKVTransferThread(unittest.TestCase):

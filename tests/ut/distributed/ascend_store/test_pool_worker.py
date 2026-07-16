@@ -18,6 +18,8 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
@@ -1426,6 +1428,64 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
             worker.layer_load_tasks[0][0].block_ranges,
             worker.layer_load_tasks[1][0].block_ranges,
         )
+
+    def test_alloc_gvas_for_save_stores_only_planned_range(self):
+        worker = self._make_worker()
+        worker.use_gva_layerwise = True
+        worker.group_num_layers = {0: 2}
+        worker.group_block_len = {0: [16, 16]}
+        worker.page_size_bytes = 32
+        worker.m_store.batch_alloc.return_value = [900, 901]
+        block_ids = np.arange(10, dtype=np.int64)
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=160,
+            save_start_token=128,
+            save_end_token=160,
+            block_ids=list(range(10)),
+            block_ids_np=block_ids,
+            block_ids_by_group_np=[block_ids],
+            block_hashes=[f"h{i}" for i in range(10)],
+            can_save=True,
+        )
+        plans = worker._build_request_group_plans([req])
+
+        worker._alloc_gvas_for_save([req], plans)
+
+        self.assertEqual(req.gva_block_offsets_by_group, [8])
+        self.assertEqual(req.gva_block_offset, 8)
+        self.assertEqual(len(req.block_gvas_by_group_np[0]), 2)
+        np.testing.assert_array_equal(req.block_gvas_by_group_np[0], [900, 901])
+
+    def test_prepare_load_gvas_stores_only_planned_range(self):
+        worker = self._make_worker()
+        worker.use_gva_layerwise = True
+        key_infos = []
+        for gva in (800, 801):
+            key_info = MagicMock()
+            key_info.size.return_value = 1
+            key_info.gva_list.return_value = [gva]
+            key_infos.append(key_info)
+        worker.m_store.batch_get_key_info.return_value = key_infos
+        worker.m_store.batch_add_lease.return_value = [0, 0]
+        block_ids = np.arange(10, dtype=np.int64)
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=160,
+            block_ids=list(range(10)),
+            block_ids_np=block_ids,
+            block_ids_by_group_np=[block_ids],
+            block_hashes=[f"h{i}" for i in range(10)],
+            load_spec=LoadSpec(vllm_cached_tokens=128, kvpool_cached_tokens=160, can_load=True, token_len=160),
+        )
+        plans = worker._build_request_group_plans([req])
+
+        worker._prepare_load_gvas([req], plans)
+
+        self.assertEqual(req.load_gva_block_offsets_by_group, [8])
+        self.assertEqual(req.load_gva_block_offset, 8)
+        self.assertEqual(len(req.load_block_gvas_by_group_np[0]), 2)
+        np.testing.assert_array_equal(req.load_block_gvas_by_group_np[0], [800, 801])
 
 
 class TestKVPoolWorkerTpMismatch(unittest.TestCase):
