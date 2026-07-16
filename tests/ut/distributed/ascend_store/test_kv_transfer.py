@@ -17,7 +17,7 @@
 
 import threading
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -26,24 +26,33 @@ import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm.distributed.kv_events import BlockStored
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+    GroupTransferData,
     KeyMetadata,
-    LayerBlockRange,
+    LayerLoadTask,
     LayerMultiBlockReqMeta,
     LayerPoolKey,
+    LayerTransferArrays,
     LayerTransferTask,
+    LayerwisePreparation,
     LoadSpec,
     PoolKey,
     ReqMeta,
+    TransferCompletion,
 )
 
 # isort: on
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+    KVCacheStoreKeyLayerSendingThread,
     KVCacheStoreLayerRecvingThread,
     KVCacheStoreLayerSendingThread,
     KVCacheStoreRecvingThread,
     KVCacheStoreSendingThread,
     KVTransferThread,
-    LayerBatchBuilder,
+    _mark_last_transfer_tasks,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_transfer import (
+    LayerTransferArrayBuilder,
+    LayerwiseTransferPreparer,
 )
 
 
@@ -122,98 +131,162 @@ class MaskedFakeTokenDatabase(FakeTokenDatabase):
         return block_idx < len(masks[kv_cache_group_id]) and masks[kv_cache_group_id][block_idx]
 
 
-class TestLayerBatchBuilderCompactGvas(unittest.TestCase):
+class TestLayerTransferArrayBuilderCompactGvas(unittest.TestCase):
     def _make_builder(self, group_id=1):
         db = MagicMock()
         db.group_block_len = {0: [16], 1: [16]}
         db.group_kv_caches_base_addr = {0: [1000], 1: [2000]}
         db.group_block_stride = {0: [16], 1: [16]}
-        return LayerBatchBuilder(
+        return LayerTransferArrayBuilder(
             token_database=db,
-            my_key_index=0,
-            num_ranks_per_layer=1,
-            page_size_bytes=16,
             num_layers=1,
             group_id=group_id,
         )
 
+    def test_layer_gvas_are_base_gvas_plus_vectorized_offsets(self):
+        db = MagicMock()
+        db.group_block_len = {0: [4, 6, 4, 6]}
+        db.group_kv_caches_base_addr = {0: [100, 200, 300, 400]}
+        db.group_block_stride = {0: [10, 10, 10, 10]}
+        builder = LayerTransferArrayBuilder(
+            token_database=db,
+            num_layers=2,
+        )
+
+        addrs, sizes, gvas = builder._build_transfer_arrays(
+            np.asarray([2, 3], dtype=np.int64),
+            np.asarray([1000, 2000], dtype=np.int64),
+            layer_id=1,
+        )
+
+        np.testing.assert_array_equal(addrs, [320, 420, 330, 430])
+        np.testing.assert_array_equal(sizes, [4, 6, 4, 6])
+        np.testing.assert_array_equal(gvas, [1010, 1014, 2010, 2014])
+
+    def test_build_addrs_only_consumes_block_ids_and_base_gvas(self):
+        data = GroupTransferData(
+            block_ids_arr=np.asarray([10, 11], dtype=np.int64),
+            base_gvas_arr=np.asarray([800, 900], dtype=np.int64),
+        )
+
+        arrays = self._make_builder().build_addrs(data, layer_id=0)
+
+        np.testing.assert_array_equal(arrays.addr_array, [2160, 2176])
+        np.testing.assert_array_equal(arrays.gvas_array, [800, 900])
+
+
+class TestLayerwiseTransferPreparer(unittest.TestCase):
     @staticmethod
-    def _make_task(request, start_block, end_block, partial_block_index=None):
-        return LayerTransferTask(
-            layer_id=0,
-            block_ranges=[
-                LayerBlockRange(
-                    request=request,
-                    start_block=start_block,
-                    end_block=end_block,
-                    partial_block_index=partial_block_index,
-                )
-            ],
-            group_id=1,
+    def _make_preparer():
+        preparer = LayerwiseTransferPreparer(
+            MagicMock(),
+            model_name="model",
+            head_or_tp_rank=0,
+            hash_block_size=16,
+            enabled=True,
+            can_allocate=True,
+            num_groups=1,
+        )
+        preparer.configure_layout(
+            group_block_len={0: [16]},
+        )
+        return preparer
+
+    def test_prepares_once_and_attaches_to_save_tasks(self):
+        plans = []
+        task = LayerTransferTask(layer_id=0, block_ranges=[])
+        layer_tasks = [[task]]
+        transfer_data = MagicMock()
+        completion = MagicMock()
+        preparer = self._make_preparer()
+        prepare_tasks = MagicMock()
+        with patch.object(
+            preparer,
+            "resolve_save_groups",
+            return_value={0: (transfer_data, completion)},
+        ) as resolve:
+            preparation = preparer.create_save_preparation(
+                plans,
+                layer_tasks,
+                prepare_tasks,
+            )
+
+            self.assertIs(task.preparation, preparation)
+            resolve.assert_not_called()
+            prepare_tasks.assert_not_called()
+
+            preparation.ensure_ready()
+            preparation.ensure_ready()
+
+            resolve.assert_called_once()
+            self.assertIs(task.transfer_data, transfer_data)
+            self.assertIs(task.completion, completion)
+            prepare_tasks.assert_called_once_with(layer_tasks)
+
+    def test_save_finishes_on_last_actual_transfer_task(self):
+        task = LayerTransferTask(layer_id=0, block_ranges=[])
+        transfer_data = MagicMock()
+        completion = TransferCompletion(["r1"], [True])
+        preparer = self._make_preparer()
+        with patch.object(
+            preparer,
+            "resolve_save_groups",
+            return_value={0: (transfer_data, completion)},
+        ):
+            preparation = preparer.create_save_preparation(
+                [],
+                [[task], []],
+                lambda tasks: _mark_last_transfer_tasks(tasks, "save"),
+            )
+            preparation.ensure_ready()
+
+        self.assertEqual(task.finished_req_ids, {"r1"})
+
+    def test_load_preparation_does_not_mutate_transfer_tasks(self):
+        task = LayerTransferTask(layer_id=0, block_ranges=[])
+        preparation = self._make_preparer().create_load_preparation(
+            [],
+            [[task]],
         )
 
-    def test_build_shared_uses_save_offset_for_selected_group(self):
-        request = ReqMeta(
-            req_id="r1",
-            block_ids_by_group=[[0, 1, 2, 3], [10, 11, 12, 13]],
-            block_ids_by_group_np=[np.arange(4), np.arange(10, 14)],
-            block_gvas_by_group_np=[np.asarray([500]), np.asarray([900, 901])],
-            gva_block_offsets_by_group=[3, 2],
-        )
+        self.assertIsNone(task.preparation)
+        self.assertIsNotNone(preparation)
 
-        shared = self._make_builder().build_shared(self._make_task(request, 2, 4), is_save=True)
+    def test_load_finishes_on_last_actual_transfer_task(self):
+        task = LayerTransferTask(layer_id=0, block_ranges=[])
+        transfer_data = MagicMock()
+        completion = TransferCompletion(["r1"], [True])
+        preparer = self._make_preparer()
+        with patch.object(
+            preparer,
+            "resolve_load_groups",
+            return_value={(0, False): (transfer_data, completion)},
+        ):
+            preparation = preparer.create_load_preparation(
+                [],
+                [[task], []],
+                lambda tasks: _mark_last_transfer_tasks(tasks, "load"),
+            )
+            preparation.ensure_ready()
 
-        self.assertIsNotNone(shared)
-        np.testing.assert_array_equal(shared.block_ids_arr, [12, 13])
-        np.testing.assert_array_equal(shared.block_gvas_arr, [900, 901])
+        self.assertEqual(task.finished_req_ids, {"r1"})
 
-    def test_build_shared_uses_load_offset_for_selected_group(self):
-        request = ReqMeta(
-            req_id="r1",
-            block_ids_by_group=[[0, 1, 2, 3], [10, 11, 12, 13]],
-            block_ids_by_group_np=[np.arange(4), np.arange(10, 14)],
-            load_block_gvas_by_group_np=[np.asarray([600]), np.asarray([800, 801])],
-            load_gva_block_offsets_by_group=[3, 2],
-        )
 
-        shared = self._make_builder().build_shared(self._make_task(request, 2, 4), is_save=False)
+class TestLayerwiseTaskPreparation(unittest.TestCase):
+    def test_key_send_reuses_cached_process_tokens(self):
+        thread = object.__new__(KVCacheStoreKeyLayerSendingThread)
+        cached = {0: [(0, 16, [MagicMock()])]}
+        thread.build_cached_process_tokens = MagicMock(return_value=cached)
+        tasks = [
+            [LayerTransferTask(layer_id=0, block_ranges=[])],
+            [LayerTransferTask(layer_id=1, block_ranges=[])],
+        ]
 
-        self.assertIsNotNone(shared)
-        np.testing.assert_array_equal(shared.block_ids_arr, [12, 13])
-        np.testing.assert_array_equal(shared.block_gvas_arr, [800, 801])
+        thread.prepare_layerwise_tasks(tasks)
 
-    def test_partial_block_works_with_empty_compact_gvas(self):
-        request = ReqMeta(
-            req_id="r1",
-            block_ids_by_group=[[0, 1, 2, 3, 4], [10, 11, 12, 13, 14]],
-            block_ids_by_group_np=[np.arange(5), np.arange(10, 15)],
-            block_gvas_by_group_np=[np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)],
-            gva_block_offsets_by_group=[4, 4],
-            last_block_gva=999,
-        )
-
-        shared = self._make_builder().build_shared(
-            self._make_task(request, 4, 4, partial_block_index=4),
-            is_save=True,
-        )
-
-        self.assertIsNotNone(shared)
-        np.testing.assert_array_equal(shared.block_ids_arr, [14])
-        np.testing.assert_array_equal(shared.block_gvas_arr, [999])
-
-    def test_group_arrays_fall_back_to_legacy_single_offset(self):
-        request = ReqMeta(
-            req_id="r1",
-            block_ids_by_group=[[0, 1, 2, 3], [10, 11, 12, 13]],
-            block_ids_by_group_np=[np.arange(4), np.arange(10, 14)],
-            block_gvas_by_group_np=[np.asarray([500, 501]), np.asarray([700, 701])],
-            gva_block_offset=2,
-        )
-
-        shared = self._make_builder().build_shared(self._make_task(request, 2, 4), is_save=True)
-
-        self.assertIsNotNone(shared)
-        np.testing.assert_array_equal(shared.block_gvas_arr, [700, 701])
+        self.assertIs(tasks[0][0].cached_process_tokens, cached)
+        self.assertIs(tasks[1][0].cached_process_tokens, cached)
+        thread.build_cached_process_tokens.assert_called_once_with(tasks[0][0])
 
 
 class TestKVTransferThread(unittest.TestCase):
@@ -541,9 +614,6 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
             tp_size=1,
             dcp_size=1,
             put_step=1,
-            my_key_index=0,
-            num_ranks_per_layer=1,
-            page_size_bytes=32,
             ready_event=threading.Event(),
             num_layers=num_layers,
             layer_save_finished_events=[threading.Event() for _ in range(num_layers)],
@@ -676,6 +746,100 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
         self.assertEqual(events[0].block_hashes, [maybe_convert_block_hash(b"h0")])
 
 
+class TestGVALayerSendingThread(unittest.TestCase):
+    def _make_thread(self, copy_result=0, builders=None):
+        store = MagicMock()
+        store.store.batch_copy.return_value = copy_result
+        db = MagicMock()
+        db.group_block_len = {0: [16]}
+        layer_finished = threading.Event()
+        thread = KVCacheStoreLayerSendingThread(
+            m_store=store,
+            token_database=db,
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            put_step=1,
+            ready_event=threading.Event(),
+            num_layers=1,
+            layer_save_finished_events=[layer_finished],
+            sync_save_events=[MagicMock()],
+            group_array_builders=builders,
+        )
+        return thread, store, layer_finished
+
+    def test_merges_group_data_and_completes_after_success(self):
+        builders = [MagicMock(), MagicMock()]
+        builders[0].build_addrs.return_value = LayerTransferArrays(
+            np.asarray([10]),
+            np.asarray([16]),
+            np.asarray([100]),
+        )
+        builders[1].build_addrs.return_value = LayerTransferArrays(
+            np.asarray([20]),
+            np.asarray([16]),
+            np.asarray([200]),
+        )
+        thread, store, layer_finished = self._make_thread(builders=builders)
+        tasks = [
+            LayerTransferTask(
+                layer_id=0,
+                block_ranges=[],
+                transfer_data=MagicMock(),
+                completion=TransferCompletion(["r1"], [True]),
+                finished_req_ids={"r1"} if group_id == 1 else set(),
+                group_id=group_id,
+            )
+            for group_id in range(2)
+        ]
+        thread.add_stored_request("r1")
+        thread.add_stored_request("r1")
+        thread.request_queue.put(tasks)
+
+        thread._handle_request(tasks)
+
+        store.store.batch_copy.assert_called_once_with([100, 200], [10, 20], [16, 16], 0)
+        self.assertEqual(thread.get_and_clear_finished_requests(), {"r1"})
+        self.assertTrue(layer_finished.is_set())
+
+    def test_missing_group_data_is_fatal(self):
+        thread, _, layer_finished = self._make_thread(builders=[MagicMock()])
+        tasks = [LayerTransferTask(layer_id=0, block_ranges=[], group_id=0)]
+        thread.request_queue.put(tasks)
+
+        with self.assertRaisesRegex(RuntimeError, "save metadata was not prepared"):
+            thread._handle_request(tasks)
+
+        self.assertFalse(layer_finished.is_set())
+
+    def test_copy_failure_does_not_complete_request_or_layer(self):
+        builder = MagicMock()
+        builder.build_addrs.return_value = LayerTransferArrays(
+            np.asarray([10]),
+            np.asarray([16]),
+            np.asarray([100]),
+        )
+        thread, _, layer_finished = self._make_thread(copy_result=1, builders=[builder])
+        tasks = [
+            LayerTransferTask(
+                layer_id=0,
+                block_ranges=[],
+                transfer_data=MagicMock(),
+                completion=TransferCompletion(["r1"], [True]),
+            )
+        ]
+        thread.add_stored_request("r1")
+        thread.request_queue.put(tasks)
+
+        with self.assertRaisesRegex(RuntimeError, "save batch_copy failed"):
+            thread._handle_request(tasks)
+
+        self.assertEqual(thread.stored_requests["r1"], 1)
+        self.assertEqual(thread.get_and_clear_finished_requests(), set())
+        self.assertFalse(layer_finished.is_set())
+
+
 @unittest.skip("LayerMultiBlockReqMeta API is deprecated, tests need update for LayerTransferTask")
 class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
     def test_handle_request(self):
@@ -706,6 +870,142 @@ class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
         t._handle_request(req)
         self.assertEqual(len(store.get_calls), 1)
         self.assertTrue(get_event.is_set())
+
+
+class TestGVALayerRecvingThread(unittest.TestCase):
+    def test_layer_transfer_does_not_touch_block_leases(self):
+        store = MagicMock()
+        store.batch_add_lease.return_value = [0, 0]
+        store.store.batch_copy.return_value = 0
+        db = MagicMock()
+        db.group_block_len = {0: [16]}
+        db.group_kv_caches_base_addr = {0: [1000]}
+        db.group_block_stride = {0: [16]}
+        builder = MagicMock()
+        builder.build_addrs.return_value = LayerTransferArrays(
+            addr_array=np.asarray([1000], dtype=np.int64),
+            size_array=np.asarray([16], dtype=np.int64),
+            gvas_array=np.asarray([2000], dtype=np.int64),
+        )
+        finished_events = [threading.Event()]
+        thread = KVCacheStoreLayerRecvingThread(
+            m_store=store,
+            token_database=db,
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            ready_event=threading.Event(),
+            get_event=threading.Event(),
+            layer_load_finished_events=finished_events,
+            layer_save_finished_events=[threading.Event()],
+            num_layers=1,
+            group_array_builders=[builder],
+        )
+        preparation_callback = MagicMock()
+        task = LayerTransferTask(
+            layer_id=0,
+            block_ranges=[],
+            transfer_data=MagicMock(),
+            completion=TransferCompletion(["r1"], [True]),
+            finished_req_ids={"r1"},
+        )
+        load_task = LayerLoadTask(
+            wait_for_save_layer=None,
+            transfer_tasks=[task],
+            layer_id=0,
+            preparation=LayerwisePreparation(preparation_callback),
+        )
+
+        thread.request_queue.put(load_task)
+        thread._handle_request(load_task)
+
+        preparation_callback.assert_called_once_with()
+        store.batch_add_lease.assert_not_called()
+        store.batch_remove_lease.assert_not_called()
+        store.store.batch_copy.assert_called_once()
+        self.assertEqual(thread.get_and_clear_finished_requests(), {"r1"})
+
+    def test_last_actual_transfer_can_finish_before_final_physical_layer(self):
+        store = MagicMock()
+        store.store.batch_copy.return_value = 0
+        db = MagicMock()
+        db.group_block_len = {0: [16, 16]}
+        builder = MagicMock()
+        builder.build_addrs.return_value = LayerTransferArrays(
+            np.asarray([1000]),
+            np.asarray([16]),
+            np.asarray([2000]),
+        )
+        thread = KVCacheStoreLayerRecvingThread(
+            m_store=store,
+            token_database=db,
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            ready_event=threading.Event(),
+            get_event=threading.Event(),
+            layer_load_finished_events=[threading.Event(), threading.Event()],
+            layer_save_finished_events=[threading.Event(), threading.Event()],
+            num_layers=2,
+            group_array_builders=[builder],
+        )
+        task = LayerTransferTask(
+            layer_id=0,
+            block_ranges=[],
+            transfer_data=MagicMock(),
+            completion=TransferCompletion(["r1"], [True]),
+            finished_req_ids={"r1"},
+        )
+        load_task = LayerLoadTask(None, [task], layer_id=0)
+        thread.request_queue.put(load_task)
+
+        thread._handle_request(load_task)
+
+        self.assertEqual(thread.get_and_clear_finished_requests(), {"r1"})
+
+    def test_copy_failure_does_not_complete_request_or_layer(self):
+        store = MagicMock()
+        store.store.batch_copy.return_value = 1
+        db = MagicMock()
+        db.group_block_len = {0: [16]}
+        builder = MagicMock()
+        builder.build_addrs.return_value = LayerTransferArrays(
+            np.asarray([1000]),
+            np.asarray([16]),
+            np.asarray([2000]),
+        )
+        layer_finished = threading.Event()
+        thread = KVCacheStoreLayerRecvingThread(
+            m_store=store,
+            token_database=db,
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            ready_event=threading.Event(),
+            get_event=threading.Event(),
+            layer_load_finished_events=[layer_finished],
+            layer_save_finished_events=[threading.Event()],
+            num_layers=1,
+            group_array_builders=[builder],
+        )
+        task = LayerTransferTask(
+            layer_id=0,
+            block_ranges=[],
+            transfer_data=MagicMock(),
+            completion=TransferCompletion(["r1"], [True]),
+            finished_req_ids={"r1"},
+        )
+        load_task = LayerLoadTask(None, [task], layer_id=0)
+        thread.request_queue.put(load_task)
+
+        with self.assertRaisesRegex(RuntimeError, "load batch_copy failed"):
+            thread._handle_request(load_task)
+
+        self.assertEqual(thread.get_and_clear_finished_requests(), set())
+        self.assertFalse(layer_finished.is_set())
 
 
 class TestKVTransferTpMismatchDispatch(unittest.TestCase):
