@@ -1349,13 +1349,13 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         for layer_tasks in worker.layer_load_tasks:
             self.assertEqual(len(layer_tasks), 0)
 
-    def test_process_save_for_layer_batch_skip_no_save(self):
+    def test_request_group_plan_skip_no_save(self):
         worker = self._make_worker()
         req = ReqMeta(req_id="r1", token_len_chunk=32, block_ids=[0, 1], block_hashes=["h0", "h1"], can_save=False)
-        worker._process_save_for_layer_batch([req], 0)
-        self.assertEqual(len(worker.layer_save_tasks[0]), 0)
+        plans = worker._build_request_group_plans([req])
+        self.assertIsNone(plans[0][0].save_block_range)
 
-    def test_process_save_for_layer_batch_skip_zero_range(self):
+    def test_request_group_plan_skip_zero_save_range(self):
         worker = self._make_worker()
         req = ReqMeta(
             req_id="r1",
@@ -1366,16 +1366,16 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
             save_start_token=16,
             save_end_token=16,
         )
-        worker._process_save_for_layer_batch([req], 0)
-        self.assertEqual(len(worker.layer_save_tasks[0]), 0)
+        plans = worker._build_request_group_plans([req])
+        self.assertIsNone(plans[0][0].save_block_range)
 
-    def test_process_load_for_layer_batch_skip_no_load(self):
+    def test_request_group_plan_skip_no_load(self):
         worker = self._make_worker()
         req = ReqMeta(req_id="r1", token_len_chunk=32, block_ids=[0, 1], block_hashes=["h0", "h1"], load_spec=None)
-        worker._process_load_for_layer_batch([req], 0)
-        self.assertEqual(len(worker.layer_load_tasks[0]), 0)
+        plans = worker._build_request_group_plans([req])
+        self.assertIsNone(plans[0][0].load_block_range)
 
-    def test_process_load_for_layer_batch_skip_cannot_load(self):
+    def test_request_group_plan_skip_cannot_load(self):
         worker = self._make_worker()
         load_spec = LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=0, can_load=False, token_len=0)
         req = ReqMeta(
@@ -1385,8 +1385,47 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
             block_hashes=["h0", "h1"],
             load_spec=load_spec,
         )
-        worker._process_load_for_layer_batch([req], 0)
-        self.assertEqual(len(worker.layer_load_tasks[0]), 0)
+        plans = worker._build_request_group_plans([req])
+        self.assertIsNone(plans[0][0].load_block_range)
+
+    def test_process_layer_data_reuses_request_group_plan_across_layers(self):
+        worker = self._make_worker()
+        worker.use_gva_layerwise = True
+        load_spec = LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=16, can_load=True, token_len=16)
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=32,
+            block_ids=[0, 1],
+            block_hashes=["h0", "h1"],
+            can_save=True,
+            load_spec=load_spec,
+        )
+
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_block_hashes",
+                side_effect=lambda hashes, _block_size, _hash_block_size: hashes,
+            ) as mock_get_block_hashes,
+            patch.object(
+                worker,
+                "_make_layerwise_gva_key",
+                wraps=worker._make_layerwise_gva_key,
+            ) as mock_make_key,
+            patch.object(worker, "_alloc_gvas_for_save"),
+            patch.object(worker, "_prepare_load_gvas"),
+        ):
+            worker.process_layer_data([req])
+
+        mock_get_block_hashes.assert_called_once()
+        self.assertEqual(mock_make_key.call_count, 2)
+        self.assertIs(
+            worker.layer_save_tasks[0][0].block_ranges,
+            worker.layer_save_tasks[1][0].block_ranges,
+        )
+        self.assertIs(
+            worker.layer_load_tasks[0][0].block_ranges,
+            worker.layer_load_tasks[1][0].block_ranges,
+        )
 
 
 class TestKVPoolWorkerTpMismatch(unittest.TestCase):
