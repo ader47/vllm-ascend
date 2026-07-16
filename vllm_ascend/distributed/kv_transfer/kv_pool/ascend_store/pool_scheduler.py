@@ -43,6 +43,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     infer_tp_mismatch_info,
     normalize_block_ids_by_group,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    get_layerwise_config,
+)
 
 
 class KVPoolScheduler:
@@ -184,6 +187,23 @@ class KVPoolScheduler:
         else:
             self.put_step = 1
         self.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+        self.layerwise_offload = False
+        if self.use_gva_layerwise:
+            layerwise_num_layers = self.num_layers
+            if kv_cache_config is not None and len(kv_cache_config.kv_cache_groups) == 1:
+                layerwise_num_layers = len(kv_cache_config.kv_cache_groups[0].layer_names)
+                self.num_layers = layerwise_num_layers
+            layerwise_config = get_layerwise_config(
+                layerwise_num_layers,
+                vllm_config.kv_transfer_config.kv_connector_extra_config,
+            )
+            if (
+                layerwise_config.has_layer_reuse
+                and kv_cache_config is not None
+                and len(kv_cache_config.kv_cache_groups) != 1
+            ):
+                raise NotImplementedError("GVA layerwise KV cache reuse does not support multiple KV cache groups.")
+            self.layerwise_offload = layerwise_config.has_layer_reuse
         self.model_name = model_config.model.split("/")[-1]
 
         # Keep this in sync with pool_worker.py because it affects GVA allocation size.
@@ -746,7 +766,7 @@ class KVPoolScheduler:
         # saved; only decode increments are gated by save_decode_cache.
         req_tuple = self._unfinished_requests.get(req_id)
         is_decoding = req_tuple is not None and req_tuple[0].num_computed_tokens >= req_tuple[0].num_prompt_tokens
-        if is_decoding and not self.save_decode_cache:
+        if is_decoding and not self.save_decode_cache and not self.layerwise_offload:
             return None
         request_tracker = self._request_trackers.get(req_id)
         if request_tracker is None:
@@ -763,7 +783,14 @@ class KVPoolScheduler:
             raise ValueError(f"Request {req_id} is not in _unfinished_requests, but it is scheduled to be cached")
         if new_block_ids is not None:
             request_tracker.update(new_block_ids)
-        load_spec = None
+        if self.layerwise_offload and num_current_tokens > 0:
+            load_spec = LoadSpec(
+                vllm_cached_tokens=num_current_tokens,
+                kvpool_cached_tokens=num_current_tokens,
+                can_load=True,
+            )
+        else:
+            load_spec = None
         return self._build_req_meta(
             request_tracker,
             request.block_hashes,
@@ -852,7 +879,7 @@ class KVPoolScheduler:
         if not force_skip_save:
             for i, req_id in enumerate(cached_reqs.req_ids):
                 new_block_ids = cached_reqs.new_block_ids[i]
-                if not new_block_ids and not self.tp_mismatch:
+                if not new_block_ids and not self.tp_mismatch and not self.layerwise_offload:
                     continue
                 if req_id in self._preempted_req_ids:
                     if not new_block_ids:

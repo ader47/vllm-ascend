@@ -1429,6 +1429,48 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
             worker.layer_load_tasks[1][0].block_ranges,
         )
 
+    def test_layer_reuse_loads_full_prefix_only_for_shared_layers(self):
+        worker = self._make_worker()
+        worker.num_layers = 3
+        worker.layerwise_offload = True
+        worker.independent_layers = [0, 2]
+        load_spec = LoadSpec(
+            vllm_cached_tokens=16,
+            kvpool_cached_tokens=32,
+            can_load=True,
+            token_len=32,
+        )
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=32,
+            block_ids=[0, 1],
+            block_hashes=["h0", "h1"],
+            load_spec=load_spec,
+        )
+
+        worker.process_layer_data([req])
+
+        self.assertEqual(worker.layer_load_tasks[0][0].block_ranges[0].start_block, 1)
+        self.assertEqual(worker.layer_load_tasks[1][0].block_ranges[0].start_block, 0)
+        self.assertEqual(worker.layer_load_tasks[2][0].block_ranges[0].start_block, 1)
+
+    def test_reused_layer_without_load_still_submits_save_gate(self):
+        worker = self._make_worker()
+        worker.num_layers = 3
+        worker.current_layer = 2
+        worker.next_layer_to_submit = 2
+        worker.num_prefetch_layers = 1
+        worker.prefetch_layer_map = {2: 0}
+        worker.layer_load_tasks = [[], [], []]
+        worker.kv_recv_thread = MagicMock()
+
+        worker._submit_ready_layer_loads()
+
+        task = worker.kv_recv_thread.add_request.call_args.args[0]
+        self.assertEqual(task.layer_id, 2)
+        self.assertEqual(task.wait_for_save_layer, 0)
+        self.assertEqual(task.transfer_tasks, [])
+
     def test_alloc_gvas_for_save_stores_only_planned_range(self):
         worker = self._make_worker()
         worker.use_gva_layerwise = True
