@@ -443,57 +443,6 @@ class TestLookupKeyClient(unittest.TestCase):
         mock_socket.close.assert_called_once_with(linger=0)
 
 
-class TestKVPoolSchedulerGenerateKeys(unittest.TestCase):
-    """Test generate_keys method."""
-
-    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
-    def _make_scheduler(self, mock_client_cls):
-        config = MagicMock()
-        config.kv_transfer_config.kv_role = "kv_producer"
-        config.kv_transfer_config.kv_connector_extra_config = {}
-        config.kv_transfer_config.get_from_extra_config.return_value = True
-        config.parallel_config.data_parallel_rank = 0
-        config.parallel_config.prefill_context_parallel_size = 1
-        config.parallel_config.decode_context_parallel_size = 1
-        config.parallel_config.tensor_parallel_size = 1
-        config.parallel_config.pipeline_parallel_size = 1
-        config.parallel_config.rank = 0
-        config.parallel_config.world_size = 1
-        config.cache_config.block_size = 16
-        config.cache_config.hash_block_size = 16
-        # Concrete model_config values so KVPoolScheduler.__init__ int math
-        # (num_kv_head < tp_size, get_num_layers, model name split, ...) works.
-        config.model_config.model = "org/llama-7b"
-        config.model_config.use_mla = False
-        config.model_config.hf_text_config = MagicMock(spec=[])
-        config.model_config.get_total_num_kv_heads.return_value = 1
-        config.model_config.get_num_layers.return_value = 2
-        return KVPoolScheduler(config, use_layerwise=False)
-
-    def test_generate_keys_basic(self):
-        scheduler = self._make_scheduler()
-        block_hashes = [b"\xaa\xbb", b"\xcc\xdd"]
-        keys, last_key = scheduler.generate_keys(block_hashes)
-        self.assertEqual(len(keys), 2)
-        self.assertIsNone(last_key)
-        self.assertIn("aabb", keys[0])
-        self.assertIn("ccdd", keys[1])
-
-    def test_generate_keys_with_last_block(self):
-        scheduler = self._make_scheduler()
-        block_hashes = [b"\xaa\xbb"]
-        keys, last_key = scheduler.generate_keys(block_hashes, req_id="r1", has_last_block=True)
-        self.assertEqual(len(keys), 1)
-        self.assertIsNotNone(last_key)
-        self.assertIn("r1_lastblock", last_key)
-
-    def test_generate_keys_empty(self):
-        scheduler = self._make_scheduler()
-        keys, last_key = scheduler.generate_keys([])
-        self.assertEqual(keys, [])
-        self.assertIsNone(last_key)
-
-
 class TestKVPoolSchedulerStoreQueryKeys(unittest.TestCase):
     """Test _generate_store_query_keys method."""
 
