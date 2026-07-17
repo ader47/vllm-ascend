@@ -163,6 +163,30 @@ class TestLayerTransferArrayBuilderCompactGvas(unittest.TestCase):
         np.testing.assert_array_equal(sizes, [4, 6, 4, 6])
         np.testing.assert_array_equal(gvas, [1010, 1014, 2010, 2014])
 
+    def test_variable_cache_legs_use_compact_layer_offsets(self):
+        db = MagicMock()
+        # Layer 0 has main K/V + indexer K; layer 1 has only main K/V.
+        db.group_block_len = {0: [4, 6, 2, 4, 6]}
+        db.group_kv_caches_base_addr = {0: [100, 200, 250, 300, 400]}
+        db.group_block_stride = {0: [10, 10, 10, 10, 10]}
+        db.group_layer_offsets = {0: [0, 3, 5]}
+        builder = LayerTransferArrayBuilder(
+            token_database=db,
+            num_layers=2,
+        )
+
+        block_ids = np.asarray([2], dtype=np.int64)
+        base_gvas = np.asarray([1000], dtype=np.int64)
+        layer0 = builder._build_transfer_arrays(block_ids, base_gvas, layer_id=0)
+        layer1 = builder._build_transfer_arrays(block_ids, base_gvas, layer_id=1)
+
+        np.testing.assert_array_equal(layer0[0], [120, 220, 270])
+        np.testing.assert_array_equal(layer0[1], [4, 6, 2])
+        np.testing.assert_array_equal(layer0[2], [1000, 1004, 1010])
+        np.testing.assert_array_equal(layer1[0], [320, 420])
+        np.testing.assert_array_equal(layer1[1], [4, 6])
+        np.testing.assert_array_equal(layer1[2], [1012, 1016])
+
     def test_build_addrs_only_consumes_block_ids_and_base_gvas(self):
         data = GroupTransferData(
             block_ids_arr=np.asarray([10, 11], dtype=np.int64),

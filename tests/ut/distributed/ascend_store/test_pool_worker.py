@@ -522,7 +522,45 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker._transfer_threads_started = True
         worker.register_kv_caches(kv_caches)
         self.assertEqual(len(worker.group_kv_caches_base_addr[0]), 2)
+        self.assertEqual(worker.token_database.group_layer_offsets[0], [0, 2])
         worker.m_store.register_buffer.assert_called_once()
+
+    def test_cache_group_metadata_bundles_optional_indexer_by_physical_layer(self):
+        worker = self._make_worker()
+        worker.num_blocks = 4
+        worker.group_kv_caches_base_addr = {}
+        worker.group_block_len = {}
+        worker.group_block_stride = {}
+        worker.group_layer_offsets = {}
+        worker.group_num_layers = {}
+
+        def make_cache(address, block_len):
+            cache = MagicMock()
+            cache.shape = [4, block_len]
+            cache.__getitem__.return_value.numel.return_value = block_len
+            cache.element_size.return_value = 1
+            cache.stride.return_value = block_len
+            cache.data_ptr.return_value = address
+            return cache
+
+        main0_k = make_cache(100, 4)
+        main0_v = make_cache(200, 6)
+        indexer0 = make_cache(250, 2)
+        main1_k = make_cache(300, 4)
+        main1_v = make_cache(400, 6)
+        worker.kv_caches = {
+            # Deliberately put the indexer first to verify layer-major ordering.
+            "model.layers.0.self_attn.indexer.k_cache": (indexer0,),
+            "model.layers.1.self_attn.attn": (main1_k, main1_v),
+            "model.layers.0.self_attn.attn": (main0_k, main0_v),
+        }
+
+        worker._infer_cache_group_metadata(0, list(worker.kv_caches))
+
+        self.assertEqual(worker.group_kv_caches_base_addr[0], [100, 200, 250, 300, 400])
+        self.assertEqual(worker.group_block_len[0], [4, 6, 2, 4, 6])
+        self.assertEqual(worker.group_layer_offsets[0], [0, 3, 5])
+        self.assertEqual(worker.group_num_layers[0], 2)
 
     def test_start_load_kv_sync(self):
         worker = self._make_worker()
