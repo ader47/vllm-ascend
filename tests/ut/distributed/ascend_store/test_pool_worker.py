@@ -562,6 +562,44 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         self.assertEqual(worker.group_layer_offsets[0], [0, 3, 5])
         self.assertEqual(worker.group_num_layers[0], 2)
 
+    def test_cache_group_metadata_supports_sparse_c8_layer_layout(self):
+        worker = self._make_worker()
+        worker.num_blocks = 4
+        worker.group_kv_caches_base_addr = {}
+        worker.group_block_len = {}
+        worker.group_block_stride = {}
+        worker.group_layer_offsets = {}
+        worker.group_num_layers = {}
+
+        def make_cache(address, block_len):
+            cache = MagicMock()
+            cache.shape = [4, block_len]
+            cache.__getitem__.return_value.numel.return_value = block_len
+            cache.element_size.return_value = 1
+            cache.stride.return_value = block_len
+            cache.data_ptr.return_value = address
+            return cache
+
+        packed_main0 = make_cache(100, 12)
+        indexer_k0 = make_cache(200, 4)
+        indexer_scale0 = make_cache(300, 1)
+        packed_main1 = make_cache(400, 12)
+        worker.kv_caches = {
+            "model.layers.0.self_attn.indexer.k_cache": (
+                indexer_k0,
+                indexer_scale0,
+            ),
+            "model.layers.1.self_attn.attn": (packed_main1,),
+            "model.layers.0.self_attn.attn": (packed_main0,),
+        }
+
+        worker._infer_cache_group_metadata(0, list(worker.kv_caches))
+
+        self.assertEqual(worker.group_kv_caches_base_addr[0], [100, 200, 300, 400])
+        self.assertEqual(worker.group_block_len[0], [12, 4, 1, 12])
+        self.assertEqual(worker.group_layer_offsets[0], [0, 3, 4])
+        self.assertEqual(worker.group_num_layers[0], 2)
+
     def test_start_load_kv_sync(self):
         worker = self._make_worker()
         worker.m_store.get = MagicMock()
