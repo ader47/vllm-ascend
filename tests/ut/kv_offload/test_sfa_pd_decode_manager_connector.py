@@ -25,6 +25,7 @@ from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.read_thread import (
 )
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.scheduler import (  # noqa: E402
     SFAPDCpuOffloadScheduler,
+    SFAPDProducerScheduler,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.send_thread import (  # noqa: E402
     MembPullSendingThread,
@@ -289,6 +290,21 @@ def test_send_thread_slices_each_group_at_chunk_boundaries():
 
     sent_message = dealer.send.call_args.args[0]
     assert sent_message[3] == [("req-0", [11], [20], 1, 0)]
+
+
+@pytest.mark.parametrize("all_groups", [False, True])
+def test_producer_scheduler_cleans_request_state_on_finish(all_groups):
+    scheduler = SFAPDProducerScheduler.__new__(SFAPDProducerScheduler)
+    request = SimpleNamespace(request_id="req-0")
+    scheduler._reqs_need_send_layerwise = {"req-0": MagicMock()}
+
+    if all_groups:
+        result = scheduler.request_finished_all_groups(request, ([1], [2]))
+    else:
+        result = scheduler.request_finished(request, [1])
+
+    assert result == (False, None)
+    assert "req-0" not in scheduler._reqs_need_send_layerwise
 
 
 def test_storage_slot_gate_is_shared_across_reuse_ring_boundary():

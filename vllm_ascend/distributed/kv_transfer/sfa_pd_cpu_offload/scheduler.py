@@ -198,13 +198,17 @@ class SFAPDProducerScheduler:
         request: Request,
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
-        return False, None
+        return self.request_finished_all_groups(request, (block_ids,))
 
     def request_finished_all_groups(
         self,
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
+        # The final chunk normally removes this tracker in
+        # build_connector_meta. Cancellation, preemption, and failures can
+        # finish earlier, so clean it up here as well.
+        self._reqs_need_send_layerwise.pop(request.request_id, None)
         return False, None
 
 

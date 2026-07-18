@@ -23,9 +23,9 @@ def _fake_memfabric(raw_engine: MagicMock) -> ModuleType:
     return module
 
 
-def test_memfabric_initialization_derives_session_from_engine_port():
+def test_memfabric_initialization_publishes_session_from_engine_port():
     raw_engine = MagicMock()
-    raw_engine.get_rpc_port.return_value = "10.0.0.8:23456_991"
+    raw_engine.get_rpc_port.return_value = 23456
     raw_engine.initialize.return_value = 0
     module = _fake_memfabric(raw_engine)
     manager = GlobalMemfabricTE()
@@ -39,12 +39,22 @@ def test_memfabric_initialization_derives_session_from_engine_port():
     module.set_log_level.assert_called_once_with(2)
     module.set_conf_store_tls.assert_called_once_with(False, "")
     raw_engine.initialize.assert_called_once_with(
-        "tcp://192.168.1.10:23456",
-        "192.168.1.10:23456",
+        "tcp://192.168.1.10",
+        "192.168.1.10",
         MEMFABRIC_ROLE_PREFILL,
         3,
         store_server_role=MEMFABRIC_ROLE_PREFILL,
     )
+    assert raw_engine.method_calls[:2] == [
+        call.initialize(
+            "tcp://192.168.1.10",
+            "192.168.1.10",
+            MEMFABRIC_ROLE_PREFILL,
+            3,
+            store_server_role=MEMFABRIC_ROLE_PREFILL,
+        ),
+        call.get_rpc_port(),
+    ]
 
 
 def test_memfabric_configuration_is_idempotent_but_role_bound():
@@ -70,20 +80,6 @@ def test_memfabric_engine_is_bound_to_initial_hostname():
         manager.get_transfer_engine("127.0.0.1")
         with pytest.raises(RuntimeError, match="initialized for hostname"):
             manager.get_transfer_engine("127.0.0.2")
-
-
-@pytest.mark.parametrize(
-    ("endpoint", "expected"),
-    [(12345, 12345), ("127.0.0.1:23456", 23456), ("10.0.0.1:34567_8", 34567)],
-)
-def test_memfabric_rpc_port_parsing(endpoint, expected):
-    assert GlobalMemfabricTE._parse_rpc_port(endpoint) == expected
-
-
-@pytest.mark.parametrize("endpoint", ["invalid", 0, 65536])
-def test_memfabric_rejects_invalid_rpc_port(endpoint):
-    with pytest.raises(RuntimeError, match="invalid RPC"):
-        GlobalMemfabricTE._parse_rpc_port(endpoint)
 
 
 def test_memfabric_registers_each_region_only_once():
