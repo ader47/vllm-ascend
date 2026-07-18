@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -1663,6 +1664,26 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         self.assertEqual(task.layer_id, 2)
         self.assertEqual(task.wait_for_save_layer, 0)
         self.assertEqual(task.transfer_tasks, [])
+
+    def test_final_save_keeps_reuse_gate_for_receive_thread(self):
+        worker = self._make_worker()
+        worker.num_layers = 3
+        worker.current_layer = 2
+        worker.prefetch_layer_map = {2: 0}
+        worker.layer_save_tasks = [[], [], []]
+        worker.sync_save_events = [MagicMock() for _ in range(3)]
+        worker.layer_save_finished_events = [threading.Event() for _ in range(3)]
+        worker.layer_save_finished_events[0].set()
+        worker.layer_save_finished_events[1].set()
+        worker.kv_send_thread = MagicMock()
+
+        worker.save_kv_layer(MagicMock())
+
+        # Layer 0 gates reuse by layer 2, so only the receive thread may
+        # consume it. Unrelated and final-layer events are cleaned here.
+        self.assertTrue(worker.layer_save_finished_events[0].is_set())
+        self.assertFalse(worker.layer_save_finished_events[1].is_set())
+        self.assertFalse(worker.layer_save_finished_events[2].is_set())
 
     def test_alloc_gvas_for_save_stores_only_planned_range(self):
         worker = self._make_worker()

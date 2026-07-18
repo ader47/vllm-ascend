@@ -1179,7 +1179,13 @@ class KVPoolWorker:
             while not self.layer_save_finished_events[self.num_layers - 1].wait(timeout=10):
                 send_thread.raise_if_failed()
                 logger.info("Layerwise %d save not done, keep waiting", self.current_layer)
+            # A reused buffer's load task owns its save gate and clears it
+            # after observing the signal. Clearing that gate here can race
+            # with the asynchronous receive thread and lose the wake-up.
+            reuse_source_layers = set(self.prefetch_layer_map.values())
             for layer_id in range(self.num_layers):
+                if layer_id in reuse_source_layers:
+                    continue
                 if self.layer_save_finished_events[layer_id].is_set():
                     self.layer_save_finished_events[layer_id].clear()
 
