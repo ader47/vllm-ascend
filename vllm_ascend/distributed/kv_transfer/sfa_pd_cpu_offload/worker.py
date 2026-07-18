@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import regex as re
@@ -68,6 +69,7 @@ if TYPE_CHECKING:
 _LAYER_IDX_RE = re.compile(r"layers\.(\d+)")
 
 CONNECTOR_THREAD_STARTUP_TIMEOUT_SECONDS = 10.0
+PD_READ_WAIT_LOG_INTERVAL_SECONDS = 10.0
 MIN_TCP_PORT = 1
 MAX_TCP_PORT = 65535
 
@@ -747,6 +749,30 @@ class SFAPDCpuOffloadProducerWorker:
             self.kv_send_layer_thread._signal_layer_done(layer_idx)
         self.current_layer += 1
 
+    def _wait_for_pd_read_completion(
+        self,
+        event: threading.Event | None,
+        error_getter: Callable[[], str | None],
+        description: str,
+    ) -> None:
+        if event is None or self.kv_send_layer_thread is None:
+            return
+        while not event.wait(timeout=PD_READ_WAIT_LOG_INTERVAL_SECONDS):
+            error = error_getter()
+            if error is not None:
+                raise RuntimeError(f"D failed to read {description}: {error}")
+            if not self.kv_send_layer_thread.is_alive():
+                startup_error = self.kv_send_layer_thread.startup_error
+                detail = f": {startup_error}" if startup_error is not None else ""
+                raise RuntimeError(
+                    f"SFAPD P-side send thread stopped while waiting for D to read {description}{detail}"
+                )
+            logger.info("Waiting for D to read %s; keep waiting", description)
+
+        error = error_getter()
+        if error is not None:
+            raise RuntimeError(f"D failed to read {description}: {error}")
+
     def wait_for_layer_send(self, layer_idx: int) -> None:
         """Block until D has read layer ``layer_idx``'s KV (buffer-reuse gate).
 
@@ -759,22 +785,17 @@ class SFAPDCpuOffloadProducerWorker:
         storage_slots = self.layer_storage_slots.get(layer_idx, ())
         if storage_slots:
             for slot_id in storage_slots:
-                event = self.kv_send_layer_thread.get_storage_send_event(slot_id)
-                if event is not None and not event.wait(timeout=10):
-                    raise RuntimeError(
-                        "Timed out waiting for D to read physical KV storage "
-                        f"slot {slot_id} before layer {layer_idx} reused it"
-                    )
-                error = self.kv_send_layer_thread.get_storage_error(slot_id)
-                if error is not None:
-                    raise RuntimeError(f"D failed to read physical KV storage slot {slot_id}: {error}")
+                self._wait_for_pd_read_completion(
+                    self.kv_send_layer_thread.get_storage_send_event(slot_id),
+                    lambda slot_id=slot_id: self.kv_send_layer_thread.get_storage_error(slot_id),
+                    f"physical KV storage slot {slot_id} for layer {layer_idx}",
+                )
         elif 0 <= layer_idx < len(self.layer_send_done_events or ()):
-            event = self.layer_send_done_events[layer_idx]
-            if not event.wait(timeout=10):
-                raise RuntimeError(f"Timed out waiting for D to read layer {layer_idx}'s KV before buffer reuse")
-            error = self.kv_send_layer_thread.get_layer_error(layer_idx)
-            if error is not None:
-                raise RuntimeError(f"D failed to read layer {layer_idx}'s KV: {error}")
+            self._wait_for_pd_read_completion(
+                self.layer_send_done_events[layer_idx],
+                lambda: self.kv_send_layer_thread.get_layer_error(layer_idx),
+                f"layer {layer_idx} KV",
+            )
 
     def get_layer_send_event(self, layer_idx: int) -> threading.Event | None:
         if self.layer_send_done_events is None:

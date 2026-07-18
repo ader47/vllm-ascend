@@ -350,6 +350,56 @@ def test_storage_slot_gate_is_shared_across_reuse_ring_boundary():
     assert not thread.get_storage_send_event(0).is_set()
 
 
+def test_pd_read_wait_continues_after_log_interval_until_read_done():
+    event = MagicMock()
+    event.wait.side_effect = [False, True]
+    send_thread = MagicMock()
+    send_thread.get_storage_send_event.return_value = event
+    send_thread.get_storage_error.return_value = None
+    send_thread.is_alive.return_value = True
+    worker = SFAPDCpuOffloadProducerWorker.__new__(SFAPDCpuOffloadProducerWorker)
+    worker.kv_send_layer_thread = send_thread
+    worker.layer_storage_slots = {0: (0,)}
+    worker.layer_send_done_events = []
+
+    worker.wait_for_layer_send(0)
+
+    assert event.wait.call_count == 2
+    send_thread.is_alive.assert_called_once_with()
+
+
+def test_pd_read_wait_fails_when_send_thread_stops():
+    event = MagicMock()
+    event.wait.return_value = False
+    send_thread = MagicMock()
+    send_thread.get_storage_send_event.return_value = event
+    send_thread.get_storage_error.return_value = None
+    send_thread.is_alive.return_value = False
+    send_thread.startup_error = None
+    worker = SFAPDCpuOffloadProducerWorker.__new__(SFAPDCpuOffloadProducerWorker)
+    worker.kv_send_layer_thread = send_thread
+    worker.layer_storage_slots = {0: (0,)}
+    worker.layer_send_done_events = []
+
+    with pytest.raises(RuntimeError, match="send thread stopped"):
+        worker.wait_for_layer_send(0)
+
+
+def test_pd_read_wait_propagates_read_failed():
+    event = MagicMock()
+    event.wait.return_value = True
+    send_thread = MagicMock()
+    send_thread.get_storage_send_event.return_value = event
+    send_thread.get_storage_error.return_value = "memfabric read failed"
+    worker = SFAPDCpuOffloadProducerWorker.__new__(SFAPDCpuOffloadProducerWorker)
+    worker.kv_send_layer_thread = send_thread
+    worker.layer_storage_slots = {0: (0,)}
+    worker.layer_send_done_events = []
+
+    with pytest.raises(RuntimeError, match="memfabric read failed"):
+        worker.wait_for_layer_send(0)
+
+
 def test_main_only_and_indexer_layers_share_their_physical_main_slot():
     main_only = LayerMetadata(
         tensor_group_idx=[0, 0],
@@ -387,9 +437,7 @@ def test_metaserver_retries_http_status_errors():
     client = MagicMock()
     client.post.return_value = response
 
-    with patch(
-        "vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.scheduler.httpx.Client"
-    ) as client_cls:
+    with patch("vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.scheduler.httpx.Client") as client_cls:
         client_cls.return_value.__enter__.return_value = client
         scheduler._access_metaserver("http://metaserver", {"request_id": "req-0"})
 
