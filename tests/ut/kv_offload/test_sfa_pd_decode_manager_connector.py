@@ -1,15 +1,21 @@
 """Regression tests for SFA PD transfer into KVOffloadDecodeManager."""
 
+import threading
+from concurrent.futures import Future
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.connector import (  # noqa: E402
+    SFAPDCpuOffloadConnector,
+)
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (  # noqa: E402
     READ_READY_BATCH,
+    LayerMetadata,
     SendTask,
     infer_sfa_component_group_ids,
 )
@@ -17,8 +23,14 @@ from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.read_thread import (
     ConsumerReadState,
     MembPullReadThread,
 )
+from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.scheduler import (  # noqa: E402
+    SFAPDCpuOffloadScheduler,
+)
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.send_thread import (  # noqa: E402
     MembPullSendingThread,
+)
+from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.worker import (  # noqa: E402
+    SFAPDCpuOffloadProducerWorker,
 )
 
 
@@ -63,7 +75,12 @@ def _make_read_thread() -> MembPullReadThread:
     return thread
 
 
-def _make_layer(k_cpu_ptr: int | None, v_cpu_ptr: int | None) -> dict:
+def _make_layer(
+    k_cpu_ptr: int | None,
+    v_cpu_ptr: int | None,
+    *,
+    has_indexer: bool = True,
+) -> dict:
     return {
         "layer_name": "model.layers.0.self_attn",
         "pool_idx": 0,
@@ -74,12 +91,16 @@ def _make_layer(k_cpu_ptr: int | None, v_cpu_ptr: int | None) -> dict:
         "p_v_len": 20,
         "k_cpu_ptr": k_cpu_ptr,
         "v_cpu_ptr": v_cpu_ptr,
-        "indexer": {
-            "p_dsa_base": 7000,
-            "block_len": 5,
-            "d_base": 8000,
-            "shape": (16, 1, 1, 5),
-        },
+        "indexer": (
+            {
+                "p_dsa_base": 7000,
+                "block_len": 5,
+                "d_base": 8000,
+                "shape": (16, 1, 1, 5),
+            }
+            if has_indexer
+            else None
+        ),
         "scale": None,
     }
 
@@ -125,7 +146,7 @@ def test_non_tp0_read_descriptors_still_transfer_indexer():
 def test_read_descriptor_rejects_incomplete_indexer_transfer():
     thread = _make_read_thread()
 
-    with pytest.raises(RuntimeError, match="indexer block count mismatch"):
+    with pytest.raises(RuntimeError, match="indexer destination range is incomplete"):
         thread._build_req_descriptors(
             _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000),
             "req-0",
@@ -135,16 +156,55 @@ def test_read_descriptor_rejects_incomplete_indexer_transfer():
         )
 
 
+def test_main_only_layer_uses_chunk_destination_slice():
+    thread = _make_read_thread()
+
+    local, peer, lengths, info = thread._build_req_descriptors(
+        _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000, has_indexer=False),
+        "req-0",
+        p_main_block_ids=[2],
+        p_indexer_block_ids=[],
+        want_info=True,
+        main_start_block=1,
+    )
+
+    assert local == [3040, 4080]
+    assert peer == [1020, 2040]
+    assert lengths == [10, 20]
+    assert info is not None
+    assert info["d_main_ids"] == [4]
+    assert info["n_indexer"] == 0
+
+
 def test_send_thread_wires_both_cache_group_block_lists():
     layer_name = "model.layers.0.self_attn"
     thread = MembPullSendingThread.__new__(MembPullSendingThread)
-    thread._state = SimpleNamespace(main_group_idx=1, indexer_group_idx=0)
+    thread._state = SimpleNamespace(
+        main_group_idx=1,
+        indexer_group_idx=0,
+        block_sizes=(32, 16),
+        layer_metadata={
+            layer_name: LayerMetadata(
+                tensor_group_idx=[1, 1, 0],
+                kv_caches_base_addr=[1000, 2000, 3000],
+                block_len=[10, 20, 5],
+                block_size_scale=[1, 1, 1],
+                main_tensor_count=2,
+                has_indexer=True,
+            )
+        },
+        layer_storage_slots={0: (0, 1)},
+    )
     thread.last_layer_idx = 0
     thread._p_save_events = {}
     thread.layer_send_done_events = [MagicMock()]
     thread.layer_transfer_finished_events = None
     thread._pending_reads_by_layer = {}
     thread._layer_read_errors = {}
+    thread._storage_read_errors = {}
+    thread.storage_send_done_events = [threading.Event(), threading.Event()]
+    for event in thread.storage_send_done_events:
+        event.set()
     thread._mf_meta_sent_paths = set()
     thread._send_mf_meta = MagicMock()
     dealer = MagicMock()
@@ -156,6 +216,8 @@ def test_send_thread_wires_both_cache_group_block_lists():
         remote_host="127.0.0.1",
         remote_port=1234,
         chunk_finish=True,
+        local_transed_tokens=0,
+        local_computed_tokens=32,
     )
 
     thread._process_send_task(
@@ -169,5 +231,277 @@ def test_send_thread_wires_both_cache_group_block_lists():
 
     sent_message = dealer.send.call_args.args[0]
     assert sent_message[0] == READ_READY_BATCH
-    assert sent_message[3] == [("req-0", [3, 4], [7])]
+    assert sent_message[3] == [("req-0", [3, 4], [7], 0, 0)]
     assert sent_message[4] == ["req-0"]
+
+
+def test_send_thread_slices_each_group_at_chunk_boundaries():
+    layer_name = "model.layers.0.self_attn"
+    thread = MembPullSendingThread.__new__(MembPullSendingThread)
+    thread._state = SimpleNamespace(
+        main_group_idx=0,
+        indexer_group_idx=1,
+        block_sizes=(16, 32),
+        layer_metadata={
+            layer_name: LayerMetadata(
+                tensor_group_idx=[0, 0, 1],
+                kv_caches_base_addr=[1000, 2000, 3000],
+                block_len=[10, 20, 5],
+                block_size_scale=[1, 1, 1],
+                main_tensor_count=2,
+                has_indexer=True,
+            )
+        },
+        layer_storage_slots={0: (0, 1)},
+    )
+    thread.last_layer_idx = 1
+    thread._p_save_events = {}
+    thread.layer_send_done_events = [threading.Event(), threading.Event()]
+    thread.layer_transfer_finished_events = None
+    thread._pending_reads_by_layer = {}
+    thread._layer_read_errors = {}
+    thread._storage_read_errors = {}
+    thread.storage_send_done_events = [threading.Event(), threading.Event()]
+    for event in [*thread.layer_send_done_events, *thread.storage_send_done_events]:
+        event.set()
+    thread._mf_meta_sent_paths = {"tcp://127.0.0.1:1234"}
+    dealer = MagicMock()
+    thread._ensure_dealer = MagicMock(return_value=dealer)
+    encoder = MagicMock()
+    encoder.encode.side_effect = lambda value: value
+    req_meta = SimpleNamespace(
+        local_block_ids=[[10, 11, 12], [20, 21]],
+        remote_host="127.0.0.1",
+        remote_port=1234,
+        chunk_finish=False,
+        local_transed_tokens=16,
+        local_computed_tokens=40,
+    )
+
+    thread._process_send_task(
+        SendTask(
+            send_request={"req-0": req_meta},
+            layer_idx=0,
+            layer_name=layer_name,
+        ),
+        encoder,
+    )
+
+    sent_message = dealer.send.call_args.args[0]
+    assert sent_message[3] == [("req-0", [11], [20], 1, 0)]
+
+
+def test_storage_slot_gate_is_shared_across_reuse_ring_boundary():
+    thread = MembPullSendingThread.__new__(MembPullSendingThread)
+    thread._state = SimpleNamespace(
+        layer_storage_slots={1: (0,), 5: (0,)},
+    )
+    thread.layer_send_done_events = [threading.Event() for _ in range(6)]
+    thread.storage_send_done_events = [threading.Event()]
+    thread.storage_send_done_events[0].set()
+    thread._storage_read_errors = {}
+    thread._layer_read_errors = {}
+    thread._pending_reads_by_layer = {}
+    thread.layer_transfer_finished_events = None
+    thread.layer_transfer_pending_events = None
+
+    thread.mark_layer_pending(5)
+    assert not thread.get_storage_send_event(0).is_set()
+    # Completing the last occupant opens the same gate observed by the first
+    # occupant in the next scheduler step.
+    thread._signal_layer_done(5)
+    assert thread.get_storage_send_event(0).is_set()
+    thread.mark_layer_pending(1)
+    assert not thread.get_storage_send_event(0).is_set()
+
+
+def test_main_only_and_indexer_layers_share_their_physical_main_slot():
+    main_only = LayerMetadata(
+        tensor_group_idx=[0, 0],
+        kv_caches_base_addr=[1000, 2000],
+        block_len=[10, 20],
+        block_size_scale=[1, 1],
+        main_tensor_count=2,
+        has_indexer=False,
+    )
+    with_indexer = LayerMetadata(
+        tensor_group_idx=[0, 0, 0],
+        kv_caches_base_addr=[1000, 2000, 3000],
+        block_len=[10, 20, 5],
+        block_size_scale=[1, 1, 1],
+        main_tensor_count=2,
+        has_indexer=True,
+    )
+
+    slots = SFAPDCpuOffloadProducerWorker._infer_layer_storage_slots(
+        {
+            "model.layers.1.self_attn": main_only,
+            "model.layers.5.self_attn": with_indexer,
+        }
+    )
+
+    assert slots[1] == (0,)
+    assert slots[5][0] == 0
+    assert len(slots[5]) == 2
+
+
+def test_metaserver_retries_http_status_errors():
+    scheduler = SFAPDCpuOffloadScheduler.__new__(SFAPDCpuOffloadScheduler)
+    response = MagicMock()
+    response.raise_for_status.side_effect = [RuntimeError("HTTP 500"), None]
+    client = MagicMock()
+    client.post.return_value = response
+
+    with patch(
+        "vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.scheduler.httpx.Client"
+    ) as client_cls:
+        client_cls.return_value.__enter__.return_value = client
+        scheduler._access_metaserver("http://metaserver", {"request_id": "req-0"})
+
+    assert client.post.call_count == 2
+    assert response.raise_for_status.call_count == 2
+
+
+def test_metaserver_callback_preserves_retry_state_after_failure():
+    scheduler = SFAPDCpuOffloadScheduler.__new__(SFAPDCpuOffloadScheduler)
+    scheduler._metaserver_lock = threading.Lock()
+    scheduler._shutdown_event = threading.Event()
+    scheduler._metaserver_retry_timers = {}
+    scheduler._cancelled_metaserver_requests = set()
+    failed_future = Future()
+    scheduler._metaserver_futures = {"req-0": failed_future}
+    params = {"do_remote_prefill": False}
+    failed_future.set_exception(RuntimeError("metaserver unavailable"))
+
+    retry_timer = MagicMock()
+    with patch(
+        "vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.scheduler.threading.Timer",
+        return_value=retry_timer,
+    ):
+        scheduler._on_metaserver_done(
+            failed_future,
+            request_id="req-0",
+            params=params,
+            url="http://metaserver",
+            message={"request_id": "req-0"},
+        )
+
+    assert params["do_remote_prefill"] is True
+    assert "req-0" not in scheduler._metaserver_futures
+    assert scheduler._metaserver_retry_timers["req-0"] is retry_timer
+    retry_timer.start.assert_called_once_with()
+
+
+def test_metaserver_callback_commits_state_only_after_success():
+    scheduler = SFAPDCpuOffloadScheduler.__new__(SFAPDCpuOffloadScheduler)
+    scheduler._metaserver_lock = threading.Lock()
+    scheduler._shutdown_event = threading.Event()
+    scheduler._metaserver_retry_timers = {}
+    scheduler._cancelled_metaserver_requests = set()
+    succeeded_future = Future()
+    scheduler._metaserver_futures = {"req-0": succeeded_future}
+    params = {"do_remote_prefill": True}
+    succeeded_future.set_result(None)
+
+    scheduler._on_metaserver_done(
+        succeeded_future,
+        request_id="req-0",
+        params=params,
+        url="http://metaserver",
+        message={"request_id": "req-0"},
+    )
+
+    assert params["do_remote_prefill"] is False
+
+
+@pytest.mark.parametrize(
+    ("p_tp", "d_tp", "p_rank", "expected_d_rank"),
+    [
+        (8, 8, 7, 7),
+        (8, 4, 0, 0),
+        (8, 4, 3, 1),
+        (8, 4, 7, 3),
+    ],
+)
+def test_prefill_to_decode_tp_rank_mapping(p_tp, d_tp, p_rank, expected_d_rank):
+    assert (
+        SFAPDCpuOffloadProducerWorker._map_prefill_rank_to_decode_rank(
+            prefill_tp_size=p_tp,
+            decode_tp_size=d_tp,
+            prefill_tp_rank=p_rank,
+        )
+        == expected_d_rank
+    )
+
+
+@pytest.mark.parametrize(
+    ("p_tp", "d_tp", "p_rank"),
+    [
+        (4, 8, 0),
+        (8, 3, 0),
+        (0, 1, 0),
+        (8, 4, 8),
+    ],
+)
+def test_prefill_to_decode_tp_rank_mapping_rejects_invalid_topology(
+    p_tp,
+    d_tp,
+    p_rank,
+):
+    with pytest.raises(ValueError):
+        SFAPDCpuOffloadProducerWorker._map_prefill_rank_to_decode_rank(
+            prefill_tp_size=p_tp,
+            decode_tp_size=d_tp,
+            prefill_tp_rank=p_rank,
+        )
+
+
+def test_read_thread_propagates_bind_failure_without_hanging():
+    state = _make_read_thread()._state
+    thread = MembPullReadThread(
+        tp_rank=0,
+        side_channel_port=12345,
+        engine=MagicMock(),
+        state=state,
+    )
+
+    with patch(
+        "vllm.utils.network_utils.make_zmq_socket",
+        side_effect=OSError("address already in use"),
+    ):
+        thread.start()
+        assert thread.ready_event.wait(timeout=1)
+        thread.join(timeout=1)
+
+    assert isinstance(thread.startup_error, OSError)
+    assert not thread.is_alive()
+
+
+def test_scheduler_shutdown_cancels_rendezvous_and_executor():
+    scheduler = SFAPDCpuOffloadScheduler.__new__(SFAPDCpuOffloadScheduler)
+    scheduler._metaserver_lock = threading.Lock()
+    scheduler._shutdown_event = threading.Event()
+    scheduler._metaserver_retry_timers = {}
+    scheduler._cancelled_metaserver_requests = set()
+    pending_future = Future()
+    scheduler._metaserver_futures = {"req-0": pending_future}
+    scheduler.executor = MagicMock()
+
+    scheduler.shutdown()
+
+    assert pending_future.cancelled()
+    scheduler.executor.shutdown.assert_called_once_with(
+        wait=False,
+        cancel_futures=True,
+    )
+
+
+def test_connector_shutdown_delegates_to_active_components():
+    connector = SFAPDCpuOffloadConnector.__new__(SFAPDCpuOffloadConnector)
+    connector.connector_worker = MagicMock()
+    connector.connector_scheduler = MagicMock()
+
+    connector.shutdown()
+
+    connector.connector_worker.shutdown.assert_called_once_with()
+    connector.connector_scheduler.shutdown.assert_called_once_with()

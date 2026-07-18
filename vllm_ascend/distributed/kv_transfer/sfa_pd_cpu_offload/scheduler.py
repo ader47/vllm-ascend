@@ -12,7 +12,9 @@ P (``kv_producer``): build metadata for layer-wise READ_READY notifications.
 
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -35,6 +37,10 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
+
+METASERVER_MAX_RETRIES = 3
+METASERVER_REQUEST_TIMEOUT_SECONDS = 10.0
+METASERVER_RETRY_DELAY_SECONDS = 1.0
 
 class _SendReqInfo:
     def __init__(
@@ -235,6 +241,11 @@ class SFAPDCpuOffloadScheduler:
         # can build request_map for get_finished even while async-waiting KV).
         self._reqs_need_recv: set[str] = set()
         self.executor = ThreadPoolExecutor(32)
+        self._metaserver_futures = {}
+        self._metaserver_retry_timers = {}
+        self._cancelled_metaserver_requests: set[str] = set()
+        self._metaserver_lock = threading.Lock()
+        self._shutdown_event = threading.Event()
 
     # ------------------------------------------------------------------
     # D side (kv_consumer)
@@ -289,11 +300,18 @@ class SFAPDCpuOffloadScheduler:
             remote_dcp_size=self.vllm_config.parallel_config.decode_context_parallel_size,
             remote_cached_tokens=request.num_computed_tokens,
         )
-        params["do_remote_prefill"] = False
         metaserver = params.get("metaserver")
         if metaserver is not None and not params.get("do_virtual", False):
-            future = self.executor.submit(self._access_metaserver, url=metaserver, message=kv_transfer_params)
-            future.add_done_callback(self._on_metaserver_done)
+            with self._metaserver_lock:
+                self._cancelled_metaserver_requests.discard(request.request_id)
+            self._submit_metaserver_request(
+                request_id=request.request_id,
+                params=params,
+                url=metaserver,
+                message=kv_transfer_params,
+            )
+        else:
+            params["do_remote_prefill"] = False
         if envs.VLLM_ASCEND_SFA_DEBUG:
             logger.info(
                 "SFAPDCpuOffload D advertised req %s: indexer_hbm_ids=%s, "
@@ -329,25 +347,126 @@ class SFAPDCpuOffloadScheduler:
         # vLLM owns the block lifecycle; the connector only drops its lookup.
         self._request_trackers.pop(request.request_id, None)
         self._reqs_need_recv.discard(request.request_id)
+        with self._metaserver_lock:
+            self._cancelled_metaserver_requests.add(request.request_id)
+            future = self._metaserver_futures.pop(request.request_id, None)
+            timer = self._metaserver_retry_timers.pop(request.request_id, None)
+        if future is not None:
+            future.cancel()
+        if timer is not None:
+            timer.cancel()
         return False, None
 
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
     def _access_metaserver(self, url: str, message: dict[str, Any]):
-        with httpx.Client(limits=httpx.Limits(max_connections=100000), timeout=None) as client:
+        with httpx.Client(
+            limits=httpx.Limits(max_connections=100000),
+            timeout=METASERVER_REQUEST_TIMEOUT_SECONDS,
+        ) as client:
             retry = 0
-            while retry < 3:
+            while retry < METASERVER_MAX_RETRIES:
                 retry += 1
                 try:
-                    client.post(url, json=message)
+                    response = client.post(url, json=message)
+                    response.raise_for_status()
                     return
                 except Exception as e:
                     logger.error("Failed to connect to metaserver: %s, retry %s", url, retry)
-                    if retry == 3:
+                    if retry == METASERVER_MAX_RETRIES:
                         raise e
 
-    @staticmethod
-    def _on_metaserver_done(future):
-        if future.exception():
-            logger.error("Access metaserver fail: %s", future.exception())
+    def _submit_metaserver_request(
+        self,
+        *,
+        request_id: str,
+        params: dict[str, Any],
+        url: str,
+        message: dict[str, Any],
+    ) -> None:
+        if self._shutdown_event.is_set():
+            return
+        future = None
+        with self._metaserver_lock:
+            if (
+                self._shutdown_event.is_set()
+                or request_id in self._cancelled_metaserver_requests
+            ):
+                return
+            self._metaserver_retry_timers.pop(request_id, None)
+            if request_id not in self._metaserver_futures:
+                future = self.executor.submit(
+                    self._access_metaserver,
+                    url=url,
+                    message=message,
+                )
+                self._metaserver_futures[request_id] = future
+        if future is not None:
+            future.add_done_callback(
+                partial(
+                    self._on_metaserver_done,
+                    request_id=request_id,
+                    params=params,
+                    url=url,
+                    message=message,
+                )
+            )
+
+    def _on_metaserver_done(
+        self,
+        future,
+        *,
+        request_id: str,
+        params: dict[str, Any],
+        url: str,
+        message: dict[str, Any],
+    ):
+        with self._metaserver_lock:
+            self._metaserver_futures.pop(request_id, None)
+        if future.cancelled() or self._shutdown_event.is_set():
+            return
+        with self._metaserver_lock:
+            if request_id in self._cancelled_metaserver_requests:
+                return
+        error = future.exception()
+        if error is not None:
+            params["do_remote_prefill"] = True
+            logger.error(
+                "Access metaserver failed for request %s; retrying in %.1f "
+                "seconds: %s",
+                request_id,
+                METASERVER_RETRY_DELAY_SECONDS,
+                error,
+            )
+            timer = threading.Timer(
+                METASERVER_RETRY_DELAY_SECONDS,
+                self._submit_metaserver_request,
+                kwargs={
+                    "request_id": request_id,
+                    "params": params,
+                    "url": url,
+                    "message": message,
+                },
+            )
+            timer.daemon = True
+            with self._metaserver_lock:
+                if self._shutdown_event.is_set():
+                    return
+                self._metaserver_retry_timers[request_id] = timer
+            timer.start()
+            return
+        params["do_remote_prefill"] = False
+
+    def shutdown(self) -> None:
+        self._shutdown_event.set()
+        with self._metaserver_lock:
+            futures = list(self._metaserver_futures.values())
+            timers = list(self._metaserver_retry_timers.values())
+            self._metaserver_futures.clear()
+            self._metaserver_retry_timers.clear()
+        for future in futures:
+            future.cancel()
+        for timer in timers:
+            timer.cancel()
+        self.executor.shutdown(wait=False, cancel_futures=True)

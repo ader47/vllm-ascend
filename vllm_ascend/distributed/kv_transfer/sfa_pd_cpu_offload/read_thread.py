@@ -25,6 +25,9 @@ from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
     SfaPDAgentMetadata,
 )
 
+READ_THREAD_POLL_TIMEOUT_MS = 100
+THREAD_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
 
 @dataclass
 class ConsumerReadState:
@@ -84,6 +87,8 @@ class MembPullReadThread(threading.Thread):
         self._failed_requests: set[str] = set()
         self._lock = threading.Lock()
         self._host = get_ip()
+        self._stop_event = threading.Event()
+        self.startup_error: BaseException | None = None
 
     def get_and_clear_done(self) -> set[str]:
         with self._lock:
@@ -104,12 +109,20 @@ class MembPullReadThread(threading.Thread):
         path = make_zmq_path("tcp", self._host, handshake_port)
         logger.info("MembPull read thread listening on: %s", path)
         ctx = zmq.Context()
+        sock = None
         try:
-            sock = make_zmq_socket(ctx=ctx, path=path, socket_type=zmq.ROUTER, bind=True)
-            self.ready_event.set()
+            try:
+                sock = make_zmq_socket(ctx=ctx, path=path, socket_type=zmq.ROUTER, bind=True)
+                sock.setsockopt(zmq.RCVTIMEO, READ_THREAD_POLL_TIMEOUT_MS)
+            except BaseException as error:
+                self.startup_error = error
+                logger.error("MembPull read thread failed to start on %s: %s", path, error)
+                return
+            finally:
+                self.ready_event.set()
             decoder = msgspec.msgpack.Decoder(type=tuple)
             encoder = msgspec.msgpack.Encoder()
-            while True:
+            while not self._stop_event.is_set():
                 try:
                     frames = sock.recv_multipart()
                     if len(frames) < 2:
@@ -152,6 +165,8 @@ class MembPullReadThread(threading.Thread):
                                 entry[0],
                                 list(entry[1]),
                                 list(entry[2] if len(entry) > 2 else entry[1]),
+                                int(entry[3]) if len(entry) > 3 else 0,
+                                int(entry[4]) if len(entry) > 4 else 0,
                             )
                             for entry in msg[3]
                         ]
@@ -216,10 +231,22 @@ class MembPullReadThread(threading.Thread):
                         sock.send_multipart((identity, b"", meta_bytes))
                     else:
                         logger.error("MembPull got unexpected message %s", msg)
+                except zmq.Again:
+                    continue
                 except Exception as e:
                     logger.error("MembPull exception: %s: %s", type(e), e)
         finally:
+            self.ready_event.set()
+            if sock is not None:
+                sock.close(linger=0)
             ctx.destroy(linger=0)
+
+    def stop(self, timeout: float = THREAD_SHUTDOWN_TIMEOUT_SECONDS) -> None:
+        self._stop_event.set()
+        if self.is_alive() and threading.current_thread() is not self:
+            self.join(timeout=timeout)
+        if self.is_alive():
+            logger.warning("MembPull read thread did not stop within %.1f seconds", timeout)
 
     def _resolve_read_layer(
         self,
@@ -253,11 +280,16 @@ class MembPullReadThread(threading.Thread):
         p_base_addrs = p_meta["base_addrs"]
         p_block_len = p_meta["block_len"]
         p_block_size_scale = p_meta.get("block_size_scale", [1] * len(p_base_addrs))
-        if len(p_base_addrs) < 3:
+        main_tensor_count = int(p_meta.get("main_tensor_count", 2))
+        if main_tensor_count != 2 or len(p_base_addrs) < main_tensor_count:
             raise RuntimeError(
-                f"MembPull P metadata for {layer_name} must expose main K/V and "
-                f"indexer tensors, got {len(p_base_addrs)} tensor(s)"
+                f"MembPull P metadata for {layer_name} must expose two main K/V "
+                f"tensors, got main_tensor_count={main_tensor_count}, "
+                f"total={len(p_base_addrs)}"
             )
+        p_has_indexer = bool(
+            p_meta.get("has_indexer", len(p_base_addrs) > main_tensor_count)
+        )
 
         cpu_pool = state.cpu_pools[offload_id]
         if cpu_pool is None:
@@ -275,30 +307,42 @@ class MembPullReadThread(threading.Thread):
                     f"P=({p_k_len}, {p_v_len}), D=({d_k_len}, {d_v_len})"
                 )
         d_indexer = state.indexer_tensors[pool_idx]
-        if d_indexer is None:
-            raise RuntimeError(f"MembPull D indexer tensor is missing for {layer_name}")
-        p_dsa_len = p_block_len[2] * p_block_size_scale[2]
-        d_dsa_row_len = d_indexer.element_size() * math.prod(d_indexer.shape[1:])
-        d_dsa_len = d_dsa_row_len * (d_indexer.shape[0] // state.num_blocks)
-        if p_dsa_len != d_dsa_len:
+        if p_has_indexer != (d_indexer is not None):
             raise RuntimeError(
-                f"MembPull indexer layout mismatch for {layer_name}: "
-                f"P external block bytes={p_dsa_len}, D={d_dsa_len}"
+                f"MembPull indexer presence mismatch for {layer_name}: "
+                f"P={p_has_indexer}, D={d_indexer is not None}"
             )
-        indexer = {
-            "p_dsa_base": p_base_addrs[2],
-            "block_len": p_dsa_len,
-            "d_base": d_indexer.data_ptr(),
-            "shape": tuple(d_indexer.shape),
-        }
+        indexer = None
+        if p_has_indexer:
+            indexer_pos = main_tensor_count
+            if len(p_base_addrs) <= indexer_pos:
+                raise RuntimeError(
+                    f"MembPull P metadata for {layer_name} marks an indexer but "
+                    "does not expose its tensor"
+                )
+            p_dsa_len = p_block_len[indexer_pos] * p_block_size_scale[indexer_pos]
+            d_dsa_row_len = d_indexer.element_size() * math.prod(d_indexer.shape[1:])
+            d_dsa_len = d_dsa_row_len * (d_indexer.shape[0] // state.num_blocks)
+            if p_dsa_len != d_dsa_len:
+                raise RuntimeError(
+                    f"MembPull indexer layout mismatch for {layer_name}: "
+                    f"P external block bytes={p_dsa_len}, D={d_dsa_len}"
+                )
+            indexer = {
+                "p_dsa_base": p_base_addrs[indexer_pos],
+                "block_len": p_dsa_len,
+                "d_base": d_indexer.data_ptr(),
+                "shape": tuple(d_indexer.shape),
+            }
 
         scale = None
         scale_tensor = state.indexer_scale_tensors[pool_idx] if pool_idx < len(state.indexer_scale_tensors) else None
         if scale_tensor is not None:
-            if len(p_base_addrs) < 4:
+            scale_pos = main_tensor_count + 1
+            if len(p_base_addrs) <= scale_pos:
                 scale = {"error": "p_addr_mismatch", "p_n": len(p_base_addrs)}
             else:
-                p_scale_len = p_block_len[3] * p_block_size_scale[3]
+                p_scale_len = p_block_len[scale_pos] * p_block_size_scale[scale_pos]
                 d_scale_row_len = scale_tensor.element_size() * math.prod(scale_tensor.shape[1:])
                 d_scale_factor = scale_tensor.shape[0] // state.num_blocks
                 d_scale_len = d_scale_row_len * d_scale_factor
@@ -310,7 +354,7 @@ class MembPullReadThread(threading.Thread):
                     }
                 else:
                     scale = {
-                        "p_scale_base": p_base_addrs[3],
+                        "p_scale_base": p_base_addrs[scale_pos],
                         "block_len": p_scale_len,
                         "d_scale_base": scale_tensor.data_ptr(),
                     }
@@ -336,6 +380,8 @@ class MembPullReadThread(threading.Thread):
         p_main_block_ids: list[int],
         p_indexer_block_ids: list[int],
         want_info: bool,
+        main_start_block: int = 0,
+        indexer_start_block: int = 0,
     ) -> tuple[list[int], list[int], list[int], dict[str, Any] | None]:
         state = self._state
         layer_name = layer["layer_name"]
@@ -348,7 +394,23 @@ class MembPullReadThread(threading.Thread):
                 layer_name,
             )
             return [], [], [], None
-        d_main_ids, d_indexer_ids = dest
+        all_d_main_ids, all_d_indexer_ids = dest
+        main_end_block = main_start_block + len(p_main_block_ids)
+        if main_end_block > len(all_d_main_ids):
+            raise RuntimeError(
+                f"MembPull main destination range is incomplete for req {ext_req_id}: "
+                f"range=[{main_start_block}, {main_end_block}), "
+                f"allocated={len(all_d_main_ids)}"
+            )
+        d_main_ids = all_d_main_ids[main_start_block:main_end_block]
+        indexer_end_block = indexer_start_block + len(p_indexer_block_ids)
+        if indexer_end_block > len(all_d_indexer_ids):
+            raise RuntimeError(
+                f"MembPull indexer destination range is incomplete for req {ext_req_id}: "
+                f"range=[{indexer_start_block}, {indexer_end_block}), "
+                f"allocated={len(all_d_indexer_ids)}"
+            )
+        d_indexer_ids = all_d_indexer_ids[indexer_start_block:indexer_end_block]
         if envs.VLLM_ASCEND_SFA_DEBUG:
             logger.info(
                 "MembPull D resolve dest: layer=%s, req=%s, p_main_ids=%s, "
@@ -360,10 +422,9 @@ class MembPullReadThread(threading.Thread):
                 d_main_ids,
                 d_indexer_ids,
             )
-        if not p_main_block_ids or not p_indexer_block_ids:
+        if not p_main_block_ids and not p_indexer_block_ids:
             raise RuntimeError(
-                f"MembPull source block ids are incomplete for {layer_name}: "
-                f"main={len(p_main_block_ids)}, indexer={len(p_indexer_block_ids)}"
+                f"MembPull source block ids are empty for {layer_name}"
             )
 
         p_k_base, p_v_base = layer["p_k_base"], layer["p_v_base"]
@@ -397,7 +458,7 @@ class MembPullReadThread(threading.Thread):
             length_chunks.append(clen)
 
         idx = layer["indexer"]
-        if len(p_indexer_block_ids) != len(d_indexer_ids):
+        if idx is not None and len(p_indexer_block_ids) != len(d_indexer_ids):
             raise RuntimeError(
                 f"MembPull indexer block count mismatch for req {ext_req_id}: "
                 f"P={len(p_indexer_block_ids)}, D={len(d_indexer_ids)}"
@@ -528,7 +589,7 @@ class MembPullReadThread(threading.Thread):
     def _do_read_batch(
         self,
         layer_name: str,
-        read_reqs: list[tuple[str, list[int], list[int]]],
+        read_reqs: list[tuple[str, list[int], list[int], int, int]],
         p_session: str | None = None,
         p_layer_meta: dict[str, Any] | None = None,
     ) -> None:
@@ -546,13 +607,21 @@ class MembPullReadThread(threading.Thread):
         all_peer_ptrs: list[int] = []
         all_lengths: list[int] = []
         read_infos: list[dict[str, Any]] = []
-        for ext_req_id, p_main_block_ids, p_indexer_block_ids in read_reqs:
+        for (
+            ext_req_id,
+            p_main_block_ids,
+            p_indexer_block_ids,
+            main_start_block,
+            indexer_start_block,
+        ) in read_reqs:
             local_ptrs, peer_ptrs, lengths, read_info = self._build_req_descriptors(
                 layer,
                 ext_req_id,
                 p_main_block_ids,
                 p_indexer_block_ids,
                 want_info,
+                main_start_block,
+                indexer_start_block,
             )
             if not local_ptrs:
                 raise RuntimeError(

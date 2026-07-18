@@ -53,6 +53,12 @@ class LayerMetadata:
     kv_caches_base_addr: list[int]
     block_len: list[int]
     block_size_scale: list[int]
+    # The first ``main_tensor_count`` entries belong to the main MLA cache.
+    # Remaining entries, when ``has_indexer`` is true, belong to the indexer.
+    # Keeping this explicit is required for sparse layers that reuse top-k
+    # indices and therefore do not own an indexer cache at all.
+    main_tensor_count: int = 2
+    has_indexer: bool = False
 
 
 class SfaPDAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):

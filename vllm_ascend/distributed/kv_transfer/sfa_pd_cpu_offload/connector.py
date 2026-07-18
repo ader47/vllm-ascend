@@ -67,13 +67,6 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # SFA path is layer-wise on both sides.
         self.use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", True)
         self.engine_id = vllm_config.kv_transfer_config.engine_id
-        # Layer-reuse mate map. For a layer that time-multiplexes a shared HBM
-        # slot, the "mate" is the slot's previous occupant whose KV D must finish
-        # reading before this layer may overwrite the slot. ``prefetch_layer_map``
-        # maps each reusing layer -> its mate; empty when layer reuse is disabled
-        # (so the gate below becomes a no-op, matching the no-reuse behavior).
-        self._reuse_mate_map: dict[int, int | None] = {}
-
         # Decode offload is asymmetric: P exposes regular paged KV while D owns
         # the KVOffloadDecodeManager CPU pool.
         from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
@@ -155,12 +148,6 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
-    def set_gva_layerwise_reuse_plan(self, reuse_mate_map: dict[int, int | None]) -> None:
-        """Install the AscendStore GVA reuse gates on the producer connector."""
-
-        if self.is_producer:
-            self._reuse_mate_map = reuse_mate_map
-
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert self.connector_worker is not None
         if self.is_consumer:
@@ -179,9 +166,8 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """Per-layer gate called before each layer's attention computation.
 
         D-side: no-op (SFA loads through ``KVOffloadDecodeManager`` directly).
-        P-side: before this layer writes HBM, wait for D to finish any transfer
-        of the same layer from the previous scheduler step. With layer reuse,
-        also wait for the shared slot's previous physical-layer occupant.
+        P-side: before this layer writes HBM, wait for D to finish every pending
+        read from the physical main/indexer storage slots touched by this layer.
 
         The per-layer send-done events are cleared when a READ_READY_BATCH is
         sent and set again by the pipelined MembPull send thread when READ_DONE
@@ -194,13 +180,6 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             return
         layer_idx = int(match.group(1))
         self.wait_for_layer_send(layer_idx)
-        mate = self._reuse_mate_map.get(layer_idx)
-        if mate is None and self.connector_worker is not None and hasattr(
-            self.connector_worker, "get_reuse_mate"
-        ):
-            mate = self.connector_worker.get_reuse_mate(layer_idx)
-        if mate is not None and mate != layer_idx:
-            self.wait_for_layer_send(mate)
 
     def save_kv_layer(
         self,
@@ -258,6 +237,15 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_worker is None:
             return None
         return self.connector_worker.get_num_cpu_blocks(req_ids)
+
+    def shutdown(self) -> None:
+        for component in (self.connector_worker, self.connector_scheduler):
+            shutdown = getattr(component, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+
+    def close(self) -> None:
+        self.shutdown()
 
     # P-side buffer-reuse gate: block until D has read a layer's source KV buffer,
     # so the buffer may be reused by a later layer.
