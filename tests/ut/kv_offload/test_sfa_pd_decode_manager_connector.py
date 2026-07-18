@@ -10,6 +10,11 @@ import pytest
 pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from vllm.distributed.kv_transfer.kv_connector.factory import (  # noqa: E402
+    KVConnectorFactory,
+)
+
+from vllm_ascend.distributed.kv_transfer import register_connector  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.connector import (  # noqa: E402
     SFAPDCpuOffloadConnector,
 )
@@ -33,6 +38,20 @@ from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.send_thread import (
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.worker import (  # noqa: E402
     SFAPDCpuOffloadProducerWorker,
 )
+
+
+def test_sfa_pd_cpu_offload_connector_is_registered():
+    with (
+        patch.object(KVConnectorFactory, "_registry", {}),
+        patch.object(KVConnectorFactory, "register_connector") as mock_register,
+    ):
+        register_connector()
+
+    mock_register.assert_any_call(
+        "SFAPDCpuOffloadConnector",
+        "vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.connector",
+        "SFAPDCpuOffloadConnector",
+    )
 
 
 def test_infer_separate_main_and_indexer_groups():
