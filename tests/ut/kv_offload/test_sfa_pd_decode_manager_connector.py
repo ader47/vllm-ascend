@@ -163,6 +163,103 @@ def test_non_tp0_read_descriptors_still_transfer_indexer():
     assert info["n_indexer"] == 1
 
 
+@pytest.mark.parametrize(
+    (
+        "k_cpu_ptr",
+        "v_cpu_ptr",
+        "has_indexer",
+        "expected_local",
+        "expected_peer",
+        "expected_lengths",
+    ),
+    [
+        (None, None, True, [8040], [7035], [5]),
+        (None, None, False, [], [], []),
+        (3000, 4000, False, [3030, 4060], [1010, 2020], [20, 40]),
+        (3000, 4000, True, [3030, 4060, 8040], [1010, 2020, 7035], [20, 40, 5]),
+    ],
+    ids=[
+        "non-tp0-indexer",
+        "non-tp0-main-only-noop",
+        "tp0-main-only",
+        "tp0-indexer",
+    ],
+)
+def test_read_descriptors_cover_tp_ownership_and_optional_indexer(
+    k_cpu_ptr,
+    v_cpu_ptr,
+    has_indexer,
+    expected_local,
+    expected_peer,
+    expected_lengths,
+):
+    thread = _make_read_thread()
+
+    local, peer, lengths, _ = thread._build_req_descriptors(
+        _make_layer(
+            k_cpu_ptr=k_cpu_ptr,
+            v_cpu_ptr=v_cpu_ptr,
+            has_indexer=has_indexer,
+        ),
+        "req-0",
+        p_main_block_ids=[1, 2],
+        p_indexer_block_ids=[7] if has_indexer else [],
+        want_info=True,
+    )
+
+    assert local == expected_local
+    assert peer == expected_peer
+    assert lengths == expected_lengths
+
+
+def test_non_tp0_main_only_layer_acknowledges_without_memfabric_read():
+    thread = _make_read_thread()
+    thread.engine = MagicMock()
+    layer = _make_layer(k_cpu_ptr=None, v_cpu_ptr=None, has_indexer=False)
+    thread._resolve_read_layer = MagicMock(return_value=layer)
+
+    thread._do_read_batch(
+        layer["layer_name"],
+        [("req-0", [1, 2], [], 0, 0)],
+        p_session="p-session",
+        p_layer_meta={},
+    )
+
+    thread.engine.batch_transfer_sync_read.assert_not_called()
+
+
+def test_owned_component_without_descriptors_still_fails():
+    thread = _make_read_thread()
+    thread.engine = MagicMock()
+    layer = _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000, has_indexer=False)
+    thread._resolve_read_layer = MagicMock(return_value=layer)
+    thread._build_req_descriptors = MagicMock(return_value=([], [], [], None))
+
+    with pytest.raises(RuntimeError, match="built no transfer descriptors"):
+        thread._do_read_batch(
+            layer["layer_name"],
+            [("req-0", [1, 2], [], 0, 0)],
+            p_session="p-session",
+            p_layer_meta={},
+        )
+
+    thread.engine.batch_transfer_sync_read.assert_not_called()
+
+
+def test_read_descriptor_rejects_missing_destination_blocks():
+    thread = _make_read_thread()
+    thread._state.dest_blocks_by_req.clear()
+
+    with pytest.raises(RuntimeError, match="no destination blocks"):
+        thread._build_req_descriptors(
+            _make_layer(k_cpu_ptr=None, v_cpu_ptr=None, has_indexer=False),
+            "req-0",
+            p_main_block_ids=[1],
+            p_indexer_block_ids=[],
+            want_info=False,
+        )
+
+
 def test_read_descriptor_rejects_incomplete_indexer_transfer():
     thread = _make_read_thread()
 

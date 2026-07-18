@@ -388,12 +388,10 @@ class MembPullReadThread(threading.Thread):
 
         dest = state.dest_blocks_by_req.get(ext_req_id)
         if dest is None:
-            logger.warning(
-                "MembPull _do_read: no dest blocks on D for req %s (layer %s), skip",
-                ext_req_id,
-                layer_name,
+            raise RuntimeError(
+                f"MembPull has no destination blocks on D for req {ext_req_id} "
+                f"(layer {layer_name})"
             )
-            return [], [], [], None
         all_d_main_ids, all_d_indexer_ids = dest
         main_end_block = main_start_block + len(p_main_block_ids)
         if main_end_block > len(all_d_main_ids):
@@ -516,8 +514,9 @@ class MembPullReadThread(threading.Thread):
                 length_chunks.append(clen)
 
         if not peer_chunks:
-            logger.warning(
-                "MembPull _do_read: nothing to transfer for %s (main=%d, indexer=%d)",
+            logger.debug(
+                "MembPull _do_read: this rank owns no requested transfer for %s "
+                "(main=%d, indexer=%d)",
                 layer_name,
                 n_main,
                 n_indexer,
@@ -624,9 +623,29 @@ class MembPullReadThread(threading.Thread):
                 indexer_start_block,
             )
             if not local_ptrs:
-                raise RuntimeError(
-                    f"MembPull built no transfer descriptors for layer {layer_name}, req {ext_req_id}"
+                owns_requested_main = (
+                    layer["k_cpu_ptr"] is not None
+                    and layer["v_cpu_ptr"] is not None
+                    and bool(p_main_block_ids)
                 )
+                owns_requested_indexer = layer["indexer"] is not None and bool(
+                    p_indexer_block_ids
+                )
+                if owns_requested_main or owns_requested_indexer:
+                    raise RuntimeError(
+                        f"MembPull built no transfer descriptors for layer "
+                        f"{layer_name}, req {ext_req_id}"
+                    )
+                if envs.VLLM_ASCEND_SFA_DEBUG:
+                    logger.info(
+                        "MembPull D skips local no-op: layer=%s, req=%s, "
+                        "P main blocks=%d, P indexer blocks=%d",
+                        layer_name,
+                        ext_req_id,
+                        len(p_main_block_ids),
+                        len(p_indexer_block_ids),
+                    )
+                continue
             all_local_ptrs.extend(local_ptrs)
             all_peer_ptrs.extend(peer_ptrs)
             all_lengths.extend(lengths)
@@ -634,9 +653,11 @@ class MembPullReadThread(threading.Thread):
                 read_infos.append(read_info)
 
         if not all_local_ptrs:
-            raise RuntimeError(
-                f"MembPull built no transfer descriptors for layer {layer_name}, reqs={len(read_reqs)}"
-            )
+            # Main KV is replicated across TP ranks and only TP0 owns its CPU
+            # destination. A non-TP0 rank therefore has no local transfer for
+            # a main-only layer (or for a chunk with no indexer blocks ready),
+            # but it still has to acknowledge READ_DONE so P can reuse storage.
+            return
 
         if envs.VLLM_ASCEND_SFA_DEBUG:
             atomic_total = sum(r.get("atomic_transfers", 0) for r in read_infos)
