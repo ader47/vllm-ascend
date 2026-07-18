@@ -1685,6 +1685,29 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         self.assertFalse(worker.layer_save_finished_events[1].is_set())
         self.assertFalse(worker.layer_save_finished_events[2].is_set())
 
+    def test_empty_layer_save_waits_for_pd_before_completion(self):
+        worker = self._make_worker()
+        worker.num_layers = 2
+        worker.current_layer = 0
+        worker.layerwise_offload = True
+        worker.prefetch_layer_map = {1: 0}
+        worker.layer_save_tasks = [[], []]
+        worker.sync_save_events = [MagicMock(), MagicMock()]
+        worker.layer_save_finished_events = [threading.Event(), threading.Event()]
+        layer_finished = worker.layer_save_finished_events[0]
+
+        def wait_for_pd(layer_id):
+            self.assertEqual(layer_id, 0)
+            self.assertFalse(layer_finished.is_set())
+
+        worker._layerwise_pd_transfer_waiter = MagicMock(side_effect=wait_for_pd)
+        worker.kv_send_thread = MagicMock()
+
+        worker.save_kv_layer(MagicMock())
+
+        worker._layerwise_pd_transfer_waiter.assert_called_once_with(0)
+        self.assertTrue(layer_finished.is_set())
+
     def test_alloc_gvas_for_save_stores_only_planned_range(self):
         worker = self._make_worker()
         worker.use_gva_layerwise = True

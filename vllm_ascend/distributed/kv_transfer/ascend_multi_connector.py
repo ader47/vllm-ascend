@@ -26,6 +26,48 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager or self._all_support_hma, (
             "HMA should not be enabled unless all sub-connectors support it"
         )
+        self._configure_layerwise_pd_completion()
+
+    def _configure_layerwise_pd_completion(self) -> None:
+        self._pd_completion_connector = next(
+            (
+                connector
+                for connector in self._connectors
+                if getattr(connector, "is_producer", False)
+                and getattr(connector, "connector_worker", None) is not None
+                and callable(getattr(connector, "wait_for_layer_send", None))
+            ),
+            None,
+        )
+        if self._pd_completion_connector is not None:
+            for connector in self._connectors:
+                set_waiter = getattr(connector, "set_layerwise_pd_transfer_waiter", None)
+                if callable(set_waiter):
+                    set_waiter(self._pd_completion_connector.wait_for_layer_send)
+
+    def _pd_connector_first(self):
+        provider = getattr(self, "_pd_completion_connector", None)
+        if provider is not None:
+            yield provider
+        yield from (connector for connector in self._connectors if connector is not provider)
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        # Close the PD-reuse gate before a sibling connector can issue an H2D
+        # load into the shared buffer, regardless of connector config order.
+        for connector in self._pd_connector_first():
+            connector.wait_for_layer_load(layer_name)
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer,
+        attn_metadata: Any,
+        **kwargs,
+    ) -> None:
+        # The producer clears the slot completion gate before AscendStore
+        # queues its asynchronous save, eliminating a publish/wait race.
+        for connector in self._pd_connector_first():
+            connector.save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         chosen_connector = self._requests_to_connector.get(request.request_id, -1)

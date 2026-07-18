@@ -771,7 +771,7 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
 
 
 class TestGVALayerSendingThread(unittest.TestCase):
-    def _make_thread(self, copy_result=0, builders=None):
+    def _make_thread(self, copy_result=0, builders=None, pd_transfer_waiter=None):
         store = MagicMock()
         store.store.batch_copy.return_value = copy_result
         db = MagicMock()
@@ -790,6 +790,7 @@ class TestGVALayerSendingThread(unittest.TestCase):
             layer_save_finished_events=[layer_finished],
             sync_save_events=[MagicMock()],
             group_array_builders=builders,
+            pd_transfer_waiter=pd_transfer_waiter,
         )
         return thread, store, layer_finished
 
@@ -861,6 +862,68 @@ class TestGVALayerSendingThread(unittest.TestCase):
 
         self.assertEqual(thread.stored_requests["r1"], 1)
         self.assertEqual(thread.get_and_clear_finished_requests(), set())
+        self.assertFalse(layer_finished.is_set())
+
+    def test_pd_read_finishes_before_layer_save_completion(self):
+        builder = MagicMock()
+        builder.build_addrs.return_value = LayerTransferArrays(
+            np.asarray([10]),
+            np.asarray([16]),
+            np.asarray([100]),
+        )
+        call_order = []
+
+        def wait_for_pd(layer_id):
+            call_order.append(("pd", layer_id))
+
+        thread, store, layer_finished = self._make_thread(
+            builders=[builder],
+            pd_transfer_waiter=wait_for_pd,
+        )
+        store.store.batch_copy.side_effect = lambda *_args: call_order.append(("save", 0)) or 0
+        tasks = [
+            LayerTransferTask(
+                layer_id=0,
+                block_ranges=[],
+                transfer_data=MagicMock(),
+                completion=TransferCompletion([], []),
+            )
+        ]
+        thread.request_queue.put(tasks)
+
+        thread._handle_request(tasks)
+
+        self.assertEqual(call_order, [("save", 0), ("pd", 0)])
+        self.assertTrue(layer_finished.is_set())
+
+    def test_pd_read_failure_does_not_release_layer_save_gate(self):
+        builder = MagicMock()
+        builder.build_addrs.return_value = LayerTransferArrays(
+            np.asarray([10]),
+            np.asarray([16]),
+            np.asarray([100]),
+        )
+
+        def fail_pd_read(_layer_id):
+            raise RuntimeError("PD read failed")
+
+        thread, _, layer_finished = self._make_thread(
+            builders=[builder],
+            pd_transfer_waiter=fail_pd_read,
+        )
+        tasks = [
+            LayerTransferTask(
+                layer_id=0,
+                block_ranges=[],
+                transfer_data=MagicMock(),
+                completion=TransferCompletion([], []),
+            )
+        ]
+        thread.request_queue.put(tasks)
+
+        with self.assertRaisesRegex(RuntimeError, "PD read failed"):
+            thread._handle_request(tasks)
+
         self.assertFalse(layer_finished.is_set())
 
 
