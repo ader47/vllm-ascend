@@ -29,8 +29,11 @@ from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
 @dataclass
 class ProducerSendState:
     total_layers: int
+    last_layer_idx: int
     layer_metadata: dict[str, LayerMetadata]
     p_session: str
+    main_group_idx: int
+    indexer_group_idx: int
     layer_transfer_finished_events: list[threading.Event] | None
     layer_transfer_pending_events: list[threading.Event] | None
 
@@ -52,9 +55,10 @@ class MembPullSendingThread(threading.Thread):
     ) -> None:
         super().__init__(daemon=True, name="SfaPDMembPullSendingThread")
         self.timeout = 10.0
-        self._mf_meta_sent = False
+        self._mf_meta_sent_paths: set[str] = set()
         self._state = state
         self.total_layers = state.total_layers
+        self.last_layer_idx = state.last_layer_idx
         self.ready_event = ready_event
         self.layer_transfer_finished_events = state.layer_transfer_finished_events
         self.layer_transfer_pending_events = state.layer_transfer_pending_events
@@ -68,6 +72,8 @@ class MembPullSendingThread(threading.Thread):
         self._persist_ctx = zmq.Context()
         self._dealers: dict[str, Any] = {}
         self._stopped = False
+        self._pending_reads_by_layer: dict[int, int] = {}
+        self._layer_read_errors: dict[int, str] = {}
         # Per-layer fresh compute-stream events recorded by the producer in
         # save_kv_layer right after KV scatter.
         self._p_save_events: dict[int, Any] = {}
@@ -101,12 +107,14 @@ class MembPullSendingThread(threading.Thread):
                     try:
                         self._process_send_task(send_task, encoder)
                     except Exception as e:
+                        layer_idx = getattr(send_task, "layer_idx", -1)
                         logger.error(
                             "MembPull send task failed (layer=%s): %s: %s",
-                            getattr(send_task, "layer_idx", "?"),
+                            layer_idx,
                             type(e).__name__,
                             e,
                         )
+                        self._fail_layer(layer_idx, str(e))
                 except queue.Empty:
                     pass
                 try:
@@ -137,68 +145,89 @@ class MembPullSendingThread(threading.Thread):
             send_task.wait_event.synchronize()
         layer_name = send_task.layer_name
 
-        read_reqs: list[tuple[str, list[int]]] = []
-        done_ext_ids: list[str] = []
-        endpoints: set[tuple[str, int]] = set()
-        layer_meta = self._state.layer_metadata[layer_name]
-        layer_group_idx = layer_meta.tensor_group_idx[0]
+        endpoint_payloads: dict[
+            tuple[str, int],
+            tuple[list[tuple[str, list[int], list[int]]], list[str]],
+        ] = {}
         for req_id, rm in send_task.send_request.items():
-            p_block_ids = rm.local_block_ids[layer_group_idx] if len(rm.local_block_ids) > layer_group_idx else []
+            p_main_block_ids = (
+                rm.local_block_ids[self._state.main_group_idx]
+                if len(rm.local_block_ids) > self._state.main_group_idx
+                else []
+            )
+            p_indexer_block_ids = (
+                rm.local_block_ids[self._state.indexer_group_idx]
+                if len(rm.local_block_ids) > self._state.indexer_group_idx
+                else []
+            )
             ext_id = get_external_request_id(req_id)
             has_endpoint = bool(rm.remote_host) and bool(rm.remote_port)
-            chunk_done = layer_idx == self.total_layers - 1 and rm.chunk_finish and has_endpoint
-            if p_block_ids and has_endpoint:
-                read_reqs.append((ext_id, p_block_ids))
-            if chunk_done:
-                done_ext_ids.append(ext_id)
-            if (p_block_ids or chunk_done) and has_endpoint:
-                endpoints.add((rm.remote_host, rm.remote_port))
+            chunk_done = layer_idx == self.last_layer_idx and rm.chunk_finish and has_endpoint
+            if (p_main_block_ids or p_indexer_block_ids or chunk_done) and has_endpoint:
+                endpoint = (rm.remote_host, rm.remote_port)
+                read_reqs, done_ext_ids = endpoint_payloads.setdefault(endpoint, ([], []))
+                if p_main_block_ids or p_indexer_block_ids:
+                    if not p_main_block_ids or not p_indexer_block_ids:
+                        raise RuntimeError(
+                            f"MembPull P source blocks are incomplete for req {ext_id}: "
+                            f"main={len(p_main_block_ids)}, indexer={len(p_indexer_block_ids)}"
+                        )
+                    read_reqs.append((ext_id, p_main_block_ids, p_indexer_block_ids))
+                if chunk_done:
+                    done_ext_ids.append(ext_id)
             if envs.VLLM_ASCEND_SFA_DEBUG:
                 logger.info(
-                    "MembPull P add READ_READY_BATCH item: layer=%d (%s), req=%s, p_blocks=%d, done=%s",
+                    "MembPull P add READ_READY_BATCH item: layer=%d (%s), req=%s, "
+                    "main_blocks=%d, indexer_blocks=%d, done=%s",
                     layer_idx,
                     layer_name,
                     ext_id,
-                    len(p_block_ids),
+                    len(p_main_block_ids),
+                    len(p_indexer_block_ids),
                     chunk_done,
                 )
 
-        if read_reqs or done_ext_ids:
+        if endpoint_payloads:
             if 0 <= layer_idx < len(self.layer_send_done_events):
                 self.layer_send_done_events[layer_idx].clear()
             if self.layer_transfer_finished_events is not None and 0 <= layer_idx < len(
                 self.layer_transfer_finished_events
             ):
                 self.layer_transfer_finished_events[layer_idx].clear()
-            if len(endpoints) != 1:
-                raise RuntimeError(
-                    f"MembPull layer {layer_idx} expects exactly one D endpoint, got {sorted(endpoints)}"
+            self._pending_reads_by_layer[layer_idx] = len(endpoint_payloads)
+            self._layer_read_errors.pop(layer_idx, None)
+            for (remote_host, remote_port), (read_reqs, done_ext_ids) in endpoint_payloads.items():
+                path = make_zmq_path("tcp", remote_host, remote_port)
+                dealer = self._ensure_dealer(path)
+                if path not in self._mf_meta_sent_paths:
+                    self._send_mf_meta(path, dealer, encoder)
+                dealer.send(
+                    encoder.encode(
+                        (READ_READY_BATCH, layer_idx, layer_name, read_reqs, done_ext_ids)
+                    )
                 )
-            remote_host, remote_port = next(iter(endpoints))
-            path = make_zmq_path("tcp", remote_host, remote_port)
-            dealer = self._ensure_dealer(path)
-
-            if not self._mf_meta_sent:
-                self._send_mf_meta(dealer, encoder)
-            dealer.send(encoder.encode((READ_READY_BATCH, layer_idx, layer_name, read_reqs, done_ext_ids)))
-            if envs.VLLM_ASCEND_SFA_DEBUG:
-                logger.info(
-                    "MembPull P send READ_READY_BATCH: layer=%d (%s), reqs=%d, done_reqs=%d",
-                    layer_idx,
-                    layer_name,
-                    len(read_reqs),
-                    len(done_ext_ids),
-                )
+                if envs.VLLM_ASCEND_SFA_DEBUG:
+                    logger.info(
+                        "MembPull P send READ_READY_BATCH: layer=%d (%s), "
+                        "endpoint=%s:%d, reqs=%d, done_reqs=%d",
+                        layer_idx,
+                        layer_name,
+                        remote_host,
+                        remote_port,
+                        len(read_reqs),
+                        len(done_ext_ids),
+                    )
         else:
             self._signal_layer_done(layer_idx)
 
-    def _send_mf_meta(self, dealer, encoder: msgspec.msgpack.Encoder) -> None:
+    def _send_mf_meta(self, path: str, dealer, encoder: msgspec.msgpack.Encoder) -> None:
         p_meta_dict = {}
         for ln, meta in self._state.layer_metadata.items():
             p_meta_dict[ln] = {
                 "base_addrs": list(meta.kv_caches_base_addr),
                 "block_len": list(meta.block_len),
                 "block_size_scale": list(meta.block_size_scale),
+                "tensor_group_idx": list(meta.tensor_group_idx),
             }
         dealer.send(encoder.encode((MF_META, self._state.p_session, encoder.encode(p_meta_dict))))
         if dealer.poll(timeout=int(self.timeout * 1000)):
@@ -206,7 +235,7 @@ class MembPullSendingThread(threading.Thread):
             payload = [f for f in frames if f != b""]
             if payload != [b"ACK"]:
                 raise RuntimeError(f"MembPull P MF_META got unexpected reply: {payload!r}")
-            self._mf_meta_sent = True
+            self._mf_meta_sent_paths.add(path)
             logger.info(
                 "MembPull P sent MF_META: session=%s, layers=%d",
                 self._state.p_session,
@@ -241,9 +270,16 @@ class MembPullSendingThread(threading.Thread):
                         layer_idx,
                         error,
                     )
+                    self._layer_read_errors[layer_idx] = str(error)
                     self._signal_layer_done(layer_idx)
 
     def _signal_layer_done(self, layer_idx: int) -> None:
+        pending = self._pending_reads_by_layer.get(layer_idx)
+        if pending is not None:
+            if pending > 1:
+                self._pending_reads_by_layer[layer_idx] = pending - 1
+                return
+            self._pending_reads_by_layer.pop(layer_idx, None)
         if 0 <= layer_idx < len(self.layer_send_done_events):
             self.layer_send_done_events[layer_idx].set()
         if self.layer_transfer_finished_events is not None and 0 <= layer_idx < len(
@@ -254,3 +290,11 @@ class MembPullSendingThread(threading.Thread):
             self.layer_transfer_pending_events[layer_idx].clear()
         if envs.VLLM_ASCEND_SFA_DEBUG:
             logger.info("MembPull P layer send complete: layer=%d", layer_idx)
+
+    def _fail_layer(self, layer_idx: int, error: str) -> None:
+        self._pending_reads_by_layer.pop(layer_idx, None)
+        self._layer_read_errors[layer_idx] = error
+        self._signal_layer_done(layer_idx)
+
+    def get_layer_error(self, layer_idx: int) -> str | None:
+        return self._layer_read_errors.get(layer_idx)
