@@ -186,24 +186,6 @@ class SFAPDCpuOffloadConsumerWorker:
                         main_ids,
                     )
 
-    def set_req_ids(self, req_ids: list):
-        return
-
-    def prepare_lru_resident_and_load(
-        self,
-        layer_name: str,
-        num_tokens: int,
-        num_reqs: int,
-        topk_indices: torch.Tensor,
-        current_slots: torch.Tensor,
-        req_ids: torch.Tensor,
-        token_to_req: torch.Tensor | None = None,
-        capturing: bool = False,
-    ) -> bool:
-        # AscendSFAKVOffloadImpl calls KVOffloadDecodeManager.onload_topk_kv
-        # directly. This legacy duck-typed hook is intentionally inactive.
-        return False
-
     def save_kv_layer(
         self,
         layer_name: str,
@@ -442,16 +424,12 @@ class SFAPDCpuOffloadProducerWorker:
         self.layer_storage_slots: dict[int, tuple[int, ...]] = {}
         self.current_layer = 0
         self.kv_send_layer_thread: MembPullSendingThread | None = None
-        self.layer_send_done_events: list[threading.Event] | None = None
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         return set(), set()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         return set()
-
-    def set_req_ids(self, req_ids: list) -> None:
-        return
 
     def get_num_cpu_blocks(self, req_ids: list[str]) -> dict[str, int] | None:
         return None
@@ -540,7 +518,6 @@ class SFAPDCpuOffloadProducerWorker:
 
     def _build_producer_send_state(self) -> ProducerSendState:
         return ProducerSendState(
-            total_layers=self.total_layers,
             last_layer_idx=self.last_layer_idx,
             layer_metadata=self.layer_metadata,
             p_session=global_memfabric_te.unique_id,
@@ -548,8 +525,6 @@ class SFAPDCpuOffloadProducerWorker:
             indexer_group_idx=self.indexer_group_idx,
             block_sizes=tuple(self.block_size),
             layer_storage_slots=self.layer_storage_slots,
-            layer_transfer_finished_events=None,
-            layer_transfer_pending_events=None,
         )
 
     @staticmethod
@@ -651,7 +626,6 @@ class SFAPDCpuOffloadProducerWorker:
         # checksums (VLLM_ASCEND_MF_VERIFY=1): P sums its source blocks so
         # the user can compare against D's destination sums in the logs.
         self.kv_send_layer_thread._source_kv_caches = kv_caches
-        self.layer_send_done_events = self.kv_send_layer_thread.layer_send_done_events
         logger.info(
             "MembPull P registered kv caches: layers=%d, p_session=%s",
             len(self.layer_metadata),
@@ -790,19 +764,6 @@ class SFAPDCpuOffloadProducerWorker:
                     lambda slot_id=slot_id: self.kv_send_layer_thread.get_storage_error(slot_id),
                     f"physical KV storage slot {slot_id} for layer {layer_idx}",
                 )
-        elif 0 <= layer_idx < len(self.layer_send_done_events or ()):
-            self._wait_for_pd_read_completion(
-                self.layer_send_done_events[layer_idx],
-                lambda: self.kv_send_layer_thread.get_layer_error(layer_idx),
-                f"layer {layer_idx} KV",
-            )
-
-    def get_layer_send_event(self, layer_idx: int) -> threading.Event | None:
-        if self.layer_send_done_events is None:
-            return None
-        if 0 <= layer_idx < len(self.layer_send_done_events):
-            return self.layer_send_done_events[layer_idx]
-        return None
 
     def shutdown(self) -> None:
         if self.kv_send_layer_thread is not None:

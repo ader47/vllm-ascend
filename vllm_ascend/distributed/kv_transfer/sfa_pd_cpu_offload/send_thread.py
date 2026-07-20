@@ -30,7 +30,6 @@ THREAD_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 @dataclass
 class ProducerSendState:
-    total_layers: int
     last_layer_idx: int
     layer_metadata: dict[str, LayerMetadata]
     p_session: str
@@ -38,8 +37,6 @@ class ProducerSendState:
     indexer_group_idx: int
     block_sizes: tuple[int, ...]
     layer_storage_slots: dict[int, tuple[int, ...]]
-    layer_transfer_finished_events: list[threading.Event] | None
-    layer_transfer_pending_events: list[threading.Event] | None
 
 
 class MembPullSendingThread(threading.Thread):
@@ -61,24 +58,14 @@ class MembPullSendingThread(threading.Thread):
         self.timeout = 10.0
         self._mf_meta_sent_paths: set[str] = set()
         self._state = state
-        self.total_layers = state.total_layers
         self.last_layer_idx = state.last_layer_idx
         self.ready_event = ready_event
-        self.layer_transfer_finished_events = state.layer_transfer_finished_events
-        self.layer_transfer_pending_events = state.layer_transfer_pending_events
         self.send_queue: queue.Queue[SendTask] = queue.Queue()
-        # Set means the layer's source buffer has no pending D-side read.
-        self.layer_send_done_events: list[threading.Event] = []
-        for _ in range(state.total_layers):
-            event = threading.Event()
-            event.set()
-            self.layer_send_done_events.append(event)
         self._persist_ctx = zmq.Context()
         self._dealers: dict[str, Any] = {}
         self._stopped = False
         self.startup_error: BaseException | None = None
         self._pending_reads_by_layer: dict[int, int] = {}
-        self._layer_read_errors: dict[int, str] = {}
         num_storage_slots = max(
             (slot for slots in state.layer_storage_slots.values() for slot in slots),
             default=-1,
@@ -179,8 +166,6 @@ class MembPullSendingThread(threading.Thread):
 
     def mark_layer_pending(self, layer_idx: int) -> None:
         """Close all gates protecting storage written by ``layer_idx``."""
-        if 0 <= layer_idx < len(self.layer_send_done_events):
-            self.layer_send_done_events[layer_idx].clear()
         for slot_id in self._state.layer_storage_slots.get(layer_idx, ()):
             self.storage_send_done_events[slot_id].clear()
             self._storage_read_errors.pop(slot_id, None)
@@ -194,6 +179,11 @@ class MembPullSendingThread(threading.Thread):
             send_task.wait_event.synchronize()
         layer_name = send_task.layer_name
 
+        # Group this layer's notifications by D-side endpoint so requests for
+        # the same ``(remote_host, remote_port)`` share one READ_READY_BATCH.
+        # Each value is ``(read_reqs, done_ext_ids)``; a read request contains
+        # ``(external_req_id, main_block_ids, indexer_block_ids,
+        # main_start_block, indexer_start_block)``.
         endpoint_payloads: dict[
             tuple[str, int],
             tuple[list[tuple[str, list[int], list[int], int, int]], list[str]],
@@ -269,12 +259,7 @@ class MembPullSendingThread(threading.Thread):
 
         if endpoint_payloads:
             self.mark_layer_pending(layer_idx)
-            if self.layer_transfer_finished_events is not None and 0 <= layer_idx < len(
-                self.layer_transfer_finished_events
-            ):
-                self.layer_transfer_finished_events[layer_idx].clear()
             self._pending_reads_by_layer[layer_idx] = len(endpoint_payloads)
-            self._layer_read_errors.pop(layer_idx, None)
             for (remote_host, remote_port), (read_reqs, done_ext_ids) in endpoint_payloads.items():
                 path = make_zmq_path("tcp", remote_host, remote_port)
                 dealer = self._ensure_dealer(path)
@@ -361,16 +346,8 @@ class MembPullSendingThread(threading.Thread):
                 self._pending_reads_by_layer[layer_idx] = pending - 1
                 return
             self._pending_reads_by_layer.pop(layer_idx, None)
-        if 0 <= layer_idx < len(self.layer_send_done_events):
-            self.layer_send_done_events[layer_idx].set()
         for slot_id in self._state.layer_storage_slots.get(layer_idx, ()):
             self.storage_send_done_events[slot_id].set()
-        if self.layer_transfer_finished_events is not None and 0 <= layer_idx < len(
-            self.layer_transfer_finished_events
-        ):
-            self.layer_transfer_finished_events[layer_idx].set()
-        if self.layer_transfer_pending_events is not None and 0 <= layer_idx < len(self.layer_transfer_pending_events):
-            self.layer_transfer_pending_events[layer_idx].clear()
         if envs.VLLM_ASCEND_SFA_DEBUG:
             logger.info("MembPull P layer send complete: layer=%d", layer_idx)
 
@@ -380,12 +357,8 @@ class MembPullSendingThread(threading.Thread):
         self._signal_layer_done(layer_idx)
 
     def _record_layer_error(self, layer_idx: int, error: str) -> None:
-        self._layer_read_errors[layer_idx] = error
         for slot_id in self._state.layer_storage_slots.get(layer_idx, ()):
             self._storage_read_errors[slot_id] = error
-
-    def get_layer_error(self, layer_idx: int) -> str | None:
-        return self._layer_read_errors.get(layer_idx)
 
     def get_storage_send_event(self, slot_id: int) -> threading.Event | None:
         if 0 <= slot_id < len(self.storage_send_done_events):

@@ -198,39 +198,9 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
     def wait_for_save(self):
         # Decode KV writes are synchronized by KVOffloadDecodeManager. P-side
-        # completion is tracked by READ_DONE/layer_send_done_events.
+        # completion is tracked by READ_DONE/storage_send_done_events.
         if self.is_consumer and self.connector_worker is not None:
             self.connector_worker.wait_for_save()
-
-    # ------------------------------------------------------------------
-    # SFA duck-typed hooks (attention/utils.py) — D side only
-    # ------------------------------------------------------------------
-    def set_req_ids(self, req_ids: list):
-        if self.connector_worker is not None:
-            self.connector_worker.set_req_ids(req_ids)
-
-    def prepare_lru_resident_and_load(
-        self,
-        layer_name: str,
-        num_tokens: int,
-        num_reqs: int,
-        topk_indices: torch.Tensor,
-        current_slots: torch.Tensor,
-        req_ids: torch.Tensor,
-        token_to_req: torch.Tensor | None = None,
-        capturing: bool = False,
-    ) -> bool:
-        assert self.connector_worker is not None
-        return self.connector_worker.prepare_lru_resident_and_load(
-            layer_name,
-            num_tokens,
-            num_reqs,
-            topk_indices,
-            current_slots,
-            req_ids,
-            token_to_req,
-            capturing,
-        )
 
     # Phase 3: real per-req CPU-block count for the solution-1 threshold.
     def get_num_cpu_blocks(self, req_ids: list[str]) -> dict[str, int] | None:

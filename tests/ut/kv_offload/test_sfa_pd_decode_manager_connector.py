@@ -378,10 +378,7 @@ def test_send_thread_wires_both_cache_group_block_lists():
     )
     thread.last_layer_idx = 0
     thread._p_save_events = {}
-    thread.layer_send_done_events = [MagicMock()]
-    thread.layer_transfer_finished_events = None
     thread._pending_reads_by_layer = {}
-    thread._layer_read_errors = {}
     thread._storage_read_errors = {}
     thread.storage_send_done_events = [threading.Event(), threading.Event()]
     for event in thread.storage_send_done_events:
@@ -437,13 +434,10 @@ def test_send_thread_slices_each_group_at_chunk_boundaries():
     )
     thread.last_layer_idx = 1
     thread._p_save_events = {}
-    thread.layer_send_done_events = [threading.Event(), threading.Event()]
-    thread.layer_transfer_finished_events = None
     thread._pending_reads_by_layer = {}
-    thread._layer_read_errors = {}
     thread._storage_read_errors = {}
     thread.storage_send_done_events = [threading.Event(), threading.Event()]
-    for event in [*thread.layer_send_done_events, *thread.storage_send_done_events]:
+    for event in thread.storage_send_done_events:
         event.set()
     thread._mf_meta_sent_paths = {"tcp://127.0.0.1:1234"}
     dealer = MagicMock()
@@ -545,14 +539,10 @@ def test_storage_slot_gate_is_shared_across_reuse_ring_boundary():
     thread._state = SimpleNamespace(
         layer_storage_slots={1: (0,), 5: (0,)},
     )
-    thread.layer_send_done_events = [threading.Event() for _ in range(6)]
     thread.storage_send_done_events = [threading.Event()]
     thread.storage_send_done_events[0].set()
     thread._storage_read_errors = {}
-    thread._layer_read_errors = {}
     thread._pending_reads_by_layer = {}
-    thread.layer_transfer_finished_events = None
-    thread.layer_transfer_pending_events = None
 
     thread.mark_layer_pending(5)
     assert not thread.get_storage_send_event(0).is_set()
@@ -574,7 +564,6 @@ def test_pd_read_wait_continues_after_log_interval_until_read_done():
     worker = SFAPDCpuOffloadProducerWorker.__new__(SFAPDCpuOffloadProducerWorker)
     worker.kv_send_layer_thread = send_thread
     worker.layer_storage_slots = {0: (0,)}
-    worker.layer_send_done_events = []
 
     worker.wait_for_layer_send(0)
 
@@ -593,7 +582,6 @@ def test_pd_read_wait_fails_when_send_thread_stops():
     worker = SFAPDCpuOffloadProducerWorker.__new__(SFAPDCpuOffloadProducerWorker)
     worker.kv_send_layer_thread = send_thread
     worker.layer_storage_slots = {0: (0,)}
-    worker.layer_send_done_events = []
 
     with pytest.raises(RuntimeError, match="send thread stopped"):
         worker.wait_for_layer_send(0)
@@ -608,7 +596,6 @@ def test_pd_read_wait_propagates_read_failed():
     worker = SFAPDCpuOffloadProducerWorker.__new__(SFAPDCpuOffloadProducerWorker)
     worker.kv_send_layer_thread = send_thread
     worker.layer_storage_slots = {0: (0,)}
-    worker.layer_send_done_events = []
 
     with pytest.raises(RuntimeError, match="memfabric read failed"):
         worker.wait_for_layer_send(0)

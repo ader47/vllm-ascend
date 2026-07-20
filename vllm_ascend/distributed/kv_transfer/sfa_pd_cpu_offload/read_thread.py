@@ -155,9 +155,15 @@ class MembPullReadThread(threading.Thread):
                     elif msg_type == READ_READY_BATCH:
                         layer_idx = msg[1]
                         layer_name = msg[2]
-                        # New messages carry main and indexer source block ids
-                        # separately. Accept the old two-field shape only when
-                        # both components share one vLLM block group.
+                        # Normalize each request to:
+                        # (external_req_id, p_main_block_ids,
+                        #  p_indexer_block_ids, main_start_block,
+                        #  indexer_start_block). The block-id lists identify
+                        # source blocks in P's HBM; the start offsets identify
+                        # the first corresponding destination block on D.
+                        # Legacy two-field entries contain one shared block-id
+                        # list, so use it for both components and default both
+                        # destination offsets to zero.
                         read_reqs = [
                             (
                                 entry[0],
