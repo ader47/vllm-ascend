@@ -6,6 +6,7 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 pytest.importorskip("torch")
@@ -631,10 +632,48 @@ def test_main_only_and_indexer_layers_share_their_physical_main_slot():
     assert len(slots[5]) == 2
 
 
-def test_metaserver_retries_http_status_errors():
+def test_consumer_scheduler_closes_remote_prefill_before_rendezvous():
+    scheduler = SFAPDCpuOffloadScheduler.__new__(SFAPDCpuOffloadScheduler)
+    scheduler.main_group_idx = 0
+    scheduler.indexer_group_idx = 1
+    scheduler.engine_id = "decode-engine"
+    scheduler.side_channel_host = "decode-host"
+    scheduler.side_channel_port = 1234
+    scheduler.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        )
+    )
+    scheduler._request_trackers = {}
+    scheduler._reqs_need_recv = set()
+    scheduler._metaserver_lock = threading.Lock()
+    scheduler._cancelled_metaserver_requests = set()
+    scheduler._submit_metaserver_request = MagicMock()
+    params = {
+        "do_remote_prefill": True,
+        "metaserver": "http://metaserver",
+    }
+    request = SimpleNamespace(
+        request_id="req-0",
+        kv_transfer_params=params,
+        num_computed_tokens=0,
+    )
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = ([1], [2])
+
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
+
+    assert params["do_remote_prefill"] is False
+    scheduler._submit_metaserver_request.assert_called_once()
+
+
+def test_metaserver_treats_legacy_http_error_as_delivered():
     scheduler = SFAPDCpuOffloadScheduler.__new__(SFAPDCpuOffloadScheduler)
     response = MagicMock()
-    response.raise_for_status.side_effect = [RuntimeError("HTTP 500"), None]
+    response.is_error = True
+    response.status_code = 500
     client = MagicMock()
     client.post.return_value = response
 
@@ -642,11 +681,30 @@ def test_metaserver_retries_http_status_errors():
         client_cls.return_value.__enter__.return_value = client
         scheduler._access_metaserver("http://metaserver", {"request_id": "req-0"})
 
+    client.post.assert_called_once_with(
+        "http://metaserver",
+        json={"request_id": "req-0"},
+    )
+    assert client_cls.call_args.kwargs["timeout"] is None
+
+
+def test_metaserver_retries_transport_errors():
+    scheduler = SFAPDCpuOffloadScheduler.__new__(SFAPDCpuOffloadScheduler)
+    response = MagicMock(is_error=False)
+    client = MagicMock()
+    client.post.side_effect = [
+        httpx.ConnectError("connection refused"),
+        response,
+    ]
+
+    with patch("vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.scheduler.httpx.Client") as client_cls:
+        client_cls.return_value.__enter__.return_value = client
+        scheduler._access_metaserver("http://metaserver", {"request_id": "req-0"})
+
     assert client.post.call_count == 2
-    assert response.raise_for_status.call_count == 2
 
 
-def test_metaserver_callback_preserves_retry_state_after_failure():
+def test_metaserver_callback_retries_without_changing_request_state():
     scheduler = SFAPDCpuOffloadScheduler.__new__(SFAPDCpuOffloadScheduler)
     scheduler._metaserver_lock = threading.Lock()
     scheduler._shutdown_event = threading.Event()
@@ -654,7 +712,6 @@ def test_metaserver_callback_preserves_retry_state_after_failure():
     scheduler._cancelled_metaserver_requests = set()
     failed_future = Future()
     scheduler._metaserver_futures = {"req-0": failed_future}
-    params = {"do_remote_prefill": False}
     failed_future.set_exception(RuntimeError("metaserver unavailable"))
 
     retry_timer = MagicMock()
@@ -665,18 +722,16 @@ def test_metaserver_callback_preserves_retry_state_after_failure():
         scheduler._on_metaserver_done(
             failed_future,
             request_id="req-0",
-            params=params,
             url="http://metaserver",
             message={"request_id": "req-0"},
         )
 
-    assert params["do_remote_prefill"] is True
     assert "req-0" not in scheduler._metaserver_futures
     assert scheduler._metaserver_retry_timers["req-0"] is retry_timer
     retry_timer.start.assert_called_once_with()
 
 
-def test_metaserver_callback_commits_state_only_after_success():
+def test_metaserver_callback_clears_completed_future():
     scheduler = SFAPDCpuOffloadScheduler.__new__(SFAPDCpuOffloadScheduler)
     scheduler._metaserver_lock = threading.Lock()
     scheduler._shutdown_event = threading.Event()
@@ -684,18 +739,16 @@ def test_metaserver_callback_commits_state_only_after_success():
     scheduler._cancelled_metaserver_requests = set()
     succeeded_future = Future()
     scheduler._metaserver_futures = {"req-0": succeeded_future}
-    params = {"do_remote_prefill": True}
     succeeded_future.set_result(None)
 
     scheduler._on_metaserver_done(
         succeeded_future,
         request_id="req-0",
-        params=params,
         url="http://metaserver",
         message={"request_id": "req-0"},
     )
 
-    assert params["do_remote_prefill"] is False
+    assert "req-0" not in scheduler._metaserver_futures
 
 
 @pytest.mark.parametrize(

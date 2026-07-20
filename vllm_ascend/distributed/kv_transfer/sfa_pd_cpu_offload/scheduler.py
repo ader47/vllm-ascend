@@ -40,8 +40,8 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 METASERVER_MAX_RETRIES = 3
-METASERVER_REQUEST_TIMEOUT_SECONDS = 10.0
 METASERVER_RETRY_DELAY_SECONDS = 1.0
+
 
 class _SendReqInfo:
     def __init__(
@@ -237,9 +237,7 @@ class SFAPDCpuOffloadScheduler:
 
         if kv_cache_config is None:
             raise ValueError("SFAPDCpuOffloadScheduler requires KVCacheConfig")
-        self.block_size = [
-            group_spec.kv_cache_spec.block_size for group_spec in kv_cache_config.kv_cache_groups
-        ]
+        self.block_size = [group_spec.kv_cache_spec.block_size for group_spec in kv_cache_config.kv_cache_groups]
         self.main_group_idx, self.indexer_group_idx = infer_sfa_component_group_ids(kv_cache_config)
 
         self.side_channel_host = get_ip()
@@ -315,18 +313,20 @@ class SFAPDCpuOffloadScheduler:
             remote_dcp_size=self.vllm_config.parallel_config.decode_context_parallel_size,
             remote_cached_tokens=request.num_computed_tokens,
         )
+        # Allocation is complete once the rendezvous request is submitted.
+        # Keep the vLLM remote-prefill state independent of the legacy proxy's
+        # HTTP result; old proxies return 500 for extra prompt-list children
+        # even though the first child has already dispatched the whole batch.
+        params["do_remote_prefill"] = False
         metaserver = params.get("metaserver")
         if metaserver is not None and not params.get("do_virtual", False):
             with self._metaserver_lock:
                 self._cancelled_metaserver_requests.discard(request.request_id)
             self._submit_metaserver_request(
                 request_id=request.request_id,
-                params=params,
                 url=metaserver,
                 message=kv_transfer_params,
             )
-        else:
-            params["do_remote_prefill"] = False
         if envs.VLLM_ASCEND_SFA_DEBUG:
             logger.info(
                 "SFAPDCpuOffload D advertised req %s: indexer_hbm_ids=%s, "
@@ -378,25 +378,36 @@ class SFAPDCpuOffloadScheduler:
     def _access_metaserver(self, url: str, message: dict[str, Any]):
         with httpx.Client(
             limits=httpx.Limits(max_connections=100000),
-            timeout=METASERVER_REQUEST_TIMEOUT_SECONDS,
+            timeout=None,
         ) as client:
             retry = 0
             while retry < METASERVER_MAX_RETRIES:
                 retry += 1
                 try:
                     response = client.post(url, json=message)
-                    response.raise_for_status()
+                    if response.is_error:
+                        logger.warning(
+                            "Metaserver returned HTTP %d for request %s; "
+                            "treating it as delivered for legacy-proxy compatibility",
+                            response.status_code,
+                            message.get("request_id"),
+                        )
                     return
-                except Exception as e:
-                    logger.error("Failed to connect to metaserver: %s, retry %s", url, retry)
+                except httpx.RequestError as error:
+                    logger.error(
+                        "Metaserver transport failed: url=%s, retry=%d, error=%s: %s",
+                        url,
+                        retry,
+                        type(error).__name__,
+                        error,
+                    )
                     if retry == METASERVER_MAX_RETRIES:
-                        raise e
+                        raise
 
     def _submit_metaserver_request(
         self,
         *,
         request_id: str,
-        params: dict[str, Any],
         url: str,
         message: dict[str, Any],
     ) -> None:
@@ -404,10 +415,7 @@ class SFAPDCpuOffloadScheduler:
             return
         future = None
         with self._metaserver_lock:
-            if (
-                self._shutdown_event.is_set()
-                or request_id in self._cancelled_metaserver_requests
-            ):
+            if self._shutdown_event.is_set() or request_id in self._cancelled_metaserver_requests:
                 return
             self._metaserver_retry_timers.pop(request_id, None)
             if request_id not in self._metaserver_futures:
@@ -422,7 +430,6 @@ class SFAPDCpuOffloadScheduler:
                 partial(
                     self._on_metaserver_done,
                     request_id=request_id,
-                    params=params,
                     url=url,
                     message=message,
                 )
@@ -433,7 +440,6 @@ class SFAPDCpuOffloadScheduler:
         future,
         *,
         request_id: str,
-        params: dict[str, Any],
         url: str,
         message: dict[str, Any],
     ):
@@ -446,10 +452,8 @@ class SFAPDCpuOffloadScheduler:
                 return
         error = future.exception()
         if error is not None:
-            params["do_remote_prefill"] = True
             logger.error(
-                "Access metaserver failed for request %s; retrying in %.1f "
-                "seconds: %s",
+                "Access metaserver failed for request %s; retrying in %.1f seconds: %s",
                 request_id,
                 METASERVER_RETRY_DELAY_SECONDS,
                 error,
@@ -459,7 +463,6 @@ class SFAPDCpuOffloadScheduler:
                 self._submit_metaserver_request,
                 kwargs={
                     "request_id": request_id,
-                    "params": params,
                     "url": url,
                     "message": message,
                 },
@@ -471,7 +474,6 @@ class SFAPDCpuOffloadScheduler:
                 self._metaserver_retry_timers[request_id] = timer
             timer.start()
             return
-        params["do_remote_prefill"] = False
 
     def shutdown(self) -> None:
         self._shutdown_event.set()
