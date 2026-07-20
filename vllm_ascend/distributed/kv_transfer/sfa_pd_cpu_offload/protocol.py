@@ -6,12 +6,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import msgspec
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
 
-GET_META_MSG = b"get_meta_msg"
+BATCH_KV_TRANSFER_PARAMS = "batch_kv_transfer_params"
 MF_META = b"mf_meta"
 READ_READY_BATCH = b"read_ready_batch"
 READ_DONE = b"read_done"
@@ -59,11 +58,6 @@ class LayerMetadata:
     # indices and therefore do not own an indexer cache at all.
     main_tensor_count: int = 2
     has_indexer: bool = False
-
-
-class SfaPDAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
-    te_rpc_port: int
-    layer_metadata: dict[str, LayerMetadata]
 
 
 @dataclass

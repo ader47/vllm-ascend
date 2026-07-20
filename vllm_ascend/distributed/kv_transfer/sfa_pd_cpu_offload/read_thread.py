@@ -17,12 +17,10 @@ from vllm.utils.network_utils import get_ip
 
 from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
-    GET_META_MSG,
     MF_META,
     READ_DONE,
     READ_FAILED,
     READ_READY_BATCH,
-    SfaPDAgentMetadata,
 )
 
 READ_THREAD_POLL_TIMEOUT_MS = 100
@@ -221,14 +219,6 @@ class MembPullReadThread(threading.Thread):
                             with self._lock:
                                 self._done_requests.update(done_ext_ids)
 
-                    elif msg_type == GET_META_MSG:
-                        meta_bytes = encoder.encode(
-                            SfaPDAgentMetadata(
-                                te_rpc_port=0,
-                                layer_metadata=self._state.layer_metadata,
-                            )
-                        )
-                        sock.send_multipart((identity, b"", meta_bytes))
                     else:
                         logger.error("MembPull got unexpected message %s", msg)
                 except zmq.Again:

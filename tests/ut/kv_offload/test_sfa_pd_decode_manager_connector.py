@@ -1,9 +1,10 @@
 """Regression tests for SFA PD transfer into KVOffloadDecodeManager."""
 
+import asyncio
 import threading
 from concurrent.futures import Future
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -14,11 +15,18 @@ from vllm.distributed.kv_transfer.kv_connector.factory import (  # noqa: E402
     KVConnectorFactory,
 )
 
+from examples.disaggregated_prefill_v1 import (  # noqa: E402
+    load_balance_proxy_layerwise_server_example as proxy_example,
+)
+from examples.disaggregated_prefill_v1.load_balance_proxy_layerwise_server_example import (  # noqa: E402
+    get_api_request_ids,
+)
 from vllm_ascend.distributed.kv_transfer import register_connector  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.connector import (  # noqa: E402
     SFAPDCpuOffloadConnector,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (  # noqa: E402
+    BATCH_KV_TRANSFER_PARAMS,
     READ_READY_BATCH,
     LayerMetadata,
     SendTask,
@@ -78,6 +86,62 @@ def test_infer_uniform_group_uses_same_block_ids():
     )
 
     assert infer_sfa_component_group_ids(config) == (0, 0)
+
+
+def test_completion_prompt_list_registers_each_vllm_child_request_id():
+    assert get_api_request_ids(
+        "/completions",
+        "parent",
+        {"prompt": ["first", "second", "third"]},
+    ) == ["cmpl-parent-0", "cmpl-parent-1", "cmpl-parent-2"]
+
+
+def test_token_id_prompt_list_remains_one_vllm_request():
+    assert get_api_request_ids(
+        "/completions",
+        "parent",
+        {"prompt": [1, 2, 3]},
+    ) == ["cmpl-parent-0"]
+
+
+def test_batch_metaserver_dispatches_prompt_list_once():
+    async def run_test():
+        parent_request_id = "parent"
+        request_ids = ("cmpl-parent-0", "cmpl-parent-1", "cmpl-parent-2")
+        request_record = ({"prompt": ["a", "b", "c"]}, 3, "/completions", parent_request_id)
+        state = SimpleNamespace(
+            req_data_dict={request_id: request_record for request_id in request_ids},
+            metaserver_lock=asyncio.Lock(),
+            metaserver_params={parent_request_id: {}},
+            metaserver_expected_ids={parent_request_id: request_ids},
+            metaserver_dispatch_tasks={},
+            metaserver_ready_events={parent_request_id: asyncio.Event()},
+        )
+        requests = []
+        for request_id in request_ids:
+            request = MagicMock()
+            request.json = AsyncMock(
+                return_value={
+                    "request_id": request_id,
+                    "do_remote_decode": True,
+                    "remote_port": 1234,
+                }
+            )
+            requests.append(request)
+
+        dispatch = AsyncMock()
+        with (
+            patch.object(proxy_example, "proxy_state", state),
+            patch.object(proxy_example, "dispatch_prefill_batch", dispatch),
+        ):
+            responses = await asyncio.gather(*(proxy_example.metaserver(request) for request in requests))
+
+        assert responses == [{"status": "ok"}] * len(request_ids)
+        dispatch.assert_awaited_once()
+        dispatched_params = dispatch.await_args.args[-1]
+        assert set(dispatched_params) == set(request_ids)
+
+    asyncio.run(run_test())
 
 
 def _make_read_thread() -> MembPullReadThread:
@@ -421,6 +485,59 @@ def test_producer_scheduler_cleans_request_state_on_finish(all_groups):
 
     assert result == (False, None)
     assert "req-0" not in scheduler._reqs_need_send_layerwise
+
+
+def test_producer_scheduler_resolves_batch_metadata_by_external_request_id():
+    scheduler = SFAPDProducerScheduler.__new__(SFAPDProducerScheduler)
+    scheduler._reqs_need_send_layerwise = {}
+    child_params = {
+        "do_remote_decode": True,
+        "remote_cached_tokens": 16,
+        "remote_host": "decode-1",
+        "remote_port": 1234,
+    }
+    request = SimpleNamespace(
+        request_id="cmpl-parent-1-12345678",
+        kv_transfer_params={
+            "do_remote_decode": True,
+            BATCH_KV_TRANSFER_PARAMS: {
+                "cmpl-parent-0": {
+                    "do_remote_decode": True,
+                    "remote_cached_tokens": 0,
+                },
+                "cmpl-parent-1": child_params,
+            },
+        },
+    )
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = ([1, 2], [3])
+
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
+
+    assert request.kv_transfer_params is child_params
+    send_req_info = scheduler._reqs_need_send_layerwise[request.request_id]
+    assert send_req_info.local_transferred_tokens == 16
+    assert send_req_info.local_block_ids == [[1, 2], [3]]
+
+
+def test_producer_scheduler_rejects_missing_batch_metadata():
+    scheduler = SFAPDProducerScheduler.__new__(SFAPDProducerScheduler)
+    scheduler._reqs_need_send_layerwise = {}
+    request = SimpleNamespace(
+        request_id="cmpl-parent-1-12345678",
+        kv_transfer_params={
+            "do_remote_decode": True,
+            BATCH_KV_TRANSFER_PARAMS: {
+                "cmpl-parent-0": {
+                    "do_remote_decode": True,
+                    "remote_cached_tokens": 0,
+                }
+            },
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="cmpl-parent-1"):
+        scheduler.update_state_after_alloc(request, MagicMock(), num_external_tokens=0)
 
 
 def test_storage_slot_gate_is_shared_across_reuse_ring_boundary():

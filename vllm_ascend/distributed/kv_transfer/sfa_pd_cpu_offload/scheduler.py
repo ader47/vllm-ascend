@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
+    BATCH_KV_TRANSFER_PARAMS,
     SfaPDConsumerMetadata,
     SfaPDProducerMetadata,
     get_external_request_id,
@@ -103,6 +104,16 @@ class SFAPDProducerScheduler:
         params = request.kv_transfer_params
         if params is None or not params.get("do_remote_decode"):
             return
+
+        batch_params = params.get(BATCH_KV_TRANSFER_PARAMS)
+        if batch_params is not None:
+            external_request_id = get_external_request_id(request.request_id)
+            params = batch_params.get(external_request_id)
+            if params is None:
+                raise RuntimeError(f"SFA PD batch metadata does not contain request {external_request_id!r}")
+            # Each vLLM child request must retain only its own D-side endpoint
+            # and cache state after a batched OpenAI completion is expanded.
+            request.kv_transfer_params = params
 
         local_block_ids = self._normalize_block_ids(blocks.get_block_ids())
         remote_cache_tokens = params["remote_cached_tokens"]
