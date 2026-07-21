@@ -112,7 +112,6 @@ class KVOffloadDecodeManager:
             device='cpu',
             pin_memory=True,
         )
-        self._graph_subscribed_streams: set[object] = set()
         self._npu_runtime = torch_npu.npu
 
         self._build_cpp()
@@ -577,15 +576,6 @@ class KVOffloadDecodeManager:
         )
         if result not in (None, 0):
             raise RuntimeError(f"memfabric D2H sparse_copy failed with result={result}")
-        if capturing:
-            # Capture records the sparse copy in stream order. A Python event
-            # here would describe capture time rather than each graph replay.
-            return
-        # Eager D2H must finish before temporary decode K/V can be released and
-        # before TP peers may read the shared CPU pool after their barrier.
-        done_event = torch_npu.npu.Event()
-        done_event.record(torch_npu.npu.current_stream())
-        done_event.synchronize()
 
     def onload_topk_kv(
         self,
@@ -669,7 +659,6 @@ class KVOffloadDecodeManager:
             if current_compute_stream not in subscribed_compute_streams:
                 torch_npu.npu._subscribe_report(current_compute_stream)
                 subscribed_compute_streams.add(current_compute_stream)
-            self._graph_subscribed_streams.add(current_compute_stream)
             torch_npu.npu._launch_host_func(
                 current_compute_stream,
                 self._onload_topk_kv_cpu,
@@ -727,8 +716,8 @@ class KVOffloadDecodeManager:
             layer_id,
         ) = args
         if self.tp_size > 1:
-            # In graph mode this callback is ordered after TP0's captured D2H;
-            # in eager mode onload_topk_kv waited for TP0's event above.
+            # Graph callbacks are stream-ordered after TP0's D2H. In eager mode,
+            # the blocking metadata copies above wait for that same stream first.
             self.tp_group.barrier()
         self.kv_offload_decode_cpp.lru_resident_compact(
             lru_req_ids_ptr,
