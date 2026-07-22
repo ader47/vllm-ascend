@@ -1872,7 +1872,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Open the prefetch gate for every SFA layer. Some GLM-5.2 layers
         # reuse cached top-k indices and have no indexer, so recording this
         # inside indexer_select_post_process would leave their gate closed.
-        record_attention_compute_start()
+        record_attention_compute_start(self.layer_name or "")
 
         if self.skip_topk:
             topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)

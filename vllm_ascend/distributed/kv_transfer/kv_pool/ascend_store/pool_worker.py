@@ -71,7 +71,7 @@ from vllm_ascend.distributed.utils import (
 )
 from vllm_ascend.memcache_comm_fence import (
     get_attention_compute_start_gate,
-    reset_attention_compute_start_gate,
+    reset_attention_compute_start_gates,
 )
 
 
@@ -906,7 +906,7 @@ class KVPoolWorker:
             self.next_layer_to_submit = 0
             self._scatter_cursor = 0
             self._early_dispatched = set()
-            reset_attention_compute_start_gate()
+            reset_attention_compute_start_gates(self.num_layers)
             if self.layer_attn_recorded_events is not None:
                 for event in self.layer_attn_recorded_events:
                     event.clear()
@@ -1179,7 +1179,20 @@ class KVPoolWorker:
                 return False
             attention_start_gate = None
             if has_load and layer_id != self.current_layer:
-                attention_start_gate = get_attention_compute_start_gate()
+                if reuse_mate is None:
+                    # No reuse dependency: the slot is empty, so release the H2D
+                    # copy at the current layer's attention boundary to start the
+                    # transfer as early as possible (e.g. first occupants L1..L3
+                    # all ride the L0 gate).
+                    attention_start_gate = get_attention_compute_start_gate(self.current_layer)
+                else:
+                    # Reused slot: release the H2D copy at the layer right after the
+                    # reuse source. slot_free(reuse_mate) is guaranteed ready by then
+                    # (the source layer finished attention before its next layer
+                    # starts), and the layers between here and layer_id mask the
+                    # transfer. Binding layer_id's own gate would serialize the copy
+                    # against layer_id's attention and leave no overlap.
+                    attention_start_gate = get_attention_compute_start_gate(reuse_mate + 1)
             recv_thread.add_request(
                 LayerLoadTask(  # type: ignore[arg-type]
                     wait_for_save_layer=reuse_mate,
@@ -1205,7 +1218,6 @@ class KVPoolWorker:
         assert self.layer_load_finished_events is not None
         assert self.kv_recv_thread is not None
         self.kv_recv_thread.raise_if_failed()
-        reset_attention_compute_start_gate()
         self._submit_ready_layer_loads()
         should_wait = (
             bool(self.layer_load_tasks[self.current_layer])
