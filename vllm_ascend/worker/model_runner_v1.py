@@ -3807,20 +3807,28 @@ class NPUModelRunner(GPUModelRunner):
         if self.vllm_config.speculative_config is not None:
             decode_width += self.vllm_config.speculative_config.num_speculative_tokens
 
+        topk_buffer_size = self.kv_offload_decode_config.topk_buffer_size
+        num_kv_heads = 1
+        k_dim = self.vllm_config.model_config.hf_text_config.kv_lora_rank
+        v_dim = self.vllm_config.model_config.hf_text_config.qk_rope_head_dim
         max_num_topk_rows = min(
             self.max_num_tokens,
             self.max_num_reqs * decode_width,
         )
-        topk_buffer_size = self.kv_offload_decode_config.topk_buffer_size
-        hf_text_config = self.vllm_config.model_config.hf_text_config
-        common_shape = (max_num_topk_rows, topk_buffer_size, 1)
-
-        k_shape = (*common_shape, hf_text_config.kv_lora_rank)
-        v_shape = (*common_shape, hf_text_config.qk_rope_head_dim)
-        return (
-            torch.empty(k_shape, dtype=torch.bfloat16, device=self.device),
-            torch.empty(v_shape, dtype=torch.bfloat16, device=self.device),
+        topk_buffer_k_size_bytes = max_num_topk_rows * topk_buffer_size * num_kv_heads * k_dim * torch.bfloat16.itemsize
+        topk_buffer_v_size_bytes = max_num_topk_rows * topk_buffer_size * num_kv_heads * v_dim * torch.bfloat16.itemsize
+        topk_buffer_raw = torch.empty([topk_buffer_k_size_bytes + topk_buffer_v_size_bytes], dtype=torch.int8, device='npu')
+        topk_buffer_k = (
+            topk_buffer_raw[:topk_buffer_k_size_bytes]
+            .view(torch.bfloat16)
+            .view([max_num_topk_rows, topk_buffer_size, num_kv_heads, k_dim])
         )
+        topk_buffer_v = (
+            topk_buffer_raw[topk_buffer_k_size_bytes:topk_buffer_k_size_bytes + topk_buffer_v_size_bytes]
+            .view(torch.bfloat16)
+            .view([max_num_topk_rows, topk_buffer_size, num_kv_heads, v_dim])
+        )
+        return (topk_buffer_k, topk_buffer_v)
 
     def _allocate_kv_offload_topk_profile_buffers(
         self,
@@ -4607,14 +4615,8 @@ class NPUModelRunner(GPUModelRunner):
                         # drop the npu k/v tensors and replace raw_k_tensor by raw_k_tensor_cpu
                         # to use the original code.
                         if self.tp_rank == 0:
-                            k_tensor_cpu = self.kv_offload_decode_manager._empty_aligned_cpu_tensor(
-                                [k_tensor_size],
-                                torch.int8,
-                                alignment,
-                            )
-                            v_tensor_cpu = self.kv_offload_decode_manager._empty_aligned_cpu_tensor(
-                                [v_tensor_size],
-                                torch.int8,
+                            [k_tensor_cpu, v_tensor_cpu] = self.kv_offload_decode_manager.empty_aligned_int8_cpu_tensors(
+                                [k_tensor_size, v_tensor_size],
                                 alignment,
                             )
                         else:

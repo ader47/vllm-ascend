@@ -68,6 +68,24 @@ class KVOffloadDecodeManager:
         tensor = offload.empty([num_elements + extra_elements], dtype=dtype, pin_memory=True)
         return cls._align_memory(tensor, alignment)[:num_elements].view(shape)
 
+    @staticmethod
+    def empty_aligned_int8_cpu_tensors(
+        sizes: list[int],
+        alignment: int = _CPU_CACHE_ALIGNMENT,
+    ) -> list[torch.Tensor]:
+        chunk_nums = [cdiv(size, alignment) for size in sizes]
+        total_chunk_num = 1 + sum(chunk_nums)
+        raw_tensor = offload.empty([total_chunk_num * alignment], dtype=torch.int8, pin_memory=True)
+        base_addr = raw_tensor.data_ptr()
+        if base_addr % alignment:
+            base_addr = (base_addr // alignment + 1) * alignment
+        base_offset = base_addr - raw_tensor.data_ptr()
+        allocate_tensors = []
+        for size, chunk_num in zip(sizes, chunk_nums):
+            allocate_tensors.append(raw_tensor[base_offset:base_offset + size])
+            base_offset += chunk_num * alignment
+        return allocate_tensors
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -217,6 +235,7 @@ class KVOffloadDecodeManager:
             self.num_layers,
             self.num_target_layers,
         )
+        self.mtp_layer_id = self.num_layers - 1 if self.num_layers != self.num_target_layers else -1
         if self.tp_rank == 0:
             preview_layer_names = self.offload_layer_names[:4]
             if len(self.offload_layer_names) > 4:
@@ -589,85 +608,103 @@ class KVOffloadDecodeManager:
         stable_prefix_lens_npu: torch.Tensor,
         token_to_req_npu: torch.Tensor | None = None,
         capturing: bool = False,
+        skip_topk: bool = False,
     ):
-        # original onload kv logic
         layer_id = self._get_offload_layer_id(layer_name)
         if num_tokens > self.max_num_topk_rows:
             raise ValueError(
                 "KV offload decode topk rows exceed configured workspace, "
                 f"num_tokens={num_tokens}, max_num_topk_rows={self.max_num_topk_rows}"
             )
-        if token_to_req_npu is not None:
-            # spec decode case, expand block_table to actual num decode tokens.
-            token_to_req_cpu = self.lru_token_to_req_cpu[:num_tokens]
-            token_to_req_cpu.copy_(token_to_req_npu[:num_tokens], non_blocking=capturing)
-            block_table_expanded = torch.index_select(
-                block_table, 0, token_to_req_npu[:num_tokens].to(torch.int64))
-            block_table_cpu = self.block_table_expanded_cpu[:num_tokens]
-            block_table_cpu.copy_(block_table_expanded, non_blocking=capturing)
-        else:
-            block_table_cpu = self.block_table_cpu[:num_reqs]
-            block_table_cpu.copy_(block_table, non_blocking=capturing)
-        topk_indices_cpu = self.lru_topk_indices_cpu[:num_tokens]
-        topk_indices_cpu.copy_(topk_indices_npu[:num_tokens], non_blocking=capturing)
-        req_ids_cpu = self.lru_req_ids_cpu[:num_tokens]
-        req_ids_cpu.copy_(req_ids_npu[:num_tokens], non_blocking=capturing)
-        stable_prefix_lens_cpu = self.lru_stable_prefix_lens_cpu[:num_tokens]
-        stable_prefix_lens_cpu.copy_(
-            stable_prefix_lens_npu[:num_tokens],
-            non_blocking=capturing,
-        )
-
-        args = (
-            num_tokens,
-            self.lru_miss_count_cpu_list[layer_id][:num_tokens],
-            self.lru_miss_tokens_cpu_list[layer_id][:num_tokens],
-            self.lru_miss_slots_cpu_list[layer_id][:num_tokens],
-            self.lru_req_ids_ptr,
-            self.lru_last_req_ids_ptrs[layer_id],
-            self.lru_topk_indices_ptr,
-            self.lru_stable_prefix_lens_ptr,
-            self.lru_slot_to_token_ptrs[layer_id],
-            self.lru_slots_ptrs[layer_id],
-            self.lru_current_slots_ptr,
-            self.lru_miss_count_ptrs[layer_id],
-            self.lru_miss_tokens_ptrs[layer_id],
-            self.lru_miss_slots_ptrs[layer_id],
-            block_table_cpu,
-            self.block_size,
-            self.token_size_bytes_k,
-            self.token_size_bytes_v,
-            self.gvas_k_bases[layer_id],
-            self.gvas_v_bases[layer_id],
-            self.addr_k_bases[layer_id],
-            self.addr_v_bases[layer_id],
-            self.lru_token_mark_workspace_ptr,
-            self.lru_token_pos_workspace_ptr,
-            self.lru_slot_workspace_ptr,
-            self.lru_miss_position_workspace_ptr,
-            self.lru_epochs_ptr,
-            self.gvas_buffer_cpu,
-            self.addr_buffer_cpu,
-            self.size_buffer_cpu,
-            self.num_tokens_buffer_cpu,
-            layer_id,
-        )
-
-        if capturing:
-            current_compute_stream = torch_npu.npu.current_stream()
-            subscribed_compute_streams = get_subscribed_compute_streams()
-            if current_compute_stream not in subscribed_compute_streams:
-                torch_npu.npu._subscribe_report(current_compute_stream)
-                subscribed_compute_streams.add(current_compute_stream)
-            torch_npu.npu._launch_host_func(
-                current_compute_stream,
-                self._onload_topk_kv_cpu,
-                args,
+        if layer_id in [0, self.mtp_layer_id]:
+            # metadata which are same across all layers, only compute/copy once in first layer.
+            # last layer (mtp layer) may have different metadata, do not skip.
+            if token_to_req_npu is not None:
+                # spec decode case, expand block_table to actual num decode tokens.
+                token_to_req_cpu = self.lru_token_to_req_cpu[:num_tokens]
+                token_to_req_cpu.copy_(token_to_req_npu[:num_tokens], non_blocking=capturing)
+                block_table_expanded = torch.index_select(
+                    block_table, 0, token_to_req_npu[:num_tokens].to(torch.int64))
+                self.block_table_expanded_cpu[:num_tokens].copy_(block_table_expanded, non_blocking=capturing)
+            else:
+                self.block_table_cpu[:num_reqs].copy_(block_table, non_blocking=capturing)
+            self.lru_req_ids_cpu[:num_tokens].copy_(req_ids_npu[:num_tokens], non_blocking=capturing)
+            self.lru_stable_prefix_lens_cpu[:num_tokens].copy_(
+                stable_prefix_lens_npu[:num_tokens],
+                non_blocking=capturing,
             )
-        else:
-            self._onload_topk_kv_cpu(args)
 
-        self.sparse_copy_args_buffer_npu.copy_(self.sparse_copy_args_buffer_cpu, non_blocking=capturing)
+        if skip_topk:
+            assert layer_id > 0, "No previous layer to reuse."
+            gvas_offset = self.gvas_k_bases[layer_id] - self.gvas_k_bases[layer_id - 1]
+            addr_offset = self.addr_k_bases[layer_id] - self.addr_k_bases[layer_id - 1]
+            assert self.gvas_v_bases[layer_id] - self.gvas_v_bases[layer_id - 1] == gvas_offset, (
+                "k/v gvas base delta mismatch."
+            )
+            assert self.addr_v_bases[layer_id] - self.addr_v_bases[layer_id - 1] == addr_offset, (
+                "k/v addr base delta mismatch."
+            )
+            self.gvas_buffer_npu += gvas_offset
+            self.addr_buffer_npu += addr_offset
+        else:
+            if token_to_req_npu is not None:
+                block_table_cpu = self.block_table_expanded_cpu[:num_tokens]
+            else:
+                block_table_cpu = self.block_table_cpu[:num_reqs]
+            topk_indices_cpu = self.lru_topk_indices_cpu[:num_tokens]
+            topk_indices_cpu.copy_(topk_indices_npu[:num_tokens], non_blocking=capturing)
+
+            args = (
+                num_tokens,
+                self.lru_miss_count_cpu_list[layer_id][:num_tokens],
+                self.lru_miss_tokens_cpu_list[layer_id][:num_tokens],
+                self.lru_miss_slots_cpu_list[layer_id][:num_tokens],
+                self.lru_req_ids_ptr,
+                self.lru_last_req_ids_ptrs[layer_id],
+                self.lru_topk_indices_ptr,
+                self.lru_stable_prefix_lens_ptr,
+                self.lru_slot_to_token_ptrs[layer_id],
+                self.lru_slots_ptrs[layer_id],
+                self.lru_current_slots_ptr,
+                self.lru_miss_count_ptrs[layer_id],
+                self.lru_miss_tokens_ptrs[layer_id],
+                self.lru_miss_slots_ptrs[layer_id],
+                block_table_cpu,
+                self.block_size,
+                self.token_size_bytes_k,
+                self.token_size_bytes_v,
+                self.gvas_k_bases[layer_id],
+                self.gvas_v_bases[layer_id],
+                self.addr_k_bases[layer_id],
+                self.addr_v_bases[layer_id],
+                self.lru_token_mark_workspace_ptr,
+                self.lru_token_pos_workspace_ptr,
+                self.lru_slot_workspace_ptr,
+                self.lru_miss_position_workspace_ptr,
+                self.lru_epochs_ptr,
+                self.gvas_buffer_cpu,
+                self.addr_buffer_cpu,
+                self.size_buffer_cpu,
+                self.num_tokens_buffer_cpu,
+                layer_id,
+            )
+
+            if capturing:
+                current_compute_stream = torch_npu.npu.current_stream()
+                subscribed_compute_streams = get_subscribed_compute_streams()
+                if current_compute_stream not in subscribed_compute_streams:
+                    torch_npu.npu._subscribe_report(current_compute_stream)
+                    subscribed_compute_streams.add(current_compute_stream)
+                torch_npu.npu._launch_host_func(
+                    current_compute_stream,
+                    self._onload_topk_kv_cpu,
+                    args,
+                )
+            else:
+                self._onload_topk_kv_cpu(args)
+
+            self.sparse_copy_args_buffer_npu.copy_(self.sparse_copy_args_buffer_cpu, non_blocking=capturing)
+
         offload.sparse_copy(
             self.gvas_buffer_npu,
             self.addr_buffer_npu,
