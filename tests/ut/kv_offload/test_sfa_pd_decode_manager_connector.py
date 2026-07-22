@@ -22,6 +22,7 @@ from examples.disaggregated_prefill_v1 import (  # noqa: E402
 from examples.disaggregated_prefill_v1.load_balance_proxy_layerwise_server_example import (  # noqa: E402
     get_api_request_ids,
 )
+from vllm_ascend import envs  # noqa: E402
 from vllm_ascend.distributed.kv_transfer import register_connector  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.connector import (  # noqa: E402
     SFAPDCpuOffloadConnector,
@@ -45,6 +46,7 @@ from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.send_thread import (
     MembPullSendingThread,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.worker import (  # noqa: E402
+    SFAPDCpuOffloadConsumerWorker,
     SFAPDCpuOffloadProducerWorker,
 )
 from vllm_ascend.distributed.kv_transfer.utils.memfabric_transfer_engine import (  # noqa: E402
@@ -372,6 +374,117 @@ def test_tp_rank_without_blocks_in_small_chunk_acknowledges_without_read():
     )
 
     thread.engine.batch_transfer_sync_read.assert_not_called()
+
+
+def test_small_chunks_rotate_across_tp_ranks():
+    layer = _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000, has_indexer=False)
+
+    for chunk_start in range(4):
+        for tp_rank in range(4):
+            thread = _make_read_thread()
+            thread.tp_rank = tp_rank
+            thread._state.tp_size = 4
+            thread._state.dest_blocks_by_req["req-0"] = ([0, 1, 2, 3], [])
+
+            local, _, _, _ = thread._build_req_descriptors(
+                layer,
+                "req-0",
+                p_main_block_ids=[chunk_start],
+                p_indexer_block_ids=[],
+                want_info=False,
+                main_start_block=chunk_start,
+            )
+
+            assert bool(local) is (tp_rank == chunk_start)
+
+
+def test_non_tp0_verify_log_marks_shared_main_as_unavailable():
+    thread = _make_read_thread()
+    thread._state.cpu_pools = [None]
+    thread._state.indexer_tensors = [None]
+    read_info = {
+        "layer_name": "model.layers.0.self_attn",
+        "ext_req_id": "req-0",
+        "pool_idx": 0,
+        "offload_id": 0,
+        "d_main_ids": [1],
+        "d_indexer_ids": [],
+        "n_main": 1,
+        "n_indexer": 0,
+        "num_transfers": 2,
+    }
+
+    with (
+        patch.object(envs, "VLLM_ASCEND_MF_VERIFY", True),
+        patch.object(envs, "VLLM_ASCEND_SFA_DEBUG", False),
+        patch(
+            "vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.read_thread.logger.info"
+        ) as log_info,
+    ):
+        thread._log_read_result(read_info)
+
+    log_args = log_info.call_args.args
+    assert "main_k=%s main_v=%s" in log_args[0]
+    assert log_args[3:5] == ("n/a", "n/a")
+
+
+def _make_consumer_worker_for_completion_test():
+    worker = SFAPDCpuOffloadConsumerWorker.__new__(SFAPDCpuOffloadConsumerWorker)
+    worker.tp_rank = 0
+    worker.tp_size = 2
+    worker.request_map = {"req-0": "req-0-internal"}
+    worker._dest_blocks_by_req = {"req-0": ([1, 2], [3])}
+    worker._cpu_blocks_by_req = {}
+    worker._invalid_block_ids = set()
+    worker._pending_done = set()
+    worker._terminal_ext_ids = set()
+    worker._mf_read_thread = MagicMock()
+    worker._mf_read_thread.get_and_clear_failed.return_value = set()
+    return worker
+
+
+def test_consumer_completion_waits_for_every_tp_rank():
+    worker = _make_consumer_worker_for_completion_test()
+    worker._mf_read_thread.get_and_clear_done.side_effect = [{"req-0"}, set()]
+    worker._gather_tp_read_status = MagicMock(
+        side_effect=[
+            [({"req-0"}, set()), (set(), set())],
+            [({"req-0"}, set()), ({"req-0"}, set())],
+        ]
+    )
+
+    assert worker.get_finished() == (set(), set())
+    assert worker.get_finished() == (set(), {"req-0-internal"})
+
+
+def test_consumer_load_errors_are_unioned_across_tp():
+    worker = _make_consumer_worker_for_completion_test()
+    worker._mf_read_thread.get_and_clear_done.return_value = set()
+    worker._mf_read_thread.get_and_clear_failed.return_value = set()
+    worker._gather_tp_read_status = MagicMock(
+        return_value=[({"req-0"}, set()), ({"req-0"}, {"req-0"})]
+    )
+
+    assert worker.get_finished() == (set(), {"req-0-internal"})
+
+    assert worker.get_block_ids_with_load_errors() == {1, 2, 3}
+    assert worker.get_block_ids_with_load_errors() == set()
+
+
+def test_failed_tp_rank_remains_terminal_until_other_ranks_finish():
+    worker = _make_consumer_worker_for_completion_test()
+    worker._mf_read_thread.get_and_clear_done.return_value = set()
+    worker._mf_read_thread.get_and_clear_failed.side_effect = [{"req-0"}, set()]
+    worker._gather_tp_read_status = MagicMock(
+        side_effect=[
+            [({"req-0"}, {"req-0"}), (set(), set())],
+            [({"req-0"}, set()), ({"req-0"}, set())],
+        ]
+    )
+
+    assert worker.get_finished() == (set(), set())
+    assert worker.get_finished() == (set(), {"req-0-internal"})
+    assert worker._gather_tp_read_status.call_args_list[1].args[0] == {"req-0"}
 
 
 def test_owned_component_without_descriptors_still_fails():

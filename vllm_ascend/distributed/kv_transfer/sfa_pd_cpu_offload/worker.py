@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 import regex as re
 import torch
 from vllm.config import VllmConfig
-from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
@@ -106,6 +106,7 @@ class SFAPDCpuOffloadConsumerWorker:
         self.kv_cache_config = kv_cache_config
         self.use_layerwise = use_layerwise
         self.tp_rank = get_tensor_model_parallel_rank()  # TP-local rank for the per-rank ZMQ port
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.side_channel_host = get_ip()
         # D-side ZMQ control-plane base port; each TP rank listens on base + tp_rank.
         self.side_channel_port = (
@@ -133,6 +134,10 @@ class SFAPDCpuOffloadConsumerWorker:
         # External req ids whose DONE signal arrived before request_map
         # was seeded (see get_finished). Retried every step until mapped.
         self._pending_done: set[str] = set()
+        # Keep rank-local terminal state (success or failure) until every TP
+        # rank has finished the same request. This is scheduler readiness state,
+        # not a per-layer barrier.
+        self._terminal_ext_ids: set[str] = set()
 
     # ------------------------------------------------------------------
     # Common
@@ -205,15 +210,57 @@ class SFAPDCpuOffloadConsumerWorker:
             self.request_map.pop(ext_id, None)
             self._dest_blocks_by_req.pop(ext_id, None)
             self._pending_done.discard(ext_id)
+            self._terminal_ext_ids.discard(ext_id)
+
+    def _gather_tp_read_status(
+        self,
+        local_terminal: set[str],
+        local_failed: set[str],
+    ) -> list[tuple[set[str], set[str]]]:
+        if self.tp_size == 1:
+            return [(local_terminal, local_failed)]
+        tp_group = get_tp_group()
+        gathered: list[tuple[set[str], set[str]] | None] = [None] * tp_group.world_size
+        torch.distributed.all_gather_object(
+            gathered,
+            (local_terminal, local_failed),
+            group=tp_group.cpu_group,
+        )
+        return [status for status in gathered if status is not None]
 
     def get_finished(self, finished_req_ids: set[str] | None = None) -> tuple[set[str], set[str]]:
         done_recving: set[str] = set()
+        local_failed: set[str] = set()
 
         # memfabric pull mode: done comes from MembPullReadThread
         if hasattr(self, "_mf_read_thread") and self._mf_read_thread is not None:
-            done = self._mf_read_thread.get_and_clear_done()
+            local_done = self._mf_read_thread.get_and_clear_done()
+            local_failed = self._mf_read_thread.get_and_clear_failed()
+            self._terminal_ext_ids.update(local_done | local_failed)
+
+        tp_status = self._gather_tp_read_status(
+            self._terminal_ext_ids,
+            local_failed,
+        )
+        finished_on_all = (
+            set.intersection(*(terminal for terminal, _ in tp_status))
+            if tp_status
+            else set()
+        )
+        failed_on_any = set().union(*(failed for _, failed in tp_status))
+        self._terminal_ext_ids.difference_update(finished_on_all)
+
+        for ext_id in failed_on_any:
+            dest = self._dest_blocks_by_req.get(ext_id)
+            if dest is None:
+                continue
+            main_block_ids, indexer_block_ids = dest
+            self._invalid_block_ids.update(main_block_ids)
+            self._invalid_block_ids.update(indexer_block_ids)
+
+        if finished_on_all or self._pending_done:
             still_pending: set[str] = set()
-            for ext_id in done | self._pending_done:
+            for ext_id in finished_on_all | self._pending_done:
                 internal = self.request_map.get(ext_id)
                 if internal is not None:
                     done_recving.add(internal)
@@ -221,11 +268,12 @@ class SFAPDCpuOffloadConsumerWorker:
                     still_pending.add(ext_id)
             self._pending_done = still_pending
 
-            if done or done_recving or self._pending_done:
+            if done_recving or self._pending_done:
                 if envs.VLLM_ASCEND_SFA_DEBUG:
                     logger.info(
-                        "MembPull D get_finished: done_ext=%s, done_recving_internal=%s, pending_done_ext=%s",
-                        done,
+                        "MembPull D get_finished: finished_all_tp_ext=%s, "
+                        "done_recving_internal=%s, pending_done_ext=%s",
+                        finished_on_all,
                         done_recving,
                         self._pending_done,
                     )
@@ -242,14 +290,6 @@ class SFAPDCpuOffloadConsumerWorker:
         return set(), done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
-        if hasattr(self, "_mf_read_thread") and self._mf_read_thread is not None:
-            for ext_id in self._mf_read_thread.get_and_clear_failed():
-                dest = self._dest_blocks_by_req.get(ext_id)
-                if dest is None:
-                    continue
-                main_block_ids, indexer_block_ids = dest
-                self._invalid_block_ids.update(main_block_ids)
-                self._invalid_block_ids.update(indexer_block_ids)
         result = self._invalid_block_ids
         self._invalid_block_ids = set()
         return result

@@ -60,10 +60,18 @@ def _coalesce_desc(
     return peer[run_start], local[run_start], merged_len
 
 
-def _tp_block_range(num_blocks: int, tp_rank: int, tp_size: int) -> tuple[int, int]:
+def _tp_block_range(
+    num_blocks: int,
+    tp_rank: int,
+    tp_size: int,
+    start_block: int = 0,
+) -> tuple[int, int]:
+    # Rotate the first owner by the chunk's global start so consecutive small
+    # chunks do not all fall on TP0.
+    logical_rank = (tp_rank - start_block % tp_size) % tp_size
     blocks_per_rank, remainder = divmod(num_blocks, tp_size)
-    start = tp_rank * blocks_per_rank + min(tp_rank, remainder)
-    count = blocks_per_rank + int(tp_rank < remainder)
+    start = logical_rank * blocks_per_rank + min(logical_rank, remainder)
+    count = blocks_per_rank + int(logical_rank < remainder)
     return start, start + count
 
 
@@ -447,7 +455,10 @@ class MembPullReadThread(threading.Thread):
             )
         if has_cpu_destination:
             owned_start, owned_end = _tp_block_range(
-                len(d_main_ids), self.tp_rank, state.tp_size
+                len(d_main_ids),
+                self.tp_rank,
+                state.tp_size,
+                main_start_block,
             )
             p_main_block_ids = p_main_block_ids[owned_start:owned_end]
             d_main_ids = d_main_ids[owned_start:owned_end]
@@ -566,14 +577,18 @@ class MembPullReadThread(threading.Thread):
             try:
                 cpu_pool = state.cpu_pools[offload_id]
                 if cpu_pool is None:
-                    mk = mv = 0.0
+                    mk = mv = "n/a"
                 else:
                     k_cpu, v_cpu = cpu_pool
-                    mk = k_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
-                    mv = v_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
+                    mk = "%.6f" % (
+                        k_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
+                    )
+                    mv = "%.6f" % (
+                        v_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
+                    )
                 mi = state.indexer_tensors[pool_idx][d_indexer_ids].float().sum().item() if d_indexer_ids else 0.0
                 logger.info(
-                    "MFV D layer %s req %s main_k=%.6f main_v=%.6f idx_post=%.6f",
+                    "MFV D layer %s req %s main_k=%s main_v=%s idx_post=%.6f",
                     layer_name,
                     ext_req_id,
                     mk,
@@ -635,7 +650,10 @@ class MembPullReadThread(threading.Thread):
             )
             if not local_ptrs:
                 owned_main_start, owned_main_end = _tp_block_range(
-                    len(p_main_block_ids), self.tp_rank, self._state.tp_size
+                    len(p_main_block_ids),
+                    self.tp_rank,
+                    self._state.tp_size,
+                    main_start_block,
                 )
                 owns_requested_main = (
                     layer["k_cpu_ptr"] is not None
