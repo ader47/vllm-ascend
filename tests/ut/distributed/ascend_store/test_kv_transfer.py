@@ -927,6 +927,193 @@ class TestGVALayerSendingThread(unittest.TestCase):
         self.assertFalse(layer_finished.is_set())
 
 
+class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
+    """Phase 1: copy_ready (a) / pd (b) / attention-done (c) -> slot_free."""
+
+    def _make_thread(self, copy_result=0, builders=None, pd_transfer_waiter=None, attn_recorded=True):
+        store = MagicMock()
+        store.store.batch_copy.return_value = copy_result
+        db = MagicMock()
+        db.group_block_len = {0: [16]}
+        layer_finished = threading.Event()
+        copy_ready = threading.Event()
+        attn_flag = threading.Event()
+        if attn_recorded:
+            attn_flag.set()
+        sync_attn = MagicMock()
+        thread = KVCacheStoreLayerSendingThread(
+            m_store=store,
+            token_database=db,
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            put_step=1,
+            ready_event=threading.Event(),
+            num_layers=1,
+            layer_save_finished_events=[layer_finished],
+            sync_save_events=[MagicMock()],
+            group_array_builders=builders,
+            pd_transfer_waiter=pd_transfer_waiter,
+            layer_copy_ready_events=[copy_ready],
+            sync_attn_events=[sync_attn],
+            layer_attn_recorded_events=[attn_flag],
+        )
+        return thread, store, layer_finished, copy_ready, sync_attn
+
+    def _make_builder(self):
+        builder = MagicMock()
+        builder.build_addrs.return_value = LayerTransferArrays(
+            np.asarray([10]),
+            np.asarray([16]),
+            np.asarray([100]),
+        )
+        return builder
+
+    def _make_task(self):
+        return [
+            LayerTransferTask(
+                layer_id=0,
+                block_ranges=[],
+                transfer_data=MagicMock(),
+                completion=TransferCompletion([], []),
+            )
+        ]
+
+    def test_copy_ready_set_after_copy_before_pd_and_slot_free(self):
+        call_order = []
+
+        def wait_for_pd(_layer_id):
+            call_order.append("pd")
+
+        thread, store, layer_finished, copy_ready, _ = self._make_thread(
+            builders=[self._make_builder()],
+            pd_transfer_waiter=wait_for_pd,
+        )
+        store.store.batch_copy.side_effect = lambda *_a: call_order.append("copy") or 0
+        tasks = self._make_task()
+        thread.request_queue.put(tasks)
+
+        thread._handle_request(tasks)
+
+        self.assertEqual(call_order, ["copy", "pd"])
+        self.assertTrue(copy_ready.is_set())
+        self.assertTrue(layer_finished.is_set())
+
+    def test_slot_free_waits_for_attention_done(self):
+        # Attention not yet recorded: the send thread must block on the
+        # threading flag, so spin it up and release the flag shortly after.
+        thread, store, layer_finished, copy_ready, sync_attn = self._make_thread(
+            builders=[self._make_builder()],
+            attn_recorded=False,
+        )
+        attn_flag = thread.layer_attn_recorded_events[0]
+        tasks = self._make_task()
+        thread.request_queue.put(tasks)
+
+        done = threading.Event()
+
+        def run():
+            thread._handle_request(tasks)
+            done.set()
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        # Give the worker a moment to reach the attention-done wait.
+        self.assertFalse(done.wait(timeout=0.2))
+        self.assertTrue(copy_ready.is_set())  # copy_ready fires before attn gate
+        self.assertFalse(layer_finished.is_set())  # slot_free still gated on (c)
+        attn_flag.set()
+        self.assertTrue(done.wait(timeout=5))
+        worker.join(timeout=5)
+        sync_attn.synchronize.assert_called_once()
+        self.assertTrue(layer_finished.is_set())
+
+    def test_no_save_branch_sets_copy_ready_and_slot_free(self):
+        # No L2G copy for the layer: copy_ready and slot_free must both still
+        # be signaled for downstream consumers (the send thread's
+        # not-has_any_save path runs exactly these three steps in order).
+        thread, store, layer_finished, copy_ready, _ = self._make_thread(builders=[self._make_builder()])
+        thread._set_copy_ready(0)
+        thread._wait_attention_done(0)
+        thread._set_slot_free(0)
+        self.assertTrue(copy_ready.is_set())
+        self.assertTrue(layer_finished.is_set())
+        store.store.batch_copy.assert_not_called()
+
+    def test_copy_ready_single_set_assert(self):
+        thread, _, _, copy_ready, _ = self._make_thread(builders=[self._make_builder()])
+        thread._set_copy_ready(0)
+        with self.assertRaises(AssertionError):
+            thread._set_copy_ready(0)
+
+
+class TestGVALayerRecvingThreadComponentEvents(unittest.TestCase):
+    """Phase 0: recv sets aggregate + per-component load events."""
+
+    def _make_thread(self, components):
+        store = MagicMock()
+        store.store.batch_copy.return_value = 0
+        db = MagicMock()
+        db.group_block_len = {0: [16]}
+        builder = MagicMock()
+        builder.build_addrs.return_value = LayerTransferArrays(
+            np.asarray([1000]),
+            np.asarray([16]),
+            np.asarray([2000]),
+        )
+        layer_finished = threading.Event()
+        component_events = {
+            component: [threading.Event()] for component in ("main", "indexer")
+        }
+        thread = KVCacheStoreLayerRecvingThread(
+            m_store=store,
+            token_database=db,
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            ready_event=threading.Event(),
+            get_event=threading.Event(),
+            layer_load_finished_events=[layer_finished],
+            layer_save_finished_events=[threading.Event()],
+            num_layers=1,
+            group_array_builders=[builder],
+            layer_component_load_finished_events=component_events,
+        )
+        return thread, layer_finished, component_events
+
+    def test_component_events_set_from_task_components(self):
+        thread, layer_finished, component_events = self._make_thread({"main", "indexer"})
+        task = LayerTransferTask(
+            layer_id=0,
+            block_ranges=[],
+            transfer_data=MagicMock(),
+            completion=TransferCompletion(["r1"], [True]),
+            finished_req_ids={"r1"},
+            component="indexer",
+        )
+        load_task = LayerLoadTask(None, [task], layer_id=0)
+        thread.request_queue.put(load_task)
+
+        thread._handle_request(load_task)
+
+        self.assertTrue(layer_finished.is_set())
+        self.assertTrue(component_events["indexer"][0].is_set())
+        self.assertFalse(component_events["main"][0].is_set())
+
+    def test_empty_tasks_set_all_component_events(self):
+        thread, layer_finished, component_events = self._make_thread(set())
+        load_task = LayerLoadTask(None, [], layer_id=0)
+        thread.request_queue.put(load_task)
+
+        thread._handle_request(load_task)
+
+        self.assertTrue(layer_finished.is_set())
+        self.assertTrue(component_events["main"][0].is_set())
+        self.assertTrue(component_events["indexer"][0].is_set())
+
+
 @unittest.skip("LayerMultiBlockReqMeta API is deprecated, tests need update for LayerTransferTask")
 class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
     def test_handle_request(self):
