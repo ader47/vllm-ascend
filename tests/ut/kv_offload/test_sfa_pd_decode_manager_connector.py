@@ -150,11 +150,15 @@ def test_batch_metaserver_dispatches_prompt_list_once():
 
 def _make_read_thread() -> MembPullReadThread:
     thread = MembPullReadThread.__new__(MembPullReadThread)
+    thread.tp_rank = 0
     thread._state = ConsumerReadState(
         num_blocks=16,
+        tp_size=1,
         layer_metadata={},
         main_name_to_idx={},
         cpu_pools=[],
+        main_gva_bases=[],
+        main_block_lens=[],
         indexer_tensors=[],
         indexer_scale_tensors=[],
         dest_blocks_by_req={"req-0": ([3, 4], [8])},
@@ -231,6 +235,34 @@ def test_non_tp0_read_descriptors_still_transfer_indexer():
     assert info["n_indexer"] == 1
 
 
+def test_non_tp0_resolves_broadcast_main_gva_without_cpu_tensor():
+    thread = _make_read_thread()
+    layer_name = "model.layers.0.self_attn"
+    thread._state.main_name_to_idx = {layer_name: 0}
+    thread._state.cpu_pools = [None]
+    thread._state.main_gva_bases = [(3000, 4000)]
+    thread._state.main_block_lens = [(10, 20)]
+    thread._state.indexer_tensors = [None]
+    thread._state.indexer_scale_tensors = [None]
+
+    layer = thread._resolve_read_layer(
+        layer_name,
+        {
+            layer_name: {
+                "base_addrs": [1000, 2000],
+                "block_len": [10, 20],
+                "block_size_scale": [1, 1],
+                "main_tensor_count": 2,
+                "has_indexer": False,
+            }
+        },
+    )
+
+    assert layer is not None
+    assert layer["k_cpu_ptr"] == 3000
+    assert layer["v_cpu_ptr"] == 4000
+
+
 @pytest.mark.parametrize(
     (
         "k_cpu_ptr",
@@ -289,6 +321,52 @@ def test_non_tp0_main_only_layer_acknowledges_without_memfabric_read():
     thread._do_read_batch(
         layer["layer_name"],
         [("req-0", [1, 2], [], 0, 0)],
+        p_session="p-session",
+        p_layer_meta={},
+    )
+
+    thread.engine.batch_transfer_sync_read.assert_not_called()
+
+
+def test_tp_ranks_split_main_blocks_into_disjoint_contiguous_ranges():
+    layer = _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000, has_indexer=False)
+    expected = [
+        ([3000, 4000], [1000, 2000], [20, 40]),
+        ([3020, 4040], [1020, 2040], [20, 40]),
+    ]
+
+    for tp_rank, (expected_local, expected_peer, expected_lengths) in enumerate(expected):
+        thread = _make_read_thread()
+        thread.tp_rank = tp_rank
+        thread._state.tp_size = 2
+        thread._state.dest_blocks_by_req["req-0"] = ([0, 1, 2, 3], [])
+
+        local, peer, lengths, info = thread._build_req_descriptors(
+            layer,
+            "req-0",
+            p_main_block_ids=[0, 1, 2, 3],
+            p_indexer_block_ids=[],
+            want_info=True,
+        )
+
+        assert local == expected_local
+        assert peer == expected_peer
+        assert lengths == expected_lengths
+        assert info is not None
+        assert info["n_main"] == 2
+
+
+def test_tp_rank_without_blocks_in_small_chunk_acknowledges_without_read():
+    thread = _make_read_thread()
+    thread.tp_rank = 1
+    thread._state.tp_size = 2
+    thread.engine = MagicMock()
+    layer = _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000, has_indexer=False)
+    thread._resolve_read_layer = MagicMock(return_value=layer)
+
+    thread._do_read_batch(
+        layer["layer_name"],
+        [("req-0", [1], [], 0, 0)],
         p_session="p-session",
         p_layer_meta={},
     )

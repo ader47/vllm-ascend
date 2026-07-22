@@ -3,9 +3,9 @@
 """Worker side of the PD-disaggregated SFA connector (memfabric pull mode).
 
 D (``kv_consumer``): binds to :class:`KVOffloadDecodeManager`'s TP-shared CPU
-KV pool and receives indexer KV into rank-local HBM. TP0 pulls main MLA KV;
-every TP rank pulls its indexer KV. Decode KV continues to be written directly
-to the same CPU pool by the decode-offload manager.
+KV pool and receives indexer KV into rank-local HBM. Every TP rank pulls a
+disjoint part of main MLA KV and its rank-local indexer KV. Decode KV continues
+to be written directly to the same CPU pool by the decode-offload manager.
 
 P (``kv_producer``): registers its HBM KV with memfabric and runs a pull-mode
 sending thread that notifies D to read (no RDMA push). A per-layer
@@ -265,9 +265,12 @@ class SFAPDCpuOffloadConsumerWorker:
         assert self.decode_manager is not None
         return ConsumerReadState(
             num_blocks=self.kv_cache_config.num_blocks,
+            tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
             layer_metadata=self.layer_metadata,
             main_name_to_idx=self._main_name_to_idx,
             cpu_pools=self._cpu_pools,
+            main_gva_bases=self._main_gva_bases,
+            main_block_lens=self._main_block_lens,
             indexer_tensors=self._indexer_tensors,
             indexer_scale_tensors=self._indexer_scale_tensors,
             dest_blocks_by_req=self._dest_blocks_by_req,
@@ -290,6 +293,14 @@ class SFAPDCpuOffloadConsumerWorker:
         self._main_name_to_idx = {n: i for i, n in enumerate(main_names)}
         k_caches_cpu = self.decode_manager.k_caches_cpu
         v_caches_cpu = self.decode_manager.v_caches_cpu
+        gvas_k = self.decode_manager.gvas_k_bases
+        gvas_v = self.decode_manager.gvas_v_bases
+        if len(gvas_k) != len(main_names) or len(gvas_v) != len(main_names):
+            raise RuntimeError("KVOffloadDecodeManager shared CPU GVA/layer count mismatch")
+        self._main_gva_bases = list(zip(gvas_k, gvas_v))
+        self._main_block_lens = self.decode_manager.cpu_block_lens
+        if len(self._main_block_lens) != len(main_names):
+            raise RuntimeError("KVOffloadDecodeManager shared CPU block-size/layer count mismatch")
         if self.tp_rank == 0:
             if len(k_caches_cpu) != len(main_names) or len(v_caches_cpu) != len(main_names):
                 raise RuntimeError("KVOffloadDecodeManager CPU pool/layer count mismatch")
@@ -365,10 +376,9 @@ class SFAPDCpuOffloadConsumerWorker:
             raise RuntimeError("SFAPD D-side read thread failed during startup") from error
         logger.info(
             "SFAPDCpuOffload D-side registered (memfabric pull): "
-            "%d indexer + %d main layers, main CPU destination on this rank=%s",
+            "%d indexer + %d TP-shared main layers",
             sum(t is not None for t in self._indexer_tensors),
             len(main_names),
-            self.tp_rank == 0,
         )
 
     def shutdown(self) -> None:
