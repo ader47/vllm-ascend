@@ -1045,12 +1045,18 @@ class LayerTransferTask:
     group_id: int = 0
     layer_idx_in_group: int = 0
     uses_hbm_tail: bool = False
-    # "main" (k/v) or "indexer" (dsa_k/dsa_k_scale); used to split per-component load.
-    component: str = "main"
     preparation: LayerwisePreparation | None = None
     # Cache for KVCacheStoreKeyLayerSendingThread:
     # maps block_range index -> list of (start, end, key_all_layers)
     cached_process_tokens: dict[int, list[tuple[int, int, list]]] | None = None
+
+
+@dataclass
+class LayerSaveTask:
+    """Layer-level save work, including control-only saves with no copies."""
+
+    layer_id: int
+    transfer_tasks: list[LayerTransferTask]
 
 
 @dataclass

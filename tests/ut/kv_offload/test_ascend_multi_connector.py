@@ -74,11 +74,13 @@ def test_layerwise_pd_completion_is_wired_and_provider_runs_first():
         wait_for_layer_send=MagicMock(),
         wait_for_layer_load=MagicMock(side_effect=lambda *_: call_order.append("pd-load")),
         save_kv_layer=MagicMock(side_effect=lambda *_args, **_kwargs: call_order.append("pd-save")),
+        on_kv_cache_written=MagicMock(side_effect=lambda *_: call_order.append("pd-written")),
     )
     store = SimpleNamespace(
         set_layerwise_pd_transfer_waiter=MagicMock(),
         wait_for_layer_load=MagicMock(side_effect=lambda *_: call_order.append("store-load")),
         save_kv_layer=MagicMock(side_effect=lambda *_args, **_kwargs: call_order.append("store-save")),
+        on_kv_cache_written=MagicMock(side_effect=lambda *_: call_order.append("store-written")),
     )
     connector = AscendMultiConnector.__new__(AscendMultiConnector)
     # Put the store first to verify the dependency does not rely on config order.
@@ -91,4 +93,12 @@ def test_layerwise_pd_completion_is_wired_and_provider_runs_first():
 
     connector.wait_for_layer_load("model.layers.7.self_attn")
     connector.save_kv_layer("model.layers.7.self_attn", object(), object())
-    assert call_order == ["pd-load", "store-load", "pd-save", "store-save"]
+    connector.on_kv_cache_written("model.layers.7.self_attn")
+    assert call_order == [
+        "pd-load",
+        "store-load",
+        "pd-save",
+        "store-save",
+        "pd-written",
+        "store-written",
+    ]

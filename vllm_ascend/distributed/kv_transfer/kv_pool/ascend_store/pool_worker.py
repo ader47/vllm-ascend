@@ -23,7 +23,6 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
 )
@@ -35,6 +34,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     KeyMetadata,
     LayerBlockRange,
     LayerLoadTask,
+    LayerSaveTask,
     LayerTransferTask,
     LayerwisePreparation,
     ReqMeta,
@@ -389,11 +389,6 @@ class KVPoolWorker:
         else:
             self.num_prefetch_layers = int(self._extra_config.get("layerwise_prefetch_layers", 1))
         self.sync_save_events: list[torch.npu.Event] | None = None
-        # Physical layer -> component of its load tasks ("indexer" for
-        # AscendSFAIndexerCacheSpec legs, else "main"). Single-group models
-        # default to "main"; used for per-component load events (Phase 3+).
-        self.physical_layer_components: dict[int, str] = self._build_layer_components()
-        self.layer_component_load_finished_events: dict[str, list[threading.Event]] | None = None
         self.layer_copy_ready_events: list[threading.Event] | None = None
         self.sync_attn_events: list[torch.npu.Event] | None = None
         self.layer_attn_recorded_events: list[threading.Event] | None = None
@@ -404,23 +399,6 @@ class KVPoolWorker:
             self.num_kv_cache_groups,
             {k: v for k, v in list(self.physical_layer_to_group_layers.items())[:3]},
         )
-
-    def _build_layer_components(self) -> dict[int, str]:
-        # Classify each group's layers by cache spec, mirroring model_runner's
-        # main/indexer layout split. Single-group models stay all "main".
-        components: dict[int, str] = {}
-        if self.kv_cache_config is None or self.num_kv_cache_groups <= 1:
-            return components
-        for group_spec in self.kv_cache_config.kv_cache_groups:
-            group_component = (
-                "indexer" if isinstance(group_spec.kv_cache_spec, AscendSFAIndexerCacheSpec) else "main"
-            )
-            for layer_name in group_spec.layer_names:
-                physical_layer = self._extract_physical_layer_index(layer_name)
-                if physical_layer >= self.num_layers:
-                    continue
-                components[physical_layer] = group_component
-        return components
 
     def _build_group_transfer_array_builders(self) -> list[LayerTransferArrayBuilder]:
         builders = []
@@ -444,10 +422,6 @@ class KVPoolWorker:
             self.layer_load_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.layer_save_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
-            self.layer_component_load_finished_events = {
-                component: [threading.Event() for _ in range(self.num_layers)]
-                for component in ("main", "indexer")
-            }
             self.layer_copy_ready_events = [threading.Event() for _ in range(self.num_layers)]
             self.sync_attn_events = [torch.npu.Event() for _ in range(self.num_layers)]
             self.layer_attn_recorded_events = [threading.Event() for _ in range(self.num_layers)]
@@ -510,7 +484,6 @@ class KVPoolWorker:
                     self.layerwise_max_transfer_blocks,
                     self.layerwise_max_transfer_bytes,
                     group_array_builders=self._build_group_transfer_array_builders(),
-                    layer_component_load_finished_events=self.layer_component_load_finished_events,
                 )
             else:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
@@ -567,11 +540,6 @@ class KVPoolWorker:
         self._layerwise_pd_transfer_waiter = waiter
         if isinstance(self.kv_send_thread, KVCacheStoreLayerSendingThread):
             self.kv_send_thread.pd_transfer_waiter = waiter
-
-    def _wait_for_layerwise_pd_transfer(self, layer_idx: int) -> None:
-        waiter = self._layerwise_pd_transfer_waiter
-        if self.layerwise_offload and waiter is not None:
-            waiter(layer_idx)
 
     def _build_cache_coordinator(self, vllm_config: VllmConfig) -> AscendStoreCoordinator | None:
         if self.kv_cache_config is None or not self.use_hybrid:
@@ -1118,7 +1086,6 @@ class KVPoolWorker:
 
         independent_layer_set = set(self.independent_layers) if self.layerwise_offload else set()
         for physical_layer in range(self.num_layers):
-            component = self.physical_layer_components.get(physical_layer, "main")
             group_layers = self.physical_layer_to_group_layers.get(physical_layer, [(0, physical_layer)])
             for group_id, layer_idx_in_group in group_layers:
                 plan = plans[group_id]
@@ -1130,7 +1097,6 @@ class KVPoolWorker:
                             block_ranges=save_ranges,
                             group_id=group_id,
                             layer_idx_in_group=layer_idx_in_group,
-                            component=component,
                         )
                     )
 
@@ -1147,7 +1113,6 @@ class KVPoolWorker:
                             group_id=group_id,
                             layer_idx_in_group=layer_idx_in_group,
                             uses_hbm_tail=uses_hbm_tail,
-                            component=component,
                         )
                     )
 
@@ -1242,9 +1207,9 @@ class KVPoolWorker:
         """Dispatch a layer's save as soon as its KV is scattered (pre-attention).
 
         Records the scatter-complete event and queues the L2G save immediately,
-        rather than waiting for save_kv_layer at layer end. Idempotent: layers
-        with no indexer never fire the attention-side hook, so save_kv_layer
-        falls back to dispatching any layer not already handled here.
+        rather than waiting for save_kv_layer at layer end. Idempotent; the
+        layer-end callback dispatches any layer whose attention path skipped
+        this hook.
         """
         if not self.use_gva_layerwise or self.kv_send_thread is None:
             return
@@ -1259,16 +1224,32 @@ class KVPoolWorker:
             return
         if idx in self._early_dispatched:
             return
+        self._dispatch_layer_save(idx)
+
+    def _dispatch_layer_save(self, layer_idx: int) -> None:
+        """Queue copy or control-only work for one physical layer."""
         assert self.sync_save_events is not None
-        self.sync_save_events[idx].record()
-        if self.layer_save_tasks[idx]:
-            send_thread = self.kv_send_thread
-            send_thread.raise_if_failed()
-            for task in self.layer_save_tasks[idx]:
-                for block_range in task.block_ranges:
-                    send_thread.add_stored_request(block_range.request.req_id)
-            send_thread.add_request(self.layer_save_tasks[idx])  # type: ignore[arg-type]
-        self._early_dispatched.add(idx)
+        assert self.kv_send_thread is not None
+        send_thread = self.kv_send_thread
+        send_thread.raise_if_failed()
+        self.sync_save_events[layer_idx].record()
+        transfer_tasks = self.layer_save_tasks[layer_idx]
+        for task in transfer_tasks:
+            for block_range in task.block_ranges:
+                send_thread.add_stored_request(block_range.request.req_id)
+        if self.use_gva_layerwise:
+            send_thread.add_request(LayerSaveTask(layer_id=layer_idx, transfer_tasks=transfer_tasks))
+        elif transfer_tasks:
+            send_thread.add_request(transfer_tasks)  # type: ignore[arg-type]
+        else:
+            # The key-based path has no shared-slot reuse or asynchronous PD
+            # completion to gate, so preserve its synchronous empty-layer
+            # completion behavior.
+            assert self.layer_copy_ready_events is not None
+            assert self.layer_save_finished_events is not None
+            self.layer_copy_ready_events[layer_idx].set()
+            self.layer_save_finished_events[layer_idx].set()
+        self._early_dispatched.add(layer_idx)
 
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
         if self.current_layer >= self.num_layers:
@@ -1279,18 +1260,7 @@ class KVPoolWorker:
         send_thread = self.kv_send_thread
         send_thread.raise_if_failed()
         if self.current_layer not in self._early_dispatched:
-            self.sync_save_events[self.current_layer].record()
-            if self.layer_save_tasks[self.current_layer]:
-                for task in self.layer_save_tasks[self.current_layer]:
-                    for block_range in task.block_ranges:
-                        send_thread.add_stored_request(block_range.request.req_id)
-                send_thread.add_request(self.layer_save_tasks[self.current_layer])  # type: ignore[arg-type]
-            else:
-                self._wait_for_layerwise_pd_transfer(self.current_layer)
-                assert self.layer_copy_ready_events is not None
-                self.layer_copy_ready_events[self.current_layer].set()
-                self.layer_save_finished_events[self.current_layer].set()
-            self._early_dispatched.add(self.current_layer)
+            self._dispatch_layer_save(self.current_layer)
         # Attention for this layer is done (post o_proj); the slot's readers
         # include the compute stream, so slot reuse must wait for it.
         assert self.sync_attn_events is not None

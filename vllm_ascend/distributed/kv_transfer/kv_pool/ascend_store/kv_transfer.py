@@ -22,6 +22,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     ChunkedTokenDatabase,
     LayerLoadTask,
     LayerMultiBlockReqMeta,
+    LayerSaveTask,
     LayerTransferArrays,
     LayerTransferTask,
     LayerwisePreparation,
@@ -1174,24 +1175,22 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.layer_save_finished_events[physical_layer].set()
 
     def add_request(  # type: ignore[override]
-        self, req_meta: list[LayerTransferTask] | LayerwisePreparation
+        self, req_meta: LayerSaveTask | LayerwisePreparation
     ) -> torch.Tensor:
         self.request_queue.put(req_meta)
 
     def _handle_request(  # type: ignore[override]
-        self, transfer_tasks: list[LayerTransferTask] | LayerwisePreparation
+        self, request: LayerSaveTask | LayerwisePreparation
     ):
-        if isinstance(transfer_tasks, LayerwisePreparation):
-            transfer_tasks.ensure_ready()
+        if isinstance(request, LayerwisePreparation):
+            request.ensure_ready()
             self.request_queue.task_done()
             return
-        if len(transfer_tasks) == 0:
-            self.request_queue.task_done()
-            return
-        preparation = transfer_tasks[0].preparation
+        physical_layer = request.layer_id
+        transfer_tasks = request.transfer_tasks
+        preparation = transfer_tasks[0].preparation if transfer_tasks else None
         if preparation is not None:
             preparation.ensure_ready()
-        physical_layer = transfer_tasks[0].layer_id
         has_any_save = False
         all_gvas = []
         all_addrs = []
@@ -1199,6 +1198,10 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         all_req_ids = []
         finished_req_ids: set[str] = set()
         for task in transfer_tasks:
+            if task.layer_id != physical_layer:
+                raise RuntimeError(
+                    f"Layerwise save request for layer {physical_layer} contains task for layer {task.layer_id}"
+                )
             transfer_data = task.transfer_data
             completion = task.completion
             if transfer_data is None or completion is None:
@@ -1238,24 +1241,19 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 )
             if res != 0:
                 raise RuntimeError(f"Layerwise {physical_layer} save batch_copy failed with return code {res}")
-            self._set_copy_ready(physical_layer)
-            if self.pd_transfer_waiter is not None:
-                self.pd_transfer_waiter(physical_layer)
-            self._wait_attention_done(physical_layer)
+
+        self._set_copy_ready(physical_layer)
+        if self.pd_transfer_waiter is not None:
+            self.pd_transfer_waiter(physical_layer)
+        self._wait_attention_done(physical_layer)
+
+        if has_any_save:
             for req_id in all_req_ids:
                 self.dec_stored_request(req_id)
             for req_id in finished_req_ids:
                 if self.try_finish_and_delete_stored_request(req_id):
                     self.set_finished_request(req_id)
-        if not has_any_save:
-            self._set_copy_ready(physical_layer)
-            if self.pd_transfer_waiter is not None:
-                self.pd_transfer_waiter(physical_layer)
-            self._wait_attention_done(physical_layer)
-            self._set_slot_free(physical_layer)
-            transfer_tasks.clear()
-            self.request_queue.task_done()
-            return
+
         self._set_slot_free(physical_layer)
         transfer_tasks.clear()
         self.request_queue.task_done()
@@ -1279,7 +1277,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
         group_array_builders: list[LayerTransferArrayBuilder] | None = None,
-        layer_component_load_finished_events: dict[str, list[threading.Event]] | None = None,
     ):
         super().__init__(
             m_store,
@@ -1294,7 +1291,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.get_event = get_event
         self.layer_load_finished_events = layer_load_finished_events
         self.layer_save_finished_events = layer_save_finished_events
-        self.layer_component_load_finished_events = layer_component_load_finished_events
         self.final_layer_id = num_layers - 1
         self.h2d_stagger_us = h2d_stagger_us
         self.max_transfer_blocks = max_transfer_blocks
@@ -1315,14 +1311,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     ) -> None:
         _mark_last_transfer_tasks(layer_tasks, "load")
 
-    def _set_layer_load_done(self, layer_id: int, components: set[str] | None = None) -> None:
-        # Set the aggregate event, plus the per-component events for every
-        # component this layer actually loaded (defaults to the full set).
+    def _set_layer_load_done(self, layer_id: int) -> None:
         assert not self.layer_load_finished_events[layer_id].is_set()
-        if self.layer_component_load_finished_events is not None:
-            for component in components if components is not None else self.layer_component_load_finished_events:
-                assert not self.layer_component_load_finished_events[component][layer_id].is_set()
-                self.layer_component_load_finished_events[component][layer_id].set()
         logger.debug("Layer load event set: layer %d", layer_id)
         self.layer_load_finished_events[layer_id].set()
 
@@ -1436,7 +1426,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
         for req_id in finished_req_ids:
             self.set_finished_request(req_id)
-        self._set_layer_load_done(layer_id, {task.component for task, _ in task_arrays})
+        self._set_layer_load_done(layer_id)
         transfer_tasks.clear()
         self.request_queue.task_done()
         self.get_event.set()

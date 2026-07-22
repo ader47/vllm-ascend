@@ -692,6 +692,12 @@ class SFAPDCpuOffloadProducerWorker:
     ) -> None:
         if self._backend != BACKEND_MEMFABRIC:
             raise RuntimeError("SFAPDCpuOffloadConnector P side supports memfabric pull only.")
+        send_thread = self.kv_send_layer_thread
+        if send_thread is None:
+            raise RuntimeError(
+                "SFAPD P-side send thread is unavailable; "
+                "register_kv_caches() must complete before save_kv_layer()"
+            )
         resolved_layer_name = layer_name or self.index_to_name.get(self.current_layer)
         if resolved_layer_name is None:
             return
@@ -707,12 +713,10 @@ class SFAPDCpuOffloadProducerWorker:
         self._pd_dispatched_layers.add(layer_idx)
         layer_group_indices = set(self.layer_metadata[resolved_layer_name].tensor_group_idx)
         if self._has_memfabric_pull_target(connector_metadata, layer_idx, layer_group_indices):
-            self.kv_send_layer_thread.mark_layer_pending(layer_idx)
-        if self.kv_send_layer_thread is None:
-            return
+            send_thread.mark_layer_pending(layer_idx)
         # Fallback path (attention hook did not fire for this layer): record
         # scatter completion now and pick the reshape/event to wait on.
-        self.kv_send_layer_thread.record_p_save_event(layer_idx)
+        send_thread.record_p_save_event(layer_idx)
         layer_attn_metadata = None
         if self.use_mla and hasattr(attn_metadata, "__getitem__"):
             try:

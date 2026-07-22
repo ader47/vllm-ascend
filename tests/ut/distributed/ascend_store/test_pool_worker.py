@@ -24,6 +24,7 @@ import numpy as np
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
+    LayerSaveTask,
     LoadSpec,
     ReqMeta,
 )
@@ -171,6 +172,10 @@ class TestKVPoolWorkerEarlyDispatch(unittest.TestCase):
         worker.on_kv_cache_written("model.layers.0.self_attn")
         worker.sync_save_events[0].record.assert_called_once()
         worker.kv_send_thread.add_request.assert_called_once()
+        request = worker.kv_send_thread.add_request.call_args.args[0]
+        self.assertIsInstance(request, LayerSaveTask)
+        self.assertEqual(request.layer_id, 0)
+        self.assertIs(request.transfer_tasks, worker.layer_save_tasks[0])
         self.assertIn(0, worker._early_dispatched)
 
     def test_hook_idempotent_on_repeat(self):
@@ -200,7 +205,7 @@ class TestKVPoolWorkerEarlyDispatch(unittest.TestCase):
 
     def test_save_kv_layer_fallback_dispatches_when_hook_missed(self):
         worker = self._make_worker()
-        # hook never fired (e.g. layer without indexer): save_kv_layer must dispatch
+        # If the attention path misses the hook, save_kv_layer must dispatch.
         worker.save_kv_layer(MagicMock())
         worker.sync_save_events[0].record.assert_called_once()
         worker.kv_send_thread.add_request.assert_called_once()
@@ -208,12 +213,50 @@ class TestKVPoolWorkerEarlyDispatch(unittest.TestCase):
         self.assertIn(0, worker._early_dispatched)
         self.assertEqual(worker.current_layer, 1)
 
-    def test_save_kv_layer_no_save_branch_sets_copy_ready(self):
+    def test_save_kv_layer_enqueues_control_task_when_hook_missed(self):
         worker = self._make_worker(with_save_tasks=False)
         worker.save_kv_layer(MagicMock())
+        worker.kv_send_thread.add_request.assert_called_once()
+        request = worker.kv_send_thread.add_request.call_args.args[0]
+        self.assertIsInstance(request, LayerSaveTask)
+        self.assertEqual(request.layer_id, 0)
+        self.assertEqual(request.transfer_tasks, [])
+        self.assertFalse(worker.layer_copy_ready_events[0].is_set())
+        self.assertFalse(worker.layer_save_finished_events[0].is_set())
+        self.assertTrue(worker.layer_attn_recorded_events[0].is_set())
+
+    def test_hook_enqueues_control_task_for_layer_without_save_data(self):
+        worker = self._make_worker(with_save_tasks=False)
+        worker.on_kv_cache_written("model.layers.0.self_attn")
+
+        worker.kv_send_thread.add_request.assert_called_once()
+        request = worker.kv_send_thread.add_request.call_args.args[0]
+        self.assertIsInstance(request, LayerSaveTask)
+        self.assertEqual(request.layer_id, 0)
+        self.assertEqual(request.transfer_tasks, [])
+        self.assertIn(0, worker._early_dispatched)
+
+        worker.save_kv_layer(MagicMock())
+        worker.kv_send_thread.add_request.assert_called_once()
+        self.assertTrue(worker.layer_attn_recorded_events[0].is_set())
+
+    def test_key_path_keeps_raw_transfer_task_request(self):
+        worker = self._make_worker()
+        worker.use_gva_layerwise = False
+
+        worker.save_kv_layer(MagicMock())
+
+        worker.kv_send_thread.add_request.assert_called_once_with(worker.layer_save_tasks[0])
+
+    def test_key_path_completes_empty_layer_synchronously(self):
+        worker = self._make_worker(with_save_tasks=False)
+        worker.use_gva_layerwise = False
+
+        worker.save_kv_layer(MagicMock())
+
+        worker.kv_send_thread.add_request.assert_not_called()
         self.assertTrue(worker.layer_copy_ready_events[0].is_set())
         self.assertTrue(worker.layer_save_finished_events[0].is_set())
-        worker.kv_send_thread.add_request.assert_not_called()
 
 
 class TestKVPoolWorkerInit(unittest.TestCase):
