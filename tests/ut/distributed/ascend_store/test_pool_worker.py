@@ -137,6 +137,85 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         self.assertFalse(worker.cache_coordinator.find_longest_cache_hit.call_args.kwargs["apply_eagle"])
 
 
+class TestKVPoolWorkerEarlyDispatch(unittest.TestCase):
+    """Phase 2: on_kv_cache_written dispatches save at scatter, save_kv_layer falls back."""
+
+    def _make_worker(self, num_layers=2, with_save_tasks=True):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+
+        worker = object.__new__(KVPoolWorker)
+        worker.num_layers = num_layers
+        worker.use_gva_layerwise = True
+        worker.current_layer = 0
+        worker._scatter_cursor = 0
+        worker._early_dispatched = set()
+        worker.sync_save_events = [MagicMock() for _ in range(num_layers)]
+        worker.sync_attn_events = [MagicMock() for _ in range(num_layers)]
+        worker.layer_attn_recorded_events = [threading.Event() for _ in range(num_layers)]
+        worker.layer_copy_ready_events = [threading.Event() for _ in range(num_layers)]
+        worker.layer_save_finished_events = [threading.Event() for _ in range(num_layers)]
+        worker.layer_save_tasks = [
+            [MagicMock(block_ranges=[MagicMock(request=MagicMock(req_id="r1"))])] if with_save_tasks else []
+            for _ in range(num_layers)
+        ]
+        worker.kv_send_thread = MagicMock()
+        worker.prefetch_layer_map = {}
+        worker.hf_config = MagicMock()
+        worker.hf_config.num_hidden_layers = num_layers
+        worker._layerwise_pd_transfer_waiter = None
+        worker.layerwise_offload = False
+        return worker
+
+    def test_hook_dispatches_and_records_scatter_event(self):
+        worker = self._make_worker()
+        worker.on_kv_cache_written("model.layers.0.self_attn")
+        worker.sync_save_events[0].record.assert_called_once()
+        worker.kv_send_thread.add_request.assert_called_once()
+        self.assertIn(0, worker._early_dispatched)
+
+    def test_hook_idempotent_on_repeat(self):
+        worker = self._make_worker()
+        worker.on_kv_cache_written("model.layers.0.self_attn")
+        worker.on_kv_cache_written("model.layers.0.self_attn")
+        worker.kv_send_thread.add_request.assert_called_once()
+        worker.sync_save_events[0].record.assert_called_once()
+
+    def test_hook_uses_cursor_when_layer_name_empty(self):
+        worker = self._make_worker()
+        worker.on_kv_cache_written("")
+        # cursor resolves layer 0 and advances
+        worker.sync_save_events[0].record.assert_called_once()
+        self.assertEqual(worker._scatter_cursor, 1)
+
+    def test_save_kv_layer_skips_already_dispatched(self):
+        worker = self._make_worker()
+        worker.on_kv_cache_written("model.layers.0.self_attn")
+        worker.kv_send_thread.reset_mock()
+        worker.save_kv_layer(MagicMock())
+        # no second dispatch, but attn-done still recorded
+        worker.kv_send_thread.add_request.assert_not_called()
+        worker.sync_attn_events[0].record.assert_called_once()
+        self.assertTrue(worker.layer_attn_recorded_events[0].is_set())
+        self.assertEqual(worker.current_layer, 1)
+
+    def test_save_kv_layer_fallback_dispatches_when_hook_missed(self):
+        worker = self._make_worker()
+        # hook never fired (e.g. layer without indexer): save_kv_layer must dispatch
+        worker.save_kv_layer(MagicMock())
+        worker.sync_save_events[0].record.assert_called_once()
+        worker.kv_send_thread.add_request.assert_called_once()
+        worker.sync_attn_events[0].record.assert_called_once()
+        self.assertIn(0, worker._early_dispatched)
+        self.assertEqual(worker.current_layer, 1)
+
+    def test_save_kv_layer_no_save_branch_sets_copy_ready(self):
+        worker = self._make_worker(with_save_tasks=False)
+        worker.save_kv_layer(MagicMock())
+        self.assertTrue(worker.layer_copy_ready_events[0].is_set())
+        self.assertTrue(worker.layer_save_finished_events[0].is_set())
+        worker.kv_send_thread.add_request.assert_not_called()
+
+
 class TestKVPoolWorkerInit(unittest.TestCase):
     """Test KVPoolWorker initialization with mocked dependencies."""
 
