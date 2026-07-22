@@ -47,6 +47,9 @@ from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.send_thread import (
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.worker import (  # noqa: E402
     SFAPDCpuOffloadProducerWorker,
 )
+from vllm_ascend.distributed.kv_transfer.utils.memfabric_transfer_engine import (  # noqa: E402
+    BACKEND_MEMFABRIC,
+)
 
 
 def test_sfa_pd_cpu_offload_connector_is_registered():
@@ -600,6 +603,25 @@ def test_pd_read_wait_propagates_read_failed():
 
     with pytest.raises(RuntimeError, match="memfabric read failed"):
         worker.wait_for_layer_send(0)
+
+
+def test_save_kv_layer_requires_send_thread_without_marking_dispatched():
+    worker = SFAPDCpuOffloadProducerWorker.__new__(SFAPDCpuOffloadProducerWorker)
+    worker._backend = BACKEND_MEMFABRIC
+    worker.kv_send_layer_thread = None
+    worker._pd_dispatched_layers = set()
+    worker.current_layer = 0
+
+    with pytest.raises(RuntimeError, match=r"register_kv_caches\(\)"):
+        worker.save_kv_layer(
+            "model.layers.0.self_attn",
+            [],
+            MagicMock(),
+            SimpleNamespace(requests={"req-0": MagicMock()}),
+        )
+
+    assert worker._pd_dispatched_layers == set()
+    assert worker.current_layer == 0
 
 
 def test_main_only_and_indexer_layers_share_their_physical_main_slot():
