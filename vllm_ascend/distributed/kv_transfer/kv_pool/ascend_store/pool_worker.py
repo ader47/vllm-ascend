@@ -389,7 +389,6 @@ class KVPoolWorker:
         else:
             self.num_prefetch_layers = int(self._extra_config.get("layerwise_prefetch_layers", 1))
         self.sync_save_events: list[torch.npu.Event] | None = None
-        self.layer_copy_ready_events: list[threading.Event] | None = None
         self.sync_attn_events: list[torch.npu.Event] | None = None
         self.layer_attn_recorded_events: list[threading.Event] | None = None
 
@@ -422,7 +421,6 @@ class KVPoolWorker:
             self.layer_load_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.layer_save_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
-            self.layer_copy_ready_events = [threading.Event() for _ in range(self.num_layers)]
             self.sync_attn_events = [torch.npu.Event() for _ in range(self.num_layers)]
             self.layer_attn_recorded_events = [threading.Event() for _ in range(self.num_layers)]
             if self.use_gva_layerwise and self.kv_role in ["kv_producer", "kv_both"]:
@@ -443,7 +441,6 @@ class KVPoolWorker:
                     self.layerwise_max_transfer_bytes,
                     group_array_builders=self._build_group_transfer_array_builders(),
                     pd_transfer_waiter=self._layerwise_pd_transfer_waiter,
-                    layer_copy_ready_events=self.layer_copy_ready_events,
                     sync_attn_events=self.sync_attn_events,
                     layer_attn_recorded_events=self.layer_attn_recorded_events,
                 )
@@ -484,6 +481,7 @@ class KVPoolWorker:
                     self.layerwise_max_transfer_blocks,
                     self.layerwise_max_transfer_bytes,
                     group_array_builders=self._build_group_transfer_array_builders(),
+                    load_lease_releaser=self._layerwise_transfer_preparer.release_finished_load_leases,
                 )
             else:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
@@ -878,9 +876,6 @@ class KVPoolWorker:
             if self.layer_attn_recorded_events is not None:
                 for event in self.layer_attn_recorded_events:
                     event.clear()
-            if self.layer_copy_ready_events is not None:
-                for event in self.layer_copy_ready_events:
-                    event.clear()
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         if len(metadata.requests) == 0:
             return
@@ -1245,9 +1240,7 @@ class KVPoolWorker:
             # The key-based path has no shared-slot reuse or asynchronous PD
             # completion to gate, so preserve its synchronous empty-layer
             # completion behavior.
-            assert self.layer_copy_ready_events is not None
             assert self.layer_save_finished_events is not None
-            self.layer_copy_ready_events[layer_idx].set()
             self.layer_save_finished_events[layer_idx].set()
         self._early_dispatched.add(layer_idx)
 

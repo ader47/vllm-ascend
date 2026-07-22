@@ -934,7 +934,7 @@ class TestGVALayerSendingThread(unittest.TestCase):
 
 
 class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
-    """Phase 1: copy_ready (a) / pd (b) / attention-done (c) -> slot_free."""
+    """PD and attention completion gate physical slot reuse."""
 
     def _make_thread(self, copy_result=0, builders=None, pd_transfer_waiter=None, attn_recorded=True):
         store = MagicMock()
@@ -942,7 +942,6 @@ class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
         db = MagicMock()
         db.group_block_len = {0: [16]}
         layer_finished = threading.Event()
-        copy_ready = threading.Event()
         attn_flag = threading.Event()
         if attn_recorded:
             attn_flag.set()
@@ -961,11 +960,10 @@ class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
             sync_save_events=[MagicMock()],
             group_array_builders=builders,
             pd_transfer_waiter=pd_transfer_waiter,
-            layer_copy_ready_events=[copy_ready],
             sync_attn_events=[sync_attn],
             layer_attn_recorded_events=[attn_flag],
         )
-        return thread, store, layer_finished, copy_ready, sync_attn
+        return thread, store, layer_finished, sync_attn
 
     def _make_builder(self):
         builder = MagicMock()
@@ -989,13 +987,13 @@ class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
             ],
         )
 
-    def test_copy_ready_set_after_copy_before_pd_and_slot_free(self):
+    def test_copy_runs_before_pd_and_slot_free(self):
         call_order = []
 
         def wait_for_pd(_layer_id):
             call_order.append("pd")
 
-        thread, store, layer_finished, copy_ready, _ = self._make_thread(
+        thread, store, layer_finished, _ = self._make_thread(
             builders=[self._make_builder()],
             pd_transfer_waiter=wait_for_pd,
         )
@@ -1006,13 +1004,12 @@ class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
         thread._handle_request(request)
 
         self.assertEqual(call_order, ["copy", "pd"])
-        self.assertTrue(copy_ready.is_set())
         self.assertTrue(layer_finished.is_set())
 
     def test_slot_free_waits_for_attention_done(self):
         # Attention not yet recorded: the send thread must block on the
         # threading flag, so spin it up and release the flag shortly after.
-        thread, store, layer_finished, copy_ready, sync_attn = self._make_thread(
+        thread, store, layer_finished, sync_attn = self._make_thread(
             builders=[self._make_builder()],
             attn_recorded=False,
         )
@@ -1030,7 +1027,7 @@ class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
         worker.start()
         # Give the worker a moment to reach the attention-done wait.
         self.assertFalse(done.wait(timeout=0.2))
-        self.assertTrue(copy_ready.is_set())  # copy_ready fires before attn gate
+        store.store.batch_copy.assert_called_once()
         self.assertFalse(layer_finished.is_set())  # slot_free still gated on (c)
         attn_flag.set()
         self.assertTrue(done.wait(timeout=5))
@@ -1044,7 +1041,7 @@ class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
         def wait_for_pd(_layer_id):
             call_order.append("pd")
 
-        thread, store, layer_finished, copy_ready, sync_attn = self._make_thread(
+        thread, store, layer_finished, sync_attn = self._make_thread(
             builders=[self._make_builder()],
             pd_transfer_waiter=wait_for_pd,
             attn_recorded=False,
@@ -1061,7 +1058,6 @@ class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
         worker.start()
 
         self.assertFalse(done.wait(timeout=0.2))
-        self.assertTrue(copy_ready.is_set())
         self.assertEqual(call_order, ["pd"])
         self.assertFalse(layer_finished.is_set())
         thread.layer_attn_recorded_events[0].set()
@@ -1070,12 +1066,6 @@ class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
         sync_attn.synchronize.assert_called_once()
         self.assertTrue(layer_finished.is_set())
         store.store.batch_copy.assert_not_called()
-
-    def test_copy_ready_single_set_assert(self):
-        thread, _, _, copy_ready, _ = self._make_thread(builders=[self._make_builder()])
-        thread._set_copy_ready(0)
-        with self.assertRaises(AssertionError):
-            thread._set_copy_ready(0)
 
 
 @unittest.skip("LayerMultiBlockReqMeta API is deprecated, tests need update for LayerTransferTask")
@@ -1111,10 +1101,45 @@ class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
 
 
 class TestGVALayerRecvingThread(unittest.TestCase):
-    def test_layer_transfer_does_not_touch_block_leases(self):
+    def test_h2d_stagger_sleeps_before_short_final_spin(self):
+        thread = KVCacheStoreLayerRecvingThread.__new__(KVCacheStoreLayerRecvingThread)
+        thread._get_h2d_stagger_delay_us = MagicMock(return_value=100)
+
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.time.perf_counter_ns",
+                side_effect=[0, 100_000],
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.time.sleep"
+            ) as sleep,
+        ):
+            thread._stagger_h2d_submit(layer_id=0)
+
+        sleep.assert_called_once_with(50 / 1_000_000)
+
+    def test_short_h2d_stagger_does_not_sleep(self):
+        thread = KVCacheStoreLayerRecvingThread.__new__(KVCacheStoreLayerRecvingThread)
+        thread._get_h2d_stagger_delay_us = MagicMock(return_value=25)
+
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.time.perf_counter_ns",
+                side_effect=[0, 25_000],
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.time.sleep"
+            ) as sleep,
+        ):
+            thread._stagger_h2d_submit(layer_id=0)
+
+        sleep.assert_not_called()
+
+    def test_layer_transfer_releases_load_leases_after_copy(self):
         store = MagicMock()
         store.batch_add_lease.return_value = [0, 0]
         store.store.batch_copy.return_value = 0
+        load_lease_releaser = MagicMock()
         db = MagicMock()
         db.group_block_len = {0: [16]}
         db.group_kv_caches_base_addr = {0: [1000]}
@@ -1139,6 +1164,7 @@ class TestGVALayerRecvingThread(unittest.TestCase):
             layer_save_finished_events=[threading.Event()],
             num_layers=1,
             group_array_builders=[builder],
+            load_lease_releaser=load_lease_releaser,
         )
         preparation_callback = MagicMock()
         task = LayerTransferTask(
@@ -1162,6 +1188,7 @@ class TestGVALayerRecvingThread(unittest.TestCase):
         store.batch_add_lease.assert_not_called()
         store.batch_remove_lease.assert_not_called()
         store.store.batch_copy.assert_called_once()
+        load_lease_releaser.assert_called_once_with({"r1"})
         self.assertEqual(thread.get_and_clear_finished_requests(), {"r1"})
 
     def test_last_actual_transfer_can_finish_before_final_physical_layer(self):
@@ -1215,6 +1242,7 @@ class TestGVALayerRecvingThread(unittest.TestCase):
             np.asarray([2000]),
         )
         layer_finished = threading.Event()
+        load_lease_releaser = MagicMock()
         thread = KVCacheStoreLayerRecvingThread(
             m_store=store,
             token_database=db,
@@ -1228,6 +1256,7 @@ class TestGVALayerRecvingThread(unittest.TestCase):
             layer_save_finished_events=[threading.Event()],
             num_layers=1,
             group_array_builders=[builder],
+            load_lease_releaser=load_lease_releaser,
         )
         task = LayerTransferTask(
             layer_id=0,
@@ -1244,6 +1273,7 @@ class TestGVALayerRecvingThread(unittest.TestCase):
 
         self.assertEqual(thread.get_and_clear_finished_requests(), set())
         self.assertFalse(layer_finished.is_set())
+        load_lease_releaser.assert_not_called()
 
 
 class TestKVTransferTpMismatchDispatch(unittest.TestCase):

@@ -153,7 +153,6 @@ class TestKVPoolWorkerEarlyDispatch(unittest.TestCase):
         worker.sync_save_events = [MagicMock() for _ in range(num_layers)]
         worker.sync_attn_events = [MagicMock() for _ in range(num_layers)]
         worker.layer_attn_recorded_events = [threading.Event() for _ in range(num_layers)]
-        worker.layer_copy_ready_events = [threading.Event() for _ in range(num_layers)]
         worker.layer_save_finished_events = [threading.Event() for _ in range(num_layers)]
         worker.layer_save_tasks = [
             [MagicMock(block_ranges=[MagicMock(request=MagicMock(req_id="r1"))])] if with_save_tasks else []
@@ -221,7 +220,6 @@ class TestKVPoolWorkerEarlyDispatch(unittest.TestCase):
         self.assertIsInstance(request, LayerSaveTask)
         self.assertEqual(request.layer_id, 0)
         self.assertEqual(request.transfer_tasks, [])
-        self.assertFalse(worker.layer_copy_ready_events[0].is_set())
         self.assertFalse(worker.layer_save_finished_events[0].is_set())
         self.assertTrue(worker.layer_attn_recorded_events[0].is_set())
 
@@ -255,7 +253,6 @@ class TestKVPoolWorkerEarlyDispatch(unittest.TestCase):
         worker.save_kv_layer(MagicMock())
 
         worker.kv_send_thread.add_request.assert_not_called()
-        self.assertTrue(worker.layer_copy_ready_events[0].is_set())
         self.assertTrue(worker.layer_save_finished_events[0].is_set())
 
 
