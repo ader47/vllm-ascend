@@ -165,7 +165,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         )
         if enable_cp() or self.enable_dsa_cp:
             raise NotImplementedError("KV offload decode currently requires TP without context parallelism")
-        if self.use_sparse_c8_sfa or self.use_sparse_c8_indexer:
+        if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
             raise NotImplementedError("KV offload decode does not support sparse C8 yet")
         if self.enable_sfa_prolog_v3 or self.enable_mlapo:
             raise NotImplementedError(
