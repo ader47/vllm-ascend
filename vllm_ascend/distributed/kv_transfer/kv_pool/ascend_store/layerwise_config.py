@@ -1,15 +1,22 @@
-import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+import regex as re
+
 _EXTRA_CONFIG_KEY_NUM_SHARED_BUFFERS = "layerwise_num_shared_buffers"
 _EXTRA_CONFIG_KEY_PREFETCH_LAYERS = "layerwise_prefetch_layers"
 _EXTRA_CONFIG_KEY_INDEPENDENT_LAYERS = "layerwise_independent_layers"
+_EXTRA_CONFIG_KEY_H2D_BENCHMARK = "h2d_benchmark"
+_EXTRA_CONFIG_KEY_H2D_BENCHMARK_BLOCK_COUNT = "h2d_benchmark_block_count"
+_EXTRA_CONFIG_KEY_H2D_BENCHMARK_BLOCK_BYTES = "h2d_benchmark_block_bytes"
+_EXTRA_CONFIG_KEY_H2D_BENCHMARK_INTERVAL_US = "h2d_benchmark_interval_us"
+_EXTRA_CONFIG_KEY_H2D_BENCHMARK_PROCESSES = "h2d_benchmark_processes"
 
 # Prefetching farther than the number of shared buffers cannot improve the
 # reuse pipeline. Cap the automatic value to avoid a large layer-0 burst.
 _DEFAULT_MAX_PREFETCH_LAYERS = 8
+_DEFAULT_H2D_BENCHMARK_BLOCK_BYTES = 16 * 1024 * 1024
 
 
 def get_layerwise_physical_layer_index(layer_name: str, base_layers: int) -> int:
@@ -33,10 +40,81 @@ class LayerwiseConfig:
     has_layer_reuse: bool
 
 
-def get_gva_layerwise_config(kv_transfer_config: Any) -> dict[str, Any] | None:
-    """Return the config for the supported GVA layerwise KV pool path."""
+@dataclass(frozen=True)
+class H2DBenchmarkConfig:
+    """Configuration for request-independent H2D interference tests."""
+
+    enabled: bool
+    block_count: int
+    block_bytes: int
+    interval_us: int
+    process_count: int
+
+    @property
+    def bytes_per_worker(self) -> int:
+        return self.block_count * self.block_bytes
+
+
+def get_h2d_benchmark_config(
+    tp_size: int,
+    extra_config: dict[str, Any] | None = None,
+) -> H2DBenchmarkConfig:
+    """Parse the opt-in H2D benchmark configuration.
+
+    One vLLM TP worker is one OS process. ``process_count`` therefore selects
+    how many worker processes in each TP group submit independent H2D traffic.
+    """
+    if tp_size < 1:
+        raise ValueError("tp_size must be at least 1")
+
+    extra_config = extra_config or {}
+    enabled_value = extra_config.get(_EXTRA_CONFIG_KEY_H2D_BENCHMARK, False)
+    if not isinstance(enabled_value, bool):
+        raise TypeError(f"{_EXTRA_CONFIG_KEY_H2D_BENCHMARK} must be a boolean")
+
+    block_count = _parse_int_config(
+        extra_config.get(_EXTRA_CONFIG_KEY_H2D_BENCHMARK_BLOCK_COUNT, 1),
+        _EXTRA_CONFIG_KEY_H2D_BENCHMARK_BLOCK_COUNT,
+    )
+    if block_count < 1:
+        raise ValueError(f"{_EXTRA_CONFIG_KEY_H2D_BENCHMARK_BLOCK_COUNT} must be at least 1")
+
+    block_bytes = _parse_int_config(
+        extra_config.get(
+            _EXTRA_CONFIG_KEY_H2D_BENCHMARK_BLOCK_BYTES,
+            _DEFAULT_H2D_BENCHMARK_BLOCK_BYTES,
+        ),
+        _EXTRA_CONFIG_KEY_H2D_BENCHMARK_BLOCK_BYTES,
+    )
+    if block_bytes < 1:
+        raise ValueError(f"{_EXTRA_CONFIG_KEY_H2D_BENCHMARK_BLOCK_BYTES} must be at least 1")
+
+    interval_us = _parse_int_config(
+        extra_config.get(_EXTRA_CONFIG_KEY_H2D_BENCHMARK_INTERVAL_US, 0),
+        _EXTRA_CONFIG_KEY_H2D_BENCHMARK_INTERVAL_US,
+    )
+    if interval_us < 0:
+        raise ValueError(f"{_EXTRA_CONFIG_KEY_H2D_BENCHMARK_INTERVAL_US} must be non-negative")
+
+    process_count = _parse_int_config(
+        extra_config.get(_EXTRA_CONFIG_KEY_H2D_BENCHMARK_PROCESSES, tp_size),
+        _EXTRA_CONFIG_KEY_H2D_BENCHMARK_PROCESSES,
+    )
+    if process_count < 1 or process_count > tp_size:
+        raise ValueError(f"{_EXTRA_CONFIG_KEY_H2D_BENCHMARK_PROCESSES} must be in [1, {tp_size}], got {process_count}")
+
+    return H2DBenchmarkConfig(
+        enabled=enabled_value,
+        block_count=block_count,
+        block_bytes=block_bytes,
+        interval_us=interval_us,
+        process_count=process_count,
+    )
+
+
+def _iter_ascend_store_extra_configs(kv_transfer_config: Any) -> Iterable[dict[str, Any]]:
     if kv_transfer_config is None:
-        return None
+        return
 
     connector_name = getattr(kv_transfer_config, "kv_connector", None)
     root_extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
@@ -50,7 +128,7 @@ def get_gva_layerwise_config(kv_transfer_config: Any) -> dict[str, Any] | None:
     elif connector_name == "MultiConnector":
         connector_configs = root_extra_config.get("connectors", [])
     else:
-        return None
+        return
 
     for connector_config in connector_configs:
         if not isinstance(connector_config, dict):
@@ -61,8 +139,24 @@ def get_gva_layerwise_config(kv_transfer_config: Any) -> dict[str, Any] | None:
         ):
             continue
         extra_config = connector_config.get("kv_connector_extra_config") or {}
+        if isinstance(extra_config, dict):
+            yield extra_config
+
+
+def get_gva_layerwise_config(kv_transfer_config: Any) -> dict[str, Any] | None:
+    """Return the config for the supported GVA layerwise KV pool path."""
+    for extra_config in _iter_ascend_store_extra_configs(kv_transfer_config):
         backend = str(extra_config.get("backend", "mooncake")).lower()
         if backend == "memcache" and extra_config.get("use_layerwise", False):
+            return extra_config
+    return None
+
+
+def get_h2d_benchmark_extra_config(kv_transfer_config: Any) -> dict[str, Any] | None:
+    """Return an enabled memcache H2D benchmark config, independent of layerwise compute."""
+    for extra_config in _iter_ascend_store_extra_configs(kv_transfer_config):
+        backend = str(extra_config.get("backend", "mooncake")).lower()
+        if backend == "memcache" and extra_config.get(_EXTRA_CONFIG_KEY_H2D_BENCHMARK, False) is True:
             return extra_config
     return None
 

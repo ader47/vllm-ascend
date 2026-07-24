@@ -29,6 +29,9 @@ from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackDecoder
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import AscendStoreKVConnectorWorkerMetadata
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    get_h2d_benchmark_config,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
     KVPoolScheduler,
     get_zmq_rpc_path_lookup,
@@ -87,6 +90,16 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         backend_name = vllm_config.kv_transfer_config.kv_connector_extra_config.get("backend", "mooncake")
         self.backend_name = backend_name.lower()
         self.use_gva_layerwise = self.use_layerwise and self.backend_name == "memcache"
+        self.h2d_benchmark = get_h2d_benchmark_config(
+            int(vllm_config.parallel_config.tensor_parallel_size),
+            vllm_config.kv_transfer_config.kv_connector_extra_config,
+        ).enabled
+        if self.h2d_benchmark and self.backend_name != "memcache":
+            raise ValueError("h2d_benchmark requires backend=memcache")
+        if self.h2d_benchmark and self.use_layerwise:
+            raise ValueError("h2d_benchmark requires use_layerwise=false to leave the compute path unchanged")
+        if self.h2d_benchmark and vllm_config.model_config.enable_sleep_mode:
+            raise ValueError("h2d_benchmark is incompatible with sleep mode because its HBM target must stay resident")
         self.consumer_is_to_put = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "consumer_is_to_put", False
         )
@@ -116,7 +129,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 kv_cache_config,
             )
             assert self.connector_worker is not None
-            if not self.use_layerwise and vllm_config.parallel_config.rank == 0:
+            if not self.use_layerwise and not self.h2d_benchmark and vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config)
 
     ############################################################
@@ -206,6 +219,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
+        if self.h2d_benchmark:
+            return
         metadata = self._get_connector_metadata()
         self._current_step_has_real_forward = forward_context is not None
         logger.debug(
@@ -224,14 +239,14 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.start_load_kv(metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        if not self.use_layerwise:
+        if not self.use_layerwise or self.h2d_benchmark:
             return
         self.connector_worker.wait_for_layer_load()
 
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
     ) -> None:
-        if not self.use_layerwise:
+        if not self.use_layerwise or self.h2d_benchmark:
             return
 
         if self.kv_role == "kv_consumer":
@@ -242,7 +257,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def on_kv_cache_written(self, layer_name: str = "") -> None:
         # Dispatch the layerwise save at scatter time; save_kv_layer covers any
         # layer the attention hook skips (e.g. layers without an indexer).
-        if not self.use_gva_layerwise or self.kv_role == "kv_consumer":
+        if not self.use_gva_layerwise or self.h2d_benchmark or self.kv_role == "kv_consumer":
             return
         if not self.has_connector_metadata():
             return
@@ -264,6 +279,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
+        if self.h2d_benchmark:
+            return set(), set()
         metadata = self._get_connector_metadata()
         if self._current_step_has_real_forward:
             try:
@@ -272,6 +289,14 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 self._current_step_has_real_forward = False
         done_sending, done_recving = self.connector_worker.get_finished(finished_req_ids, metadata)
         return done_sending, done_recving
+
+    def shutdown(self) -> None:
+        worker = getattr(self, "connector_worker", None)
+        if self.h2d_benchmark and worker is not None:
+            worker.shutdown()
+
+    def close(self) -> None:
+        self.shutdown()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Return KV block IDs that failed to load on the worker."""

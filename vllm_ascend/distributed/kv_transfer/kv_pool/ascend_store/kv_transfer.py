@@ -36,6 +36,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_transfer
 )
 
 _H2D_STAGGER_SPIN_US = 50
+_NANOSECONDS_PER_MICROSECOND = 1_000
+_H2D_BENCHMARK_LEASE_TTL_MS = 24 * 60 * 60 * 1_000
+_H2D_BENCHMARK_LEASE_REFRESH_NS = (_H2D_BENCHMARK_LEASE_TTL_MS * 1_000_000) // 2
 
 
 def _circular_shift(lst: list, offset: int) -> list:
@@ -68,6 +71,146 @@ def _mark_last_transfer_tasks(layer_tasks: list[list[LayerTransferTask]], operat
     # finish the request on its last submitted transfer instead.
     for req_id, task in last_task_by_req.items():
         task.finished_req_ids.add(req_id)
+
+
+class H2DBenchmarkThread(threading.Thread):
+    """Generate fixed-rate H2D traffic independently of model requests."""
+
+    def __init__(
+        self,
+        m_store: Backend,
+        source_keys: list[str],
+        destination_base_addr: int,
+        block_bytes: int,
+        interval_us: int,
+        phase_offset_us: int,
+        ready_event: threading.Event,
+    ) -> None:
+        super().__init__(daemon=True, name="H2DBenchmark")
+        if not source_keys:
+            raise ValueError("H2D benchmark requires at least one source block")
+        self.m_store = m_store
+        self.source_keys = source_keys
+        self.destination_addrs = [
+            destination_base_addr + block_index * block_bytes for block_index in range(len(source_keys))
+        ]
+        self.block_sizes = [block_bytes] * len(source_keys)
+        self.interval_us = interval_us
+        self.phase_offset_us = phase_offset_us
+        self.ready_event = ready_event
+        self.stop_event = threading.Event()
+        self.source_gvas: list[int] = []
+        self._next_submit_ns = 0
+        self._next_lease_refresh_ns = 0
+        self._fatal_error: BaseException | None = None
+        self.submitted_batches = 0
+
+    def _refresh_source_leases(self, now_ns: int | None = None) -> None:
+        lease_results = self.m_store.batch_add_lease(
+            self.source_keys,
+            _H2D_BENCHMARK_LEASE_TTL_MS,
+        )
+        if len(lease_results) != len(self.source_keys) or any(int(result) != 0 for result in lease_results):
+            raise RuntimeError(
+                "H2D benchmark failed to lease source blocks: "
+                f"expected={len(self.source_keys)}, actual={len(lease_results)}"
+            )
+        if now_ns is None:
+            now_ns = time.perf_counter_ns()
+        self._next_lease_refresh_ns = now_ns + _H2D_BENCHMARK_LEASE_REFRESH_NS
+
+    def _initialize_sources(self) -> None:
+        source_gvas = self.m_store.batch_alloc(self.source_keys, self.block_sizes)
+        if len(source_gvas) != len(self.source_keys) or any(int(gva) <= 0 for gva in source_gvas):
+            raise RuntimeError(
+                "H2D benchmark failed to allocate source blocks: "
+                f"expected={len(self.source_keys)}, actual={len(source_gvas)}"
+            )
+        self.source_gvas = [int(gva) for gva in source_gvas]
+        assert self.m_store.store is not None
+        seed_result = self.m_store.store.batch_copy(
+            self.source_gvas,
+            self.destination_addrs,
+            self.block_sizes,
+            0,
+        )
+        if seed_result != 0:
+            raise RuntimeError(f"H2D benchmark source initialization failed with return code {seed_result}")
+        self._refresh_source_leases()
+
+    def _initialize_submit_deadline(self, now_ns: int) -> None:
+        interval_ns = self.interval_us * _NANOSECONDS_PER_MICROSECOND
+        phase_ns = self.phase_offset_us * _NANOSECONDS_PER_MICROSECOND
+        if interval_ns == 0:
+            self._next_submit_ns = now_ns + phase_ns
+            return
+        phase_ns %= interval_ns
+        self._next_submit_ns = ((now_ns - phase_ns) // interval_ns + 1) * interval_ns + phase_ns
+
+    def _wait_for_next_submit(self) -> bool:
+        if self._next_submit_ns == 0:
+            self._initialize_submit_deadline(time.perf_counter_ns())
+
+        while not self.stop_event.is_set():
+            now_ns = time.perf_counter_ns()
+            if self._next_lease_refresh_ns and now_ns >= self._next_lease_refresh_ns:
+                self._refresh_source_leases(now_ns)
+                continue
+            if now_ns >= self._next_submit_ns:
+                return True
+
+            wake_ns = self._next_submit_ns
+            if self._next_lease_refresh_ns:
+                wake_ns = min(wake_ns, self._next_lease_refresh_ns)
+            if self.stop_event.wait((wake_ns - now_ns) / 1_000_000_000):
+                return False
+        return False
+
+    def _submit_once(self) -> None:
+        assert self.m_store.store is not None
+        result = self.m_store.store.batch_copy(
+            self.source_gvas,
+            self.destination_addrs,
+            self.block_sizes,
+            1,
+        )
+        if result != 0:
+            raise RuntimeError(f"H2D benchmark batch_copy failed with return code {result}")
+        self.submitted_batches += 1
+        completed_ns = time.perf_counter_ns()
+        interval_ns = self.interval_us * _NANOSECONDS_PER_MICROSECOND
+        if interval_ns == 0:
+            self._next_submit_ns = completed_ns
+            return
+
+        self._next_submit_ns += interval_ns
+        if self._next_submit_ns <= completed_ns:
+            missed_periods = (completed_ns - self._next_submit_ns) // interval_ns + 1
+            self._next_submit_ns += missed_periods * interval_ns
+
+    def raise_if_failed(self) -> None:
+        if self._fatal_error is not None:
+            raise RuntimeError("H2D benchmark background transfer failed") from self._fatal_error
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def run(self) -> None:
+        try:
+            self.m_store.set_device()
+            self._initialize_sources()
+            self.ready_event.set()
+            while self._wait_for_next_submit():
+                self._submit_once()
+        except Exception as error:
+            self._fatal_error = error
+            logger.exception("H2D benchmark thread failed")
+        finally:
+            self.ready_event.set()
+            if self.source_gvas:
+                result = self.m_store.batch_remove_lease(self.source_keys)
+                if result != 0:
+                    logger.error("H2D benchmark failed to release source leases: res=%d", result)
 
 
 class KVTransferThread(threading.Thread):
@@ -1164,9 +1307,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
 
     def _set_slot_free(self, physical_layer: int) -> None:
         # slot_free = L2G copy done AND PD transfer done AND attention done.
-        assert not self.layer_save_finished_events[physical_layer].is_set(), (
-            f"thread: {physical_layer} save failed "
-        )
+        assert not self.layer_save_finished_events[physical_layer].is_set(), f"thread: {physical_layer} save failed "
         logger.debug("Layer save event set: layer %d", physical_layer)
         self.layer_save_finished_events[physical_layer].set()
 

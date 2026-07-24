@@ -820,6 +820,41 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         self.assertIn("r1", done_s)
         self.assertEqual(done_r, set())
 
+    def test_get_finished_is_independent_of_h2d_benchmark_health(self):
+        worker = self._make_worker(kv_role="kv_producer")
+        worker.h2d_benchmark = True
+        worker.h2d_benchmark_active = True
+        worker.h2d_benchmark_thread = MagicMock()
+        worker.h2d_benchmark_thread.raise_if_failed.side_effect = RuntimeError("H2D failed")
+
+        result = worker.get_finished(set(), AscendConnectorMetadata(set(), set()))
+
+        self.assertEqual(result, (set(), set()))
+        worker.h2d_benchmark_thread.raise_if_failed.assert_not_called()
+
+    def test_shutdown_stops_and_joins_h2d_benchmark(self):
+        worker = self._make_worker(kv_role="kv_producer")
+        thread = MagicMock()
+        thread.is_alive.return_value = False
+        worker.h2d_benchmark_thread = thread
+
+        worker.shutdown()
+
+        thread.stop.assert_called_once_with()
+        thread.join.assert_called_once()
+        self.assertIsNone(worker.h2d_benchmark_thread)
+
+    def test_h2d_benchmark_start_load_ignores_prompt_metadata(self):
+        worker = self._make_worker(kv_role="kv_producer")
+        worker.h2d_benchmark = True
+        worker.process_layer_data = MagicMock()
+
+        metadata = AscendConnectorMetadata(set(), set())
+        metadata.add_request(MagicMock())
+        worker.start_load_kv(metadata)
+
+        worker.process_layer_data.assert_not_called()
+
     def test_get_finished_consumer(self):
         worker = self._make_worker(kv_role="kv_consumer")
         meta = AscendConnectorMetadata(set(), set())

@@ -64,6 +64,8 @@ from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
     get_gva_layerwise_config,
+    get_h2d_benchmark_config,
+    get_h2d_benchmark_extra_config,
     get_layerwise_kv_cache_num_tensors,
     get_layerwise_physical_layer_index,
     get_layerwise_storage_indices,
@@ -531,12 +533,26 @@ class NPUWorker(WorkerBase):
         bytes.
         """
         GiB = lambda b: b / GiB_bytes
+        h2d_extra_config = get_h2d_benchmark_extra_config(self.vllm_config.kv_transfer_config)
+        h2d_reserved_bytes = 0
+        if h2d_extra_config is not None:
+            h2d_config = get_h2d_benchmark_config(
+                self.parallel_config.tensor_parallel_size,
+                h2d_extra_config,
+            )
+            h2d_reserved_bytes = h2d_config.bytes_per_worker
 
         # Fast path: user has explicitly specified KV cache size via
         # --kv-cache-memory. Still run profile_run() to compile the model,
         # but skip the memory profiling calculation entirely.
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             self.model_runner.profile_run()
+            available_kv_cache_memory_bytes = kv_cache_memory_bytes - h2d_reserved_bytes
+            if available_kv_cache_memory_bytes <= 0:
+                raise ValueError(
+                    "H2D benchmark shadow buffer does not fit in kv_cache_memory_bytes: "
+                    f"kv_cache_memory_bytes={kv_cache_memory_bytes}, reserved={h2d_reserved_bytes}"
+                )
             logger.info(
                 "Initial free memory %.2f GiB, reserved %.2f GiB for KV Cache "
                 "as specified by kv_cache_memory_bytes, skipping memory profiling. "
@@ -548,7 +564,12 @@ class NPUWorker(WorkerBase):
                 GiB(self.init_snapshot.free_memory),
                 GiB(kv_cache_memory_bytes),
             )
-            return kv_cache_memory_bytes
+            if h2d_reserved_bytes:
+                logger.info(
+                    "Reserve %.2f GiB from the explicit KV cache budget for the H2D benchmark shadow buffer.",
+                    GiB(h2d_reserved_bytes),
+                )
+            return available_kv_cache_memory_bytes
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -609,6 +630,18 @@ class NPUWorker(WorkerBase):
                     factor,
                 )
 
+        if h2d_reserved_bytes:
+            if self.available_kv_cache_memory_bytes <= h2d_reserved_bytes:
+                raise ValueError(
+                    "Insufficient NPU memory for the H2D benchmark shadow buffer: "
+                    f"available={self.available_kv_cache_memory_bytes}, reserved={h2d_reserved_bytes}"
+                )
+            self.available_kv_cache_memory_bytes -= h2d_reserved_bytes
+            logger.info(
+                "Reserve %.2f GiB of NPU memory for the H2D benchmark shadow buffer.",
+                GiB(h2d_reserved_bytes),
+            )
+
         logger.debug(profile_result)
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
@@ -637,8 +670,9 @@ class NPUWorker(WorkerBase):
             if not keep_device_kv_cache:
                 self.available_kv_cache_memory_bytes += needed_dram_size_bytes
                 logger.info_once(
-                    "KV offload decode is enabled, enlarge total available memory to "
-                    "%.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
+                    "KV offload decode is enabled, enlarge total available memory to %.2f GiB",
+                    GiB(self.available_kv_cache_memory_bytes),
+                    scope="local",
                 )
 
         return int(self.available_kv_cache_memory_bytes)

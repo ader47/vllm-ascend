@@ -43,6 +43,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 
 # isort: on
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+    H2DBenchmarkThread,
     KVCacheStoreKeyLayerSendingThread,
     KVCacheStoreLayerRecvingThread,
     KVCacheStoreLayerSendingThread,
@@ -1100,6 +1101,84 @@ class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
         self.assertTrue(get_event.is_set())
 
 
+class TestH2DBenchmarkThread(unittest.TestCase):
+    def _make_thread(self):
+        store = MagicMock()
+        store.batch_alloc.return_value = [1000, 2000]
+        store.batch_add_lease.return_value = [0, 0]
+        store.store.batch_copy.return_value = 0
+        thread = H2DBenchmarkThread(
+            m_store=store,
+            source_keys=["source-0", "source-1"],
+            destination_base_addr=9000,
+            block_bytes=4,
+            interval_us=100,
+            phase_offset_us=0,
+            ready_event=threading.Event(),
+        )
+        return thread, store
+
+    def test_allocates_and_submits_configured_blocks_as_one_periodic_batch(self):
+        thread, store = self._make_thread()
+
+        thread._initialize_sources()
+        store.store.batch_copy.assert_called_once_with([1000, 2000], [9000, 9004], [4, 4], 0)
+        store.store.batch_copy.reset_mock()
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.time.perf_counter_ns",
+            return_value=1_000_000,
+        ):
+            thread._submit_once()
+
+        store.batch_alloc.assert_called_once_with(["source-0", "source-1"], [4, 4])
+        store.store.batch_copy.assert_called_once_with([1000, 2000], [9000, 9004], [4, 4], 1)
+        self.assertEqual(thread.submitted_batches, 1)
+        self.assertEqual(thread._next_submit_ns, 1_100_000)
+
+    def test_waits_for_fixed_period_without_busy_spin(self):
+        thread, _ = self._make_thread()
+        thread._next_submit_ns = 1_100_000
+        thread.stop_event = MagicMock()
+        thread.stop_event.wait.return_value = False
+        thread.stop_event.is_set.return_value = False
+
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.time.perf_counter_ns",
+            return_value=1_000_000,
+        ):
+            self.assertTrue(thread._wait_for_next_submit())
+
+        thread.stop_event.wait.assert_called_once_with(100 / 1_000_000)
+
+    def test_missed_periods_keep_the_original_phase(self):
+        thread, store = self._make_thread()
+        thread.source_gvas = [1000, 2000]
+        thread._next_submit_ns = 1_000_000
+
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.time.perf_counter_ns",
+            return_value=1_350_000,
+        ):
+            thread._submit_once()
+
+        store.store.batch_copy.assert_called_once_with([1000, 2000], [9000, 9004], [4, 4], 1)
+        self.assertEqual(thread._next_submit_ns, 1_400_000)
+
+    def test_run_stops_and_releases_source_leases(self):
+        thread, store = self._make_thread()
+
+        def stop_after_first_h2d(*args):
+            if args[-1] == 1:
+                thread.stop()
+            return 0
+
+        store.store.batch_copy.side_effect = stop_after_first_h2d
+        thread.run()
+
+        self.assertEqual(thread.submitted_batches, 1)
+        store.batch_remove_lease.assert_called_once_with(["source-0", "source-1"])
+
+
 class TestGVALayerRecvingThread(unittest.TestCase):
     def test_h2d_stagger_sleeps_before_short_final_spin(self):
         thread = KVCacheStoreLayerRecvingThread.__new__(KVCacheStoreLayerRecvingThread)
@@ -1110,9 +1189,7 @@ class TestGVALayerRecvingThread(unittest.TestCase):
                 "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.time.perf_counter_ns",
                 side_effect=[0, 100_000],
             ),
-            patch(
-                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.time.sleep"
-            ) as sleep,
+            patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.time.sleep") as sleep,
         ):
             thread._stagger_h2d_submit(layer_id=0)
 
@@ -1127,9 +1204,7 @@ class TestGVALayerRecvingThread(unittest.TestCase):
                 "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.time.perf_counter_ns",
                 side_effect=[0, 25_000],
             ),
-            patch(
-                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.time.sleep"
-            ) as sleep,
+            patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.time.sleep") as sleep,
         ):
             thread._stagger_h2d_submit(layer_id=0)
 

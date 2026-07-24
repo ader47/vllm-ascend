@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import math
 import threading
+import uuid
 from collections.abc import Callable
 
 import torch
@@ -48,6 +49,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import
     ExternalCachedBlockPool,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+    H2DBenchmarkThread,
     KVCacheStoreKeyLayerRecvingThread,
     KVCacheStoreKeyLayerSendingThread,
     KVCacheStoreLayerRecvingThread,
@@ -59,6 +61,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     record_failed_blocks,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    get_h2d_benchmark_config,
     get_layerwise_config,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_transfer import (
@@ -73,6 +76,9 @@ from vllm_ascend.memcache_comm_fence import (
     get_attention_compute_start_gate,
     reset_attention_compute_start_gates,
 )
+
+_H2D_BENCHMARK_START_TIMEOUT_S = 60
+_H2D_BENCHMARK_SHUTDOWN_TIMEOUT_S = 10
 
 
 class KVPoolWorker:
@@ -159,6 +165,20 @@ class KVPoolWorker:
         self.h2d_stagger_us = int(extra_config.get("h2d_stagger_us", 0))
         self.layerwise_max_transfer_blocks = int(extra_config.get("layerwise_max_transfer_blocks", 0))
         self.layerwise_max_transfer_bytes = int(extra_config.get("layerwise_max_transfer_bytes", 0))
+        h2d_benchmark_config = get_h2d_benchmark_config(self.tp_size, extra_config)
+        self.h2d_benchmark = h2d_benchmark_config.enabled
+        if self.h2d_benchmark and self.backend_name != "memcache":
+            raise ValueError("h2d_benchmark requires backend=memcache")
+        if self.h2d_benchmark and self.use_layerwise:
+            raise ValueError("h2d_benchmark requires use_layerwise=false to leave the compute path unchanged")
+        if self.h2d_benchmark and self.h2d_stagger_us < 0:
+            raise ValueError("h2d_stagger_us must be non-negative in H2D benchmark mode")
+        self.h2d_benchmark_block_count = h2d_benchmark_config.block_count
+        self.h2d_benchmark_block_bytes = h2d_benchmark_config.block_bytes
+        self.h2d_benchmark_interval_us = h2d_benchmark_config.interval_us
+        self.h2d_benchmark_process_count = h2d_benchmark_config.process_count
+        self.h2d_benchmark_active = self.h2d_benchmark and self.tp_rank < self.h2d_benchmark_process_count
+        self._h2d_benchmark_buffer: torch.Tensor | None = None
 
         logger.info(
             "use_hybrid: %s, use_mamba: %s, num_kv_cache_groups: %s, hash_block_size: %s, lcm_block_size: %s",
@@ -316,6 +336,7 @@ class KVPoolWorker:
     def _init_state_vars(self) -> None:
         self.kv_send_thread: KVTransferThread | None = None
         self.kv_recv_thread: KVTransferThread | None = None
+        self.h2d_benchmark_thread: H2DBenchmarkThread | None = None
         self._transfer_threads_started = False
         self._layerwise_pd_transfer_waiter: Callable[[int], None] | None = None
         self.group_num_layers: dict[int, int] = {}
@@ -423,7 +444,7 @@ class KVPoolWorker:
             self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
             self.sync_attn_events = [torch.npu.Event() for _ in range(self.num_layers)]
             self.layer_attn_recorded_events = [threading.Event() for _ in range(self.num_layers)]
-            if self.use_gva_layerwise and self.kv_role in ["kv_producer", "kv_both"]:
+            if self.use_gva_layerwise and not self.h2d_benchmark and self.kv_role in ["kv_producer", "kv_both"]:
                 ready_event_sending = threading.Event()
                 self.kv_send_thread = KVCacheStoreLayerSendingThread(
                     self.m_store,
@@ -446,7 +467,7 @@ class KVPoolWorker:
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
-            elif self.kv_role in ["kv_producer", "kv_both"]:
+            elif not self.h2d_benchmark and self.kv_role in ["kv_producer", "kv_both"]:
                 ready_event_sending = threading.Event()
                 self.kv_send_thread = KVCacheStoreKeyLayerSendingThread(
                     self.m_store,
@@ -531,6 +552,54 @@ class KVPoolWorker:
                 self.kv_recv_thread.start()
                 ready_event.wait()
         self._transfer_threads_started = True
+
+    def _start_h2d_benchmark_thread(self) -> None:
+        if not self.h2d_benchmark_active:
+            return
+        if self.h2d_benchmark_thread is not None:
+            if self.h2d_benchmark_thread.is_alive():
+                return
+            self.h2d_benchmark_thread = None
+        if self._h2d_benchmark_buffer is None:
+            raise RuntimeError("H2D benchmark destination buffer is not initialized")
+
+        run_id = uuid.uuid4().hex
+        source_keys = [
+            (
+                f"__vllm_h2d_benchmark__@{self.model_name}@dp{self.dp_rank}"
+                f"@pp{self.pp_rank}@tp{self.tp_rank}@{run_id}@{block_index}"
+            )
+            for block_index in range(self.h2d_benchmark_block_count)
+        ]
+        ready_event = threading.Event()
+        self.h2d_benchmark_thread = H2DBenchmarkThread(
+            self.m_store,
+            source_keys,
+            self._h2d_benchmark_buffer.data_ptr(),
+            self.h2d_benchmark_block_bytes,
+            self.h2d_benchmark_interval_us,
+            self.tp_rank * self.h2d_stagger_us,
+            ready_event,
+        )
+        self.h2d_benchmark_thread.start()
+        if not ready_event.wait(timeout=_H2D_BENCHMARK_START_TIMEOUT_S):
+            self.h2d_benchmark_thread.stop()
+            raise TimeoutError(f"H2D benchmark did not initialize within {_H2D_BENCHMARK_START_TIMEOUT_S} seconds")
+        self.h2d_benchmark_thread.raise_if_failed()
+
+    def shutdown(self) -> None:
+        thread = self.h2d_benchmark_thread
+        if thread is None:
+            return
+        thread.stop()
+        thread.join(timeout=_H2D_BENCHMARK_SHUTDOWN_TIMEOUT_S)
+        if thread.is_alive():
+            logger.error(
+                "H2D benchmark thread did not stop within %d seconds",
+                _H2D_BENCHMARK_SHUTDOWN_TIMEOUT_S,
+            )
+            return
+        self.h2d_benchmark_thread = None
 
     def set_layerwise_pd_transfer_waiter(self, waiter: Callable[[int], None]) -> None:
         if not self.layerwise_offload:
@@ -794,6 +863,27 @@ class KVPoolWorker:
         ptrs = [start for start, _ in registered_regions.values()]
         lengths = [end - start for start, end in registered_regions.values()]
 
+        if self.h2d_benchmark_active:
+            # H2D benchmark traffic must never target model KV cache. Keeping
+            # this tensor alive on the worker makes its address stable for the
+            # lifetime of the benchmark thread.
+            if self._h2d_benchmark_buffer is None:
+                self._h2d_benchmark_buffer = torch.empty(
+                    self.h2d_benchmark_block_count * self.h2d_benchmark_block_bytes,
+                    dtype=torch.uint8,
+                    device=first_kv_cache.device,
+                )
+            ptrs.append(self._h2d_benchmark_buffer.data_ptr())
+            lengths.append(self._h2d_benchmark_buffer.numel())
+            logger.info(
+                "H2D benchmark enabled on TP worker %d/%d: blocks=%d block_bytes=%d interval_us=%d",
+                self.tp_rank,
+                self.tp_size,
+                self.h2d_benchmark_block_count,
+                self.h2d_benchmark_block_bytes,
+                self.h2d_benchmark_interval_us,
+            )
+
         if self.kv_cache_config is not None and self.use_hybrid:
             for group_id, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
                 self._infer_cache_group_metadata(group_id, group_spec.layer_names)
@@ -864,9 +954,15 @@ class KVPoolWorker:
         if hasattr(self.m_store, "init_store"):
             self.m_store.init_store()
         self.m_store.register_buffer(ptrs, lengths)
-        self._start_kv_transfer_threads()
+        if self.h2d_benchmark:
+            self._start_h2d_benchmark_thread()
+            self._transfer_threads_started = True
+        else:
+            self._start_kv_transfer_threads()
 
     def start_load_kv(self, metadata: AscendConnectorMetadata):
+        if self.h2d_benchmark:
+            return
         self.current_layer = 0
         if self.use_layerwise:
             self.next_layer_to_submit = 0
@@ -1173,6 +1269,8 @@ class KVPoolWorker:
                 submitted_layers += 1
 
     def wait_for_layer_load(self) -> None:
+        if self.h2d_benchmark:
+            return
         if self.current_layer >= self.num_layers:
             return
         assert self.layer_load_finished_events is not None
@@ -1476,6 +1574,9 @@ class KVPoolWorker:
             send_thread.dec_stored_request(req_id)  # type: ignore[attr-defined]
 
     def get_finished(self, finished_req_ids: set[str], meta: AscendConnectorMetadata) -> tuple[set[str], set[str]]:
+        if self.h2d_benchmark:
+            return set(), set()
+
         if finished_req_ids and self.use_gva_layerwise:
             finished_load_req_ids = finished_req_ids.copy()
 
@@ -1507,7 +1608,6 @@ class KVPoolWorker:
             self.kv_recv_thread.discard_finished_requests(meta.preempted_req_ids)
             if self.load_async:
                 done_recving = self.kv_recv_thread.get_and_clear_finished_requests(meta.loading_req_ids)
-
         logger.debug(
             "Number of completed KV cache send requests: %d, receive requests: %d, tp_rank:%d",
             len(done_sending),

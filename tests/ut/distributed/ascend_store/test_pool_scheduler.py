@@ -85,6 +85,7 @@ class TestKVPoolScheduler(unittest.TestCase):
         config.parallel_config.world_size = 1
         config.cache_config.block_size = block_size
         config.cache_config.hash_block_size = block_size
+        config.cache_config.enable_prefix_caching = False
         # Concrete model_config values so KVPoolScheduler.__init__ int math
         # (num_kv_head < tp_size, get_num_layers, model name split, ...) works.
         config.model_config.model = "org/llama-7b"
@@ -128,6 +129,67 @@ class TestKVPoolScheduler(unittest.TestCase):
         self.assertEqual(need, 32)  # 48 - 16
         self.assertFalse(is_async)
         self.assertIn("r1", scheduler.load_specs)
+
+    def test_h2d_benchmark_does_not_create_prompt_transfer_metadata(self):
+        config = self._make_config(
+            kv_role="kv_consumer",
+            extra_config={
+                "backend": "memcache",
+                "use_layerwise": False,
+                "h2d_benchmark": True,
+                "h2d_benchmark_block_bytes": 4096,
+                "h2d_benchmark_processes": 1,
+            },
+        )
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+        scheduler._get_layerwise_gva_hit_tokens = MagicMock(return_value=64)
+        request = MagicMock()
+        request.prompt_token_ids = list(range(64))
+        request.num_tokens = 64
+        request.request_id = "benchmark-request"
+
+        result = scheduler.get_num_new_matched_tokens(request, 0)
+
+        self.assertEqual(result, (0, False))
+        scheduler._get_layerwise_gva_hit_tokens.assert_not_called()
+        self.assertNotIn(request.request_id, scheduler.load_specs)
+        self.assertIsNone(scheduler.store_scheduler)
+
+        scheduler.update_state_after_alloc(request, MagicMock(), 0)
+        self.assertNotIn(request.request_id, scheduler._unfinished_requests)
+
+        scheduler._process_new_request = MagicMock()
+        metadata = scheduler.build_connector_meta(MagicMock())
+        self.assertEqual(metadata.requests, [])
+        self.assertEqual(metadata.unfinished_request_ids, set())
+        scheduler._process_new_request.assert_not_called()
+        self.assertEqual(scheduler.request_finished(request, []), (False, None))
+        self.assertEqual(scheduler.request_finished_all_groups(request, ([],)), (False, None))
+
+    def test_h2d_benchmark_does_not_change_prefix_caching(self):
+        config = self._make_config(
+            extra_config={
+                "backend": "memcache",
+                "use_layerwise": False,
+                "h2d_benchmark": True,
+            },
+        )
+        config.cache_config.enable_prefix_caching = True
+
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+        self.assertTrue(scheduler.h2d_benchmark)
+
+    def test_h2d_benchmark_rejects_layerwise_compute(self):
+        config = self._make_config(
+            extra_config={
+                "backend": "memcache",
+                "use_layerwise": True,
+                "h2d_benchmark": True,
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "use_layerwise=false"):
+            KVPoolScheduler(config, use_layerwise=True)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_get_num_new_matched_tokens_all_hit(self, mock_client_cls):

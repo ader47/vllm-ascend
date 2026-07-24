@@ -83,6 +83,11 @@ Change `"kv_role"` to `"kv_producer"` or `"kv_consumer"` for PD disaggregation.
 | `layerwise_max_transfer_blocks` | `0` (unlimited) | Maximum number of KV blocks per transfer batch. |
 | `layerwise_max_transfer_bytes` | `0` (unlimited) | Maximum bytes per transfer batch. |
 | `h2d_stagger_us` | `0` | Stagger delay (microseconds) between H2D copies across TP ranks to avoid bus contention. |
+| `h2d_benchmark` | `false` | Enable a continuous H2D traffic generator that is independent of model requests. |
+| `h2d_benchmark_block_count` | `1` | Number of blocks submitted in each periodic H2D batch. |
+| `h2d_benchmark_block_bytes` | `16777216` (16 MiB) | Size in bytes of every H2D benchmark block. |
+| `h2d_benchmark_interval_us` | `0` | Fixed monotonic-clock period in microseconds between H2D batch deadlines. `0` submits continuously without pacing. |
+| `h2d_benchmark_processes` | TP size | Number of TP worker processes per TP group that submit H2D traffic. Must be between 1 and the TP size. |
 | `discard_partial_chunks` | `true` (non-layerwise) / `false` (layerwise) | Whether to discard KV for incomplete chunk boundaries. Layerwise defaults to `false` to preserve partial layers. |
 
 ## Usage Scenarios
@@ -240,6 +245,62 @@ monopolizing the transfer bus. Set to `0` (default) for unlimited.
 On multi-TP deployments, H2D (host-to-device) copies for all TP ranks can
 contend on the PCIe/HCCS bus. Set `h2d_stagger_us` to spread them out (e.g.
 `100` for a 100 µs stagger between ranks).
+
+### Dependency-free H2D interference test
+
+`h2d_benchmark` is an experimental measurement mode for isolating the effect of
+H2D traffic on compute operator dispatch. It uses the Ascend Store memcache copy
+primitive without enabling layerwise behavior on the compute path. After
+KV-cache registration, each participating TP worker allocates private source
+blocks in memcache and a private shadow buffer in HBM. A dedicated background
+thread continuously copies the configured source blocks into shadow HBM.
+
+The generator does not inspect prompts, perform scheduler-side KV lookup, create
+request metadata, or participate in forward/request completion callbacks. The
+copied bytes never enter model KV cache. Benchmark failures are logged by the
+background thread instead of being raised from a request callback, so neither
+path consumes state produced by the other path.
+
+For example, the following configuration runs 4 MiB H2D copies from two worker
+processes in each TP group:
+
+```json
+{
+    "backend": "memcache",
+    "use_layerwise": false,
+    "h2d_benchmark": true,
+    "h2d_benchmark_block_count": 8,
+    "h2d_benchmark_block_bytes": 4194304,
+    "h2d_benchmark_interval_us": 100,
+    "h2d_benchmark_processes": 2
+}
+```
+
+This mode requires `backend=memcache` and `use_layerwise=false`; rejecting
+layerwise compute keeps the benchmark switch from changing KV-buffer reuse or
+graph execution. The process count does not spawn extra processes: it selects
+participating processes from the existing TP workers, so the configured TP size
+must be at least that large. H2D completion and health do not gate attention or
+request completion. Check worker logs for an asynchronous transfer failure.
+Disable prefix caching separately when the experiment must recompute every
+prompt; benchmark mode itself does not change that compute setting. Sleep mode
+is rejected because it could release the shadow-HBM allocation while the
+background generator is still using its address.
+
+Each periodic submission contains `h2d_benchmark_block_count` blocks of
+`h2d_benchmark_block_bytes` bytes, so the bytes submitted per period and the
+private shadow-HBM footprint per participating worker are both
+`block_count * block_bytes`. This memory is reserved from the per-worker KV-cache
+budget before KV-cache allocation. The generator starts before the first request,
+runs for the worker lifetime, refreshes its source leases, and releases them
+during connector shutdown.
+
+The interval controls batch start times on an absolute monotonic-time grid. A
+late or long-running batch skips elapsed slots and resumes at the next grid
+deadline; missed slots are not replayed as a burst and do not shift later
+deadlines. `h2d_stagger_us` is a per-rank phase offset on that grid. Operating
+system scheduling and the native copy call still limit achievable precision,
+especially for very small microsecond intervals.
 
 ## Supported Models
 

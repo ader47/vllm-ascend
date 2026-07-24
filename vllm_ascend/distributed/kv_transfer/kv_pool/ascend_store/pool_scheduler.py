@@ -45,6 +45,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     normalize_block_ids_by_group,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    get_h2d_benchmark_config,
     get_layerwise_config,
 )
 
@@ -162,18 +163,30 @@ class KVPoolScheduler:
         backend_name = vllm_config.kv_transfer_config.kv_connector_extra_config.get("backend", "mooncake")
         self.backend_name = backend_name.lower()
         self.use_gva_layerwise = self.use_layerwise and self.backend_name == "memcache"
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        h2d_benchmark_config = get_h2d_benchmark_config(
+            self.tp_size,
+            vllm_config.kv_transfer_config.kv_connector_extra_config,
+        )
+        self.h2d_benchmark = h2d_benchmark_config.enabled
+        if self.h2d_benchmark and self.backend_name != "memcache":
+            raise ValueError("h2d_benchmark requires backend=memcache")
+        if self.h2d_benchmark and self.use_layerwise:
+            raise ValueError("h2d_benchmark requires use_layerwise=false to leave the compute path unchanged")
+
         backend = backend_map.get(self.backend_name)
         if backend is None:
             raise ValueError(f"Unsupported KV pool backend: {backend_name}")
-        backend_path = backend.get("path")
-        backend_class_name = backend.get("name")
-        assert backend_path is not None and backend_class_name is not None
-        backend_module = importlib.import_module(backend_path)
-        backend_class = getattr(backend_module, backend_class_name)
-        self.store_scheduler = backend_class.create_scheduler_client(vllm_config.parallel_config)
+        self.store_scheduler = None
+        if not self.h2d_benchmark:
+            backend_path = backend.get("path")
+            backend_class_name = backend.get("name")
+            assert backend_path is not None and backend_class_name is not None
+            backend_module = importlib.import_module(backend_path)
+            backend_class = getattr(backend_module, backend_class_name)
+            self.store_scheduler = backend_class.create_scheduler_client(vllm_config.parallel_config)
 
         model_config = vllm_config.model_config
-        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.pp_rank = (vllm_config.parallel_config.rank // self.tp_size) % self.pp_size
         self.use_mla = False
@@ -349,9 +362,7 @@ class KVPoolScheduler:
 
             group_key_start = len(query_keys)
             for block_hash in group_block_hashes:
-                query_keys.extend(
-                    self._make_layerwise_gva_keys_for_hit_check(group_id, block_hash_to_str(block_hash))
-                )
+                query_keys.extend(self._make_layerwise_gva_keys_for_hit_check(group_id, block_hash_to_str(block_hash)))
             query_plans.append(
                 (
                     group_key_start,
@@ -381,8 +392,7 @@ class KVPoolScheduler:
         exists = np.asarray(exists_states, dtype=np.int8)
         if np.any((exists != 0) & (exists != 1)):
             raise RuntimeError(
-                f"KV pool layerwise exists check failed for request {request.request_id}: "
-                f"states={exists_states}"
+                f"KV pool layerwise exists check failed for request {request.request_id}: states={exists_states}"
             )
         ranks_per_block = self.tp_size // self.put_step
         hits_per_group: list[int] = []
@@ -535,6 +545,11 @@ class KVPoolScheduler:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
+        if self.h2d_benchmark:
+            # The benchmark owns an independent, continuously running traffic
+            # generator. Requests must never create external-cache metadata.
+            return 0, False
+
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_load:
             return 0, False
 
@@ -618,6 +633,9 @@ class KVPoolScheduler:
         For SharedStorageConnector, update _request_needs_load
         if the CacheManager this allocated blocks for us.
         """
+        if self.h2d_benchmark:
+            return
+
         local_block_ids: list[list[int]] = [[] for _ in self.kv_cache_group_ids]
         if num_external_tokens > 0:
             local_block_ids = normalize_block_ids_by_group(blocks.get_block_ids())
@@ -861,6 +879,9 @@ class KVPoolScheduler:
         except the `kv_connector_metadata` field.
         Also, calling this function will reset the state of the connector.
         """
+        if self.h2d_benchmark:
+            return AscendConnectorMetadata(set(), set())
+
         force_skip_save = self.kv_role == "kv_consumer" and not self.consumer_is_to_put
 
         for finished_req_id in scheduler_output.finished_req_ids:
@@ -990,6 +1011,8 @@ class KVPoolScheduler:
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
+        if self.h2d_benchmark:
+            return False, None
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
             self._delayed_free_req_ids.discard(request.request_id)
             return False, None
@@ -1014,6 +1037,8 @@ class KVPoolScheduler:
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         """HMA path for hybrid KV cache groups."""
+        if self.h2d_benchmark:
+            return False, None
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
             self._delayed_free_req_ids.discard(request.request_id)
             return False, None
