@@ -2,7 +2,8 @@
 
 > - 最后更新：2026-07-28
 > - 目标基线：vLLM v0.23.0 + vLLM-Ascend v0.23.0
-> - 当前完成度：P0-P3 控制面与 HBM 双平面已实现；P4-P7 尚在迁移
+> - 当前完成度：P0-P4 控制面与 worker 行投影已实现；P4 等待 910C
+>   验证，P5-P7 尚在迁移
 > - 首要验收模型：GLM-5.1；兼容回归模型：DeepSeek-V3.2
 
 ## 1. 文档定位
@@ -14,7 +15,7 @@
 - 迁移计划回答“新旧基线有什么差异、下一阶段做什么、测试证据是否齐全”。
 
 迁移过程中每完成一个阶段，应先按实际代码更新本文，再在迁移计划中记录
-验收结果。尚未实现的 P4-P7 只列接口边界，不写成可运行能力。
+验收结果。尚未实现的 P5-P7 只列接口边界，不写成可运行能力。
 
 ## 2. 目标与当前边界
 
@@ -35,19 +36,21 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
 - scheduler/core 侧请求 cache 布局规划；
 - PREFILL、DENSE、ENTER、SPARSE 的双 pool block 分配；
 - prefill 输出返回后的 resident 满块释放时序；
-- 不复制上游 `Scheduler.schedule()` 的薄调度适配。
+- 不复制上游 `Scheduler.schedule()` 的薄调度适配；
+- scheduler/core 已提交状态到 worker 最终 `InputBatch` 行序的列式投影；
+- ENTER 的 resident MLA block table 全量替换。
 
 当前尚未完成：
 
-- scheduler/core 到 worker 的 DSA 行状态与 ENTER 整表替换投影；
 - DRAM arena、满块 dump 和请求 ledger；
 - LIDU、KSC、SFA-Offload 的 eager 数据面；
 - DSA FULL graph；
 - prefix cache、chunked prefill、prefill/decode mixed、preemption/resume、
   speculative/MTP、async scheduling、KV transfer 和 A5 设备验收。
 
-因此，当前 `cache-init` 成功只证明 P0-P3 的控制面和 HBM 物理初始化成立，
-不能据此宣称稀疏卸载数据面已经生成。
+因此，已有 `cache-init` 结果只证明 P0-P3 的控制面和 HBM 物理初始化成立；
+P4 仍需 910C 单测验证。即使 P4 通过，也不能据此宣称稀疏卸载数据面已经
+生成。
 
 ## 3. 当前总体架构
 
@@ -66,7 +69,8 @@ flowchart TB
     ALLOC --> IDX
     ALLOC --> MLA
     SCHED["DSAOffloadScheduler 薄适配"] --> COORD
-    COORD -. "P4 待实现：最小状态投影" .-> INPUT["NPUInputBatch"]
+    COORD --> PROJECTION["DSA cache-layout 列式投影"]
+    PROJECTION --> INPUT["NPUInputBatch 固定容量行状态"]
     INPUT -. "P5/P6 待实现" .-> DATA["LIDU -> KSC -> SFA-Offload"]
 ```
 
@@ -78,15 +82,17 @@ flowchart TB
 | 请求 cache 布局 | 阶段、冻结预算、resident 有效长度 | `DSARequestCachePlanner` |
 | 物理块表 | 两个 plane 的 request→blocks 映射 | `DSAKVCacheCoordinator` 下的两个 manager |
 
-P4 worker 行状态只能是上述 scheduler/core 真源的 **投影**，不能成为第二套
-请求阶段账本。eager 与 graph 也必须消费同一个投影和 buffer owner。
+worker 行状态是上述 scheduler/core 真源的 **投影**，不是第二套请求阶段
+账本。eager 与 graph 后续都必须消费这个投影和同一个 buffer owner。
 
 ## 4. 与 v0.23 基线的集成方式
 
 ### 4.1 不修改 vLLM
 
 实现只修改 vLLM-Ascend。vLLM 的 `Request`、`SchedulerOutput` 和
-`Scheduler.schedule()` 当前均未复制或动态追加 DSA 字段。
+`Scheduler.schedule()` 均未修改或复制。DSA 使用 vLLM-Ascend 自有的薄
+`DSAOffloadSchedulerOutput` 子类增加一个类型化 projection 字段，不对
+上游类做 monkey patch 或运行期动态挂字段。
 
 ### 4.2 使用基线扩展点
 
@@ -97,6 +103,8 @@ P4 worker 行状态只能是上述 scheduler/core 真源的 **投影**，不能�
 | KV group/config hook | 构造两个物理 group 和 ratio 容量 |
 | coordinator factory | 创建 `DSAKVCacheCoordinator` |
 | `scheduler_config.scheduler_cls` | 安装薄 `DSAOffloadScheduler` |
+| `SchedulerOutput` dataclass | 浅包装为只增加一个 projection 的 Ascend 子类 |
+| `NPUInputBatch` | 持有固定容量 DSA SoA 行状态 |
 | `NPUModelRunner` cache 初始化 | 分配、reshape、绑定两个独立 plane |
 
 v0.19 依靠全局 monkey patch 修改 `Request`、Scheduler 和输出结构。v0.23
@@ -251,22 +259,31 @@ allocation；这些组合在分配边界再次显式拒绝。
 保序。未来改为异步多 stream 时，必须新增 event/readiness 协议，不能只凭
 host 输出返回释放 HBM 块。
 
-## 10. P4-P7 接口边界
+## 10. P4 实现与 P5-P7 接口边界
 
 ### 10.1 P4：scheduler→worker 投影
 
-必须表达：
+P4 已实现以下合同：
 
-- 每个 scheduled row 的 cache stage；
-- target/sparse budget；
-- resident valid length；
-- ENTER 的 resident block table 整表替换。
+- `DSARequestCacheLayoutProjection` 按 scheduled request 顺序列式承载
+  stage、target/sparse budget、resident valid length；
+- `DSAOffloadSchedulerOutput` 浅包装原生输出，基线字段继续共享原对象；
+- 多进程 pickle 往返保留 projection 类型和内容；
+- worker 先执行原生 `_update_states()` 的 remove/add/condense/reorder，
+  再通过 `req_id_to_index` 投影到最终行序；
+- `DSAInputBatchCacheLayout` 使用一个 `[4, max_num_reqs]` 的固定容量
+  `CpuGpuBuffer`。四个 SoA 列在 device 侧均为连续向量；
+- eager 后续使用 active-prefix，graph 使用 captured-prefix + PAD，
+  二者共享同一个 owner；
+- 只有 ENTER 行携带 resident 全量 block IDs，并覆盖 worker request
+  账本与对应 `MultiGroupBlockTable` 行；其他阶段不额外改写 block table。
 
-不得：
+P4 明确不做：
 
 - 在 worker 各 rank 根据长度重新决定阶段；
 - 为 eager 和 graph 创建两套语义状态；
 - 每 step 构造多份 request-id→scalar Python 字典。
+- 提前 H2D 或连接任何 DSA 算子；P5/P6 将复用已有固定地址 owner。
 
 ### 10.2 P5：eager 数据面
 
@@ -297,20 +314,26 @@ preemption、prefix cache、MTP、chunked/mixed prefill 和 KV transfer 都会
 | `dsa_offload/kv_cache_manager.py` | 阶段感知的实际 block 分配 |
 | `dsa_offload/request_cache_layout.py` | 请求 cache 布局 plan/commit |
 | `dsa_offload/scheduler.py` | 薄 phase barrier 与输出后释放 |
+| `dsa_offload/scheduler_output.py` | scheduler→worker 最小列式投影 |
+| `dsa_offload/input_batch.py` | worker 固定容量行状态与 ENTER 整表覆盖 |
 | `core/kv_cache_interface.py` | DSA spec/manager registry 注册 |
-| `worker/model_runner_v1.py` | spec 生成、tensor 分配、reshape 和绑定 |
+| `worker/npu_input_batch.py` | 可选 DSA buffer owner |
+| `worker/model_runner_v1.py` | cache 初始化及基线行重排后的 DSA 投影 |
 | `platform.py` | 配置收敛、scheduler 类和启动期校验 |
 
 ## 12. 当前验证状态
 
 已获得的 910C 证据：
 
-- P0-P2 单元测试 41 项通过；
+- P0-P3 单元测试 59 项全部通过，无 skip、xfail 或失败；
 - DSA disabled GLM-5.1 回归通过；
 - DSA `cache-init` 成功；
 - HBM 容量报告只打印一次；
 - `async_scheduling=True` 按支持矩阵拒绝；
 - Indexer/MLA 3:1 容量和双 tensor 初始化符合预期。
 
-P3 当前本地纯逻辑测试通过；双 manager、scheduler 和端到端验证仍需在
-Linux + `torch_npu` 环境完成。完整命令和逐阶段验收结果维护在迁移计划中。
+P3 的请求布局、双 manager 失败原子性与 scheduler 薄适配已经在
+Linux + Ascend 环境通过 UT。P4 的 projection pickle、最终行序重排、
+ENTER 整表覆盖和 PAD 初始化共 5 项纯 CPU 测试在本地通过；完整 910C
+回归待执行。P5 数据面尚未接通，因此当前仍不以长请求端到端稀疏生成作为
+验收项。完整命令和逐阶段验收结果维护在迁移计划中。

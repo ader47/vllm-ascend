@@ -4,6 +4,7 @@
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
@@ -11,7 +12,13 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus
 
+from vllm_ascend.dsa_offload.request_cache_layout import (
+    DSARequestCacheStage,
+)
 from vllm_ascend.dsa_offload.scheduler import DSAOffloadScheduler
+from vllm_ascend.dsa_offload.scheduler_output import (
+    DSAResidentBlockTableReplacement,
+)
 
 
 @dataclass(eq=False)
@@ -146,6 +153,55 @@ def test_no_waiting_requests_use_the_upstream_schedule_fast_path(
         raise AssertionError("steady decode should not evaluate the DSA phase gate")
 
     scheduler._has_running_prefill_work = fail_if_gate_is_evaluated  # type: ignore[method-assign]
+    scheduler._attach_dsa_cache_layout = lambda output: output  # type: ignore[method-assign]
     monkeypatch.setattr(Scheduler, "schedule", lambda self: marker)
 
     assert scheduler.schedule() is marker
+
+
+def test_projection_carries_enter_resident_table_and_scalar_state() -> None:
+    scheduler = _make_scheduler()
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {"dense": 1, "enter": 1}
+    output.total_num_scheduled_tokens = 2
+    states = {
+        "dense": SimpleNamespace(
+            stage=DSARequestCacheStage.DENSE_DECODE,
+            target_resident_budget_tokens=2048,
+            sparse_budget_tokens=0,
+            resident_valid_tokens=-1,
+        ),
+        "enter": SimpleNamespace(
+            stage=DSARequestCacheStage.ENTER_SPARSE_DECODE,
+            target_resident_budget_tokens=4096,
+            sparse_budget_tokens=4096,
+            resident_valid_tokens=4097,
+        ),
+    }
+    scheduler.dsa_coordinator = SimpleNamespace(
+        get_request_cache_state=states.get,
+        resident_manager=SimpleNamespace(
+            req_to_blocks={
+                "enter": [
+                    SimpleNamespace(block_id=301),
+                    SimpleNamespace(block_id=302),
+                ]
+            }
+        ),
+    )
+
+    projection = scheduler._build_dsa_cache_layout_projection(output)
+
+    assert projection.request_ids == ("dense", "enter")
+    assert projection.stages == (
+        int(DSARequestCacheStage.DENSE_DECODE),
+        int(DSARequestCacheStage.ENTER_SPARSE_DECODE),
+    )
+    assert projection.target_resident_budget_tokens == (2048, 4096)
+    assert projection.resident_block_table_replacements == (
+        DSAResidentBlockTableReplacement(
+            request_id="enter",
+            block_ids=(301, 302),
+        ),
+    )
+    assert projection.num_enter_rows == 1

@@ -1,8 +1,8 @@
 # DSA 稀疏卸载 v0.23 迁移计划
 
 > - 最后更新：2026-07-28
-> - 当前阶段：P2 物理解耦已通过 GLM-5.1 910C 初验；P3 scheduler/core
->   请求 cache 布局控制面已实现，等待 910C 单测与调度 smoke 验证
+> - 当前阶段：P0-P3 已通过 Linux + Ascend 单测；P4 scheduler→worker
+>   列式投影与 ENTER 整表替换已实现，等待 910C 回归
 > - 迁移目标：只修改 vLLM-Ascend，不修改 vLLM
 
 ## 1. 文档职责
@@ -236,8 +236,8 @@ P0 当前状态：合同与矩阵已冻结；910C golden 工件待在 P2 数据�
 | P0 | 0 | 语义、支持矩阵、回归合同、迁移记录 | 合同完成，golden 待采集 |
 | P1 | 0 | 类型化配置与能力型模型识别 | GLM-5.1 服务器验证通过 |
 | P2 | 0 | Indexer/MLA spec、字节规划、物理 tensor 解耦 | GLM-5.1 910C cache 初始化与容量报告通过；DeepSeek-V3.2 回归待补 |
-| P3 | 0 | 独立 manager/coordinator 与请求 cache 布局合同 | 控制面实现完成，910C 验证待执行 |
-| P4 | 1 | `NPUInputBatch`、block table、统一行状态 | 未开始 |
+| P3 | 0 | 独立 manager/coordinator 与请求 cache 布局合同 | Linux + Ascend 59 项累计 UT 通过 |
+| P4 | 1 | `NPUInputBatch`、block table、统一行状态 | 实现完成，本地专项测试通过，910C 回归待执行 |
 | P5 | 1 | eager 数据面：dump、LIDU、KSC、SFA-Offload | 未开始 |
 | P6 | 1 | 复用原生图捕获/replay | 未开始 |
 | P7 | 2 | 清理、场景扩展、A5 算子验证 | 未开始 |
@@ -427,8 +427,9 @@ DeepSeek-V3.2 使用相同命令替换模型路径。预期：
 
 1. 待测试机具备权重后，完成 DeepSeek-V3.2 的 `cache-init` 强制回归。
 
-本轮 `cache-init` 成功只证明控制面和物理初始化成立。P4/P5 尚未接通，
-不得据此宣称 DSA dump、LIDU/KSC/SFA-Offload 数据面已经可用。
+本轮 `cache-init` 成功只证明 P0-P3 控制面和物理初始化成立，不覆盖 P4
+worker 投影；P5 尚未接通，不得据此宣称 DSA
+dump、LIDU/KSC/SFA-Offload 数据面已经可用。
 
 ### 10.7 与 v0.19 语义实现的复核结论
 
@@ -442,8 +443,8 @@ DeepSeek-V3.2 使用相同命令替换模型路径。预期：
 | 两个 plane 使用独立 block ID 空间 | 每个 group 拥有独立 `BlockPool` | 已对齐 |
 | worker 分别分配、reshape 和绑定两张 cache | Indexer 4D view、MLA tuple 和窄绑定器均已初始化通过 | 已对齐 |
 | attention 共用一次 forward，但能取得两组寻址信息 | resident SFA metadata 附带 Indexer block table/slot mapping view | 结构已接通，算子消费待 P5 |
-| Indexer 保留完整上下文，MLA 在 ENTER 后收缩为 budget+tail | 类型化 planner 与双 manager 已实现 PREFILL/DENSE/ENTER/SPARSE 分配 | 控制面已对齐，worker 整表投影待 P4 |
-| 满块 dump、DRAM ledger、LIDU/KSC/SFA-Offload | 当前 `cache-init` 不进入这些路径 | 未迁移，属于 P4/P5 |
+| Indexer 保留完整上下文，MLA 在 ENTER 后收缩为 budget+tail | planner、双 manager 和 worker ENTER 全量表投影已经接通 | P4 结构已对齐，910C 验证待补 |
+| 满块 dump、DRAM ledger、LIDU/KSC/SFA-Offload | 当前 `cache-init` 不进入这些路径 | 未迁移，属于 P5 |
 
 因此，“Indexer/MLA 初步解耦完成”只用于描述 P2 的物理空间与初始化
 合同。它不等价于请求运行期解耦完成，也不等价于 DSA 稀疏卸载已经可生成。
@@ -526,18 +527,24 @@ waiting prefill 只有在 **两个物理 pool 都能容纳完整 dense prompt** 
 `long_prefill_token_threshold` 都会在启动期拒绝，防止 v0.23 通过后者
 隐式切分长 prompt。
 
-### 11.4 P3/P4 边界
+### 11.4 P3→P4 传输合同
 
 coordinator 中的两张 block table 是 scheduler/core 侧逻辑真源。v0.23
 原生 cached-request 输出只携带各 group **新增** 的 block IDs；ENTER
 需要把 worker 的 resident 表从 dense 全表替换为 `budget + tail`，不能用
 “追加新块”正确表达。
 
-因此 P3 不新增平行 `SchedulerOutput` 类型，也不把临时字段动态挂到 vLLM
-对象上。P4 必须把已 commit 的阶段、resident 有效长度、冻结 budget 和
-必要的整表 replacement 以最小 Ascend 扩展投影到 `NPUInputBatch`，
-eager/graph 共用同一 owner。P4/P5 完成前，长请求 `generate` 仍不是有效
-验收项。
+P4 使用 `DSAOffloadSchedulerOutput` 薄子类增加单个类型化 projection
+字段。它按 dataclass 固定字段浅包装基线输出，不复制调度输出构造逻辑，
+不修改 vLLM 类，也不动态挂四份字典。projection 携带已 commit 的阶段、
+resident 有效长度、冻结 budget，以及仅 ENTER 行需要的全量 resident
+replacement。
+
+worker 先完整执行原生 `_update_states()`，让 remove/add/condense/backend
+reorder 得到最终行序，再通过 `req_id_to_index` 写入
+`NPUInputBatch` 的统一 owner。这样既不复制基线请求生命周期，也不会把
+scheduler 的传输顺序误当成 worker 行号。P5 完成前，长请求 `generate`
+仍不是有效验收项。
 
 ### 11.5 P3 验收门槛
 
@@ -546,13 +553,14 @@ eager/graph 共用同一 owner。P4/P5 完成前，长请求 `generate` 仍不�
 - 容量失败不提前推进阶段，不留下半替换 resident 表；
 - waiting prefill 容量不足时不饿死已有 decode；
 - 首版不支持 preemption 时必须显式拒绝；
-- 不新增整套 SchedulerOutput 类型；
+- 不复制或全局替换 SchedulerOutput；
 - 不复制调度循环；
 - 不在 worker 各 rank 独立决定逻辑 block 分配。
 
-当前 Windows 本地已通过请求 cache 布局纯逻辑测试 7 项；涉及真实 vLLM
-scheduler/manager 导入的 P3 单测依赖 Linux `uvloop` 与 `torch_npu`，需在
-910C 环境与已有 P0-P2 用例一并执行：
+P3 已在 Linux + Ascend 环境与 P0-P2 用例一并验证：共收集并通过 59 项，
+无 skip、xfail 或失败。其中新增覆盖包括请求 budget 冻结、四阶段转换、
+双 pool 分配与释放、ENTER 容量失败原子性、块对齐尾块，以及薄 scheduler
+的 phase barrier、双 pool admission 和无 waiting 请求快路径。测试命令为：
 
 ```bash
 python -m pytest \
@@ -569,8 +577,38 @@ python -m pytest \
 
 ### P4：统一行状态
 
-将跨 step 状态纳入 `NPUInputBatch` 的类型化固定容量列；eager 和 graph 使用
-同一 owner 的不同 view。`MultiGroupBlockTable` 承担多物理池块表。
+已实现：
+
+1. `DSARequestCacheLayoutProjection` 用紧凑 tuple 列承载四个标量合同，
+   只有 ENTER 行传全量 resident block IDs；
+2. `DSAOffloadSchedulerOutput` 是 pickle-safe 的薄子类，所有基线字段做
+   O(1) 浅包装；
+3. `NPUInputBatch` 仅在 DSA 开启时创建一个 `[4, max_num_reqs]` 的
+   `CpuGpuBuffer`，四个 device 列保持连续；
+4. worker 在基线最终行重排之后刷新 active-prefix；未来 graph
+   captured-prefix 的额外行统一写 PAD；
+5. ENTER 覆盖 worker request resident 账本及对应 `BlockTable` 行，
+   DENSE/SPARSE 不产生额外块表写入；
+6. P4 不执行 H2D。P5/P6 复用同一 owner，一次复制后供 eager/graph
+   消费。
+
+本地已通过 projection pickle、乱序行映射、ENTER 整表替换、缺失替换拒绝
+和 PAD 初始化 5 项专项测试；910C 累计 UT 待验证。
+
+P4 服务器累计回归命令如下；预期由 P3 的 59 项增加到 65 项：
+
+```bash
+python -m pytest \
+  tests/ut/dsa_offload/test_config.py \
+  tests/ut/dsa_offload/test_model_support.py \
+  tests/ut/dsa_offload/test_kv_cache.py \
+  tests/ut/dsa_offload/test_request_cache_layout.py \
+  tests/ut/dsa_offload/test_kv_cache_layout.py \
+  tests/ut/dsa_offload/test_scheduler.py \
+  tests/ut/dsa_offload/test_scheduler_output.py \
+  tests/ut/dsa_offload/test_input_batch.py \
+  -vv --tb=short
+```
 
 ### P5：eager 数据面
 
@@ -594,7 +632,7 @@ MTP、async scheduling、KV transfer 和 A5 算子实现。
 | 动态 `CacheConfig` 属性 | `AscendConfig.dsa_offload_config` |
 | 架构名白名单 | 模型能力协议 |
 | 全局 Scheduler monkey patch | coordinator/manager 与薄 DSA 调度适配 |
-| 全局替换 SchedulerOutput 类 | 现有输出结构或最小 Ascend 扩展 |
+| 全局替换 SchedulerOutput 类 | 只增加一个 projection 的薄 Ascend 子类 |
 | patch `SingleTypeKVCacheManager` | `KVCacheSpecRegistry` 注册 manager |
 | 独立 DSA graph buffers/dispatcher | `NPUInputBatch` + 原生 graph buffer/view |
 | 复制 `_update_states/_prepare_inputs` | 在 vLLM-Ascend 原生方法内增加局部 DSA 行为 |
@@ -617,7 +655,7 @@ MTP、async scheduling、KV transfer 和 A5 算子实现。
 |---|---|---|
 | group 容量编码在 spec 还是由 tensor size 推导 | P2 | 优先由 finalized tensor size 推导 |
 | 是否需要薄 DSA Scheduler 适配 | P3 | 已确认需要；只保留 phase barrier、输出后释放和 preemption 拒绝 |
-| DSA 状态是否进入 SchedulerOutput | P3/P4 | P3 不扩展；P4 设计最小 Ascend 投影与 resident 整表 replacement |
+| DSA 状态是否进入 SchedulerOutput | P3/P4 | 已采用一个类型化 projection 的薄子类；不修改或全局替换 vLLM 类 |
 | preempt 后 tokenwise row 与 DRAM ledger 生命周期 | P7 | row 释放，DRAM ledger 独立保留 |
 | prefix/content hash 的 DRAM 身份 | P7 | 首版使用 request lifetime + logical block |
 | A5 算子实现 | P7 | 框架 ABI 保持不变，由算子侧适配 |
@@ -668,3 +706,13 @@ MTP、async scheduling、KV transfer 和 A5 算子实现。
     更新唯一 state；删除未消费字段和无效初始状态分配；
   - 新增 `dsa_offload_design.md`，持续记录当前已落地架构；迁移过程、风险
     与验收证据继续保留在本文。
+  - P3 与既有 P0-P2 用例在 Linux + Ascend 环境累计 59 项全部通过；
+  - 完成 P4 scheduler→worker 列式 projection；使用薄、pickle-safe 的
+    `DSAOffloadSchedulerOutput`，不复制或 monkey patch 上游输出类；
+  - 在原生 `_update_states()` 完成请求增删、压缩和 backend reorder 后，
+    将四列状态映射到 `NPUInputBatch` 最终行序；
+  - 新增一个 SoA 固定容量 `CpuGpuBuffer`，为 eager active-prefix 与
+    graph captured-prefix + PAD 预留同一 owner；
+  - ENTER 使用 scheduler 真源覆盖 worker resident request/block-table
+    行，补齐 v0.23 cached-request append-only delta 无法表达整表替换的
+    缺口；本地 5 项专项测试通过，910C 累计回归待执行。
