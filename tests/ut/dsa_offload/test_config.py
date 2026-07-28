@@ -20,6 +20,11 @@ def _vllm_config(
     block_size: int = 128,
     speculative_config=None,
     kv_transfer_config=None,
+    decode_context_parallel_size: int = 1,
+    prefill_context_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
+    kv_cache_metrics: bool = False,
+    enable_kv_cache_events: bool = False,
 ):
     hf_text_config = SimpleNamespace(
         index_topk=2048,
@@ -44,6 +49,17 @@ def _vllm_config(
         cache_config=SimpleNamespace(
             block_size=block_size,
             enable_prefix_caching=enable_prefix_caching,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=decode_context_parallel_size,
+            prefill_context_parallel_size=prefill_context_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+        ),
+        observability_config=SimpleNamespace(
+            kv_cache_metrics=kv_cache_metrics,
+        ),
+        kv_events_config=SimpleNamespace(
+            enable_kv_cache_events=enable_kv_cache_events,
         ),
         speculative_config=speculative_config,
         kv_transfer_config=kv_transfer_config,
@@ -122,6 +138,17 @@ def test_invalid_static_config_is_rejected(
         ({"enable_prefix_caching": True}, "prefix caching"),
         ({"speculative_config": object()}, "speculative decoding"),
         ({"kv_transfer_config": object()}, "KV transfer connectors"),
+        (
+            {"decode_context_parallel_size": 2},
+            "context parallelism",
+        ),
+        (
+            {"prefill_context_parallel_size": 2},
+            "context parallelism",
+        ),
+        ({"pipeline_parallel_size": 2}, "pipeline parallelism"),
+        ({"kv_cache_metrics": True}, "KV-cache metrics"),
+        ({"enable_kv_cache_events": True}, "KV-cache events"),
     ],
 )
 def test_initial_runtime_support_matrix_is_enforced(

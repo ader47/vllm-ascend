@@ -313,3 +313,27 @@ def register_ascend_kv_cache_specs() -> None:
         manager_class=SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowMLASpec,
     )
+
+    # DSA offload 使用独立的 spec/manager identity，避免 v0.23 registry
+    # 按 FullAttentionSpec 将 Indexer dense plane 与 resident MLA plane
+    # 自动归并。这里只注册类型关系；是否产出这些 spec 由 model runner
+    # 根据类型化 DSA 配置决定。
+    from vllm_ascend.dsa_offload.kv_cache import (
+        DSAIndexerKVSpec,
+        DSAResidentMLAAttentionSpec,
+    )
+    from vllm_ascend.dsa_offload.kv_cache_manager import (
+        DSAIndexerKVCacheManager,
+        DSAResidentMLAKVCacheManager,
+    )
+
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=DSAIndexerKVSpec,
+        manager_class=DSAIndexerKVCacheManager,
+        uniform_type_base_spec=DSAIndexerKVSpec,
+    )
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=DSAResidentMLAAttentionSpec,
+        manager_class=DSAResidentMLAKVCacheManager,
+        uniform_type_base_spec=DSAResidentMLAAttentionSpec,
+    )
