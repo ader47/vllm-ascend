@@ -245,6 +245,11 @@ class AscendSFAMetadata:
     group_len: torch.Tensor | None = None
     group_key_idx: torch.Tensor | None = None
     group_key_cache_idx: torch.Tensor | None = None
+    # DSA 的 resident MLA attention 复用同一份 SFA metadata，同时携带
+    # Indexer plane 的独立寻址视图。这里不复制 tensor，只保留对
+    # MultiGroupBlockTable 固定 buffer 切片的引用。
+    dsa_indexer_block_table: torch.Tensor | None = None
+    dsa_indexer_slot_mapping: torch.Tensor | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -373,6 +378,16 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
+        dsa_indexer_block_table = (
+            common_attn_metadata.dsa_indexer_block_table[:num_reqs]
+            if common_attn_metadata.dsa_indexer_block_table is not None
+            else None
+        )
+        dsa_indexer_slot_mapping = (
+            common_attn_metadata.dsa_indexer_slot_mapping[:num_input_tokens]
+            if common_attn_metadata.dsa_indexer_slot_mapping is not None
+            else None
+        )
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
 
         block_size = self.kernel_block_size
@@ -524,6 +539,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             group_len=actual_group_len,
             group_key_idx=actual_group_key_idx,
             group_key_cache_idx=actual_group_key_cache_idx,
+            dsa_indexer_block_table=dsa_indexer_block_table,
+            dsa_indexer_slot_mapping=dsa_indexer_slot_mapping,
         )
 
     def build_for_graph_capture(

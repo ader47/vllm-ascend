@@ -242,6 +242,14 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     positions: torch.Tensor = None
     positions_cpu: torch.Tensor = None
 
+    # DSA 将 Indexer dense plane 与 resident MLA plane 分成两个独立
+    # KV-cache group，但二者仍服务同一次 MLA attention。基础字段
+    # block_table_tensor/slot_mapping 指向 resident MLA；下面两个字段只
+    # 补充 Indexer 的寻址视图，避免为 Indexer 再构造一整套 attention
+    # metadata。它们直接引用 MultiGroupBlockTable 的预分配 buffer。
+    dsa_indexer_block_table: torch.Tensor | None = None
+    dsa_indexer_slot_mapping: torch.Tensor | None = None
+
     # Current attention state (e.g., ChunkedPrefill, DecodeOnly).
     attn_state: Any = None
 
@@ -281,6 +289,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,
             positions_cpu=self.positions_cpu,
+            dsa_indexer_block_table=self.dsa_indexer_block_table,
+            dsa_indexer_slot_mapping=self.dsa_indexer_slot_mapping,
             attn_state=self.attn_state,
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
             num_input_tokens=self.num_input_tokens,

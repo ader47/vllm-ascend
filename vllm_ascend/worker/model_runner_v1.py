@@ -195,6 +195,13 @@ else:
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.dsa_offload.kv_cache import (
+    DSAIndexerKVSpec,
+    DSAKVCacheGroupIds,
+    DSAResidentMLAAttentionSpec,
+    get_dsa_kv_cache_binding_order,
+    get_dsa_kv_cache_group_ids,
+)
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
@@ -334,6 +341,10 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        self.dsa_offload_enabled = (
+            self.ascend_config.dsa_offload_config.enabled
+        )
+        self.dsa_kv_cache_group_ids: DSAKVCacheGroupIds | None = None
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
@@ -3076,7 +3087,15 @@ class NPUModelRunner(GPUModelRunner):
                     slot_mapping,
                     kv_cache_gid,
                 )
-            if self.model_config.enable_return_routed_experts and kv_cache_gid == 0:
+            routed_experts_kv_cache_gid = (
+                self.dsa_kv_cache_group_ids.resident_mla
+                if self.dsa_kv_cache_group_ids is not None
+                else 0
+            )
+            if (
+                self.model_config.enable_return_routed_experts
+                and kv_cache_gid == routed_experts_kv_cache_gid
+            ):
                 if self.routed_experts_initialized:
                     # snapshot slot_mapping into a private device
                     # buffer so the next ``_prepare_inputs`` does not
@@ -3087,8 +3106,26 @@ class NPUModelRunner(GPUModelRunner):
                     )
             return blk_table_tensor, slot_mapping
 
-        block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
-        self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
+        primary_kv_cache_gid = (
+            self.dsa_kv_cache_group_ids.resident_mla
+            if self.dsa_kv_cache_group_ids is not None
+            else 0
+        )
+        primary_block_table, primary_slot_mapping = (
+            _get_block_table_and_slot_mapping(primary_kv_cache_gid)
+        )
+        self.long_seq_metadata, primary_block_table = _get_pcp_metadata(
+            primary_block_table
+        )
+        if self.dsa_kv_cache_group_ids is not None:
+            dsa_indexer_block_table, dsa_indexer_slot_mapping = (
+                _get_block_table_and_slot_mapping(
+                    self.dsa_kv_cache_group_ids.indexer
+                )
+            )
+        else:
+            dsa_indexer_block_table = None
+            dsa_indexer_slot_mapping = None
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
         ]
@@ -3122,14 +3159,16 @@ class NPUModelRunner(GPUModelRunner):
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,
             max_seq_len=max_seq_len,
-            block_table_tensor=block_table_gid_0,
-            slot_mapping=slot_mapping_gid_0,
+            block_table_tensor=primary_block_table,
+            slot_mapping=primary_slot_mapping,
             causal=True,
             is_prefilling=is_prefilling,
             num_input_tokens=num_tokens_padded,
             actual_seq_lengths_q=self.actual_seq_lengths_q,
             positions=self.positions,
             positions_cpu=self._dsa_positions_cpu_buf if self.use_compress else None,
+            dsa_indexer_block_table=dsa_indexer_block_table,
+            dsa_indexer_slot_mapping=dsa_indexer_slot_mapping,
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
@@ -3217,6 +3256,15 @@ class NPUModelRunner(GPUModelRunner):
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            # Indexer 是独立物理 cache group，因此仍由 MultiGroupBlockTable
+            # 维护自己的 block table/slot mapping；但它没有独立 attention
+            # forward。其寻址视图已经挂到 resident SFA common metadata，
+            # 这里不再复制构建第二份 SFA metadata。
+            if (
+                self.dsa_kv_cache_group_ids is not None
+                and kv_cache_gid == self.dsa_kv_cache_group_ids.indexer
+            ):
+                continue
             cm = copy(cm_base)  # shallow copy
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
@@ -3230,14 +3278,14 @@ class NPUModelRunner(GPUModelRunner):
             # But gdn needs an unpadded one.
             # gdn_query_start_loc is an unpadded version of query_start_loc.
             # TODO delete it if fia's check is removed.
-            if self._has_gdn:
+            if self._has_gdn and self.attn_groups[kv_cache_gid]:
                 attn_group = self.attn_groups[kv_cache_gid][0]
                 builder = attn_group.get_metadata_builder(0)
                 if isinstance(builder, GDNAttentionMetadataBuilder):
                     cm.query_start_loc_cpu = self.gdn_query_start_loc.cpu[: num_reqs_padded + 1]
                     cm.query_start_loc = self.gdn_query_start_loc.gpu[: num_reqs_padded + 1]
 
-            if kv_cache_gid > 0:
+            if kv_cache_gid != primary_kv_cache_gid:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid
                 )
@@ -3796,12 +3844,19 @@ class NPUModelRunner(GPUModelRunner):
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+        self.dsa_kv_cache_group_ids = (
+            get_dsa_kv_cache_group_ids(kv_cache_config)
+            if self.dsa_offload_enabled
+            else None
+        )
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
         self.initialize_attn_backend(kv_cache_config)
         self.use_hybrid_blocks = len(self.attn_groups) > 1
         # NOTE: Currently, we determine whether we need `num_accepted_tokens` through `MambaSpec`.
         self.need_accepted_tokens = any(
-            [isinstance(attn_group[0].kv_cache_spec, MambaSpec) for attn_group in self.attn_groups]
+            isinstance(attn_group[0].kv_cache_spec, MambaSpec)
+            for attn_group in self.attn_groups
+            if attn_group
         )
 
         self.may_reinitialize_input_batch(kv_cache_config)
@@ -3871,6 +3926,7 @@ class NPUModelRunner(GPUModelRunner):
         kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
         # Change the memory buffer to the desired shape
         kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
+        num_attn_module = 2 if self.model_config.hf_text_config.model_type == "longcat_flash" else 1
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
@@ -3889,10 +3945,11 @@ class NPUModelRunner(GPUModelRunner):
             for layer_name, kv_cache in kv_caches.items():
                 self.compilation_config.static_forward_context[
                     layer_name].kv_cache = [kv_cache]
+        elif self.dsa_offload_enabled:
+            self._bind_dsa_split_kv_caches(kv_caches, kv_cache_config)
         else:
             from vllm.v1.worker.utils import bind_kv_cache
 
-            num_attn_module = 2 if self.model_config.hf_text_config.model_type == "longcat_flash" else 1
             bind_kv_cache(kv_caches, self.compilation_config.static_forward_context, self.kv_caches, num_attn_module)
 
         if self.enable_hamming_sparse is True:
@@ -3907,6 +3964,44 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         return kv_caches
+
+    def _bind_dsa_split_kv_caches(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
+        """把同一 transformer layer 的两张 DSA cache 分别绑定到模型。
+
+        resident MLA 与 Indexer cache 有不同的物理容量和 module identity，
+        但二者的名字包含相同 layer index。vLLM 通用 binder 在昇腾平台会
+        将这种情况视作不受支持的同层多 attention cache，因此 DSA 在这里
+        按最终 KVCacheConfig 的类型化 group 明确绑定。非 DSA 路径仍完整
+        使用上游 binder。
+        """
+
+        assert len(self.kv_caches) == 0
+        binding_order = get_dsa_kv_cache_binding_order(kv_cache_config)
+        expected_layers = set(binding_order)
+        actual_layers = set(kv_caches)
+        if actual_layers != expected_layers:
+            raise RuntimeError(
+                "DSA KV-cache binding set does not match finalized groups: "
+                f"missing={tuple(sorted(expected_layers - actual_layers))}, "
+                f"unexpected={tuple(sorted(actual_layers - expected_layers))}"
+            )
+
+        forward_context = self.compilation_config.static_forward_context
+        missing_context = expected_layers.difference(forward_context)
+        if missing_context:
+            raise RuntimeError(
+                "DSA KV-cache layers are missing from static forward context: "
+                f"{tuple(sorted(missing_context))}"
+            )
+
+        for layer_name in binding_order:
+            kv_cache = kv_caches[layer_name]
+            forward_context[layer_name].kv_cache = kv_cache
+            self.kv_caches.append(kv_cache)
 
     def _get_layer_kv_cache_specs(self, kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
         layer_kv_cache_spec: dict[str, KVCacheSpec] = {}
@@ -4057,6 +4152,21 @@ class NPUModelRunner(GPUModelRunner):
             self.hybrid_with_attn_and_mamba = self.hybrid_with_attn_and_mamba or (use_mamba and use_attn)
             for idx in range(len(kv_cache_tensor.shared_by)):
                 layer_name = kv_cache_tensor.shared_by[idx]
+                current_layer_spec = layer_kv_cache_spec[layer_name]
+                if isinstance(current_layer_spec, DSAIndexerKVSpec):
+                    if layer_name not in kv_cache_raw_tensors:
+                        tensor = self._allocate_int8_cache_tensor(
+                            kv_cache_tensor.size,
+                            alignment,
+                        )
+                        for layer_name_inner in kv_cache_tensor.shared_by:
+                            if isinstance(
+                                layer_kv_cache_spec[layer_name_inner],
+                                DSAIndexerKVSpec,
+                            ):
+                                kv_cache_raw_tensors[layer_name_inner] = tensor
+                    continue
+
                 # Single tensor path for: mamba, hybrid attn-mamba, or cache_only_layers
                 if (
                     "linear_attn" in layer_name
@@ -4311,6 +4421,32 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_caches: dict[str, torch.Tensor] = {}
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+
+        # Indexer plane 只是一张独立的 dense cache，没有自己的 attention
+        # backend/metadata builder。按 spec 直接恢复算子消费的标准 4D
+        # [block, token, head, dim] 视图，避免为了 reshape 伪造 SFA group。
+        for layer_name, current_kv_cache_spec in layer_kv_cache_spec.items():
+            if not isinstance(current_kv_cache_spec, DSAIndexerKVSpec):
+                continue
+            raw_tensor = kv_cache_raw_tensors[layer_name]
+            assert raw_tensor is not None
+            assert (
+                raw_tensor.numel() % current_kv_cache_spec.page_size_bytes == 0
+            )
+            num_blocks = (
+                raw_tensor.numel() // current_kv_cache_spec.page_size_bytes
+            )
+            assert num_blocks >= kv_cache_config.num_blocks
+            kv_cache_shape = (
+                num_blocks,
+                current_kv_cache_spec.block_size,
+                current_kv_cache_spec.num_kv_heads,
+                current_kv_cache_spec.head_size,
+            )
+            kv_caches[layer_name] = raw_tensor.view(
+                current_kv_cache_spec.dtype
+            ).view(kv_cache_shape)
+
         for group in self._kv_cache_spec_attn_group_iterator():
             attn_backend = group.backend
             current_kv_cache_spec = group.kv_cache_spec
@@ -4696,12 +4832,20 @@ class NPUModelRunner(GPUModelRunner):
                 # This is an attention backend that supports virtual
                 # block splitting. Get the supported block sizes from
                 # the backend.
-                attn_groups = self.attn_groups[kv_cache_group_id]
-                backends = [attn_group.backend for attn_group in attn_groups]
                 kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
-                selected_kernel_size = select_common_block_size(
-                    kv_manager_block_size, backends
-                )
+                if isinstance(kv_cache_spec, DSAIndexerKVSpec):
+                    # Indexer group 没有 attention backend，但仍需要独立
+                    # BlockTable/slot mapping。LIDU 直接按 manager block size
+                    # 消费，因此无需虚拟 block splitting。
+                    selected_kernel_size = kv_manager_block_size
+                else:
+                    attn_groups = self.attn_groups[kv_cache_group_id]
+                    backends = [
+                        attn_group.backend for attn_group in attn_groups
+                    ]
+                    selected_kernel_size = select_common_block_size(
+                        kv_manager_block_size, backends
+                    )
                 self.kernel_block_sizes.append([selected_kernel_size])
             else:
                 # This is likely Mamba or other non-attention cache,
@@ -4778,11 +4922,16 @@ class NPUModelRunner(GPUModelRunner):
             # they are cached correctly, there will be different objects per
             # layer.
             for layer_name in kv_cache_group_spec.layer_names:
-                attn_backend = layers[layer_name].get_attn_backend()
-                full_cls_name = attn_backend.full_cls_name()
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                     layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                if isinstance(layer_kv_cache_spec, DSAIndexerKVSpec):
+                    # Indexer 是被 resident MLA forward 消费的 cache plane，
+                    # 不是第二个 attention layer。保留空 attention group，
+                    # 让 group id 与 MultiGroupBlockTable 对齐即可。
+                    continue
+                attn_backend = layers[layer_name].get_attn_backend()
+                full_cls_name = attn_backend.full_cls_name()
                 key = (full_cls_name, layer_kv_cache_spec)
                 attn_backends[key] = AttentionGroupKey(attn_backend, layer_kv_cache_spec)
                 attn_backend_layers[key].append(layer_name)
@@ -4861,6 +5010,10 @@ class NPUModelRunner(GPUModelRunner):
         if has_ec_transfer() and get_ec_transfer().is_producer:
             return {}
 
+        from vllm.model_executor.models.deepseek_v2 import (
+            DeepseekV32IndexerCache,
+        )
+
         kv_cache_spec: dict[str, list[KVCacheSpec]] = defaultdict(list)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         # NOTE: Must process Attention/MLAAttention before MambaBase to maintain
@@ -4895,7 +5048,40 @@ class NPUModelRunner(GPUModelRunner):
                     enable_sparse_sfa_c8_for_layer = bool(getattr(impl, "enable_sparse_sfa_c8", False))
                     enable_sparse_li_c8_for_layer = bool(getattr(impl, "enable_sparse_li_c8", False))
 
-                    if enable_sparse_sfa_c8_for_layer:
+                    if self.dsa_offload_enabled:
+                        if (
+                            enable_sparse_sfa_c8_for_layer
+                            or enable_sparse_li_c8_for_layer
+                        ):
+                            raise RuntimeError(
+                                "The initial DSA Indexer/MLA split migration "
+                                "supports bf16/fp16 cache planes only; sparse "
+                                "SFA/LI C8 cache packing must be disabled."
+                            )
+                        if not has_indexer:
+                            raise RuntimeError(
+                                "DSA sparse offload requires one independent "
+                                "Indexer cache for every resident MLA layer; "
+                                f"layer={layer_name} has no local indexer."
+                            )
+                        resident_head_dim = (
+                            self.model_config.hf_text_config.kv_lora_rank,
+                            self.model_config.hf_text_config.qk_rope_head_dim,
+                            0,
+                        )
+                        kv_cache_spec[layer_name] = (
+                            DSAResidentMLAAttentionSpec(
+                                block_size=self.block_size,
+                                num_kv_heads=1,
+                                head_size=sum(resident_head_dim),
+                                sparse_head_dim=resident_head_dim,
+                                dtype=self.kv_cache_dtype,
+                                cache_dtype_str=(
+                                    self.vllm_config.cache_config.cache_dtype
+                                ),
+                            )
+                        )
+                    elif enable_sparse_sfa_c8_for_layer:
                         packed_kv_head_dim = get_sfa_qsfa_packed_head_dim(
                             self.model_config.hf_text_config.kv_lora_rank,
                             self.model_config.hf_text_config.qk_rope_head_dim,
@@ -4916,17 +5102,18 @@ class NPUModelRunner(GPUModelRunner):
                             0,
                         )
 
-                    kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
-                        block_size=self.block_size,
-                        num_kv_heads=1,
-                        head_size=sum(sparse_head_dim),
-                        sparse_head_dim=sparse_head_dim,
-                        dtype=self.kv_cache_dtype,
-                        cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
-                        cache_sparse_sfa_c8=enable_sparse_sfa_c8_for_layer,
-                        cache_sparse_li_c8=enable_sparse_li_c8_for_layer,
-                        sfa_dcp_replicated_indexer_size=self.sfa_dcp_replicated_indexer_size,
-                    )
+                    if not self.dsa_offload_enabled:
+                        kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                            block_size=self.block_size,
+                            num_kv_heads=1,
+                            head_size=sum(sparse_head_dim),
+                            sparse_head_dim=sparse_head_dim,
+                            dtype=self.kv_cache_dtype,
+                            cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                            cache_sparse_sfa_c8=enable_sparse_sfa_c8_for_layer,
+                            cache_sparse_li_c8=enable_sparse_li_c8_for_layer,
+                            sfa_dcp_replicated_indexer_size=self.sfa_dcp_replicated_indexer_size,
+                        )
                 elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if getattr(attn_module.impl, "fa_quant_layer", False):
                         head_size = attn_module.head_size + attn_module.qk_rope_head_dim
@@ -4945,12 +5132,22 @@ class NPUModelRunner(GPUModelRunner):
             elif isinstance(attn_module, MambaBase):
                 mamba_layers[layer_name] = attn_module
 
+            elif isinstance(attn_module, DeepseekV32IndexerCache):
+                if self.dsa_offload_enabled:
+                    kv_cache_spec[layer_name] = DSAIndexerKVSpec(
+                        block_size=attn_module.cache_config.block_size,
+                        num_kv_heads=1,
+                        head_size=attn_module.head_dim,
+                        dtype=attn_module.dtype,
+                    )
+
             elif isinstance(attn_module, CacheOnlyAttentionLayer):
                 # Only CacheOnlyAttentionLayer (extract_hidden_states draft model)
                 # is handled here. Other AttentionLayerBase subclasses such as
-                # DeepseekV32IndexerCache are intentionally skipped: on Ascend,
-                # the indexer's k_cache is replaced by IndexerWrapper, so its
-                # KV cache is unused.
+                # DeepseekV32IndexerCache are handled by the preceding branch:
+                # native Ascend skips its original cache after IndexerWrapper
+                # takes ownership, while DSA restores it as an independent
+                # dense plane.
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     # Rebuild to a fresh, picklable spec (the returned one
                     # references a stale MLAAttentionSpec class shadowed by

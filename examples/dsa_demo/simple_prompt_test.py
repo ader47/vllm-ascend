@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""验证 v0.23 DSA 迁移 P1 配置控制面。
+"""验证 v0.23 DSA 迁移 P2 KV-cache 控制面。
 
 本脚本只验证：
 
 1. DSA 关闭时，v0.23 原生路径没有受到影响；
-2. DSA 开启时，类型化配置和模型能力校验能够通过；
+2. DSA 开启时，Indexer/MLA 能形成两个独立 group、tensor 和物理池；
 3. 尚未支持的 async scheduling 会在启动期被明确拒绝。
 
-P2-P5 尚未接通前，``enabled`` 模式仍使用 v0.23 原生 packed
-Indexer/MLA cache，不代表已经发生 DSA 稀疏卸载。
+``cache-init`` 模式只构造 ``LLM`` 并等待 KV cache 初始化完成，不执行
+``generate``。P4/P5 数据面尚未接通前，调用生成不能证明 DSA 稀疏卸载
+正确，甚至可能让原生 SFA 按 packed cache 语义误读独立 tensor。
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ DEFAULT_PROMPTS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the v0.23 DSA P1 configuration smoke test.",
+        description="Run the v0.23 DSA P2 KV-cache control-plane smoke test.",
     )
     parser.add_argument(
         "--model",
@@ -49,9 +50,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("disabled", "enabled", "reject-async"),
-        default="enabled",
-        help="P1 scenario to execute.",
+        choices=("disabled", "cache-init", "reject-async"),
+        default="cache-init",
+        help="P2 scenario to execute.",
     )
     parser.add_argument("--tensor-parallel-size", type=int, default=16)
     parser.add_argument("--data-parallel-size", type=int, default=1)
@@ -75,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--result-json",
         type=Path,
-        help="Optional path used to store deterministic output token IDs.",
+        help="Optional path used to store output token IDs for comparison.",
     )
     args = parser.parse_args()
 
@@ -120,7 +121,7 @@ def build_dsa_sparse_config() -> dict[str, Any]:
         "resident_budget_tokens": [6144, 10240, 12288],
         "max_active_reqs": 256,
         "hot_cpu_block_multiple": 3.0,
-        # P1 只验证配置控制面；图数据面将在 P6 迁移。
+        # P2 只验证 cache 控制面；图数据面将在 P6 迁移。
         "enable_row_mode_decode_graph": False,
         "trace_points": {
             "enabled": False,
@@ -149,7 +150,7 @@ def write_result(path: Path | None, payload: dict[str, Any]) -> None:
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    print(f"[dsa-p1] wrote result: {path}")
+    print(f"[dsa-p2] wrote result: {path}")
 
 
 def main() -> None:
@@ -164,6 +165,7 @@ def main() -> None:
     llm_kwargs: dict[str, Any] = {
         "model": args.model,
         "tensor_parallel_size": args.tensor_parallel_size,
+        "pipeline_parallel_size": 1,
         "data_parallel_size": args.data_parallel_size,
         "quantization": args.quantization,
         "seed": 1024,
@@ -186,15 +188,18 @@ def main() -> None:
         }
 
     config_payload = {
-        "phase": "P1-control-plane",
+        "phase": "P2-kv-cache-control-plane",
         "mode": args.mode,
         "model": args.model,
         "prompts": args.prompts,
         "llm": {key: value for key, value in llm_kwargs.items() if key not in {"model"}},
         "environment": {key: os.environ.get(key) for key in NATIVE_RUNTIME_ENV_OVERRIDES},
-        "notice": ("P2-P5 are not connected yet; enabled mode does not prove that sparse offload occurred."),
+        "notice": (
+            "P4-P5 are not connected yet; cache-init only validates split "
+            "Indexer/MLA cache construction and allocation."
+        ),
     }
-    print("[dsa-p1] configuration:")
+    print("[dsa-p2] configuration:")
     print(json.dumps(config_payload, ensure_ascii=False, indent=2))
 
     expected_error = "DSA sparse offload currently requires async_scheduling=False"
@@ -212,12 +217,23 @@ def main() -> None:
             "expected_error": expected_error,
             "observed_error": str(exc),
         }
-        print("[dsa-p1] PASS: async scheduling was rejected as expected")
+        print("[dsa-p2] PASS: async scheduling was rejected as expected")
         write_result(args.result_json, payload)
         return
 
     if args.mode == "reject-async":
         raise AssertionError("DSA enabled with async_scheduling=True unexpectedly started")
+
+    if args.mode == "cache-init":
+        payload = {
+            **config_payload,
+            "status": "passed",
+            "expected_log": "DSA HBM CACHE CAPACITY REPORT",
+        }
+        print("[dsa-p2] PASS: split Indexer/MLA KV cache initialized; generation was intentionally skipped")
+        write_result(args.result_json, payload)
+        del llm
+        return
 
     sampling_params = SamplingParams(
         temperature=0.0,
@@ -242,11 +258,11 @@ def main() -> None:
             }
             output_payload.append(record)
             print(
-                f"[dsa-p1] request={request_idx} "
+                f"[dsa-p2] request={request_idx} "
                 f"token_ids={record['token_ids']} "
                 f"finish_reason={record['finish_reason']!r}"
             )
-            print(f"[dsa-p1] output={record['text']!r}")
+            print(f"[dsa-p2] output={record['text']!r}")
 
         payload = {
             **config_payload,

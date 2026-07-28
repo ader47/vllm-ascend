@@ -17,9 +17,23 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.dsa_offload.kv_cache import (
+    build_dsa_kv_cache_config,
+    build_dsa_kv_cache_groups,
+    dsa_max_memory_usage_bytes,
+    dsa_pool_bytes_per_base_block,
+    has_dsa_split_kv_cache_groups,
+    has_dsa_split_kv_cache_specs,
+    report_dsa_kv_cache_config,
+)
 from vllm_ascend.utils import vllm_version_is
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
+_orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
+_orig_get_kv_cache_config_from_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
+_orig_pool_bytes_per_block = vllm.v1.core.kv_cache_utils._pool_bytes_per_block
+_orig_max_memory_usage_bytes_from_groups = vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups
+_orig_report_kv_cache_config = vllm.v1.core.kv_cache_utils._report_kv_cache_config
 
 
 def _ascend_resolve_kv_cache_block_sizes(
@@ -249,9 +263,73 @@ def _get_kv_cache_config_deepseek_v4(
     return num_blocks, kv_cache_tensors
 
 
+def _ascend_get_kv_cache_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    """保留原生分组策略，仅对显式 DSA split spec 接管分组。"""
+
+    if has_dsa_split_kv_cache_specs(kv_cache_spec):
+        return build_dsa_kv_cache_groups(kv_cache_spec)
+    return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+
+
+def _ascend_get_kv_cache_config_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    if has_dsa_split_kv_cache_groups(kv_cache_groups):
+        return build_dsa_kv_cache_config(
+            vllm_config,
+            kv_cache_groups,
+            available_memory,
+        )
+    return _orig_get_kv_cache_config_from_groups(
+        vllm_config,
+        kv_cache_groups,
+        available_memory,
+    )
+
+
+def _ascend_pool_bytes_per_block(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    if has_dsa_split_kv_cache_groups(kv_cache_groups):
+        return dsa_pool_bytes_per_base_block(kv_cache_groups)
+    return _orig_pool_bytes_per_block(kv_cache_groups)
+
+
+def _ascend_max_memory_usage_bytes_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    if has_dsa_split_kv_cache_groups(kv_cache_groups):
+        return dsa_max_memory_usage_bytes(vllm_config, kv_cache_groups)
+    return _orig_max_memory_usage_bytes_from_groups(
+        vllm_config,
+        kv_cache_groups,
+    )
+
+
+def _ascend_report_kv_cache_config(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+) -> None:
+    if has_dsa_split_kv_cache_groups(kv_cache_config.kv_cache_groups):
+        report_dsa_kv_cache_config(vllm_config, kv_cache_config)
+        return
+    _orig_report_kv_cache_config(vllm_config, kv_cache_config)
+
+
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
+vllm.v1.core.kv_cache_utils.get_kv_cache_groups = _ascend_get_kv_cache_groups
+vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = _ascend_get_kv_cache_config_from_groups
+vllm.v1.core.kv_cache_utils._pool_bytes_per_block = _ascend_pool_bytes_per_block
+vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups = _ascend_max_memory_usage_bytes_from_groups
+vllm.v1.core.kv_cache_utils._report_kv_cache_config = _ascend_report_kv_cache_config
 # vllm v0.24.0 renamed _get_kv_cache_config_deepseek_v4 to _get_kv_cache_config_packed and
 # get_kv_cache_config_from_groups now calls _get_kv_cache_config_packed directly, bypassing
 # the alias patch above. Patch the canonical name so Ascend's non-packed layout is used.

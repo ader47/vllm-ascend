@@ -1,7 +1,7 @@
 # DSA 稀疏卸载 v0.23 迁移计划
 
 > - 最后更新：2026-07-28
-> - 当前阶段：P0/P1 已完成本地实现与单测，等待 910C 拉起验证
+> - 当前阶段：P2/P3 cache 控制面已完成本地实现，等待 910C 初始化验收
 > - 迁移目标：只修改 vLLM-Ascend，不修改 vLLM
 
 ## 1. 文档职责
@@ -119,9 +119,22 @@ v0.23 的 Ascend 实现有意忽略原始 `DeepseekV32IndexerCache` spec：
 - vLLM-Ascend 已有 coordinator factory、KV 分组和配置计算扩展点；
 - vLLM-Ascend 已有 `NPUInputBatch` 和 `MultiGroupBlockTable`。
 
-P2 的当前方向是：将 `num_blocks` 保持为 MLA 基础容量，以配置 ratio
+v0.23 的这次重构把三种此前容易混在一起的语义分开了：
+
+1. spec/registry 决定单层 cache 的字节布局和块生命周期算法；
+2. group 决定哪些层共用一张逻辑 block table；
+3. tensor 决定 worker 最终分配多少物理字节。
+
+原生多 group coordinator 仍共享一个 `BlockPool`，是因为其 hybrid cache
+解决的是“不同 attention 类型共享一个逻辑 block ID 空间”的问题。DSA
+的 Indexer/MLA 不仅 page 字节不同，容量也按 ratio 不同，两边 block ID
+都从 0 独立编号，因此不能复用该单 pool 假设。
+
+P2 的实现将 `num_blocks` 保持为 MLA 基础容量，以配置 ratio
 计算 Indexer tensor 容量；各物理池的最终 block 数由 finalized
 tensor/spec 尺寸推导，避免重新引入 v0.19 的动态 `CacheConfig` 属性。
+跨 rank 收敛时，vLLM 会按最小 `num_blocks` 等比例缩小每个
+`KVCacheTensor.size`，因此 Indexer:MLA ratio 仍能保持不变。
 
 ### 5.3 配置初始化时序
 
@@ -167,6 +180,9 @@ v0.23 的平台流程先构造 `AscendConfig`，后执行 `refresh_block_size()`
 | chunked prefill | 关闭 |
 | speculative/MTP | 关闭 |
 | KV transfer connector | 关闭 |
+| DCP/PCP | 均为 1 |
+| pipeline parallel | 1 |
+| KV-cache metrics/events | 关闭 |
 | 图模式 | P6 完成前仅验证 eager |
 
 这些限制用于隔离核心迁移，不代表最终能力边界。每解除一项限制，必须追加
@@ -217,9 +233,9 @@ P0 当前状态：合同与矩阵已冻结；910C golden 工件待在 P2 数据�
 | 阶段 | 优先级 | 内容 | 当前状态 |
 |---|---:|---|---|
 | P0 | 0 | 语义、支持矩阵、回归合同、迁移记录 | 合同完成，golden 待采集 |
-| P1 | 0 | 类型化配置与能力型模型识别 | 本地实现完成，待 910C 拉起 |
-| P2 | 0 | Indexer/MLA spec、字节规划、物理 tensor 解耦 | 未开始 |
-| P3 | 0 | 独立 manager/coordinator 与生命周期合同 | 未开始 |
+| P1 | 0 | 类型化配置与能力型模型识别 | GLM-5.1 服务器验证通过 |
+| P2 | 0 | Indexer/MLA spec、字节规划、物理 tensor 解耦 | 本地实现完成，待 910C 验收 |
+| P3 | 0 | 独立 manager/coordinator 与生命周期合同 | 双 pool 与逐组件 admission 已实现；阶段生命周期待迁移 |
 | P4 | 1 | `NPUInputBatch`、block table、统一行状态 | 未开始 |
 | P5 | 1 | eager 数据面：dump、LIDU、KSC、SFA-Offload | 未开始 |
 | P6 | 1 | 复用原生图捕获/replay | 未开始 |
@@ -273,44 +289,92 @@ additional_config = {
 - 配置与模型能力单测：24 项通过；
 - `AscendConfig` 独立导入：通过，无循环导入；
 - 服务器 smoke 入口：`examples/dsa_demo/simple_prompt_test.py`；
-- 910C 待验证：
+- GLM-5.1 W4A8、EP/TP16 服务器验证：
 
-  1. DSA 关闭时可正常拉起原生模型；
-  2. DSA 开启且不兼容配置时给出明确错误；
-  3. GLM-5.1 与 DeepSeek-V3.2 能正确识别能力；
-  4. `block_size` 在 Ascend 刷新后再校验。
+  1. DSA 关闭时正常拉起并生成；
+  2. DSA 开启时类型化配置和 GLM-5.1 能力识别通过；
+  3. `async_scheduling=True` 准确触发启动期拒绝；
+  4. 最终 `block_size=128` 校验通过。
 
-## 10. P2：物理 cache 解耦计划
+同一 `disabled` 配置在两个独立进程中已经观察到 decode token 分叉，因此
+该环境不具备跨进程逐 token 确定性。P1 的非回归判断以“DSA 配置没有计算
+路径消费者、关闭/开启均可正常拉起、同模式漂移已被基线复现”为依据。
+DeepSeek-V3.2 的服务器回归可与 P2 cache 初始化测试合并执行。
+
+## 10. P2：物理 cache 解耦
 
 P2 只处理“空间是什么、占多少、如何绑定”，不提前迁移请求阶段和算子热
 路径。
 
-### 10.1 设计步骤
+### 10.1 已实现设计
 
-1. 在 vLLM-Ascend 注册 DSA 专用 Indexer spec 和 manager 类型。
-2. 在 DSA 模式下，`NPUModelRunner.get_kv_cache_spec()` 显式产生：
+1. 在 `KVCacheSpecRegistry` 注册：
+
+   - `DSAIndexerKVSpec -> DSAIndexerKVCacheManager`；
+   - `DSAResidentMLAAttentionSpec -> DSAResidentMLAKVCacheManager`。
+
+   两个 spec 各自作为 uniform-type base，禁止被自动归并。
+
+2. DSA 模式下，`NPUModelRunner.get_kv_cache_spec()` 显式产生：
 
    - 全量 Indexer dense plane；
    - MLA resident plane；
    - 非 DSA 模式继续产生原生 packed `AscendMLAAttentionSpec`。
 
-3. DSA resident MLA spec 的 page size 只计算 MLA latent、RoPE 和必要
-   scale，不再包含 Indexer K。
-4. Indexer tensor 和 MLA tensor 独立计算字节数与 block 容量。
-5. 只从 finalized `KVCacheTensor.size`/spec 推导物理容量；不在
+3. `IndexerWrapper` 在 DSA 拉起期保留原始 Indexer cache 的
+   `static_forward_context` identity，并把原生 fp8-naive 132B 复合布局
+   修正为算子实际消费的 128 维 bf16/fp16 单向量布局。
+4. resident MLA spec 的 page size 只计算 MLA latent 与 RoPE，第三个
+   `sparse_head_dim` 为 0，不再重复计算 Indexer K。
+5. 分组固定为 Indexer 在前、resident MLA 在后；当前 GLM-5.1 和
+   DeepSeek-V3.2 要求每个 resident 层都有独立 Indexer cache。
+   `skip_topk` 只表示复用 top-k，并不表示省略 Indexer cache。显式共享
+   Indexer 的更新模型暂不支持。
+6. `KVCacheConfig.num_blocks` 表示 resident MLA base blocks；
+   Indexer tensor 使用 `ratio * num_blocks`，两组最终容量均从
+   `KVCacheTensor.size / page_size_bytes` 反推。
+7. 自动容量按一个 MLA base block 的加权物理成本计算，显式
+   `num_gpu_blocks_override` 仍沿用 base-block 语义。
+8. model runner 分别分配并 reshape Indexer 4D tensor 与 MLA
+   latent/RoPE tuple。二者在同一 transformer layer 下拥有不同 module
+   name；vLLM 通用 `bind_kv_cache` 在昇腾上会拒绝这种同层双 cache，
+   因此 DSA 使用仅在解耦模式生效的类型化 binder，将两张 cache 分别
+   绑定回各自 `static_forward_context` 模块。非 DSA 路径继续原样调用
+   上游 binder。
+9. 只从 finalized `KVCacheTensor.size`/spec 推导物理容量；不在
    `CacheConfig` 增加 `dsa_num_blocks` 一类影子字段。
-6. 输出确定性的容量报告，并在所有 rank 核对相同的 group 顺序和容量。
-7. 设计并测试 cache binding：每层 attention/indexer 必须绑定到正确 tensor，
-   禁止沿用 packed tuple 的位置假设。
+10. 容量报告中的总字节、两组 blocks 与 tokens 均来自最终 tensor。
+11. 两个 plane 继续各自拥有 `MultiGroupBlockTable` 中的 block table 和
+    slot mapping，但只为真实 resident MLA attention 构建一份 SFA
+    metadata。Indexer 的两个寻址 tensor 作为该 metadata 的附加视图传递，
+    不复制数据，也不创建第二个 SFA metadata builder。
+12. Indexer 4D tensor 直接按 `DSAIndexerKVSpec` reshape；不再为了取得
+    shape 而把 Indexer cache group 伪装成 `AscendSFABackend`。
 
-### 10.2 P2 禁止事项
+### 10.2 当前边界
+
+- P2 已改变物理 cache ABI，原生 SFA 仍按 packed tuple 消费 cache；
+- LIDU/KSC/SFA-Offload 尚未重新连接到独立 Indexer tensor；
+- 因此 DSA 开启后当前只允许验证 `LLM` cache 初始化，不运行
+  `generate`；
+- Indexer group 是“有独立物理 cache/block table、无独立 attention
+  forward”的寻址 plane。`attn_groups[indexer_gid]` 有意为空；model runner
+  对该 group 单独完成 kernel block-size 选择与 4D tensor reshape，并把
+  寻址视图附着到 resident SFA metadata。后续 P4/P5 应继续扩展这份共享
+  metadata，而不是恢复第二套 builder；
+- DCP/PCP、pipeline parallel 以及 KV-cache metrics/events 首版启动期拒绝。
+  PP 的全局 group 投影允许 stage 出现空 group，当前尚未定义空平面的
+  双 pool 容量语义；metrics/event payload 则以裸 block ID 为键，而
+  两个独立 pool 都从 0 编号，直接共用会发生碰撞。
+
+### 10.3 P2 禁止事项
 
 - 只恢复 `DeepseekV32IndexerCache.get_kv_cache_spec()` 而不修改 consumer；
 - 在 `AscendMLAAttentionSpec.page_size_bytes` 中同时计算两套 Indexer 空间；
 - 用同一个标量 block 数假装两个物理池容量相同；
 - 为了快速跑通而复制 v0.19 `patch_kv_cache_utils.py`。
 
-### 10.3 P2 验收门槛
+### 10.4 P2 验收门槛
 
 - DSA 关闭时原生 packed layout 完全不变；
 - DSA 开启时不存在 Indexer 双重分配；
@@ -318,6 +382,24 @@ P2 只处理“空间是什么、占多少、如何绑定”，不提前迁移�
 - TP 各 rank 的 group 顺序与容量一致；
 - GLM-5.1 和 DeepSeek-V3.2 均通过 cache 初始化；
 - 仅完成空间初始化尚不能宣称 DSA 推理可用。
+
+### 10.5 910C 验收入口
+
+```bash
+python examples/dsa_demo/simple_prompt_test.py \
+  --model /home/models/GLM-5.1-W4A8 \
+  --mode cache-init \
+  --result-json /tmp/dsa-p2-glm51-cache-init.json
+```
+
+DeepSeek-V3.2 使用相同命令替换模型路径。预期：
+
+1. 权重和 KV cache 初始化完成，脚本不进入 `generate`；
+2. 日志恰好出现一份 `DSA HBM CACHE CAPACITY REPORT`；
+3. `Indexer dense plane blocks == MLA resident plane blocks * ratio`；
+4. `KVCacheConfig.num_blocks` 对应 resident MLA，而非两组块数之和；
+5. 没有 `Some layers are not correctly initialized`、group 数量或
+   tensor page 对齐错误。
 
 ## 11. P3：分配与生命周期计划
 
@@ -329,7 +411,23 @@ P2 只处理“空间是什么、占多少、如何绑定”，不提前迁移�
 - admission 进行 component-wise 容量检查，不能只看某个合并比例；
 - target resident budget 在请求 admission 时冻结。
 
-### 11.2 Scheduler 决策门
+### 11.2 已完成的控制面基础
+
+- 每个 KV-cache group 拥有独立 `BlockPool`，block ID namespace 不共享；
+- single-type manager 直接持有对应真实 pool；
+- 顶层只通过 `DSABlockPoolView` 聚合 usage、reset 和 event；
+- 顶层继续使用 vLLM 原生 `KVCacheManager`。平台 patch 直接条件包装该类的
+  `allocate_slots` 方法，而不是依赖 scheduler 模块是否已导入来替换构造器；
+  DSA coordinator 只把两处“总块数 vs 单 pool” admission 改为逐
+  component 比较，非 DSA 调用完整委托上游实现；
+- 保留上游 scheduler/hash/group block-size 整除不变量；
+- 未复制或替换 `Scheduler.schedule()`。
+
+这些实现只解决“两个 pool 怎样不被当成一个 pool”。resident MLA 当前仍
+按 full-attention 方式随完整序列增长，尚未迁移 DENSE/ENTER/SPARSE 的
+回收与固定 budget 生命周期，因此不能作为完整 P3 验收结果。
+
+### 11.3 Scheduler 决策门
 
 P3 实现前逐项回答：
 
@@ -342,7 +440,7 @@ P3 实现前逐项回答：
 
 只有右列确实出现时才引入 Scheduler 适配，而且必须复用基线 `schedule()`。
 
-### 11.3 P3 验收门槛
+### 11.4 P3 验收门槛
 
 - add、decode grow、ENTER、free 的两组 block 账本一致；
 - 首版不支持 preemption 时必须在启动期或 admission 明确拒绝；
@@ -415,4 +513,18 @@ MTP、async scheduling、KV transfer 和 A5 算子实现。
   - 冻结首版支持矩阵和 P0 回归合同；
   - 完成 P1 类型化配置、模型能力识别和两阶段 block-size 校验；
   - 增加 P1 disabled/enabled/reject-async 三模式服务器 smoke demo；
-  - 明确 P2/P3 的实现边界与验收门槛。
+  - 完成 GLM-5.1 W4A8、EP/TP16 的 P1 服务器验证，并记录原生路径跨进程
+    decode 非确定性；
+  - 完成 DSA Indexer/resident MLA 独立 spec、group、tensor 和容量规划；
+  - 完成双物理 `BlockPool`、类型化 manager 与逐 component admission
+    基础；
+  - 使用与 scheduler 导入时序无关的原生 `KVCacheManager` 条件包装，
+    消除早期平台 patch 静默漏装 DSA admission 的风险；
+  - 增加同层 resident MLA/Indexer 双 cache 的窄绑定器，绕开上游
+    非 CUDA 平台通用 binder 对同层多 cache 的显式拒绝；
+  - 增加跨 rank tensor 等比收缩、plane ratio、weighted admission 和
+    双 pool reset 单测；
+  - 将服务器 smoke 更新为 P2 disabled/cache-init/reject-async，明确
+    P4/P5 接通前禁止把生成结果作为 DSA 正确性证据；
+  - 明确 DCP/PCP、pipeline parallel、KV-cache metrics/events 和显式
+    shared Indexer 的首版边界。

@@ -56,6 +56,21 @@ class IndexerWrapper(nn.Module):
         self.wk_weights_proj = vllm_indexer.wk_weights_proj
         self.k_norm = vllm_indexer.k_norm
         self.softmax_scale = vllm_indexer.softmax_scale
+        self.k_cache_layer_name: str | None = None
+        indexer_cache = vllm_indexer.k_cache
+        if indexer_cache is not None:
+            self.k_cache_layer_name = indexer_cache.prefix
+            if get_ascend_config().dsa_offload_config.enabled:
+                # vLLM 原生 Indexer cache 使用 fp8-naive 的 132B 复合布局；
+                # DSA offload 的独立 dense plane 保存算子直接消费的 128 维
+                # key，dtype 与模型 MLA cache 对齐。static_forward_context 中
+                # 仍持有 indexer_cache 对象，model runner 会据此产出独立
+                # DSAIndexerKVSpec 并完成物理绑定。
+                cache_dtype = get_current_vllm_config().model_config.dtype
+                if cache_dtype not in (torch.float16, torch.bfloat16):
+                    cache_dtype = torch.bfloat16
+                indexer_cache.head_dim = self.head_dim
+                indexer_cache.dtype = cache_dtype
         vllm_indexer.topk_indices_buffer = None  # delete topk_indices_buffer
         vllm_indexer.k_cache = None  # delete k_cache
 

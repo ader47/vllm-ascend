@@ -541,6 +541,8 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common_attn_metadata.attn_mask = None
         common_attn_metadata.attn_state = AscendAttentionState.ChunkedPrefill
         common_attn_metadata.block_table_tensor = torch.randn(100, 4)
+        common_attn_metadata.dsa_indexer_block_table = torch.arange(40, dtype=torch.int32).view(10, 4)
+        common_attn_metadata.dsa_indexer_slot_mapping = torch.arange(100, dtype=torch.int64)
         common_attn_metadata.cos = None
         common_attn_metadata.sin = None
         common_attn_metadata.num_input_tokens = 100
@@ -555,6 +557,14 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert isinstance(metadata, AscendSFAMetadata)
         assert metadata.num_actual_tokens == common_attn_metadata.num_actual_tokens
         assert metadata.slot_mapping.shape == (100, 4, 1024)
+        assert torch.equal(
+            metadata.dsa_indexer_block_table,
+            common_attn_metadata.dsa_indexer_block_table,
+        )
+        assert torch.equal(
+            metadata.dsa_indexer_slot_mapping,
+            common_attn_metadata.dsa_indexer_slot_mapping,
+        )
 
     @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
     @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
@@ -600,6 +610,8 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common_attn_metadata.attn_mask = None
         common_attn_metadata.attn_state = AscendAttentionState.ChunkedPrefill
         common_attn_metadata.block_table_tensor = torch.randn(100, 4)
+        common_attn_metadata.dsa_indexer_block_table = None
+        common_attn_metadata.dsa_indexer_slot_mapping = None
         common_attn_metadata.cos = None
         common_attn_metadata.sin = None
         common_attn_metadata.num_input_tokens = 100
@@ -660,6 +672,8 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common_attn_metadata.attn_mask = None
         common_attn_metadata.attn_state = AscendAttentionState.ChunkedPrefill
         common_attn_metadata.block_table_tensor = torch.randn(100, 4)
+        common_attn_metadata.dsa_indexer_block_table = None
+        common_attn_metadata.dsa_indexer_slot_mapping = None
         common_attn_metadata.cos = None
         common_attn_metadata.sin = None
         common_attn_metadata.num_input_tokens = 100

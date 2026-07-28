@@ -284,6 +284,8 @@ class DSAOffloadConfig:
         capabilities = require_dsa_offload_model_support(vllm_config.model_config)
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
+        parallel_config = vllm_config.parallel_config
+        observability_config = vllm_config.observability_config
 
         max_num_seqs = int(scheduler_config.max_num_seqs or 0)
         if max_num_seqs > self.max_active_reqs:
@@ -303,6 +305,21 @@ class DSAOffloadConfig:
             raise ValueError("DSA sparse offload does not yet support speculative decoding")
         if vllm_config.kv_transfer_config is not None:
             raise ValueError("DSA sparse offload does not yet support KV transfer connectors")
+        if parallel_config.decode_context_parallel_size != 1 or parallel_config.prefill_context_parallel_size != 1:
+            raise ValueError("DSA split Indexer/MLA cache does not yet support decode or prefill context parallelism")
+        if parallel_config.pipeline_parallel_size != 1:
+            raise ValueError("DSA split Indexer/MLA cache does not yet support pipeline parallelism")
+        if observability_config.kv_cache_metrics:
+            raise ValueError(
+                "DSA split Indexer/MLA cache does not yet support KV-cache "
+                "metrics because independent block pools reuse block IDs"
+            )
+        kv_events_config = vllm_config.kv_events_config
+        if kv_events_config is not None and kv_events_config.enable_kv_cache_events:
+            raise ValueError(
+                "DSA split Indexer/MLA cache does not yet support KV-cache "
+                "events because independent block pools reuse block IDs"
+            )
         if self.enable_row_mode_decode_graph and bool(vllm_config.model_config.enforce_eager):
             raise ValueError("enable_row_mode_decode_graph requires enforce_eager=False")
         return capabilities

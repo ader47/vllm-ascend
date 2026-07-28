@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM projectx
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import sys
 from collections.abc import Mapping
+from functools import wraps
 from math import lcm
 
 import vllm
@@ -31,6 +32,15 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
+from vllm_ascend.dsa_offload.kv_cache import (
+    has_dsa_split_kv_cache_groups,
+)
+from vllm_ascend.dsa_offload.kv_cache_coordinator import (
+    DSAKVCacheCoordinator,
+)
+from vllm_ascend.dsa_offload.kv_cache_manager import (
+    allocate_dsa_slots,
+)
 
 USE_MULTI_GROUPS_KV_CACHE = True
 
@@ -467,6 +477,23 @@ def get_kv_cache_coordinator(
     eagle_attn_layer_names: list[str] | None = None,
     metrics_collector: KVCacheMetricsCollector | None = None,
 ) -> KVCacheCoordinator:
+    if has_dsa_split_kv_cache_groups(kv_cache_config.kv_cache_groups):
+        if scheduler_block_size is None:
+            raise RuntimeError("DSA split KV-cache requires a resolved scheduler block size")
+        return DSAKVCacheCoordinator(
+            kv_cache_config=kv_cache_config,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+            use_eagle=use_eagle,
+            enable_caching=enable_caching,
+            enable_kv_cache_events=enable_kv_cache_events,
+            dcp_world_size=dcp_world_size,
+            pcp_world_size=pcp_world_size,
+            scheduler_block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
+            metrics_collector=metrics_collector,
+        )
+
     if _is_deepseek_v4_kv_cache_config(kv_cache_config):
         return AscendHybridKVCacheCoordinator(
             kv_cache_config,
@@ -524,3 +551,18 @@ vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator = get_kv_cache_coordi
 _kv_cache_manager = sys.modules.get("vllm.v1.core.kv_cache_manager")
 if _kv_cache_manager is not None:
     _kv_cache_manager.get_kv_cache_coordinator = get_kv_cache_coordinator  # type: ignore[attr-defined]
+
+# Scheduler may import KVCacheManager either before or after platform patches
+# run. Patching the class method itself is therefore more reliable than
+# replacing one module's cached constructor binding. Non-DSA calls delegate to
+# the exact upstream implementation.
+if _kv_cache_manager is not None:
+    _original_allocate_slots = _kv_cache_manager.KVCacheManager.allocate_slots
+
+    @wraps(_original_allocate_slots)
+    def _ascend_allocate_slots(self, *args, **kwargs):
+        if isinstance(self.coordinator, DSAKVCacheCoordinator):
+            return allocate_dsa_slots(self, *args, **kwargs)
+        return _original_allocate_slots(self, *args, **kwargs)
+
+    _kv_cache_manager.KVCacheManager.allocate_slots = _ascend_allocate_slots
