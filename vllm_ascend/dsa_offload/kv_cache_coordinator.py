@@ -8,9 +8,15 @@ hybrid cache。DSA 的 Indexer dense plane 与 MLA resident plane 容量不同�
 block id 也分别索引各自 tensor，因此必须为每个 group 建立独立 BlockPool，
 并在 admission 时逐 component 检查。
 
-本模块只改变物理池所有权和容量判断，不复制 Scheduler 主循环，也不处理
-dense -> resident 阶段转换。prefix cache、KV connector 和 speculative
-decode 已由首版配置合同提前拒绝。
+本模块同时持有请求 cache 布局 planner：manager 先生成不可变布局计划，完成
+双 pool 容量检查和物理修改后再 commit；prefill 输出返回后，薄 Scheduler
+也通过这里释放已卸载的 resident 满块。它仍不复制 Scheduler 主循环，
+prefix cache、KV connector 和 speculative decode 由首版配置合同提前拒绝。
+
+这里的 block table 是 scheduler/core 侧逻辑真源。v0.23 原生
+``SchedulerOutput`` 对 cached request 只表达“追加的新块”，尚不能表达
+ENTER 对 resident 表的整表替换；该传输与 worker 行状态属于 P4，不能由各
+worker 根据长度自行重新分配。
 """
 
 from __future__ import annotations
@@ -32,7 +38,12 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend.dsa_offload.kv_cache import (
     get_dsa_group_num_blocks,
+    get_dsa_kv_cache_group_ids,
     validate_dsa_kv_cache_config,
+)
+from vllm_ascend.dsa_offload.request_cache_layout import (
+    DSARequestCachePlanner,
+    DSARequestCacheState,
 )
 
 
@@ -158,6 +169,39 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
         )
         self.num_single_type_manager = len(self.single_type_managers)
+        self.group_ids = get_dsa_kv_cache_group_ids(kv_cache_config)
+
+        from vllm_ascend.ascend_config import get_ascend_config
+        from vllm_ascend.dsa_offload.kv_cache_manager import (
+            DSAIndexerKVCacheManager,
+            DSAResidentMLAKVCacheManager,
+        )
+
+        indexer_manager = self.single_type_managers[self.group_ids.indexer]
+        resident_manager = self.single_type_managers[self.group_ids.resident_mla]
+        if not isinstance(indexer_manager, DSAIndexerKVCacheManager):
+            raise RuntimeError(
+                f"DSA Indexer group did not resolve to DSAIndexerKVCacheManager: {type(indexer_manager).__name__}"
+            )
+        if not isinstance(
+            resident_manager,
+            DSAResidentMLAKVCacheManager,
+        ):
+            raise RuntimeError(
+                "DSA resident MLA group did not resolve to "
+                "DSAResidentMLAKVCacheManager: "
+                f"{type(resident_manager).__name__}"
+            )
+        self.indexer_manager = indexer_manager
+        self.resident_manager = resident_manager
+
+        dsa_config = get_ascend_config().dsa_offload_config
+        self.request_cache_layout = DSARequestCachePlanner(
+            block_size=scheduler_block_size,
+            sparse_activation_tokens=(dsa_config.sparse_activation_tokens),
+            prompt_budget_thresholds=(dsa_config.prompt_budget_thresholds),
+            resident_budget_tokens=dsa_config.resident_budget_tokens,
+        )
 
     def get_num_blocks_to_allocate_by_group(
         self,
@@ -238,6 +282,67 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
                 strict=True,
             )
         )
+
+    def can_admit_dense_request(
+        self,
+        *,
+        request_id: str,
+        num_tokens: int,
+        total_computed_tokens: int = 0,
+    ) -> bool:
+        """检查一个 prefill 请求能否同时装入两个 dense plane。"""
+
+        empty_blocks = tuple(() for _ in range(self.num_single_type_manager))
+        requirements = self.get_num_blocks_to_allocate_by_group(
+            request_id=request_id,
+            num_tokens=min(int(num_tokens), self.max_model_len),
+            new_computed_blocks=empty_blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=int(total_computed_tokens),
+            num_tokens_main_model=min(
+                int(num_tokens),
+                self.max_model_len,
+            ),
+            apply_admission_cap=True,
+        )
+        return self.can_allocate(requirements)
+
+    def get_request_cache_state(
+        self,
+        request_id: str,
+    ) -> DSARequestCacheState | None:
+        return self.request_cache_layout.get_state(request_id)
+
+    def release_prefill_resident_blocks(
+        self,
+        request_id: str,
+        *,
+        preserve_tail_block: bool,
+    ) -> bool:
+        """释放已 dump 的 dense-prefill MLA 满块，只保留不满尾块。
+
+        当前首版只支持单 stream、同步 scheduler。数据面接通后，上一轮
+        prefill 的 MLA 写入和 full-block dump 在同一 NPU stream 上有序
+        完成，scheduler 收到输出后才能调用这里。若未来改为异步多流，
+        必须先增加 event/readiness 协议，不能继续直接释放这些 HBM 块。
+        """
+
+        req_blocks = self.resident_manager.req_to_blocks.get(request_id)
+        if not req_blocks:
+            return False
+
+        preserved_tail = req_blocks[-1] if preserve_tail_block else None
+        releasable = req_blocks[:-1] if preserved_tail is not None else req_blocks
+        self.resident_manager.req_to_blocks[request_id] = [preserved_tail] if preserved_tail is not None else []
+        if releasable:
+            self.resident_manager.block_pool.free_blocks(reversed(releasable))
+        self.resident_manager.num_cached_block.pop(request_id, None)
+        self.request_cache_layout.mark_prefill_resident_released(request_id)
+        return True
+
+    def free(self, request_id: str) -> None:
+        super().free(request_id)
+        self.request_cache_layout.free(request_id)
 
     def get_num_common_prefix_blocks(
         self,
