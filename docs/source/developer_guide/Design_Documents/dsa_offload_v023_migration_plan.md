@@ -1,7 +1,8 @@
 # DSA 稀疏卸载 v0.23 迁移计划
 
 > - 最后更新：2026-07-28
-> - 当前阶段：P2/P3 cache 控制面已完成本地实现，等待 910C 初始化验收
+> - 当前阶段：P2 物理解耦已通过 GLM-5.1 910C 初验；P3 scheduler/core
+>   请求 cache 布局控制面已实现，等待 910C 单测与调度 smoke 验证
 > - 迁移目标：只修改 vLLM-Ascend，不修改 vLLM
 
 ## 1. 文档职责
@@ -152,8 +153,8 @@ v0.23 的平台流程先构造 `AscendConfig`，后执行 `refresh_block_size()`
 
 1. 如果 coordinator/manager 与共享 planner 足以派生状态，不新增 DSA
    Scheduler；
-2. 如果 request target budget 或生命周期确实无法从现有接口派生，只增加
-   很薄的 Ascend 生命周期适配，并始终调用 `super()`；
+2. 如果 request target budget 或 cache 布局确实无法从现有接口派生，只
+   增加很薄的 Ascend 调度适配，并始终调用 `super()`；
 3. 禁止复制 `schedule()`，禁止全局替换
    `SchedulerOutput/NewRequestData/CachedRequestData`。
 
@@ -234,8 +235,8 @@ P0 当前状态：合同与矩阵已冻结；910C golden 工件待在 P2 数据�
 |---|---:|---|---|
 | P0 | 0 | 语义、支持矩阵、回归合同、迁移记录 | 合同完成，golden 待采集 |
 | P1 | 0 | 类型化配置与能力型模型识别 | GLM-5.1 服务器验证通过 |
-| P2 | 0 | Indexer/MLA spec、字节规划、物理 tensor 解耦 | 本地实现完成，待 910C 验收 |
-| P3 | 0 | 独立 manager/coordinator 与生命周期合同 | 双 pool 与逐组件 admission 已实现；阶段生命周期待迁移 |
+| P2 | 0 | Indexer/MLA spec、字节规划、物理 tensor 解耦 | GLM-5.1 910C cache 初始化与容量报告通过；DeepSeek-V3.2 回归待补 |
+| P3 | 0 | 独立 manager/coordinator 与请求 cache 布局合同 | 控制面实现完成，910C 验证待执行 |
 | P4 | 1 | `NPUInputBatch`、block table、统一行状态 | 未开始 |
 | P5 | 1 | eager 数据面：dump、LIDU、KSC、SFA-Offload | 未开始 |
 | P6 | 1 | 复用原生图捕获/replay | 未开始 |
@@ -401,52 +402,168 @@ DeepSeek-V3.2 使用相同命令替换模型路径。预期：
 5. 没有 `Some layers are not correctly initialized`、group 数量或
    tensor page 对齐错误。
 
-## 11. P3：分配与生命周期计划
+### 10.6 当前验收结果
 
-### 11.1 首选结构
+2026-07-28 在 Ascend 910C、GLM-5.1 W4A8、TP16/EP 环境完成：
+
+- `test_config.py`、`test_model_support.py` 和 `test_kv_cache.py` 共
+  41 项单测全部通过；
+- DSA 关闭时原生 packed cache 路径正常完成生成；
+- DSA `cache-init` 模式完成模型、双平面 KV cache 和 worker 绑定初始化，
+  并按设计跳过 `generate`；
+- `async_scheduling=True` 在权重加载前准确命中启动期拒绝；
+- 未观察到 group 数量、同层双 cache 绑定、tensor reshape 或 page 对齐
+  异常；
+- 最终容量报告给出 resident MLA 1,536 blocks/196,608 tokens、Indexer
+  4,608 blocks/589,824 tokens，严格满足 3:1 比例；最大 resident budget
+  12,288 tokens 加一个 128-token 尾块后，每请求占用 12,416 resident
+  slots，因此 MLA 容量上限为 15 个请求；Indexer 在
+  `max_model_len=8,192` 时容量上限为 72 个请求；报告包含
+  `Configured decode limit`，该配置最终由 `max_num_seqs=2` 限制为
+  2 个请求；
+- 最终两组 KV tensor 共分配 29,444,014,080 bytes（27.42 GiB）。
+
+当前仍需补充一项证据，完成前不将 P2 标记为全部验收完成：
+
+1. 待测试机具备权重后，完成 DeepSeek-V3.2 的 `cache-init` 强制回归。
+
+本轮 `cache-init` 成功只证明控制面和物理初始化成立。P4/P5 尚未接通，
+不得据此宣称 DSA dump、LIDU/KSC/SFA-Offload 数据面已经可用。
+
+### 10.7 与 v0.19 语义实现的复核结论
+
+本轮不是按文件逐段搬运 v0.19 patch，而是按其功能合同逐项映射到 v0.23：
+
+| v0.19 已验证合同 | v0.23 当前实现 | 结论 |
+|---|---|---|
+| Indexer 与 MLA 使用不同 spec identity | 两个 DSA 专用 spec 注册到 `KVCacheSpecRegistry` | 已对齐 |
+| MLA page 不重复包含 Indexer 字节 | resident spec 的第三段 `sparse_head_dim` 为 0 | 已对齐 |
+| Indexer 容量为 MLA base blocks 的 ratio 倍 | ratio 编码进 finalized `KVCacheTensor.size` | 已对齐，且移除动态影子字段 |
+| 两个 plane 使用独立 block ID 空间 | 每个 group 拥有独立 `BlockPool` | 已对齐 |
+| worker 分别分配、reshape 和绑定两张 cache | Indexer 4D view、MLA tuple 和窄绑定器均已初始化通过 | 已对齐 |
+| attention 共用一次 forward，但能取得两组寻址信息 | resident SFA metadata 附带 Indexer block table/slot mapping view | 结构已接通，算子消费待 P5 |
+| Indexer 保留完整上下文，MLA 在 ENTER 后收缩为 budget+tail | 类型化 planner 与双 manager 已实现 PREFILL/DENSE/ENTER/SPARSE 分配 | 控制面已对齐，worker 整表投影待 P4 |
+| 满块 dump、DRAM ledger、LIDU/KSC/SFA-Offload | 当前 `cache-init` 不进入这些路径 | 未迁移，属于 P4/P5 |
+
+因此，“Indexer/MLA 初步解耦完成”只用于描述 P2 的物理空间与初始化
+合同。它不等价于请求运行期解耦完成，也不等价于 DSA 稀疏卸载已经可生成。
+P3 已直接建立在现有类型化 manager 和双 pool 上，不需要退回 v0.19 的
+全局 scheduler/manager patch 形态。
+
+## 11. P3：分配与请求 cache 布局计划
+
+### 11.1 最终采用的结构
 
 - 使用 vLLM-Ascend coordinator factory 创建 DSA coordinator；
 - Indexer manager 维护完整上下文 block；
 - MLA resident manager 维护 sparse budget、保留尾块和阶段转换所需空间；
 - admission 进行 component-wise 容量检查，不能只看某个合并比例；
-- target resident budget 在请求 admission 时冻结。
+- target resident budget 在请求首次成功 admission 时冻结；
+- 使用 `scheduler_config.scheduler_cls` 安装薄
+  `DSAOffloadScheduler`，只表达 DSA 阶段屏障和输出后释放时机；
+- 所有通用 token budget、waiting/running 队列处理、请求 admission 和
+  `SchedulerOutput` 构造仍调用 vLLM 原生 `Scheduler.schedule()`。
 
-### 11.2 已完成的控制面基础
+### 11.2 请求 cache 布局语义真源
 
-- 每个 KV-cache group 拥有独立 `BlockPool`，block ID namespace 不共享；
-- single-type manager 直接持有对应真实 pool；
-- 顶层只通过 `DSABlockPoolView` 聚合 usage、reset 和 event；
-- 顶层继续使用 vLLM 原生 `KVCacheManager`。平台 patch 直接条件包装该类的
-  `allocate_slots` 方法，而不是依赖 scheduler 模块是否已导入来替换构造器；
-  DSA coordinator 只把两处“总块数 vs 单 pool” admission 改为逐
-  component 比较，非 DSA 调用完整委托上游实现；
-- 保留上游 scheduler/hash/group block-size 整除不变量；
-- 未复制或替换 `Scheduler.schedule()`。
+`DSARequestCachePlanner` 是 scheduler/core 侧唯一 DSA cache 布局账本。
+它不接管 vLLM `RequestStatus`，不修改 vLLM `Request`，也不在 worker 各
+rank 重新推导状态。每个请求仅持久化一个 slotted state：
 
-这些实现只解决“两个 pool 怎样不被当成一个 pool”。resident MLA 当前仍
-按 full-attention 方式随完整序列增长，尚未迁移 DENSE/ENTER/SPARSE 的
-回收与固定 budget 生命周期，因此不能作为完整 P3 验收结果。
+- 当前 `PREFILL/DENSE_DECODE/ENTER_SPARSE_DECODE/SPARSE_DECODE`；
+- 按 prompt token 数选择且跨 decode step 冻结的 target resident budget；
+- 当前 sparse budget 和 resident 有效 token 数；
+- prefill resident 满块是否已经释放。
 
-### 11.3 Scheduler 决策门
+planner 使用轻量不可变 plan 和可变持久 state 组成的 `plan/commit`
+两阶段协议：
 
-P3 实现前逐项回答：
+1. `plan()` 只计算候选布局，不推进跨 step 状态；
+2. manager 先分别检查 Indexer pool 与 resident pool；
+3. 容量满足后修改两个物理 block table；
+4. 所有分配成功后才 `commit()`，原地更新该请求唯一 state；
+5. 容量失败返回 `None` 时，阶段和 resident 表保持原状。
 
-| 问题 | 可以由 coordinator/现有数据派生时 | 无法派生时 |
+每个 step 只创建一个 slotted plan。`tail_tokens` 与 ENTER 的 resident
+整表替换标志由 plan 属性派生，不单独存储；旧实现中未被生产路径消费的
+`resident_tokens_need_slot` 已删除。这样既保留失败原子性，也避免 steady
+decode 反复创建初始状态、下一状态及普通 dataclass `__dict__`。
+
+四阶段的物理语义如下：
+
+| 阶段 | Indexer plane | resident MLA plane |
 |---|---|---|
-| target budget | planner 内计算并持久化 | 增加最小 request 生命周期字段 |
-| 两组 block 分配 | coordinator/manager 完成 | 增加薄调度适配 |
-| 新满块识别 | 由 logical length 与 block table 派生 | 输出最小 tensor/list 元数据 |
-| preempt/resume | 首版直接拒绝 | 后续单独设计 DRAM ledger |
+| `PREFILL` | 按完整 prompt 分配 | 按完整 prompt 分配，供 prefill 与 dump |
+| `DENSE_DECODE` | 随完整上下文增长 | 随完整上下文增长 |
+| `ENTER_SPARSE_DECODE` | 保留并继续增长完整上下文 | 一次性替换为 `budget + tail`；旧尾块未满时原块复用 |
+| `SPARSE_DECODE` | 随完整上下文增长 | 物理块表固定，只有有效尾长随 step 变化 |
 
-只有右列确实出现时才引入 Scheduler 适配，而且必须复用基线 `schedule()`。
+当 prompt 恰好块对齐时，首个 decode token 需要一张新的尾块；prompt
+未块对齐时，ENTER 保留原 dense-prefill 尾块，避免丢失其中已有 KV。
 
-### 11.4 P3 验收门槛
+### 11.3 薄 Scheduler 适配
+
+P3 证明仅靠 manager 无法完整表达以下两个时序约束，因此采用子类扩展点，
+而不是恢复 v0.19 的全局 monkey patch：
+
+1. 首版禁止 prefill/decode 进入同一个 model forward。薄 scheduler 在调用
+   `super().schedule()` 前临时隐藏不属于本轮 phase 的队列视图，返回后按
+   原顺序恢复；它不复制上游调度循环。
+2. prefill 满块只有在对应 model forward 已返回后才允许释放。当前首版
+   dump 与模型执行位于同一 NPU stream，stream 内保序，因此
+   `update_from_output()` 返回点可以作为同步边界。未来引入异步多 stream
+   dump 时，必须增加 event/readiness 协议，不能沿用该假设。
+
+waiting prefill 只有在 **两个物理 pool 都能容纳完整 dense prompt** 时才
+阻塞已有 decode；否则先让 decode 前进并释放资源，避免 waiting 请求导致
+全局停滞。动态 preemption/resume 尚无 DRAM ledger 恢复合同，首版一旦
+触发即显式 `RuntimeError`。
+
+纯 steady decode 且 waiting/skipped-waiting 均为空时，DSA scheduler
+直接调用上游快路径，不执行 phase gate 扫描，也不构造临时空队列。
+
+`enable_chunked_prefill=True` 和非零
+`long_prefill_token_threshold` 都会在启动期拒绝，防止 v0.23 通过后者
+隐式切分长 prompt。
+
+### 11.4 P3/P4 边界
+
+coordinator 中的两张 block table 是 scheduler/core 侧逻辑真源。v0.23
+原生 cached-request 输出只携带各 group **新增** 的 block IDs；ENTER
+需要把 worker 的 resident 表从 dense 全表替换为 `budget + tail`，不能用
+“追加新块”正确表达。
+
+因此 P3 不新增平行 `SchedulerOutput` 类型，也不把临时字段动态挂到 vLLM
+对象上。P4 必须把已 commit 的阶段、resident 有效长度、冻结 budget 和
+必要的整表 replacement 以最小 Ascend 扩展投影到 `NPUInputBatch`，
+eager/graph 共用同一 owner。P4/P5 完成前，长请求 `generate` 仍不是有效
+验收项。
+
+### 11.5 P3 验收门槛
 
 - add、decode grow、ENTER、free 的两组 block 账本一致；
-- 首版不支持 preemption 时必须在启动期或 admission 明确拒绝；
+- prefill 后释放只保留未满尾块；块对齐 prompt 不误保留旧满块；
+- 容量失败不提前推进阶段，不留下半替换 resident 表；
+- waiting prefill 容量不足时不饿死已有 decode；
+- 首版不支持 preemption 时必须显式拒绝；
 - 不新增整套 SchedulerOutput 类型；
 - 不复制调度循环；
 - 不在 worker 各 rank 独立决定逻辑 block 分配。
+
+当前 Windows 本地已通过请求 cache 布局纯逻辑测试 7 项；涉及真实 vLLM
+scheduler/manager 导入的 P3 单测依赖 Linux `uvloop` 与 `torch_npu`，需在
+910C 环境与已有 P0-P2 用例一并执行：
+
+```bash
+python -m pytest \
+  tests/ut/dsa_offload/test_config.py \
+  tests/ut/dsa_offload/test_model_support.py \
+  tests/ut/dsa_offload/test_kv_cache.py \
+  tests/ut/dsa_offload/test_request_cache_layout.py \
+  tests/ut/dsa_offload/test_kv_cache_layout.py \
+  tests/ut/dsa_offload/test_scheduler.py \
+  -vv --tb=short
+```
 
 ## 12. P4-P7 摘要
 
@@ -476,7 +593,7 @@ MTP、async scheduling、KV transfer 和 A5 算子实现。
 |---|---|
 | 动态 `CacheConfig` 属性 | `AscendConfig.dsa_offload_config` |
 | 架构名白名单 | 模型能力协议 |
-| 全局 Scheduler monkey patch | coordinator/manager，必要时薄生命周期适配 |
+| 全局 Scheduler monkey patch | coordinator/manager 与薄 DSA 调度适配 |
 | 全局替换 SchedulerOutput 类 | 现有输出结构或最小 Ascend 扩展 |
 | patch `SingleTypeKVCacheManager` | `KVCacheSpecRegistry` 注册 manager |
 | 独立 DSA graph buffers/dispatcher | `NPUInputBatch` + 原生 graph buffer/view |
@@ -499,8 +616,8 @@ MTP、async scheduling、KV transfer 和 A5 算子实现。
 | 问题 | 最晚决策阶段 | 当前方向 |
 |---|---|---|
 | group 容量编码在 spec 还是由 tensor size 推导 | P2 | 优先由 finalized tensor size 推导 |
-| 是否需要薄 Scheduler 生命周期适配 | P3 | 默认不需要，按证据决定 |
-| DSA 状态是否进入 SchedulerOutput | P3/P4 | 优先由共享 planner 和既有 block IDs 派生 |
+| 是否需要薄 DSA Scheduler 适配 | P3 | 已确认需要；只保留 phase barrier、输出后释放和 preemption 拒绝 |
+| DSA 状态是否进入 SchedulerOutput | P3/P4 | P3 不扩展；P4 设计最小 Ascend 投影与 resident 整表 replacement |
 | preempt 后 tokenwise row 与 DRAM ledger 生命周期 | P7 | row 释放，DRAM ledger 独立保留 |
 | prefix/content hash 的 DRAM 身份 | P7 | 首版使用 request lifetime + logical block |
 | A5 算子实现 | P7 | 框架 ABI 保持不变，由算子侧适配 |
@@ -526,5 +643,28 @@ MTP、async scheduling、KV transfer 和 A5 算子实现。
     双 pool reset 单测；
   - 将服务器 smoke 更新为 P2 disabled/cache-init/reject-async，明确
     P4/P5 接通前禁止把生成结果作为 DSA 正确性证据；
+  - 完成 GLM-5.1 W4A8、TP16/EP 的 P2 服务器初验：41 项 DSA 单测、
+    disabled 生成、cache-init、reject-async 和双平面容量报告均通过；
+    DeepSeek-V3.2 回归保留为待补证据；
+  - 对照 v0.19 的完整功能合同复核 v0.23 P2：spec、page bytes、finalized
+    tensor、双 pool、worker reshape/bind 均已对齐；将 DENSE/ENTER/SPARSE
+    cache 布局转换和算子消费明确保留在 P3-P5；
   - 明确 DCP/PCP、pipeline parallel、KV-cache metrics/events 和显式
     shared Indexer 的首版边界。
+  - 增加类型化请求 cache 布局 planner，以 plan/commit 协议冻结 prompt
+    budget，并实现 PREFILL、DENSE、ENTER、SPARSE 的双平面分配；
+  - ENTER 保留未满 dense 尾块，块对齐 prompt 为首个 decode token
+    分配新尾块；steady sparse 只增长 Indexer，resident 物理表保持固定；
+  - 增加基于 `scheduler_cls` 的薄 DSA scheduler，继续调用上游
+    `schedule()`，仅提供 prefill-first phase barrier、输出后 resident
+    释放和不支持 preemption 的显式错误；
+  - 明确 v0.23 cached-request 的 append-only block delta 无法表达 ENTER
+    resident 整表替换，该 worker 投影留给 P4；
+  - 补充隐式 `long_prefill_token_threshold` 拒绝以及 cache 布局、容量失败
+    原子性、队列恢复单测。
+  - 将宽泛的 request lifecycle 命名收敛为 request cache layout，明确不
+    接管 vLLM `RequestStatus`；
+  - 请求持久 state 与每 step plan 改为 slotted 结构，steady decode 原地
+    更新唯一 state；删除未消费字段和无效初始状态分配；
+  - 新增 `dsa_offload_design.md`，持续记录当前已落地架构；迁移过程、风险
+    与验收证据继续保留在本文。

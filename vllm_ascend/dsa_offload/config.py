@@ -299,6 +299,10 @@ class DSAOffloadConfig:
             raise ValueError("DSA sparse offload currently requires async_scheduling=False")
         if bool(scheduler_config.enable_chunked_prefill):
             raise ValueError("DSA sparse offload does not yet support chunked prefill")
+        if int(scheduler_config.long_prefill_token_threshold or 0) > 0:
+            raise ValueError(
+                "DSA sparse offload does not support implicit chunked prefill through long_prefill_token_threshold"
+            )
         if bool(cache_config.enable_prefix_caching):
             raise ValueError("DSA sparse offload does not yet support prefix caching")
         if vllm_config.speculative_config is not None:

@@ -74,6 +74,7 @@ else:
 _CUSTOM_OP_REGISTERED = False
 # Delete after the driver is released; temporarily hard-coded to 4
 MAX_CAPTURE_SIZES_FOR_950 = 4
+_DSA_OFFLOAD_SCHEDULER_CLS = "vllm_ascend.dsa_offload.scheduler.DSAOffloadScheduler"
 
 
 def config_deprecated_logging():
@@ -714,6 +715,24 @@ class NPUPlatform(Platform):
                 "vllm_ascend.core.scheduler_profiling_chunk.ProfilingChunkScheduler"
             )
             import vllm_ascend.patch.platform.patch_profiling_chunk  # noqa
+
+        if ascend_config.dsa_offload_config.enabled:
+            if ascend_config.enable_balance_scheduling:
+                raise ValueError("DSA sparse offload does not yet support Ascend balance scheduling")
+            configured_scheduler = vllm_config.scheduler_config.scheduler_cls
+            if configured_scheduler is not None:
+                configured_scheduler_name = (
+                    configured_scheduler
+                    if isinstance(configured_scheduler, str)
+                    else (f"{configured_scheduler.__module__}.{configured_scheduler.__qualname__}")
+                )
+                if configured_scheduler_name != _DSA_OFFLOAD_SCHEDULER_CLS:
+                    raise ValueError(
+                        "DSA sparse offload cannot be combined with another "
+                        "custom scheduler: "
+                        f"scheduler_cls={configured_scheduler_name}"
+                    )
+            vllm_config.scheduler_config.scheduler_cls = _DSA_OFFLOAD_SCHEDULER_CLS
 
         cp_size = parallel_config.decode_context_parallel_size * parallel_config.prefill_context_parallel_size
         use_sparse = model_uses_sfa_sparse(model_config)

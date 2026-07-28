@@ -15,6 +15,7 @@ def _vllm_config(
     architecture: str = "GlmMoeDsaForCausalLM",
     async_scheduling: bool | None = False,
     enable_chunked_prefill: bool = False,
+    long_prefill_token_threshold: int = 0,
     enable_prefix_caching: bool = False,
     enforce_eager: bool = True,
     block_size: int = 128,
@@ -45,6 +46,7 @@ def _vllm_config(
             max_num_seqs=16,
             async_scheduling=async_scheduling,
             enable_chunked_prefill=enable_chunked_prefill,
+            long_prefill_token_threshold=long_prefill_token_threshold,
         ),
         cache_config=SimpleNamespace(
             block_size=block_size,
@@ -135,6 +137,10 @@ def test_invalid_static_config_is_rejected(
         ({"async_scheduling": None}, "async_scheduling=False"),
         ({"async_scheduling": True}, "async_scheduling=False"),
         ({"enable_chunked_prefill": True}, "chunked prefill"),
+        (
+            {"long_prefill_token_threshold": 1024},
+            "implicit chunked prefill",
+        ),
         ({"enable_prefix_caching": True}, "prefix caching"),
         ({"speculative_config": object()}, "speculative decoding"),
         ({"kv_transfer_config": object()}, "KV transfer connectors"),
