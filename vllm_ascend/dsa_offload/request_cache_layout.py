@@ -25,19 +25,10 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING
 
-
-class DSARequestView(Protocol):
-    """cache 布局规划所需的最小 vLLM Request 只读视图。"""
-
-    request_id: str
-    num_prompt_tokens: int
-    num_computed_tokens: int
-    num_output_tokens: int
-
-    @property
-    def num_tokens(self) -> int: ...
+if TYPE_CHECKING:
+    from vllm.v1.request import Request
 
 
 class DSARequestCacheStage(enum.IntEnum):
@@ -144,7 +135,7 @@ class DSARequestCachePlanner:
 
     def plan(
         self,
-        request: DSARequestView,
+        request: Request,
         *,
         num_new_tokens: int,
         max_model_len: int,
@@ -238,7 +229,7 @@ class DSARequestCachePlanner:
 
     def should_release_resident_after_prefill(
         self,
-        request: DSARequestView,
+        request: Request,
     ) -> bool:
         state = self._states.get(request.request_id)
         if (

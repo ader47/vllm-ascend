@@ -195,12 +195,18 @@ else:
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.dsa_offload.input_batch import (
+    apply_dsa_cache_layout_projection,
+)
 from vllm_ascend.dsa_offload.kv_cache import (
     DSAIndexerKVSpec,
     DSAKVCacheGroupIds,
     DSAResidentMLAAttentionSpec,
     get_dsa_kv_cache_binding_order,
     get_dsa_kv_cache_group_ids,
+)
+from vllm_ascend.dsa_offload.scheduler_output import (
+    DSAOffloadSchedulerOutput,
 )
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
@@ -577,6 +583,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.vllm_config.speculative_config.num_speculative_tokens if self.vllm_config.speculative_config else 0
             ),
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+            dsa_offload_enabled=self.dsa_offload_enabled,
         )
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         # here we use int32
@@ -751,7 +758,48 @@ class NPUModelRunner(GPUModelRunner):
                 if num_computed_tokens < req_state.num_computed_tokens:
                     req_state.prev_num_draft_len = 0
 
-        return super()._update_states(scheduler_output)
+        deferred_output_update = super()._update_states(scheduler_output)
+        if self.dsa_offload_enabled:
+            self._update_dsa_cache_layout(scheduler_output)
+        return deferred_output_update
+
+    def _update_dsa_cache_layout(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """在基线完成最终请求行重排后应用 DSA cache-layout 投影。"""
+
+        state = self.input_batch.dsa_cache_layout
+        if state is None:
+            raise RuntimeError(
+                "DSA is enabled but NPUInputBatch has no cache-layout owner"
+            )
+        if scheduler_output.total_num_scheduled_tokens == 0:
+            state.clear()
+            return
+        if not isinstance(scheduler_output, DSAOffloadSchedulerOutput):
+            raise RuntimeError(
+                "DSA worker requires DSAOffloadSchedulerOutput, got "
+                f"{type(scheduler_output).__name__}"
+            )
+        projection = scheduler_output.dsa_cache_layout
+        if projection is None:
+            raise RuntimeError(
+                "DSA scheduler output is missing cache-layout projection"
+            )
+        group_ids = self.dsa_kv_cache_group_ids
+        if group_ids is None:
+            raise RuntimeError(
+                "DSA worker cache group IDs are not initialized"
+            )
+
+        apply_dsa_cache_layout_projection(
+            input_batch=self.input_batch,
+            requests=self.requests,
+            state=state,
+            projection=projection,
+            resident_group_id=group_ids.resident_mla,
+        )
 
     def _pad_query_start_loc_for_fia(
         self,
@@ -4898,6 +4946,7 @@ class NPUModelRunner(GPUModelRunner):
                 max_num_blocks_per_req=max_num_blocks,
                 kv_cache_groups=kv_cache_config.kv_cache_groups,
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+                dsa_offload_enabled=self.dsa_offload_enabled,
             )
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:

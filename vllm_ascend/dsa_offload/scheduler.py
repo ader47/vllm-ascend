@@ -2,16 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DSA 稀疏卸载的最薄调度策略适配。
 
-本模块不复制 vLLM ``Scheduler.schedule()``，也不定义平行的
-``SchedulerOutput``。基线调度器仍负责 token budget、请求队列、KV block
-分配和输出更新；DSA 子类只补充当前首版无法由通用调度器表达的三个约束：
+本模块不复制 vLLM ``Scheduler.schedule()``。基线调度器仍负责 token
+budget、请求队列、KV block 分配和输出更新；DSA 子类只补充当前首版无法
+由通用调度器表达的三个约束：
 
 * prefill 与 decode 暂不进入同一个 model forward；
 * prefill 数据面完成后，scheduler 才能释放已卸载的 resident 满块；
 * preemption/resume 尚未建立 DRAM ledger 恢复协议，发生时显式失败。
 
 阶段与 budget 的语义真源位于 ``request_cache_layout``，物理 block table 由
-``DSAKVCacheCoordinator`` 持有。这里不向 vLLM ``Request`` 动态追加字段。
+``DSAKVCacheCoordinator`` 持有。每轮输出只用一个薄
+``DSAOffloadSchedulerOutput`` 投影已提交状态，不向 vLLM ``Request`` 动态
+追加字段，也不复制调度输出的构造逻辑。
 """
 
 from __future__ import annotations
@@ -28,6 +30,14 @@ from vllm.v1.request import Request, RequestStatus
 
 from vllm_ascend.dsa_offload.kv_cache_coordinator import (
     DSAKVCacheCoordinator,
+)
+from vllm_ascend.dsa_offload.request_cache_layout import (
+    DSARequestCacheStage,
+)
+from vllm_ascend.dsa_offload.scheduler_output import (
+    DSAOffloadSchedulerOutput,
+    DSARequestCacheLayoutProjection,
+    DSAResidentBlockTableReplacement,
 )
 
 
@@ -155,13 +165,76 @@ class DSAOffloadScheduler(Scheduler):
 
         return restore
 
+    def _build_dsa_cache_layout_projection(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> DSARequestCacheLayoutProjection:
+        """把 scheduler 语义真源投影为本轮 scheduled-request 列。
+
+        ``num_scheduled_tokens`` 的键序只用于建立紧凑传输列；worker 会在
+        基线 ``_update_states`` 完成后按最终 ``InputBatch`` 行号重新映射。
+        ENTER 行额外携带 resident 全量 block table，因为 vLLM cached
+        request 的普通输出只能表达增量追加，不能表达整表替换。
+        """
+
+        request_ids = tuple(scheduler_output.num_scheduled_tokens)
+        row_count = len(request_ids)
+        stages = [0] * row_count
+        target_budgets = [0] * row_count
+        sparse_budgets = [0] * row_count
+        resident_valid_tokens = [-1] * row_count
+        resident_replacements: list[DSAResidentBlockTableReplacement] = []
+
+        for row, request_id in enumerate(request_ids):
+            state = self.dsa_coordinator.get_request_cache_state(request_id)
+            if state is None:
+                raise RuntimeError(
+                    f"DSA scheduled request has no committed cache-layout state: request_id={request_id!r}"
+                )
+            stages[row] = int(state.stage)
+            target_budgets[row] = int(state.target_resident_budget_tokens)
+            sparse_budgets[row] = int(state.sparse_budget_tokens)
+            resident_valid_tokens[row] = int(state.resident_valid_tokens)
+
+            if state.stage == DSARequestCacheStage.ENTER_SPARSE_DECODE:
+                resident_blocks = self.dsa_coordinator.resident_manager.req_to_blocks.get(request_id)
+                if not resident_blocks:
+                    raise RuntimeError(
+                        f"DSA ENTER request has no committed resident block table: request_id={request_id!r}"
+                    )
+                resident_replacements.append(
+                    DSAResidentBlockTableReplacement(
+                        request_id=request_id,
+                        block_ids=tuple(int(block.block_id) for block in resident_blocks),
+                    )
+                )
+
+        return DSARequestCacheLayoutProjection(
+            request_ids=request_ids,
+            stages=tuple(stages),
+            target_resident_budget_tokens=tuple(target_budgets),
+            sparse_budget_tokens=tuple(sparse_budgets),
+            resident_valid_tokens=tuple(resident_valid_tokens),
+            resident_block_table_replacements=tuple(resident_replacements),
+        )
+
+    def _attach_dsa_cache_layout(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> DSAOffloadSchedulerOutput:
+        projection = self._build_dsa_cache_layout_projection(scheduler_output)
+        return DSAOffloadSchedulerOutput.from_base(
+            scheduler_output,
+            dsa_cache_layout=projection,
+        )
+
     def schedule(self) -> SchedulerOutput:
         # 首版禁用 chunked prefill、async scheduling 和 PP；一次完整
         # prefill 的 schedule/update_from_output 之间不会再次进入 scheduler。
         # 因此没有 waiting 请求时不可能在下一轮遗留可调度 prefill，直接
         # 走上游快路径，避免 steady decode 额外构造空队列或扫描 row。
         if not self.waiting and not self.skipped_waiting:
-            return super().schedule()
+            return self._attach_dsa_cache_layout(super().schedule())
 
         token_budget = 0 if self._pause_state == PauseState.PAUSED_ALL else self.max_num_scheduled_tokens
         prefill_barrier = self._has_running_prefill_work() or self._has_schedulable_waiting_prefill(token_budget)
@@ -173,10 +246,11 @@ class DSAOffloadScheduler(Scheduler):
             restore = self._withhold_waiting_for_decode()
 
         try:
-            return super().schedule()
+            scheduler_output = super().schedule()
         finally:
             if restore is not None:
                 restore()
+        return self._attach_dsa_cache_layout(scheduler_output)
 
     def _preempt_request(
         self,
