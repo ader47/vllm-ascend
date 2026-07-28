@@ -660,6 +660,7 @@ class NPUPlatform(Platform):
                 parallel_config.worker_cls = "vllm_ascend.worker.worker.NPUWorker"
 
         refresh_block_size(vllm_config)
+        ascend_config.dsa_offload_config.validate_finalized_cache_contract(vllm_config)
 
         # Activate custom ops for v1, except on 310P
         if get_ascend_device_type() != AscendDeviceType._310P:

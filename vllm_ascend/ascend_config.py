@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
+from vllm_ascend.dsa_offload import DSA_SPARSE_CONFIG_KEY, DSAOffloadConfig
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -33,6 +35,11 @@ class AscendConfig:
         self.vllm_config = vllm_config
         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
         self._check_mooncake_c8_kv_cache_quant(vllm_config)
+
+        self.dsa_offload_config = DSAOffloadConfig.from_dict(
+            additional_config.get(DSA_SPARSE_CONFIG_KEY),
+            vllm_config=vllm_config,
+        )
 
         xlite_graph_config = additional_config.get("xlite_graph_config", {})
         self.xlite_graph_config = XliteGraphConfig(xlite_graph_config, vllm_config)
