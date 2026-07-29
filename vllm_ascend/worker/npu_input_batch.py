@@ -30,6 +30,7 @@ from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm_ascend.dsa_offload.input_batch import (
     DSAInputBatchCacheLayout,
 )
+from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
 from vllm_ascend.worker.block_table import MultiGroupBlockTable
 
 
@@ -53,6 +54,7 @@ class NPUInputBatch(InputBatch):
         cp_kv_cache_interleave_size: int = 1,
         kv_cache_groups: list[KVCacheGroupSpec] | None = None,
         dsa_offload_enabled: bool = False,
+        dsa_resident_token_pool: DSAResidentTokenPool | None = None,
     ):
         self.is_pooling_model = is_pooling_model
         self.is_spec_decode = is_spec_decode
@@ -130,11 +132,16 @@ class NPUInputBatch(InputBatch):
         # DSA 与基线共用同一个 InputBatch 请求行序。这里仅在特性开启时
         # 创建固定容量的列式扩展；eager 使用 active-prefix，后续 graph
         # 使用 captured-prefix + PAD，但二者必须共享这个 buffer owner。
+        if dsa_offload_enabled and dsa_resident_token_pool is None:
+            raise ValueError(
+                "DSA-enabled NPUInputBatch requires a resident token pool"
+            )
         self.dsa_cache_layout = (
             DSAInputBatchCacheLayout(
                 max_num_reqs=max_num_reqs,
                 device=device,
                 pin_memory=pin_memory,
+                resident_token_pool=dsa_resident_token_pool,
             )
             if dsa_offload_enabled
             else None

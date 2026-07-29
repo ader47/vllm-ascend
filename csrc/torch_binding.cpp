@@ -38,11 +38,15 @@
 #include "mc2/dispatch_gmm_combine_decode/dispatch_gmm_combine_decode_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_weight_nz_tensor_list/grouped_matmul_swiglu_quant_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_v2/grouped_matmul_swiglu_quant_v2_torch_adpt.h"
+#include "attention/kv_cache_full_block_dump/kv_cache_full_block_dump_torch_adpt.h"
+#include "attention/kvcache_scatter_copy/kvcache_scatter_copy_torch_adpt.h"
 #include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
+#include "attention/lightning_indexer_decode_update/lightning_indexer_decode_update_torch_adpt.h"
 #include "mc2/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "moe/moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h"
 #include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
+#include "attention/sparse_flash_attention_for_offload/sparse_flash_attention_for_offload_torch_adpt.h"
 #include "attention/kv_quant_sparse_flash_attention/kv_quant_sparse_flash_attention_torch_adpt.h"
 #include "attention/lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
 #include "attention/ngram_spec_decode/ngram_spec_decode_torch_adpt.h"
@@ -2205,6 +2209,23 @@ std::vector<int64_t> get_npu_storage_shape(const at::Tensor& tensor)
     return std::vector<int64_t>(desc.storage_sizes_.begin(), desc.storage_sizes_.end());
 }
 
+void kv_cache_full_block_dump_torch_op(
+    const at::Tensor& src_cache_0,
+    const at::Tensor& src_cache_1,
+    at::Tensor dst_cache_0,
+    at::Tensor dst_cache_1,
+    const at::Tensor& src_block_ids,
+    const at::Tensor& dst_block_ids)
+{
+    vllm_ascend::npu_kv_cache_full_block_dump(
+        src_cache_0,
+        src_cache_1,
+        dst_cache_0,
+        dst_cache_1,
+        src_block_ids,
+        dst_block_ids);
+}
+
 
 } // namespace vllm_ascend
 
@@ -2381,6 +2402,50 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                                                  (Tensor output, Tensor output_scale, Tensor output_offset)"
     );
     ops.impl("grouped_matmul_swiglu_quant_weight_nz_tensor_list", torch::kPrivateUse1, &vllm_ascend::grouped_matmul_swiglu_quant_weight_nz_tensor_list);
+
+    // DSA offload keeps output addresses caller-owned so eager active-prefix
+    // views and later ACL-graph captured-prefix views share one tensor ABI.
+    ops.def(
+        "npu_lightning_indexer_decode_update_out("
+        "Tensor query, Tensor key, Tensor weights, Tensor req_pool_entries, "
+        "Tensor(a!) cache_slots, Tensor row_modes, "
+        "Tensor actual_seq_lengths_key, Tensor block_table, "
+        "Tensor(b!) topk_index_out, Tensor(c!) topk_slots_out, "
+        "Tensor(d!) miss_count_out, Tensor(e!) tail_info_out) -> ()");
+    ops.impl("npu_lightning_indexer_decode_update_out",
+             torch::kPrivateUse1,
+             &vllm_ascend::npu_lightning_indexer_decode_update_out);
+
+    ops.def(
+        "npu_kvcache_scatter_copy(Tensor(a!) hbm_k_rope, "
+        "Tensor(b!) hbm_kv_cache, Tensor dram_k_rope, "
+        "Tensor dram_kv_cache, Tensor hbm_block_table, "
+        "Tensor dram_block_table, Tensor src_token_ids, "
+        "Tensor dst_slots, Tensor copy_counts) -> ()");
+    ops.impl("npu_kvcache_scatter_copy",
+             torch::kPrivateUse1,
+             &vllm_ascend::npu_kvcache_scatter_copy);
+
+    ops.def(
+        "npu_sparse_flash_attention_for_offload("
+        "Tensor query, Tensor key, Tensor value, Tensor sparse_indices, "
+        "Tensor tail_info, float scale_value, int sparse_block_size, "
+        "Tensor block_table, Tensor actual_seq_lengths_query, "
+        "Tensor actual_seq_lengths_kv, Tensor query_rope, Tensor key_rope, "
+        "str layout_query, str layout_kv, int sparse_mode) -> Tensor");
+    ops.impl("npu_sparse_flash_attention_for_offload",
+             torch::kPrivateUse1,
+             &vllm_ascend::npu_sparse_flash_attention_for_offload);
+
+    // 通用双 plane 满块复制。dst=-1 是空转哨兵，block 0 仍是合法地址。
+    ops.def(
+        "kv_cache_full_block_dump(Tensor src_cache_0, "
+        "Tensor src_cache_1, Tensor(a!) dst_cache_0, "
+        "Tensor(b!) dst_cache_1, Tensor src_block_ids, "
+        "Tensor dst_block_ids) -> ()");
+    ops.impl("kv_cache_full_block_dump",
+             torch::kPrivateUse1,
+             &vllm_ascend::kv_cache_full_block_dump_torch_op);
 
     ops.def(
         "grouped_matmul_swiglu_quant_v2(Tensor x, Tensor[] weight, Tensor[] weight_scale, Tensor x_scale,  Tensor group_list,  Tensor? smooth_scale=None,"

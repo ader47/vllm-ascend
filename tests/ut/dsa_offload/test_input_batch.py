@@ -12,6 +12,7 @@ from vllm_ascend.dsa_offload.input_batch import (
 from vllm_ascend.dsa_offload.request_cache_layout import (
     DSARequestCacheStage,
 )
+from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
 from vllm_ascend.dsa_offload.scheduler_output import (
     DSARequestCacheLayoutProjection,
     DSAResidentBlockTableReplacement,
@@ -27,9 +28,16 @@ class _BlockTable:
 
 
 class _InputBatch:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        request_ids: tuple[str, ...] = ("dense", "enter"),
+    ) -> None:
         self.max_num_reqs = 4
-        self.req_id_to_index = {"dense": 0, "enter": 1}
+        self._request_ids = request_ids
+        self.req_id_to_index = {
+            request_id: row
+            for row, request_id in enumerate(request_ids)
+        }
         self.block_table = [_BlockTable(), _BlockTable()]
 
     @property
@@ -38,14 +46,29 @@ class _InputBatch:
 
     @property
     def req_ids(self) -> list[str]:
-        return ["dense", "enter"]
+        return list(self._request_ids)
+
+
+class _NoLookupRequestRows(dict[str, int]):
+    def get(self, key: str, default: int | None = None) -> int | None:
+        raise AssertionError(
+            f"stable row-order refresh must not look up request {key!r}"
+        )
 
 
 def _make_state() -> DSAInputBatchCacheLayout:
+    resident_token_pool = DSAResidentTokenPool(
+        max_num_reqs=4,
+        num_layers=2,
+        max_model_len=8192,
+        max_resident_budget_tokens=4096,
+        device=torch.device("cpu"),
+    )
     return DSAInputBatchCacheLayout(
         max_num_reqs=4,
         device=torch.device("cpu"),
         pin_memory=False,
+        resident_token_pool=resident_token_pool,
     )
 
 
@@ -90,6 +113,8 @@ def test_projection_follows_final_input_batch_rows_and_replaces_enter_table() ->
         int(DSARequestCacheStage.ENTER_SPARSE_DECODE),
     ]
     assert state.sparse_budget_tokens_cpu[:2].tolist() == [0, 2048]
+    assert state.row_modes_cpu[:2].tolist() == [1, 2]
+    assert state.resident_pool_indices_cpu[:2].tolist() == [0, 1]
     assert requests["enter"].block_ids[1] == [310, 311, 211]
     assert input_batch.block_table[1].added_rows == [([310, 311, 211], 1)]
 
@@ -113,9 +138,30 @@ def test_projection_rejects_enter_replacement_count_mismatch() -> None:
         raise AssertionError("ENTER without a replacement must fail")
 
 
-def test_graph_padding_rows_are_reset_before_copy() -> None:
-    input_batch = _InputBatch()
+def test_graph_padding_rows_are_reset_when_active_batch_shrinks() -> None:
     state = _make_state()
+    full_input_batch = _InputBatch(
+        ("dense", "enter", "old-2", "old-3")
+    )
+    full_projection = DSARequestCacheLayoutProjection(
+        request_ids=("dense", "enter", "old-2", "old-3"),
+        stages=(
+            int(DSARequestCacheStage.DENSE_DECODE),
+            int(DSARequestCacheStage.SPARSE_DECODE),
+            int(DSARequestCacheStage.DENSE_DECODE),
+            int(DSARequestCacheStage.SPARSE_DECODE),
+        ),
+        target_resident_budget_tokens=(2048, 4096, 2048, 4096),
+        sparse_budget_tokens=(0, 4096, 0, 4096),
+        resident_valid_tokens=(-1, 4097, -1, 4097),
+        resident_block_table_replacements=(),
+    )
+    state.refresh(
+        input_batch=full_input_batch,
+        projection=full_projection,
+    )
+
+    input_batch = _InputBatch()
     projection = DSARequestCacheLayoutProjection(
         request_ids=("dense", "enter"),
         stages=(
@@ -128,7 +174,6 @@ def test_graph_padding_rows_are_reset_before_copy() -> None:
         resident_block_table_replacements=(),
     )
     state.refresh(input_batch=input_batch, projection=projection)
-    state.stages_cpu[2:] = 99
 
     state.copy_to_device(4)
 
@@ -141,3 +186,43 @@ def test_graph_padding_rows_are_reset_before_copy() -> None:
         -1,
     ]
     assert state.stages.tolist() == state.stages_cpu.tolist()
+    assert state.row_modes_cpu.tolist() == [1, 2, 0, 0]
+    assert state.resident_pool_indices_cpu[2:].tolist() == [4, 4]
+
+
+def test_stable_row_order_uses_bulk_column_refresh() -> None:
+    input_batch = _InputBatch()
+    input_batch.req_id_to_index = _NoLookupRequestRows(
+        {
+            "dense": 0,
+            "enter": 1,
+        }
+    )
+    state = _make_state()
+    projection = DSARequestCacheLayoutProjection(
+        request_ids=("dense", "enter"),
+        stages=(
+            int(DSARequestCacheStage.DENSE_DECODE),
+            int(DSARequestCacheStage.SPARSE_DECODE),
+        ),
+        target_resident_budget_tokens=(2048, 4096),
+        sparse_budget_tokens=(0, 4096),
+        resident_valid_tokens=(-1, 4097),
+        resident_block_table_replacements=(),
+    )
+
+    state.refresh(input_batch=input_batch, projection=projection)
+
+    assert state.valid
+    assert state.row_count == 2
+    assert state.stages_cpu[:2].tolist() == [
+        int(DSARequestCacheStage.DENSE_DECODE),
+        int(DSARequestCacheStage.SPARSE_DECODE),
+    ]
+    assert state.target_resident_budget_tokens_cpu[:2].tolist() == [
+        2048,
+        4096,
+    ]
+    assert state.sparse_budget_tokens_cpu[:2].tolist() == [0, 4096]
+    assert state.resident_valid_tokens_cpu[:2].tolist() == [-1, 4097]
+    assert state.resident_pool_indices_cpu[:2].tolist() == [0, 1]

@@ -15,10 +15,14 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from vllm_ascend.dsa_offload.contracts import (
+    DSA_INDEX_HEAD_DIM,
+    DSA_KV_LORA_RANK,
     DSA_LIDU_OUTPUT_CAPACITY,
     DSA_LIDU_SUPPORTED_RESIDENT_BUDGETS,
+    DSA_QK_ROPE_HEAD_DIM,
     DSA_REQUIRED_CACHE_BLOCK_SIZE,
     DSA_SFA_COMPUTE_TOPK,
+    DSA_SUPPORTED_INDEX_HEAD_COUNTS,
 )
 from vllm_ascend.dsa_offload.model_support import (
     DSAOffloadModelCapabilities,
@@ -282,6 +286,35 @@ class DSAOffloadConfig:
         vllm_config: Any,
     ) -> DSAOffloadModelCapabilities:
         capabilities = require_dsa_offload_model_support(vllm_config.model_config)
+        operator_contract = {
+            "index_head_dim": (
+                capabilities.index_head_dim,
+                DSA_INDEX_HEAD_DIM,
+            ),
+            "kv_lora_rank": (
+                capabilities.kv_lora_rank,
+                DSA_KV_LORA_RANK,
+            ),
+            "qk_rope_head_dim": (
+                capabilities.qk_rope_head_dim,
+                DSA_QK_ROPE_HEAD_DIM,
+            ),
+        }
+        mismatched = {
+            name: {"actual": actual, "required": required}
+            for name, (actual, required) in operator_contract.items()
+            if actual != required
+        }
+        if capabilities.index_num_heads not in DSA_SUPPORTED_INDEX_HEAD_COUNTS:
+            mismatched["index_n_heads"] = {
+                "actual": capabilities.index_num_heads,
+                "required": DSA_SUPPORTED_INDEX_HEAD_COUNTS,
+            }
+        if mismatched:
+            raise ValueError(
+                "DSA offload model dimensions do not match the current "
+                f"LIDU/KSC/SFA-Offload ABI: {mismatched}"
+            )
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
         parallel_config = vllm_config.parallel_config

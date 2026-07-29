@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""验证 v0.23 DSA 迁移 P2 KV-cache 控制面。
+"""验证 v0.23 DSA 迁移的控制面与 P5 eager 数据面。
 
 本脚本只验证：
 
 1. DSA 关闭时，v0.23 原生路径没有受到影响；
 2. DSA 开启时，Indexer/MLA 能形成两个独立 group、tensor 和物理池；
-3. 尚未支持的 async scheduling 会在启动期被明确拒绝。
+3. ``eager`` 模式可执行 LIDU/KSC/SFA-Offload 与满块 dump 数据面；
+4. 尚未支持的 async scheduling 会在启动期被明确拒绝。
 
 ``cache-init`` 模式只构造 ``LLM`` 并等待 KV cache 初始化完成，不执行
-``generate``。P4/P5 数据面尚未接通前，调用生成不能证明 DSA 稀疏卸载
-正确，甚至可能让原生 SFA 按 packed cache 语义误读独立 tensor。
+``generate``；``eager`` 模式才会执行生成。默认短 prompt 只覆盖 DENSE
+row，验证真实稀疏卸载时应通过 ``--prompt`` 传入超过
+``sparse_activation_tokens`` 的文本。
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ DEFAULT_PROMPTS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the v0.23 DSA P2 KV-cache control-plane smoke test.",
+        description="Run the v0.23 DSA cache-control or P5 eager data-plane smoke test.",
     )
     parser.add_argument(
         "--model",
@@ -50,9 +52,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("disabled", "cache-init", "reject-async"),
+        choices=("disabled", "cache-init", "eager", "reject-async"),
         default="cache-init",
-        help="P2 scenario to execute.",
+        help="Migration scenario to execute.",
     )
     parser.add_argument("--tensor-parallel-size", type=int, default=16)
     parser.add_argument("--data-parallel-size", type=int, default=1)
@@ -121,7 +123,7 @@ def build_dsa_sparse_config() -> dict[str, Any]:
         "resident_budget_tokens": [6144, 10240, 12288],
         "max_active_reqs": 256,
         "hot_cpu_block_multiple": 3.0,
-        # P2 只验证 cache 控制面；图数据面将在 P6 迁移。
+        # P5 只接通 eager 数据面；图数据面将在 P6 迁移。
         "enable_row_mode_decode_graph": False,
         "trace_points": {
             "enabled": False,
@@ -187,17 +189,27 @@ def main() -> None:
             "dsa_sparse_config": dsa_config,
         }
 
+    phase = (
+        "P5-eager-data-plane"
+        if args.mode == "eager"
+        else "P2-kv-cache-control-plane"
+    )
+    notice = (
+        "P5 eager data plane is enabled; graph replay remains a P6 task."
+        if args.mode == "eager"
+        else (
+            "cache-init validates split Indexer/MLA cache construction and "
+            "allocation without executing the P5 operator chain."
+        )
+    )
     config_payload = {
-        "phase": "P2-kv-cache-control-plane",
+        "phase": phase,
         "mode": args.mode,
         "model": args.model,
         "prompts": args.prompts,
         "llm": {key: value for key, value in llm_kwargs.items() if key not in {"model"}},
         "environment": {key: os.environ.get(key) for key in NATIVE_RUNTIME_ENV_OVERRIDES},
-        "notice": (
-            "P4-P5 are not connected yet; cache-init only validates split "
-            "Indexer/MLA cache construction and allocation."
-        ),
+        "notice": notice,
     }
     print("[dsa-p2] configuration:")
     print(json.dumps(config_payload, ensure_ascii=False, indent=2))
