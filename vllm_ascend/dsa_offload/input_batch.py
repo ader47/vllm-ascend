@@ -11,11 +11,12 @@ projection 写入最终 InputBatch 行序。它不维护第二套请求生命周
 ``stage, target_budget, sparse_budget, resident_valid_tokens, row_mode,
 resident_pool_index``
 
-CPU view 服务 host 控制面，固定地址 device view 预留给后续 eager/graph
-共同消费。P4 只建立投影并修正 ENTER 的 resident block table，不主动触发
-H2D；P5/P6 复用这个 owner，而不是另建 graph-only metadata。稳定请求行序
-下六列采用批量刷新；请求增删或重排时，才执行一次 request-id 映射并同步
-稳定 resident-pool 行。
+CPU view 服务 host 控制面，固定地址 device view 由 eager/graph 共同消费。
+``refresh()`` 在基线最终行序上更新 CPU 投影并修正 ENTER 的 resident block
+table；forward 准备阶段再由同一 owner 批量同步设备镜像。graph capture 只
+临时覆盖 device captured-prefix，不修改 CPU 请求真源，也不另建 graph-only
+metadata。稳定请求行序下六列采用批量刷新；请求增删或重排时，才执行一次
+request-id 映射并同步稳定 resident-pool 行。
 
 需要特别区分两种生命周期：vLLM 会把“本轮未调度”的请求临时移出
 persistent ``InputBatch``，但请求本身仍在运行。resident pool 行和 DRAM
@@ -171,7 +172,7 @@ class DSAInputBatchCacheLayout:
         self,
         callback: Callable[[int], None],
     ) -> None:
-        """绑定 P5 DRAM ledger 的稳定 pool-row 释放入口。"""
+        """绑定 DRAM ledger 的稳定 pool-row 释放入口。"""
 
         self._pool_release_callback = callback
 
@@ -315,7 +316,7 @@ class DSAInputBatchCacheLayout:
         self.valid = True
 
     def copy_to_device(self, row_count: int | None = None) -> torch.Tensor:
-        """供后续 P5/P6 在统一 owner 上执行一次 H2D。"""
+        """把 active/captured prefix 从统一 owner 同步到设备。"""
 
         if not self.valid:
             raise RuntimeError("DSA InputBatch cache layout must be refreshed first")

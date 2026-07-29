@@ -153,8 +153,8 @@ def build_dsa_kv_cache_groups(
     """按 plane 构造两个稳定有序的 KV-cache group。
 
     Indexer group 固定在前、resident MLA group 固定在后。稳定顺序不仅便于
-    容量报告，也为后续 P3 coordinator 的 component-wise block table 语义
-    提供确定的 group id。
+    容量报告，也为 ``DSAKVCacheCoordinator`` 的 component-wise block
+    table 语义提供确定的 group id。
     """
 
     indexer_specs = {name: spec for name, spec in kv_cache_specs.items() if is_dsa_indexer_spec(spec)}

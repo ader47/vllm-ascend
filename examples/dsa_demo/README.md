@@ -1,156 +1,205 @@
-# DSA 稀疏卸载 v0.23 迁移 Demo
+# DSA 稀疏卸载测试入口
 
-本目录用于分别验证迁移阶段的 P2 KV-cache 控制面、P5 eager 数据面和
-P6 FULL decode graph。
+本目录是 v0.23 DSA 的 tester-facing 验收入口。脚本默认以 GLM-5.1 为首要
+模型，DeepSeek-V3.2 使用相同配置做强制回归。
 
-P2 已把 Indexer dense plane 与 MLA resident plane 拆成独立 spec、group、
-tensor 和物理 block pool。P4 已接通 scheduler/worker 请求语义，P5 已接通
-LIDU、KSC、SFA-Offload、固定 DRAM store 和满块 dump；P6 在同一套
-InputBatch/runtime owner 上接入 v0.23 原生 FULL decode capture/replay。
+| 文件 | 用途 |
+|---|---|
+| `simple_prompt_test.py` | 基线隔离、cache-init、eager 和 graph 冒烟 |
+| `qa_dataset_test.py` | LongBench 风格数据集精度回归，可切 disabled/eager/graph |
+| `eval_dataset_acc_score.py` | 对 QA 脚本生成的 JSONL 计算 LongBench 指标 |
+
+当前架构和稳定 ABI 见
+[DSA 稀疏卸载详细设计](../../docs/source/developer_guide/Design_Documents/dsa_offload_design.md)。
 
 ## 1. 前置条件
 
-- 已安装匹配的 vLLM v0.23 和当前 vLLM-Ascend checkout；
-- 当前首要验证模型为 GLM-5.1；
-- DeepSeek-V3.2 是强制回归模型；
-- 使用 Ascend 910C；
-- 首版使用 PP=1、DCP=1、PCP=1，并关闭 KV-cache metrics/events；
-- 模型支持的量化方式通过 `--quantization` 指定，默认是 `ascend`。
+- 配套 vLLM v0.23 和当前 vLLM-Ascend 已安装；
+- 当前 checkout 的自定义算子已经完整编译并重新安装；
+- Ascend 910C 首版使用 PP=1、DCP=1、PCP=1；
+- `block_size=128`；
+- 关闭 async scheduling、chunked prefill、prefix cache、MTP/speculative
+  decoding、KV transfer 和 KV-cache metrics/events；
+- 正式精度和性能测试关闭 DSA trace points。
 
-P5 新增并注册了自定义算子。无论是否使用 editable 安装，首次部署该提交都
-需要完整重编译并重新安装 vLLM-Ascend。
+脚本只设置必要的 vLLM/vLLM-Ascend 原生环境变量。DSA 功能参数全部位于
+`additional_config["dsa_sparse_config"]`，不再通过零散 DSA 环境变量控制。
 
-## 2. 五个验收用例
-
-下面以 GLM-5.1 模型为例。输出分别保存为 JSON，便于核对启动结果和 token
-序列。
-
-### 2.1 DSA 关闭：原生基线非回归
-
-```bash
-python examples/dsa_demo/simple_prompt_test.py \
-  --model /home/models/GLM-5.1-W4A8 \
-  --mode disabled \
-  --result-json /tmp/dsa-p2-disabled.json
-```
-
-预期：正常加载并生成。
-
-### 2.2 DSA 开启：双平面 cache 初始化
-
-```bash
-python examples/dsa_demo/simple_prompt_test.py \
-  --model /home/models/GLM-5.1-W4A8 \
-  --mode cache-init \
-  --result-json /tmp/dsa-p2-cache-init.json
-```
-
-预期：类型化配置与模型能力校验通过，日志恰好出现一份
-`DSA HBM CACHE CAPACITY REPORT`，其中包含两个物理平面：
-
-- `Indexer dense plane` 的 block 数为 `MLA resident plane` 的
-  `indexer_mla_block_ratio` 倍；
-- `KVCacheConfig.num_blocks` 等于 MLA resident plane 的 block 数；
-- resident MLA 与 Indexer cache 均成功绑定到各自的
-  `static_forward_context` 模块，不出现同层多 cache 的
-  `NotImplementedError`；
-- 脚本明确打印 `generation was intentionally skipped`。
-
-该结果只说明 P2 cache 控制面工作正常，不说明已经发生 DRAM dump 或
-LIDU/KSC/SFA-Offload 计算。
-
-### 2.3 DSA 开启：P5 eager 数据面
-
-```bash
-python examples/dsa_demo/simple_prompt_test.py \
-  --model /home/models/GLM-5.1-W4A8 \
-  --mode eager \
-  --max-model-len 8192 \
-  --max-num-batched-tokens 8192 \
-  --result-json /tmp/dsa-p5-eager.json
-```
-
-默认短 prompt 会覆盖 DENSE row，并真实执行统一的 P5 算子链。验证
-ENTER/SPARSE、DRAM dump 和换入时，使用重复的 `--prompt` 传入长短混合
-请求，并保证 `--max-model-len`、`--max-num-batched-tokens` 足以容纳最长
-请求。当前配置的首个稀疏激活阈值是 6144 token。
-
-预期：
-
-- 生成完成且输出没有乱码、异常提前 EOS；
-- 日志中只有一份 DSA 容量报告；
-- 不出现原生 packed cache 与独立 Indexer/MLA plane 混用；
-- `enable_row_mode_decode_graph=False`，本用例只验收 eager。
-
-### 2.4 不支持组合：拒绝 async scheduling
-
-```bash
-python examples/dsa_demo/simple_prompt_test.py \
-  --model /home/models/GLM-5.1-W4A8 \
-  --mode reject-async \
-  --result-json /tmp/dsa-p2-reject-async.json
-```
-
-预期：在加载模型权重前失败，脚本识别到以下错误后以成功状态退出：
+首次拉起应看到且只看到一份：
 
 ```text
-DSA sparse offload currently requires async_scheduling=False
+================ DSA HBM CACHE CAPACITY REPORT ================
 ```
 
-### 2.5 DSA 开启：P6 FULL decode graph
+报告中的 Indexer blocks 应等于 resident MLA base blocks 乘
+`indexer_mla_block_ratio`。
+
+## 2. 快速冒烟
+
+`simple_prompt_test.py` 延续 v0.19 的直接用法，不提供一长串 CLI 参数。
+先修改文件顶部“用户配置”区：
+
+```python
+MODEL_PATH = "/mnt/kv_dpc/weight/GLM-5.1-w4a8"
+RUN_MODE = "eager"  # disabled / cache-init / eager / graph
+PROMPTS = [
+    "第一个测试文本",
+    "第二个测试文本",
+]
+MAX_NUM_SEQS = 2
+MAX_MODEL_LEN = 8192
+MAX_NUM_BATCHED_TOKENS = 8192
+RESULT_JSON = None  # 需要保存对照 token IDs 时填写路径
+```
+
+然后直接运行：
 
 ```bash
-python examples/dsa_demo/simple_prompt_test.py \
-  --model /home/models/GLM-5.1-W4A8 \
-  --mode graph \
-  --max-num-seqs 4 \
-  --max-model-len 8192 \
-  --max-num-batched-tokens 8192 \
-  --result-json /tmp/dsa-p6-graph.json
+python examples/dsa_demo/simple_prompt_test.py
 ```
 
-脚本按 `max_num_seqs` 自动生成原生 FULL decode capture sizes。prefill、
-multi-token 和 capture size 未覆盖属于正常 eager；单 token 的
-DENSE/ENTER/SPARSE 任意混排行复用同一类 FULL 图，active batch 可以向上
-padding，额外行由统一 owner 提供 PAD。必须使用具有独立 decode routine
-的模式（脚本配置为 `FULL_DECODE_ONLY`）；图容量以原生 dispatcher 最终
-保留的 uniform FULL keys 为准，而非用户输入列表。DP 下任一 replica
-处于正常 eager 阶段时，所有 rank 跟随原生全局决议共同 eager。
+四种模式的作用：
 
-默认短 prompt 主要验证全 DENSE replay。验证 ENTER/SPARSE、新满块 dump
-与 PAD 时，传入长短混合 prompt，并至少让 `max_num_seqs` 大于实际请求数
-一次，以覆盖 captured rows 大于 active rows。
+- `disabled`：不传 `dsa_sparse_config`，验证 DSA 修改未影响原生路径；
+- `cache-init`：只构造 `LLM`，验证 Indexer/resident MLA 双平面初始化；
+- `eager`：执行 DSA LIDU/KSC/SFA-Offload 和满块 dump；
+- `graph`：执行 `VLLM_COMPILE + FULL_DECODE_ONLY`。
 
-## 3. 结果核对
+`cache-init` 不执行 `generate()`，因此不能证明数据面算子已经运行。结果 JSON
+也不捕获 engine-core 子进程日志；容量报告是否出现且只出现一次，必须在
+完整控制台日志中单独核对。
 
-`disabled`、`cache-init`、`eager` 和 `graph` 都成功后，核对：
+默认短 prompt 主要覆盖 DENSE。构造 sparse/ENTER 或混合预算 batch 时，直接
+替换 `PROMPTS` 并相应增大 `MAX_NUM_SEQS`、`MAX_MODEL_LEN` 和
+`MAX_NUM_BATCHED_TOKENS`。实际阈值覆盖应使用 tokenizer token 长度，不要把
+字符数当 token 数。
 
-- 两次使用相同模型、prompt、seed 和采样参数；
-- `disabled` 的输出结构、首 token 和 finish reason 是否合理；
-- `cache-init` 日志中是否恰好包含一份 DSA 容量报告；
-- `eager` 是否真实完成生成，并覆盖预期的 DENSE/ENTER/SPARSE 行；
-- `graph` 是否完成 capture/replay，且与 eager 没有异常 EOS、乱码或行间
-  状态污染；
-- Indexer/MLA block 数、token 容量和总分配字节是否自洽；
-- `reject-async` 是否准确命中预期错误，而不是在更早位置异常退出。
+graph 模式下，单 token DENSE/ENTER/SPARSE 任意混排可进入统一 FULL graph；
+prefill、multi-token、capture-size miss 或其他原生动态 blocker 会被 DSA
+显式送入 true eager，不会执行一张仅覆盖部分 DSA metadata 的 piecewise
+graph。非法 async 配置由 `tests/ut/dsa_offload/test_config.py` 覆盖，不再
+为了这一项给最小脚本增加独立运行模式。
 
-GLM-5.1 W4A8 在 EP/TP 多卡环境下，即使 `temperature=0` 和 seed 相同，
-两个独立进程的原生 `disabled` 结果也可能从 decode 阶段开始分叉。因此，
-只有先证明同一 `disabled` 模式可重复，才能把 disabled/enabled 的完整
-token IDs 不一致视为配置副作用；不能直接用跨进程逐 token 相等作为 P2
-验收门槛。
+## 3. QA 数据集回归
 
-请保留以下信息用于问题定位：
+`qa_dataset_test.py` 延续旧项目对测试同事更直接的用法：修改文件顶部“用户
+配置”区，不强制记忆大量 CLI 参数。至少设置：
 
-- 从 `non-default args` 到 KV cache 初始化完成的日志；
-- 三份结果 JSON 和完整 DSA 容量报告；
-- vLLM、vLLM-Ascend commit；
-- 模型路径与 architecture；
-- CANN、torch、torch-npu 版本。
+```python
+MODEL_PATH = "/mnt/kv_dpc/weight/GLM-5.1-w4a8"
+DATASET_FILE = "/home/data/longbench/multifieldqa_zh.jsonl"
+DATASET_START = 0
+DATASET_LIMIT = 100
+RESULT_DIR = "LongBenchResult/glm51_dsa"
+RUN_MODE = "eager"
+BATCH_SIZE = 4
+MAX_MODEL_LEN = 131072
+MAX_NUM_BATCHED_TOKENS = 131072
+```
 
-## 4. 后续回归
+然后运行：
 
-v0.19 的 `qa_dataset_test.py` 和 `eval_dataset_acc_score.py` 用于完整 DSA
-数据面的精度回归。P5 服务器冒烟通过后，再迁移这两个脚本并建立
-GLM-5.1 为主、DeepSeek-V3.2 为强制回归的完整精度矩阵；P6 已在同一元数据
-所有权模型上接入图模式，但仍需完成 910C capture/replay 与精度验收。
+```bash
+python examples/dsa_demo/qa_dataset_test.py
+```
+
+建议对同一数据切片跑三次：
+
+1. `RUN_MODE="disabled"`：原生基线；
+2. `RUN_MODE="eager"`：DSA eager；
+3. `RUN_MODE="graph"`：DSA FULL decode graph。
+
+脚本自动在 `RESULT_DIR` 下增加 `disabled/eager/graph` 子目录，不会让三次
+结果相互覆盖。
+
+输出 JSONL 保留：
+
+- `pred`；
+- `answers`；
+- `all_classes`；
+- LongBench `length`；
+- `sample_id`、`sample_index`；
+- 实际 `prompt_tokens`。
+
+这既可用于自动评分，也可直接定位异常请求。若一批 prompt token 总数超过
+`max_num_batched_tokens`，脚本会提示 scheduler 可能分多轮完成 prefill；
+当前 chunked prefill 仍保持关闭。
+
+脚本默认 `MIN_TOKENS=0`，不会强制模型绕过正常 EOS。评分器也仅按
+LongBench 官方规则对 `trec/triviaqa/samsum/lsht` 截取首行；QA 和
+retrieval 任务保留完整输出参与评分，以免掩盖后续乱码、重复 prompt 或异常
+提前结束。
+
+## 4. LongBench 评分
+
+评分脚本需要环境中存在 `jieba`、`fuzzywuzzy` 和 `rouge`。对一个目录：
+
+```bash
+python examples/dsa_demo/eval_dataset_acc_score.py \
+  --result-path \
+  examples/dsa_demo/LongBenchResult/glm51_dsa/eager
+```
+
+对单个文件：
+
+```bash
+python examples/dsa_demo/eval_dataset_acc_score.py \
+  --result-path /path/to/multifieldqa_zh.jsonl
+```
+
+增加 `--longbench-e` 可输出 `0-4k`、`4-8k` 和 `8k+` 三档分数。
+
+## 5. 最小回归矩阵
+
+| 维度 | 至少覆盖 |
+|---|---|
+| 模式 | disabled、eager、graph |
+| batch | bsz=1、bsz>1 |
+| 长度 | 超短、DENSE、三档 resident budget |
+| row mode | 全 DENSE、全 SPARSE、DENSE/ENTER/SPARSE mixed |
+| graph | active=captured、active<captured 的 PAD |
+| dump | prefill 多满块、decode 跨满块 |
+| 生命周期 | 请求结束、InputBatch condense/reorder、stable row 复用 |
+| 模型 | GLM-5.1 主验收、DeepSeek-V3.2 回归 |
+
+不要只看“进程跑完”。至少核对：
+
+- 无乱码和异常提前 EOS；
+- 同一请求在 bsz=1 与 bsz>1 下没有明显语义断裂；
+- eager 与 graph 没有单行串扰；
+- finish reason 与输出 token 数合理；
+- 容量报告的 blocks、tokens、bytes 自洽；
+- 没有 silent fallback 到未启用 DSA 的路径。
+
+## 6. 问题反馈工件
+
+出现问题时保留：
+
+- vLLM 和 vLLM-Ascend commit；
+- 完整脚本配置或结果 JSON；
+- 模型 architecture、量化方式、TP/EP/DP；
+- prompt token 长度和出错 sample index；
+- 从 `non-default args` 到异常结束的完整日志；
+- DSA HBM 容量报告；
+- eager/graph 对照 token IDs 与 finish reason；
+- CANN、torch、torch-npu、设备型号；
+- 性能问题对应的 profiler 目录和测试场景。
+
+`trace_points` 当前是拉起期可解析的预留合同，尚无稳定日志 consumer。不要
+把“没有 trace 输出”解释成 DSA 未运行；确认路径应结合容量报告、自定义
+算子 profiling 和输出结果。
+
+## 7. 当前不支持
+
+- chunked prefill 与 prefill/decode mixed batch；
+- async scheduling；
+- prefix cache；
+- preemption/resume；
+- speculative decoding/MTP；
+- KV transfer connector；
+- context parallel 和 pipeline parallel；
+- KV-cache metrics/events；
+- A5 设备算子验收。
+
+这些能力会在后续按独立合同逐项扩展。在相应实现和回归完成前，不要通过
+删除启动期校验强行打开。

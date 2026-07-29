@@ -1,119 +1,150 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm-ascend/main/docs/source/logos/vllm-ascend-logo-text-dark.png">
-    <img alt="vllm-ascend" src="https://raw.githubusercontent.com/vllm-project/vllm-ascend/main/docs/source/logos/vllm-ascend-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# vLLM-Ascend DSA Sparse Offload
 
-<h3 align="center">
-vLLM Ascend Plugin
-</h3>
+本分支在 vLLM-Ascend v0.23.0 上实现 DSA 稀疏卸载，不修改配套的 vLLM
+源码。实现以 GLM-5.1 为首要验收模型，并保留 DeepSeek-V3.2 兼容回归。
 
-<div align="center">
+> 上游 vLLM-Ascend 项目说明原样保存在
+> [README.upstream.md](README.upstream.md) 和
+> [README.upstream.zh.md](README.upstream.zh.md)。
 
-[![DeepWiki](https://img.shields.io/badge/DeepWiki-Ask_AI-_.svg?style=flat&color=0052D9&labelColor=000000&logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACwAAAAyCAYAAAAnWDnqAAAAAXNSR0IArs4c6QAAA05JREFUaEPtmUtyEzEQhtWTQyQLHNak2AB7ZnyXZMEjXMGeK/AIi+QuHrMnbChYY7MIh8g01fJoopFb0uhhEqqcbWTp06/uv1saEDv4O3n3dV60RfP947Mm9/SQc0ICFQgzfc4CYZoTPAswgSJCCUJUnAAoRHOAUOcATwbmVLWdGoH//PB8mnKqScAhsD0kYP3j/Yt5LPQe2KvcXmGvRHcDnpxfL2zOYJ1mFwrryWTz0advv1Ut4CJgf5uhDuDj5eUcAUoahrdY/56ebRWeraTjMt/00Sh3UDtjgHtQNHwcRGOC98BJEAEymycmYcWwOprTgcB6VZ5JK5TAJ+fXGLBm3FDAmn6oPPjR4rKCAoJCal2eAiQp2x0vxTPB3ALO2CRkwmDy5WohzBDwSEFKRwPbknEggCPB/imwrycgxX2NzoMCHhPkDwqYMr9tRcP5qNrMZHkVnOjRMWwLCcr8ohBVb1OMjxLwGCvjTikrsBOiA6fNyCrm8V1rP93iVPpwaE+gO0SsWmPiXB+jikdf6SizrT5qKasx5j8ABbHpFTx+vFXp9EnYQmLx02h1QTTrl6eDqxLnGjporxl3NL3agEvXdT0WmEost648sQOYAeJS9Q7bfUVoMGnjo4AZdUMQku50McDcMWcBPvr0SzbTAFDfvJqwLzgxwATnCgnp4wDl6Aa+Ax283gghmj+vj7feE2KBBRMW3FzOpLOADl0Isb5587h/U4gGvkt5v60Z1VLG8BhYjbzRwyQZemwAd6cCR5/XFWLYZRIMpX39AR0tjaGGiGzLVyhse5C9RKC6ai42ppWPKiBagOvaYk8lO7DajerabOZP46Lby5wKjw1HCRx7p9sVMOWGzb/vA1hwiWc6jm3MvQDTogQkiqIhJV0nBQBTU+3okKCFDy9WwferkHjtxib7t3xIUQtHxnIwtx4mpg26/HfwVNVDb4oI9RHmx5WGelRVlrtiw43zboCLaxv46AZeB3IlTkwouebTr1y2NjSpHz68WNFjHvupy3q8TFn3Hos2IAk4Ju5dCo8B3wP7VPr/FGaKiG+T+v+TQqIrOqMTL1VdWV1DdmcbO8KXBz6esmYWYKPwDL5b5FA1a0hwapHiom0r/cKaoqr+27/XcrS5UwSMbQAAAABJRU5ErkJggg==)](https://deepwiki.com/vllm-project/vllm-ascend)
+## 当前能力
 
-</div>
+- HBM KV cache 拆分为完整 Indexer K 平面和有界 resident MLA 平面；
+- worker 持有固定容量、固定地址的 hot DRAM NOPE/ROPE arena；
+- scheduler 统一管理 `PREFILL`、`DENSE_DECODE`、
+  `ENTER_SPARSE_DECODE`、`SPARSE_DECODE` 请求布局；
+- decode 整批执行 LIDU -> KSC -> SFA-Offload，不按 dense/sparse
+  拆分子 batch；
+- prefill 与 decode 新满 MLA block 通过独立
+  `KvCacheFullBlockDump` 算子写入 DRAM；
+- eager 与 ACL FULL decode graph 共用同一套 InputBatch 行状态、
+  resident pool、DRAM ledger 和算子缓冲；
+- `DENSE`、`ENTER`、`SPARSE` 任意混排、不同 resident budget 和
+  graph PAD 行可以复用同一 FULL decode 图族；
+- DSA 关闭时保留 vLLM-Ascend v0.23 原生 cache 和执行路径。
 
-<p align="center">
-| <a href="https://www.hiascend.com/en/"><b>About Ascend</b></a> | <a href="https://docs.vllm.ai/projects/ascend/en/latest/"><b>Documentation</b></a> | <a href="https://slack.vllm.ai"><b>#SIG-Ascend</b></a> | <a href="https://discuss.vllm.ai/c/hardware-support/vllm-ascend-support"><b>Users Forum</b></a> | <a href="https://tinyurl.com/vllm-ascend-meeting"><b>Weekly Meeting</b></a> |
-</p>
+```mermaid
+flowchart LR
+    C["additional_config.dsa_sparse_config"] --> A["AscendConfig"]
+    A --> K["Indexer / resident MLA 双平面"]
+    A --> S["DSAOffloadScheduler"]
+    S --> I["NPUInputBatch 六列投影"]
+    I --> R["共享 eager/graph runtime"]
+    R --> L["LIDU"]
+    L --> X["KSC miss 换入"]
+    X --> F["SFA-Offload"]
+    D["Hot DRAM arena"] --> X
+    F --> U["Full-block dump"]
+    U --> D
+```
 
-<p align="center">
-<a ><b>English</b></a> | <a href="README.zh.md"><b>中文</b></a>
-</p>
+## 代码集成
 
----
-*Latest News* 🔥
+vLLM 通过 Python distribution entry point 发现 vLLM-Ascend 平台插件。
+DSA 优先使用 v0.23 的 `AscendConfig`、KV spec registry、coordinator
+factory、`scheduler_cls`、`NPUInputBatch` 和原生 FULL graph dispatcher
+等扩展点。vLLM 尚无正式扩展点的 KV 分组、容量规划和
+`KVCacheManager.allocate_slots()` 位置，复用 vLLM-Ascend 现有 patch
+入口做带 DSA 类型守卫的窄适配；非 DSA 调用原样委托给上游实现。
 
-- [2026/07] We released the first release candidate [v0.23.0rc1](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.23.0rc1)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.23.0rc1/) to start using vLLM Ascend Plugin on Ascend.
-- [2026/05] We released the new official version [v0.18.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.18.0)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.18.0/) to start using vLLM Ascend Plugin on Ascend.
-- [2026/02] We released the new official version [v0.13.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.13.0)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.13.0/) to start using vLLM Ascend Plugin on Ascend.
+因此，后续开发不应重新引入 vLLM 源码修改、全量复制上游 scheduler，或
+恢复已退役的 GatherSelection 数据面。
 
-<details>
-<summary>More</summary>
+## 最小配置
 
-- [2025/12] We released the new official version [v0.11.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.11.0)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.11.0/) to start using vLLM Ascend Plugin on Ascend.
-- [2025/09] We released the new official version [v0.9.1](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.9.1)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.9.1/tutorials/large_scale_ep.html) to start deploying large-scale Expert Parallelism (EP) on Ascend.
-- [2025/08] We hosted the [vLLM Beijing Meetup](https://mp.weixin.qq.com/s/7n8OYNrCC_I9SJaybHA_-Q) with vLLM and Tencent! Please find the [meetup slides](https://drive.google.com/drive/folders/1Pid6NSFLU43DZRi0EaTcPgXsAzDvbBqF).
-- [2025/06] [User stories](https://docs.vllm.ai/projects/ascend/en/latest/community/user_stories/index.html) page is now live! It kicks off with LLaMA-Factory/verl/TRL/GPUStack to demonstrate how vLLM Ascend assists Ascend users in enhancing their experience across fine-tuning, evaluation, reinforcement learning (RL), and deployment scenarios.
-- [2025/06] [Contributors](https://docs.vllm.ai/projects/ascend/en/latest/community/contributors.html) page is now live! All contributions deserve to be recorded, thanks for all contributors.
-- [2025/05] We've released the first official version [v0.7.3](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.7.3)! We collaborated with the vLLM community to publish a blog post sharing our practice: [Introducing vLLM Hardware Plugin, Best Practice from Ascend NPU](https://blog.vllm.ai/2025/05/12/hardware-plugin.html).
-- [2025/03] We hosted the [vLLM Beijing Meetup](https://mp.weixin.qq.com/s/VtxO9WXa5fC-mKqlxNUJUQ) with vLLM team! Please find the [meetup slides](https://drive.google.com/drive/folders/1Pid6NSFLU43DZRi0EaTcPgXsAzDvbBqF).
-- [2025/02] vLLM community officially created [vllm-project/vllm-ascend](https://github.com/vllm-project/vllm-ascend) repo for running vLLM seamlessly on the Ascend NPU.
-- [2024/12] We are working with the vLLM community to support [[RFC]: Hardware pluggable](https://github.com/vllm-project/vllm/issues/11162).
+```python
+from vllm import LLM
 
-</details>
+llm = LLM(
+    model="/path/to/GLM-5.1-W4A8",
+    tensor_parallel_size=16,
+    quantization="ascend",
+    block_size=128,
+    max_num_seqs=4,
+    max_model_len=131072,
+    max_num_batched_tokens=131072,
+    enable_prefix_caching=False,
+    enable_chunked_prefill=False,
+    async_scheduling=False,
+    enforce_eager=True,
+    additional_config={
+        "dsa_sparse_config": {
+            "enabled": True,
+            "split_indexer_cache": True,
+            "indexer_mla_block_ratio": 3,
+            "sparse_activation_tokens": 6144,
+            "prompt_budget_thresholds": [32768, 65536],
+            "resident_budget_tokens": [6144, 10240, 12288],
+            "max_active_reqs": 256,
+            "hot_cpu_block_multiple": 3.0,
+            "enable_row_mode_decode_graph": False,
+            "trace_points": {
+                "enabled": False,
+                "points": ["first_sample"],
+                "ranks": [0],
+            },
+        },
+    },
+)
+```
 
----
+图模式需要同时设置：
 
-## Overview
+```python
+enforce_eager=False
+compilation_config={
+    "mode": "VLLM_COMPILE",
+    "cudagraph_mode": "FULL_DECODE_ONLY",
+    "cudagraph_capture_sizes": [1, 2, 4, 8],
+}
+additional_config={
+    "dsa_sparse_config": {
+        # 其余配置同上
+        "enabled": True,
+        "enable_row_mode_decode_graph": True,
+    },
+}
+```
 
-vLLM Ascend (`vllm-ascend`) is a community maintained hardware plugin for running vLLM seamlessly on the Ascend NPU.
+首次部署或更新 DSA 自定义算子后，必须完整重编译并重新安装
+vLLM-Ascend。
 
-It is the recommended approach for supporting the Ascend backend within the vLLM community. It adheres to the principles outlined in the [[RFC]: Hardware pluggable](https://github.com/vllm-project/vllm/issues/11162), providing a hardware-pluggable interface that decouples the integration of the Ascend NPU with vLLM.
+## 当前边界
 
-By using vLLM Ascend plugin, popular open-source models, including Transformer-like, Mixture-of-Experts (MoE), Embedding, Multi-modal LLMs can run seamlessly on the Ascend NPU.
+当前版本尚未支持：
 
-For detailed information on supported models, please refer to [supported models](https://docs.vllm.ai/projects/ascend/en/latest/user_guide/support_matrix/supported_models.html).
+- chunked prefill 和 prefill/decode mixed batch；
+- async scheduling；
+- prefix cache；
+- preemption/resume；
+- speculative decoding 与 MTP；
+- 外部 KV transfer connector；
+- decode/prefill context parallel 和 pipeline parallel；
+- KV-cache metrics/events；
+- A5 算子验收。
 
-## Prerequisites
+具有显式配置入口的未支持组合会在启动期拒绝，preemption/resume 会在当前
+运行边界明确失败。A5 尚未建立设备类型 fail-fast，只能视为未验收，不能
+假设当前算子与 cache 布局可用。DP 和在线推理属于下一阶段扩展项，当前
+离线验证以 DP=1 为主。
 
-- Hardware: Atlas 800I A2 Inference series, Atlas A2 Training series, Atlas 800I A3 Inference series, Atlas A3 Training series, Atlas 300I Duo (Experimental)
-- OS: Linux
-- Software:
-    - Python >= 3.10, < 3.13
-    - CANN == 9.0.1 (For Ascend HDK version, please refer to the [Release Notes](https://www.hiascend.com/document/detail/zh/canncommercial/900/releasenote/releasenote_0000.html))
-    - PyTorch == 2.10.0, torch-npu == 2.10.0.post2
-    - vLLM (the same version as vllm-ascend)
+## 文档与测试入口
 
-## Getting Started
+- [DSA 稀疏卸载详细设计](docs/source/developer_guide/Design_Documents/dsa_offload_design.md)
+- [DSA demo 与测试说明](examples/dsa_demo/README.md)
+- [上游 vLLM-Ascend README](README.upstream.md)
 
-Please use the following recommended versions to get started quickly:
+`simple_prompt_test.py` 延续旧版测试方式：先在文件顶部修改 `MODEL_PATH`、
+`RUN_MODE` 和 prompt 等常量，再直接运行。`RUN_MODE` 可取
+`disabled/cache-init/eager/graph`。
 
-| Version    | Release type | Doc                                  |
-|------------|--------------|--------------------------------------|
-| v0.23.0rc1 | Latest release candidate | See [QuickStart](https://docs.vllm.ai/projects/ascend/en/v0.23.0rc1/quick_start.html) and [Installation](https://docs.vllm.ai/projects/ascend/en/v0.23.0rc1/installation.html) for more details |
-| v0.18.0 | Latest stable version | See [QuickStart](https://docs.vllm.ai/projects/ascend/en/v0.18.0/quick_start.html) and [Installation](https://docs.vllm.ai/projects/ascend/en/v0.18.0/installation.html) for more details |
+```bash
+python -m pytest tests/ut/dsa_offload -vv --tb=short
 
-## Branch
+python examples/dsa_demo/simple_prompt_test.py
+```
 
-vllm-ascend has a main branch and a dev branch.
-
-- **main**: main branch, corresponds to the vLLM main branch, and is continuously monitored for quality through Ascend CI.
-- **releases/vX.Y.Z**: development branch, created alongside new releases of vLLM. For example, `releases/v0.13.0` is the dev branch for vLLM `v0.13.0` version.
-
-Below are the maintained branches:
-
-| Branch           | Status       | Note                                 |
-|------------------|--------------|--------------------------------------|
-| main             | Maintained   | CI commitment for vLLM main branch and vLLM v0.23.0 tag |
-| v0.7.1-dev       | Unmaintained | Outdated, no longer maintained. |
-| v0.7.3-dev       | Unmaintained | Only bug fixes are allowed, and no new release tags anymore. |
-| v0.9.1-dev       | Unmaintained | Only bug fixes are allowed, and no new release tags anymore. |
-| v0.11.0-dev      | Unmaintained | Only bug fixes are allowed, and no new release tags anymore. |
-| releases/v0.13.0 | Maintained   | CI commitment for vLLM 0.13.0 version |
-| releases/v0.18.0 | Maintained   | CI commitment for vLLM 0.18.0 version |
-| releases/v0.20.2rc | Maintained | CI commitment for vLLM 0.20.2 version |
-| rfc/feature-name | Maintained   | [Feature branches](https://docs.vllm.ai/projects/ascend/en/latest/community/versioning_policy.html#feature-branches) for collaboration |
-| releases/v0.23.0 | Maintained   | CI commitment for vLLM 0.23.0 version |
-  
-Please refer to [Versioning policy](https://docs.vllm.ai/projects/ascend/en/latest/community/versioning_policy.html) for more details.
-
-## Contributing
-
-See [CONTRIBUTING](https://docs.vllm.ai/projects/ascend/en/latest/developer_guide/contribution/index.html) for more details, which is a step-by-step guide to help you set up the development environment, build and test.
-
-We welcome and value any contributions and collaborations:
-
-- Please let us know if you encounter a bug by [filing an issue](https://github.com/vllm-project/vllm-ascend/issues)
-- Please use [User forum](https://discuss.vllm.ai/c/hardware-support/vllm-ascend-support) for usage questions and help.
-
-## Weekly Meeting
-
-- vLLM Ascend Weekly Meeting: <https://tinyurl.com/vllm-ascend-meeting>
-- Wednesday, 15:00 - 16:00 (UTC+8, [Convert to your timezone](https://dateful.com/convert/gmt8?t=15))
-
-## License
-
-Apache License 2.0, as found in the [LICENSE](./LICENSE) file.
+数据集精度回归与评分分别使用
+`examples/dsa_demo/qa_dataset_test.py` 和
+`examples/dsa_demo/eval_dataset_acc_score.py`。正式精度、性能测试必须关闭
+DSA trace points。
