@@ -15,6 +15,7 @@ from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
 from vllm_ascend.dsa_offload.runtime import DSAOffloadRuntime
 from vllm_ascend.dsa_offload.scheduler_output import (
     DSARequestCacheLayoutProjection,
+    DSAResidentBlockTableReplacement,
 )
 
 
@@ -136,3 +137,55 @@ def test_dump_plan_is_compact_and_idempotent() -> None:
         resident_group_id=0,
     )
     assert runtime.dump_job_count == 0
+
+
+def test_enter_rejects_missing_dram_source_blocks() -> None:
+    resident_pool, runtime, _ = _make_runtime()
+    state = DSAInputBatchCacheLayout(
+        max_num_reqs=1,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        resident_token_pool=resident_pool,
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=["req-0"],
+        req_id_to_index={"req-0": 0},
+        num_computed_tokens_cpu=np.array([256], dtype=np.int32),
+        block_table=[_ResidentBlockTable()],
+    )
+    state.refresh(
+        input_batch=input_batch,
+        projection=DSARequestCacheLayoutProjection(
+            request_ids=("req-0",),
+            stages=(
+                int(DSARequestCacheStage.ENTER_SPARSE_DECODE),
+            ),
+            target_resident_budget_tokens=(256,),
+            sparse_budget_tokens=(256,),
+            resident_valid_tokens=(257,),
+            resident_block_table_replacements=(
+                DSAResidentBlockTableReplacement(
+                    request_id="req-0",
+                    block_ids=(10, 11, 12),
+                ),
+            ),
+        ),
+    )
+
+    try:
+        runtime.prepare_forward(
+            input_batch=input_batch,
+            state=state,
+            num_scheduled_tokens=np.array([1], dtype=np.int32),
+            req_indices=torch.zeros(1, dtype=torch.int64),
+            positions=torch.tensor([256], dtype=torch.int64),
+            num_reqs=1,
+            num_tokens=1,
+            resident_group_id=0,
+        )
+    except RuntimeError as error:
+        assert "incomplete DRAM block table" in str(error)
+        assert "first_missing_logical_block=0" in str(error)
+    else:
+        raise AssertionError("ENTER must reject a null DRAM source mapping")

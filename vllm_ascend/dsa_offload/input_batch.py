@@ -16,6 +16,11 @@ CPU view 服务 host 控制面，固定地址 device view 预留给后续 eager/
 H2D；P5/P6 复用这个 owner，而不是另建 graph-only metadata。稳定请求行序
 下六列采用批量刷新；请求增删或重排时，才执行一次 request-id 映射并同步
 稳定 resident-pool 行。
+
+需要特别区分两种生命周期：vLLM 会把“本轮未调度”的请求临时移出
+persistent ``InputBatch``，但请求本身仍在运行。resident pool 行和 DRAM
+ledger 属于完整请求生命周期，只能在 ``finished_req_ids`` 到达时释放，不能
+跟随 InputBatch 的临时成员变化回收。
 """
 
 from __future__ import annotations
@@ -159,8 +164,20 @@ class DSAInputBatchCacheLayout:
 
         self._pool_release_callback = callback
 
+    def release_request(self, request_id: str) -> None:
+        """在请求真正结束时释放 resident 行及其 DRAM ledger。"""
+
+        released_index = self.resident_token_pool.release(request_id)
+        if (released_index is not None
+                and self._pool_release_callback is not None):
+            self._pool_release_callback(released_index)
+        # finished_req_ids 可能与同一轮新提交的同名 request 重叠。清空这份
+        # 仅用于跳过稳态重映射的行序缓存，确保新请求仍会重新 acquire。
+        if request_id in self._request_ids:
+            self._request_ids = ()
+
     def clear(self, *, input_batch: NPUInputBatch | None = None) -> None:
-        """清空本轮 view，并同步请求增删产生的 resident-pool 行变化。"""
+        """清空本轮 view，并按当前 InputBatch 行序刷新 pool-row 投影。"""
 
         old_row_count = self.row_count
         if old_row_count:
@@ -312,17 +329,13 @@ class DSAInputBatchCacheLayout:
         self,
         request_ids: tuple[str, ...],
     ) -> None:
-        """仅在请求集合或最终行序变化时重建 batch-row→pool-row 映射。"""
+        """按最终行序刷新 batch-row→pool-row，不改变请求级所有权。
 
-        request_id_set = set(request_ids)
-        for request_id in self._request_ids:
-            if request_id not in request_id_set:
-                released_index = self.resident_token_pool.release(request_id)
-                if (
-                    released_index is not None
-                    and self._pool_release_callback is not None
-                ):
-                    self._pool_release_callback(released_index)
+        基线 ``GPUModelRunner._update_states`` 会移除本轮未调度的 persistent
+        batch 行。这里若据此释放 pool row，会把仍在运行请求的 LIDU
+        ``cache_slots`` 和 DRAM block table 一并清空。真正的释放由
+        ``release_request()`` 在 ``finished_req_ids`` 边界完成。
+        """
 
         for row, request_id in enumerate(request_ids):
             self.resident_pool_indices_cpu[row] = (

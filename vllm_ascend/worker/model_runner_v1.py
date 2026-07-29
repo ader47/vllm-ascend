@@ -803,6 +803,18 @@ class NPUModelRunner(GPUModelRunner):
                 if num_computed_tokens < req_state.num_computed_tokens:
                     req_state.prev_num_draft_len = 0
 
+        if self.dsa_offload_enabled:
+            state = self.input_batch.dsa_cache_layout
+            if state is None:
+                raise RuntimeError(
+                    "DSA is enabled but NPUInputBatch has no cache-layout owner"
+                )
+            # resident pool/DRAM ledger 属于请求生命周期，不能跟随基线
+            # persistent InputBatch 对“本轮未调度行”的临时移除而释放。
+            # 必须在 super() 消费 finished_req_ids 前显式回收。
+            for req_id in scheduler_output.finished_req_ids:
+                state.release_request(req_id)
+
         deferred_output_update = super()._update_states(scheduler_output)
         if self.dsa_offload_enabled:
             self._update_dsa_cache_layout(scheduler_output)
