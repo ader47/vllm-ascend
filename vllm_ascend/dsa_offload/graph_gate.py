@@ -8,7 +8,7 @@ buffer，也不修改请求生命周期：
 
 * 单 token 的 DENSE/ENTER/SPARSE 任意混排可以入图；
 * active batch 可以向上匹配 capture size，额外行由统一 owner 提供 PAD；
-* prefill、multi-token 和 capture size 未覆盖属于正常 eager 阶段；
+* prefill、multi-token 和 capture size 未覆盖属于正常 true-eager 阶段；
 * 状态缺失、行数错位等内部合同破坏必须显式失败。
 """
 

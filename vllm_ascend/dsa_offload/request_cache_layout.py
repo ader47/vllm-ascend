@@ -17,8 +17,8 @@ planner 采用 plan/commit 两阶段协议。容量检查和物理分配成功�
 decode step 重建状态对象。
 
 该账本位于 scheduler/core 进程，只保存标量语义，不承担 worker tensor 行
-状态。P4 会把已 commit 的状态投影到 ``NPUInputBatch``；eager/graph 都应
-消费同一个投影，而不是各自重新推导阶段。
+状态。``DSAOffloadSchedulerOutput`` 会把已 commit 的状态投影到
+``NPUInputBatch``；eager/graph 都消费同一个投影，而不是各自重新推导阶段。
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ class DSARequestCacheState:
     """一个请求跨 step 持久化的 scheduler cache 布局账本。
 
     ``sparse_budget_tokens`` 和 ``resident_valid_tokens`` 虽可由当前请求
-    长度重新推导，但保留在这里作为 P4 scheduler→worker 投影的单一真源，
+    长度重新推导，但保留在这里作为 scheduler→worker 投影的单一真源，
     避免 worker、eager 和 graph 分别实现阶段计算。
     """
 

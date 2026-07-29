@@ -2,20 +2,16 @@
 
 > - 最后更新：2026-07-29
 > - 目标基线：vLLM v0.23.0 + vLLM-Ascend v0.23.0
-> - 当前完成度：P0-P5 已完成 910C 初验；P6 图数据面已实现，
->   等待 910C capture/replay 验证；P7 尚未开始
+> - 当前完成度：核心控制面、eager 和 FULL decode graph 已完成 910C 初验；
+>   扩展场景尚未开始
 > - 首要验收模型：GLM-5.1；兼容回归模型：DeepSeek-V3.2
 
 ## 1. 文档定位
 
-本文描述 **v0.23 迁移分支当前已经落地的设计**。它与
-`dsa_offload_v023_migration_plan.md` 分工如下：
-
-- 本文回答“当前代码是什么结构、谁持有什么真源、稳定不变量是什么”；
-- 迁移计划回答“新旧基线有什么差异、下一阶段做什么、测试证据是否齐全”。
-
-迁移过程中每完成一个阶段，应先按实际代码更新本文，再在迁移计划中记录
-验收结果。尚未实现的 P7 只列接口边界，不写成可运行能力。
+本文描述 **v0.23 分支当前已经落地的设计**，是公开项目中关于 DSA
+“当前代码是什么结构、谁持有什么真源、稳定不变量是什么”的唯一设计真源。
+后续每完成一个扩展场景，都应先按实际代码更新本文，再更新对应 demo 和
+验收矩阵。尚未实现的能力只列接口边界，不写成可运行能力。
 
 ## 2. 目标与当前边界
 
@@ -48,12 +44,15 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
 当前尚未完成：
 
 - prefix cache、chunked prefill、prefill/decode mixed、preemption/resume、
-  speculative/MTP、async scheduling、KV transfer 和 A5 设备验收。
+  speculative/MTP、async scheduling、KV transfer、KV-cache
+  metrics/events 和 A5 设备验收。
 
-已有 `cache-init` 和 P4 累计 UT 证明控制面、HBM 物理初始化和 worker
-投影成立；P5 另有 910C 自定义算子编译与长请求 eager 生成初验证据。P6
-当前只完成框架实现和合同 UT，必须通过服务器 graph 编译与 eager/graph
-精度对照后才能标记为可用。
+当前已在 Linux + Ascend 环境完成 102 项 DSA UT，并取得 GLM-5.1 W4A8、
+TP16/EP 的 disabled、cache-init、eager 与 FULL decode graph 初验证据。
+graph 已覆盖 bsz=4 的同长度约 8K prompt，以及约
+5K/20K/8K/40K 的混合长度与不同 resident budget。该结果证明
+capture/replay 主路径可运行，但仍不替代完整 QA 数据集、长时间连续调度、
+请求结束/行复用和 DeepSeek-V3.2 回归。
 
 ## 3. 当前总体架构
 
@@ -101,14 +100,54 @@ worker 行状态是上述 scheduler/core 真源的 **投影**，不是第二套�
 
 ## 4. 与 v0.23 基线的集成方式
 
-### 4.1 不修改 vLLM
+### 4.1 Python 插件发现与安装时序
 
-实现只修改 vLLM-Ascend。vLLM 的 `Request`、`SchedulerOutput` 和
-`Scheduler.schedule()` 均未修改或复制。DSA 使用 vLLM-Ascend 自有的薄
-`DSAOffloadSchedulerOutput` 子类增加一个类型化 projection 字段，不对
-上游类做 monkey patch 或运行期动态挂字段。
+DSA 实现只修改 vLLM-Ascend，不修改配套 vLLM checkout。这里的“零修改”
+不等于 vLLM 不参与：vLLM 提供硬件插件发现与若干扩展点，Python 提供
+distribution metadata 和运行时导入机制。
 
-### 4.2 使用基线扩展点
+vLLM-Ascend 安装时在 `setup.py` 注册：
+
+```text
+vllm.platform_plugins:
+  ascend = vllm_ascend:register
+
+vllm.general_plugins:
+  ascend_* = vllm_ascend:register_*
+```
+
+`from vllm import LLM` 首次导入 vLLM 后，vLLM 通过
+`importlib.metadata.entry_points()` 查询当前 Python 环境中已安装
+distribution 的这些 entry point。平台插件的 `register()` 返回
+`vllm_ascend.platform.NPUPlatform`，后续配置收敛、模型 runner 和
+attention backend 才进入 Ascend 实现。
+
+engine-core 子进程还会加载 general plugins。它们通过
+`vllm_ascend._ensure_global_patch()` 调用原生 `adapt_patch()`；
+`_GLOBAL_PATCH_APPLIED` 保证同一进程重复触发时幂等。patch 必须早于被替换
+函数首次用于构造 scheduler/cache manager；仅早于一次普通函数调用还不够，
+因为其他模块可能已经用 `from ... import ...` 缓存了旧引用。
+
+```mermaid
+sequenceDiagram
+    participant U as "用户脚本"
+    participant V as "vLLM import/plugin loader"
+    participant A as "vLLM-Ascend"
+    participant E as "EngineCore/Worker"
+
+    U->>V: from vllm import LLM
+    V->>A: 加载 platform entry point
+    A-->>V: NPUPlatform
+    U->>V: LLM(...)
+    V->>A: NPUPlatform.check_and_update_config
+    A->>A: 解析 DSAOffloadConfig/安装 scheduler_cls
+    V->>E: 创建 engine-core 与 worker
+    E->>A: 加载 general plugins
+    A->>A: 幂等安装 vLLM-Ascend 全局 patch
+    E->>A: 构造 DSA coordinator/model runner
+```
+
+### 4.2 扩展点与窄 patch 的边界
 
 | v0.23 扩展点 | DSA 用法 |
 |---|---|
@@ -123,8 +162,26 @@ worker 行状态是上述 scheduler/core 真源的 **投影**，不是第二套�
 | common/SFA attention metadata | 在同一份 resident metadata 上附带 Indexer/DSA view |
 | `AscendSFAImpl` | DSA 开启时执行 LIDU/KSC/SFA-Offload 和层后 dump |
 
-v0.19 依靠全局 monkey patch 修改 `Request`、Scheduler 和输出结构。v0.23
-迁移只保留其功能合同，不照搬旧 patch 拓扑。
+能够直接修改 vLLM-Ascend 的位置都采用显式类型和普通调用，不再为 DSA
+单独制造 patch 层。vLLM v0.23 尚未给出正式扩展点的少数位置，DSA 复用
+vLLM-Ascend 已有 patch 模块：
+
+| 现有 patch 模块 | DSA 窄适配 |
+|---|---|
+| `patch_kv_cache_utils.py` | 识别 DSA split spec/group，接管分组、ratio 容量和容量报告 |
+| `patch_kv_cache_coordinator.py` | 识别 DSA group 创建 coordinator，并仅对 `DSAKVCacheCoordinator` 调用 `allocate_dsa_slots()` |
+
+每个 wrapper 都先用类型化 spec/group/coordinator 判断是否为 DSA；不满足
+时调用保存的上游原函数。不能再为同一目标函数叠加第二个 DSA wrapper，
+因为 Python 属性替换遵循最后一次赋值，多个互不知情的 wrapper 会产生安装
+顺序依赖。新逻辑应合并到现有 wrapper，并继续依赖 vLLM-Ascend 全局 patch
+的进程内幂等安装。
+
+DSA 没有 patch `Request`，没有复制或 patch
+`Scheduler.schedule()`，也没有全局替换 `SchedulerOutput`。它通过
+`scheduler_config.scheduler_cls` 安装薄 `DSAOffloadScheduler`，再用
+vLLM-Ascend 自有的 `DSAOffloadSchedulerOutput` 子类附加一个类型化
+projection。v0.19 的 patch 拓扑只作为历史参考，不是 v0.23 的实现范式。
 
 ## 5. 配置与模型能力
 
@@ -148,7 +205,36 @@ additional_config={
 
 `config.py` 在拉起期完成类型转换、未知字段拒绝和支持矩阵校验。当前首版
 显式拒绝 async scheduling、chunked prefill、prefix cache、speculative
-decode、KV transfer、context/pipeline parallel 等未建立完整合同的组合。
+decode、KV transfer、context/pipeline parallel、KV-cache metrics/events
+等未建立完整合同的组合。
+
+| 字段 | 默认值 | 当前语义 |
+|---|---:|---|
+| `enabled` | `False` | DSA 总开关；关闭时不创建 DSA cache、scheduler 或 runtime |
+| `split_indexer_cache` | `True` | 兼容性输入；DSA 开启时必须为真，解析后由 `enabled` 派生 |
+| `indexer_mla_block_ratio` | `3` | Indexer HBM blocks 与 resident MLA base blocks 的容量比 |
+| `sparse_activation_tokens` | `6144` | 完整上下文超过该值后允许进入 sparse 布局 |
+| `prompt_budget_thresholds` | `[32768, 65536]` | admission 时按 prompt 长度选择 resident 档位 |
+| `resident_budget_tokens` | `[6144, 10240, 12288]` | N 个 prompt 阈值划分 N+1 个区间，每个区间对应一个冻结 resident budget |
+| `max_active_reqs` | `256` | 配置上界，必须覆盖 `max_num_seqs`；不是实际预分配行数 |
+| `hot_cpu_block_multiple` | `3.0` | DRAM usable blocks 相对 Indexer HBM blocks 的浮点倍数，最终向上取整 |
+| `enable_row_mode_decode_graph` | `False` | 允许 DSA 单 token decode 进入原生 FULL graph |
+| `trace_points` | 关闭 | 拉起期解析的预留调测合同；当前仅接受 `first_sample`，尚无稳定日志 consumer |
+
+实际 `DSAInputBatchCacheLayout` 列式状态按 `max_num_seqs` 分配；
+`DSAResidentTokenPool.cache_slots` 额外增加一条共享 PAD 物理行，即
+`max_num_seqs + 1`。两者都不按 `max_active_reqs=256` 分配。后者保留为
+未来将 DRAM ledger 与 resident 活跃行生命周期解耦时的请求账本容量合同，
+当前首先用于拒绝 `max_num_seqs > max_active_reqs` 的配置。
+
+静态算子 ABI 还要求：
+
+- `block_size=128`；
+- `max_model_len <= 262144`；
+- resident budget 只能取 `6144/10240/12288`，且与 block size 对齐；
+- LIDU caller-owned 输出列宽固定为 `16384`；
+- Indexer head dim 为 128，MLA latent/rope 维度为 512/64；
+- 当前 Indexer heads 支持 32 或 64。
 
 模型支持采用能力判断，不仅依赖 architecture 名称。模型必须具备：
 
@@ -224,8 +310,8 @@ Indexer K。两张 tensor 在初始化后分别绑定到共享模型层。
 - `prefill_resident_released`。
 
 目标 budget 在请求首次成功 admission 时按 prompt token 数选择，decode
-期间不换档。`sparse_budget_tokens` 与 `resident_valid_tokens` 保留为 P4
-worker 投影真源，避免 worker、eager 和 graph 各自重新计算。
+期间不换档。`sparse_budget_tokens` 与 `resident_valid_tokens` 保留为
+scheduler→worker 投影真源，避免 worker、eager 和 graph 各自重新计算。
 
 ### 7.3 Plan/commit
 
@@ -275,11 +361,11 @@ allocation；这些组合在分配边界再次显式拒绝。
 保序。未来改为异步多 stream 时，必须新增 event/readiness 协议，不能只凭
 host 输出返回释放 HBM 块。
 
-## 10. P4-P5 实现与 P6-P7 接口边界
+## 10. Scheduler→worker 投影与执行接口
 
-### 10.1 P4：scheduler→worker 投影
+### 10.1 Scheduler→worker 投影
 
-P4 已实现以下合同：
+当前投影层实现以下合同：
 
 - `DSARequestCacheLayoutProjection` 按 scheduled request 顺序列式承载
   stage、target/sparse budget、resident valid length；
@@ -300,7 +386,7 @@ P4 已实现以下合同：
 - 只有 ENTER 行携带 resident 全量 block IDs，并覆盖 worker request
   账本与对应 `MultiGroupBlockTable` 行；其他阶段不额外改写 block table。
 
-P4 明确不做：
+该投影层明确不做：
 
 - 在 worker 各 rank 根据长度重新决定阶段；
 - 为 eager 和 graph 创建两套语义状态；
@@ -308,9 +394,9 @@ P4 明确不做：
 - 为了消除 scheduler 的一次 O(B) projection 而复制上游
   `Scheduler.schedule()`；v0.23 输出构造处没有逐请求扩展钩子。
 
-### 10.2 P5：eager 数据面
+### 10.2 Eager 数据面
 
-P5 已按以下结构接通：
+eager 路径按以下结构接通：
 
 - `DSAResidentTokenPool` 为活跃请求分配与 InputBatch 行号解耦的稳定行；
 - `cache_slots[layer, pool_row, position]` 是 LIDU 跨 step 原址更新的逐层
@@ -332,14 +418,14 @@ P5 已按以下结构接通：
 - 满块边界判定使用 worker-lifetime NumPy scratch；steady 无 dump step
   不构造 job 列，DRAM 表版本未变化时不重复 H2D。
 
-P5 eager 继续只消费 active-prefix；P6 通过同一 owner 的
-captured-prefix + PAD 扩展图执行 view，没有改变 P5 的请求语义。
+eager 只消费 active-prefix；graph 通过同一 owner 的 captured-prefix + PAD
+扩展执行 view，没有改变 eager 的请求语义。
 
-### 10.3 P6：图模式
+### 10.3 图模式
 
 复用 v0.23 原生 FULL decode capture/replay：
 
-- `graph_gate.py` 只读取 P4 InputBatch 投影，允许单 token
+- `graph_gate.py` 只读取统一 InputBatch 投影，允许单 token
   DENSE/ENTER/SPARSE 混排；prefill、multi-token 和 capture-size miss
   正常走 true eager；
 - 原生 dispatcher 的最终 uniform FULL keys 是 capture 容量唯一真源，
@@ -357,16 +443,336 @@ captured-prefix + PAD 扩展图执行 view，没有改变 P5 的请求语义。
 - `_build_attention_metadata`、attention builder、模型 forward 和 ACLGraph
   wrapper 均复用基线，不维护 graph-only 元数据类。
 
-### 10.4 P7：场景扩展
+### 10.4 扩展场景边界
 
 preemption、prefix cache、MTP、chunked/mixed prefill 和 KV transfer 都会
 改变 ledger 或状态恢复合同，应在稳定 eager/graph 数据面之后逐项设计。
 
-## 11. 代码索引
+## 11. Decode 数据面与算子 ABI
+
+### 11.1 三种编号不要混用
+
+| 名称 | 含义 | 典型消费者 |
+|---|---|---|
+| token position | token 在完整请求序列中的位置，范围 `[0, seq_len)` | Indexer、`topk_index`、DRAM logical block 推导 |
+| resident logical slot | token 当前在该请求 resident 预算区中的逻辑槽位 | `cache_slots`、`topk_slots`、SFA-Offload |
+| physical block id | HBM 或 DRAM arena 中的物理块编号 | block table、KSC、full-block dump |
+
+`topk_index` 不是 HBM slot；`topk_slots` 也不是 token id。KSC 使用前者定位
+DRAM 中的源 token，使用后者定位 resident HBM 的目标槽位。SFA-Offload
+只消费换入完成后的 `topk_slots` 和尾块信息。
+
+### 11.2 `cache_slots` 持久状态
+
+每层的状态形状为：
+
+```text
+[max_num_seqs + 1 PAD, aligned(max_model_len + 1)]
+```
+
+前 `W-1` 列是 `token position -> resident logical slot` 映射，最后一列
+是该行的状态元数据：
+
+- `0`：尚未建立 sparse resident；
+- `-budget`：下一次 SPARSE 行执行 first-fill；
+- `+budget`：该层 resident 映射已经建立，进入 steady update。
+
+它是唯一逐层、跨 decode step 的 tokenwise 真源。`DSAOffloadRuntime`
+中的 LIDU 输出只是当前层短生命周期 scratch，不能替代 `cache_slots`。
+
+### 11.3 LIDU 输出合同
+
+LIDU 使用 caller-owned 固定地址输出：
+
+| 输出 | 形状 | 语义 |
+|---|---|---|
+| `topk_index` | `int32[B, 1, 16384]` | 完整序列 token position；KSC 的源 token |
+| `topk_slots` | `int32[B, 1, 16384]` | 对应 resident logical slot；KSC 目标与 SFA 稀疏索引 |
+| `miss_count` | `int32[B]` | KSC 只消费 `[0, miss_count)` 前缀 |
+| `tail_info` | `int32[B, 2]` | `[tail_slot_start, tail_token_count]` |
+
+逐行语义：
+
+| row mode | 行为 |
+|---|---|
+| `PAD=0` | 输出无效、`miss_count=0`，不修改持久状态 |
+| `DENSE=1` | 计算完整 Indexer 序列的 top2048；`topk_slots=topk_index`、`miss_count=0`、无尾块追加；不修改 `cache_slots` |
+| `SPARSE=2` 且 metadata<0 | first-fill：建立 target budget resident 映射，产生需要换入的 miss prefix |
+| `SPARSE=2` 且 metadata>0 | steady：保留命中槽，只为 miss token 分配/复用槽并原址更新映射 |
+| `SPARSE=2` 且 metadata=0 | 非法生命周期输入，不允许静默按 DENSE 处理 |
+
+`ENTER_SPARSE_DECODE` 在 scheduler 仍是独立阶段，但映射到设备
+`row_mode=SPARSE`，由负预算区分 first-fill。因此 DENSE、ENTER、steady
+SPARSE 和 PAD 能共用同一条算子拓扑和同一张 captured graph。
+
+“DENSE”表示 MLA 物理 cache 尚未收缩，完整上下文仍在 HBM 可寻址；它不
+表示 SFA 做全量稠密 attention。当前 DSA decode 与模型原生 DSA 语义一致，
+仍由 LIDU 从完整 Indexer 序列选 top2048 交给 SFA。
+
+### 11.4 KSC 与 SFA-Offload
+
+KSC 不重新判断命中，也不检查 `miss_count` 之后的输出：
+
+```text
+src_token_ids = topk_index[:, :, :miss_count]
+dst_slots     = topk_slots[:, :, :miss_count]
+```
+
+因此“miss token 必须紧凑放在输出前缀”是 LIDU 与 KSC 的硬 ABI。host
+不得用 `.item()` 读取 `miss_count` 后再拆请求；copy count 直接作为设备
+tensor 交给 KSC。
+
+SFA-Offload 读取每行前 2048 个 `topk_slots`，SPARSE 行再根据
+`tail_info` 追加预算区之后的不满尾块有效 token。尾块保持全量参与的原因
+是它尚未成为可卸载的完整 block。DENSE 行的 `tail_info=[-1, 0]`，其
+top2048 slot 直接等于完整序列 position。
+
+### 11.5 单行 first-fill 示例
+
+假设 prompt admission 后冻结 `target_budget=6144`，当前完整长度为
+`6500`：
+
+1. scheduler 计算最后一个不满块之前共有 6400 个 token，提交 ENTER，
+   resident MLA 表被替换成 6144 预算槽加一个尾块；
+2. worker 写 `row_mode=SPARSE`，并将该请求所有层的 metadata 列设为
+   `-6144`；
+3. LIDU first-fill 选择并排列 6144 个 resident token，写
+   `cache_slots[token_position]=resident_slot`；
+4. `miss_count=6144`，KSC 将 miss-prefix 从 DRAM 换入对应 HBM slot；
+5. 中间已经完成的 256 个 token 位于 DRAM，当前不满尾块有 100 个 token；
+   `tail_info=[6144, 100]`，SFA 使用重要 top2048 加这 100 个尾部 token；
+6. LIDU 把 metadata 改为 `+6144`，下一 step 进入 steady。
+
+后续若 top2048 只有 37 个 token 不在 resident，LIDU 只把这 37 个 miss
+放在输出前缀，KSC 只搬 37 个 token；更大的 6144 resident budget 正是
+用空间降低跨 step miss 的手段。
+
+### 11.6 Attention 接入点
+
+v0.23 不再保留 v0.19 的通用 `attention_begin/after_indexer/
+attention_finished` hook 对象。当前接入直接落在 vLLM-Ascend 自有
+`AscendSFAImpl` 的既有阶段：
+
+| 位置 | DSA 行为 |
+|---|---|
+| model runner cache 初始化 | 为每个 SFA layer 绑定 `DSALayerOffloadContext` |
+| `indexer_select_post_process()` prefill 分支 | 复用基线 lightning-indexer，但读取独立 Indexer plane/table |
+| `indexer_select_post_process()` decode 分支 | 调用该层 context 的 LIDU→KSC，返回 `DSAOffloadSelectionOutput` |
+| `_execute_sparse_flash_attention_process()` | 识别上述 selection，调用 SFA-Offload |
+| SFA 返回后、`v_up_proj` 前 | 调用该层 full-block dump |
+
+这里仍保留“选择/物化”和“attention 计算”两个清晰阶段，只是使用真实
+`AscendSFAImpl` 调用点，而不再额外维护一套空的 hook 生命周期。层的
+Indexer cache、layer id 和 runtime 在初始化期绑定，热路径不重复遍历
+`static_forward_context`。
+
+## 12. Hot DRAM 与满块卸载
+
+### 12.1 Arena 和 ledger
+
+`DSAHotDRAMStore` 对每层创建两张 NPU 可寻址 swapped-memory arena：
+
+```text
+NOPE: [dram_blocks + 1, block_size, 1, kv_lora_rank]
+ROPE: [dram_blocks + 1, block_size, 1, qk_rope_head_dim]
+```
+
+不同层的 payload tensor 独立，但所有层共享同一套 DRAM physical block-id
+语义和请求逻辑表。block `0` 是已清零的空映射；有效 DRAM block id 从 1
+开始。容量按
+`ceil(indexer_hbm_blocks * hot_cpu_block_multiple)` 计算，初始化后不扩容，
+保证 eager 和 graph 中 arena 基地址稳定。
+
+逻辑表为：
+
+```text
+[resident_pool_storage_rows, ceil(max_model_len / block_size)]
+```
+
+它记录 `stable pool row -> logical full block -> DRAM block id`。当前关闭
+prefix cache、preemption 和 KV connector，所以不同请求不共享 DRAM
+block，也没有 hash/refcount 管理。
+
+### 12.2 Dump 计划与执行时序
+
+model-forward 元数据准备阶段批量识别本轮新完成的 full block，并预留
+DRAM block。逐层 attention 完成 SFA 后，`KvCacheFullBlockDump` 只接收：
+
+```text
+resident NOPE/ROPE cache
+DRAM NOPE/ROPE arena
+src_hbm_block_ids
+dst_dram_block_ids
+```
+
+算子不感知请求、stage 或 token position。prefill 与 decode 使用相同
+复制 ABI；差别只在本轮 job 数量。
+
+当前所有 attention 和 dump 位于同一 NPU stream，stream 内严格保序：
+
+```text
+本层 SFA 读取 HBM -> 本层 full-block dump -> 后续层
+```
+
+该 block 到下一 model-forward 才可能被 LIDU/KSC 消费。因此当前不需要
+额外的“dump finished”状态、D2H polling 或 event。scheduler 在 prefill
+model output 返回后释放已经 dump 的 resident 满块。未来引入异步多 stream
+时必须重新设计 event/readiness 协议，不能沿用这一同步假设。
+
+### 12.3 eager 与 graph 空转合同
+
+- eager：没有新满块时直接跳过算子；有 job 时提交紧凑 src/dst 前缀；
+- graph：为了保持 captured topology，始终传 captured-row 固定宽度；
+  空行使用 `src=0, dst=-1`；
+- `dst=-1` 是 dump 算子的唯一空转哨兵，不能和 DRAM ledger 的空映射
+  block `0` 混用。
+
+## 13. 统一 metadata 与图模式
+
+### 13.1 生命周期分层
+
+| 生命周期 | 数据 | owner |
+|---|---|---|
+| 拉起期 | 类型化配置、spec、固定容量 tensor | `AscendConfig` / model runner |
+| 请求跨 step | 阶段、冻结预算、resident 有效长度 | scheduler/core planner |
+| worker 跨 step | InputBatch 六列投影、stable pool row、`cache_slots`、DRAM ledger | `NPUInputBatch` / resident pool / DRAM store |
+| 单次 model forward | token row mode、slot mapping position、active DRAM table、dump jobs | `DSAOffloadRuntime` |
+| 单层 | LIDU 四个输出和 SFA selection view | `DSALayerOffloadContext` |
+
+这套分层防止把 request lifetime、step lifetime 和 layer lifetime 混进一个
+大对象。`DSAOffloadRuntime` 不复制 scheduler 阶段账本，只从 InputBatch
+投影构造本轮设备 view。
+
+### 13.2 六列 InputBatch SoA
+
+`DSAInputBatchCacheLayout` 持有一个 `[6, max_num_seqs]`
+`CpuGpuBuffer`：
+
+```text
+stage
+target_resident_budget_tokens
+sparse_budget_tokens
+resident_valid_tokens
+row_mode
+resident_pool_index
+```
+
+这里的 SoA（Structure of Arrays）表示同一种字段沿 batch 连续，而不是每个
+请求保存一个 Python 对象。scheduler 输出前四列，worker 派生后两列。
+原生 `_update_states()` 完成 add/remove/condense/reorder 后再刷新 DSA
+active-prefix，因此最终行序与基线 `InputBatch` 完全一致。
+
+### 13.3 eager 与 graph 的关系
+
+eager 和 graph 并不是两套 DSA 元数据：
+
+```text
+同一个 CPU 真源 / 同一个 CpuGpuBuffer / 同一个 resident pool
+                   |
+        +----------+----------+
+        |                     |
+ active-prefix view   captured-prefix + PAD view
+        |                     |
+      eager             FULL graph replay
+```
+
+DSA 不另建完整图编译流程。原生 vLLM/vLLM-Ascend 继续负责：
+
+- `VLLM_COMPILE` 与 piecewise 编译；
+- FULL decode capture size 过滤、向上 padding 和 dispatcher；
+- `_build_attention_metadata`；
+- ACL graph capture/replay 和 DP 全局图模式决议。
+
+DSA 只增加：
+
+- 读取统一行状态的准入 gate；
+- captured-prefix 的 PAD 行；
+- capture dummy 所需的合法 SPARSE first-fill 临时状态；
+- 固定地址的 LIDU/KSC/SFA/dump 元数据 view。
+
+dummy capture 不代表真实请求。捕获前临时安装，捕获后在 `finally` 恢复，
+不能推进 CPU 请求阶段、占用真实 DRAM ledger 或把 LIDU 原址更新遗留给首个
+真实 replay。
+
+### 13.4 DSA 图准入失败为什么是 true eager
+
+vLLM/vLLM-Ascend 基线在 `VLLM_COMPILE` 下同时具备 piecewise compiled
+forward 和 FULL ACL graph replay。不过当前 DSA 对预期的 row-mode gate
+miss 会显式设置 `force_eager`，并在模型调用处设置
+`skip_compiled_model_forward`，因此不会落到 piecewise：
+
+- `enforce_eager=True`：全程 true eager；
+- `VLLM_COMPILE + DSA gate miss`：跳过 compiled model，本轮 true eager；
+- `VLLM_COMPILE + DSA gate hit`：FULL ACL graph replay。
+
+prefill、multi-token、capture-size miss、cascade/encoder blocker，以及 DP
+全局图模式决议降级，都是当前 DSA 的预期 true-eager 场景。piecewise
+backend 仍属于基线编译体系的一部分，但不是 DSA gate miss 的执行后端。
+
+## 14. 请求生命周期与资源回收
+
+```mermaid
+stateDiagram-v2
+    [*] --> PREFILL
+    PREFILL --> DENSE: "prompt 未达到 sparse 条件"
+    PREFILL --> ENTER: "首次 decode 已满足激活与 resident 条件"
+    DENSE --> DENSE: "完整上下文继续增长"
+    DENSE --> ENTER: "首次满足 sparse 条件"
+    ENTER --> SPARSE: "resident 整表替换 + first-fill"
+    SPARSE --> SPARSE: "steady LIDU/KSC/SFA"
+    DENSE --> [*]: "finished/free"
+    SPARSE --> [*]: "finished/free"
+```
+
+请求结束时：
+
+1. 基线移除 InputBatch 行；
+2. resident pool 归还 stable row，但不立即清大 tensor；
+3. DRAM store 批量回收该 row 的 physical block ids 并清 logical row；
+4. 该 resident row 下次 `acquire()` 时只做一次所有层整行清理；
+5. scheduler/core 同时释放两个 HBM manager 和请求 cache-layout state。
+
+把大 `cache_slots` 清理延迟到 row reuse，避免 release 和 acquire 各写一次。
+“临时未被本轮调度”不等于 request finished；persistent InputBatch 在
+condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
+
+当前 preemption 明确失败。未来目标不是把全部状态绑死在一个生命周期：
+
+- tokenwise resident row 按 `max_num_seqs + PAD` 分配，preempt 时可释放；
+- DRAM ledger 应有独立、可跨 preempt 保留的请求行；
+- resume 重新分配 resident row，并用 DRAM ledger 执行 first-fill。
+
+该拆分尚未实现，因此当前文档不能把 `max_active_reqs` 描述成已经存在的
+独立 DRAM 请求池。
+
+## 15. 性能不变量与已知成本
+
+热路径必须保持：
+
+- 不按 DENSE/SPARSE 拆 Python 子 batch；
+- 不用 `.item()`/`.to("cpu")` 读取 miss、stage 或 row mode；
+- 不逐层创建大 tensor，LIDU 输出由所有层串行复用；
+- DRAM table 版本不变时不重复 H2D；
+- 无 dump 的 eager step 不调用 dump 算子；
+- graph 使用固定地址 view，不在 replay 前替换 owner；
+- request-id 映射只在 InputBatch 结构变化时做，steady 行序批量刷新。
+
+当前仍有两个已知成本：
+
+1. scheduler 需要在 `super().schedule()` 返回后对最终 scheduled requests
+   做一次 O(B) projection。vLLM v0.23 没有逐请求输出扩展钩子；为了消掉
+   这一次遍历去复制 `schedule()` 得不偿失。
+2. v0.23 的 fused Indexer 投影返回带行 stride 的 `weights` 后缀 view，
+   当前 LIDU kernel 要求紧凑 `[B, N_idx]`，因此 `ops.py` 每层执行一次
+   `weights.contiguous()` 小拷贝。后续算子若支持显式 stride/layout，可
+   删除该兼容成本。
+
+## 16. 代码索引
 
 | 模块 | 当前职责 |
 |---|---|
-| `dsa_offload/config.py` | 类型化配置和支持矩阵 |
+| `dsa_offload/config.py` | 类型化配置、算子 ABI 和支持矩阵校验 |
+| `dsa_offload/contracts.py` | 框架与四个算子共享的静态常量 |
 | `dsa_offload/model_support.py` | 模型能力判断 |
 | `dsa_offload/kv_cache.py` | spec、group、容量、绑定顺序和报告 |
 | `dsa_offload/kv_cache_coordinator.py` | 双 pool 所有权和请求块表 |
@@ -376,32 +782,54 @@ preemption、prefix cache、MTP、chunked/mixed prefill 和 KV transfer 都会
 | `dsa_offload/scheduler_output.py` | scheduler→worker 最小列式投影 |
 | `dsa_offload/input_batch.py` | worker 固定容量行状态与 ENTER 整表覆盖 |
 | `dsa_offload/graph_gate.py` | 原生 FULL decode graph 的纯准入策略 |
-| `dsa_offload/resident_pool.py` | 稳定 pool row 与逐层 LIDU `cache_slots` |
-| `dsa_offload/dram_store.py` | 固定 DRAM arena、逻辑 block ledger 与整行释放 |
-| `dsa_offload/runtime.py` | eager/graph 共用 metadata owner 与逐层执行上下文 |
-| `dsa_offload/ops.py` | LIDU、KSC、SFA-Offload、满块 dump 的 tensor ABI |
+| `dsa_offload/resident_pool.py` | stable pool row 与逐层 LIDU `cache_slots` |
+| `dsa_offload/dram_store.py` | 固定 DRAM arena、逻辑 block ledger 与批量释放 |
+| `dsa_offload/runtime.py` | eager/graph 共用 metadata owner 与逐层上下文 |
+| `dsa_offload/ops.py` | LIDU、KSC、SFA-Offload、full-block dump tensor ABI |
 | `core/kv_cache_interface.py` | DSA spec/manager registry 注册 |
 | `worker/npu_input_batch.py` | 可选 DSA buffer owner |
 | `worker/model_runner_v1.py` | cache 初始化、行投影、双 slot mapping 与 runtime 绑定 |
 | `attention/sfa_v1.py` | DSA attention 算子链和层后满块 dump |
 | `platform.py` | 配置收敛、scheduler 类和启动期校验 |
 
-## 12. 当前验证状态
+## 17. 当前验证状态
 
 已获得的 910C 证据：
 
-- P0-P4 累计单元测试全部通过，无 skip、xfail 或失败；
+- `python -m pytest tests/ut/dsa_offload -vv --tb=short` 共 102 项通过；
 - DSA disabled GLM-5.1 回归通过；
-- DSA `cache-init` 成功；
-- HBM 容量报告只打印一次；
+- DSA `cache-init` 成功，HBM 容量报告只打印一次；
 - `async_scheduling=True` 按支持矩阵拒绝；
-- Indexer/MLA 3:1 容量和双 tensor 初始化符合预期。
-- GLM-5.1 W4A8、bsz=4、约 8K prompt 的 P5 eager 生成初验通过。
+- Indexer/MLA 3:1 容量和双 tensor 初始化符合预期；
+- GLM-5.1 W4A8、bsz=4、约 8K prompt 的 eager 生成初验通过；
+- FULL decode graph 已覆盖 bsz=4 的四条相同约 8K prompt；
+- FULL decode graph 已覆盖约 5K/20K/8K/40K 混合长度和不同预算档位。
 
-P3 的请求布局、双 manager 失败原子性与 scheduler 薄适配，以及 P4 的
-projection pickle、最终行序重排、ENTER 整表覆盖、PAD 初始化和 stable
-批量刷新均已在 Linux + Ascend 环境通过 UT。P5 新增 resident pool、
-DRAM store 与 runtime 专项测试，并完成 910C 自定义算子编译和长请求
-eager 初验。P6 已增加 gate、capture dummy 恢复、PAD 和 dump 固定宽度
-合同测试；完整 910C FULL graph capture/replay 与数据集精度回归待执行。
-完整命令和逐阶段验收结果维护在迁移计划中。
+这些结果证明当前核心控制面、eager 和 graph 主路径可运行。尚需补齐：
+
+- QA 数据集 disabled/eager/graph 精度对照；
+- bsz=1 与 bsz>1、全 DENSE、全 SPARSE、ENTER mixed；
+- active rows 小于 captured rows 的 PAD；
+- 请求完成、行复用和长时间 continuous batching；
+- DeepSeek-V3.2 强制回归；
+- profiling 性能基线；
+- A5 算子编译与运行。
+
+完整测试命令和验收要求维护在 `examples/dsa_demo/README.md`。
+
+## 18. v0.19 知识归档说明
+
+本设计文档已经吸收 v0.19 原型中仍有价值的内容：插件/patch 时序、双 HBM
+plane、hot DRAM、四阶段请求布局、列式元数据、stable resident row、
+LIDU/KSC/SFA ABI、full-block dump、eager/graph 共用 owner、生命周期和
+测试矩阵。以下旧形态有意不保留为当前实现：
+
+- 全局 Scheduler monkey patch 与输出类重绑定；
+- 复制 `_update_states()`、`_prepare_inputs()` 或图 dispatcher；
+- packed MLA+Indexer page-size 补丁；
+- 旧 GatherSelection 算子链和兼容 fallback；
+- 运行时环境变量式 DSA trace 开关；
+- 已无消费方的异步 dump 状态。
+
+因此 v0.19 checkout 不再是理解、运行或测试 v0.23 DSA 的必要依赖；它只
+保留历史提交溯源价值。

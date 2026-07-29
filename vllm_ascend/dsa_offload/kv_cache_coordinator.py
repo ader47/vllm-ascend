@@ -15,8 +15,9 @@ prefix cache、KV connector 和 speculative decode 由首版配置合同提前�
 
 这里的 block table 是 scheduler/core 侧逻辑真源。v0.23 原生
 ``SchedulerOutput`` 对 cached request 只表达“追加的新块”，尚不能表达
-ENTER 对 resident 表的整表替换；该传输与 worker 行状态属于 P4，不能由各
-worker 根据长度自行重新分配。
+ENTER 对 resident 表的整表替换；该传输由类型化 scheduler projection 和
+worker ``DSAInputBatchCacheLayout`` 共同完成，不能由各 worker 根据长度
+自行重新分配。
 """
 
 from __future__ import annotations

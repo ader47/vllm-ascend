@@ -11,8 +11,8 @@
 * 本轮满块 dump 的紧凑 src/dst 列。
 
 所有大 tensor 在 model runner 初始化期预分配。steady step 只刷新 active
-prefix；DRAM 逻辑表未变化时不会重复 H2D。P6 图模式复用这些 owner 的
-captured-prefix + PAD，而不是另建一套 graph-only 语义。
+prefix；DRAM 逻辑表未变化时不会重复 H2D。图模式复用这些 owner 的
+captured-prefix + PAD view，而不是另建一套 graph-only 语义。
 """
 
 from __future__ import annotations
