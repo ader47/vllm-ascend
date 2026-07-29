@@ -26,6 +26,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.dsa_offload.contracts import (
+    DSA_DRAM_NULL_BLOCK_ID,
     DSA_LIDU_OUTPUT_CAPACITY,
     DSA_ROW_MODE_SPARSE,
 )
@@ -37,6 +38,9 @@ from vllm_ascend.dsa_offload.ops import (
     kvcache_scatter_copy,
     lightning_indexer_decode_update,
     sparse_flash_attention_for_offload,
+)
+from vllm_ascend.dsa_offload.request_cache_layout import (
+    DSARequestCacheStage,
 )
 from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
 
@@ -245,7 +249,12 @@ class DSAOffloadRuntime:
             num_scheduled_tokens=num_scheduled_tokens,
             resident_group_id=resident_group_id,
         )
-        self._refresh_active_dram_table(state)
+        dram_table_refreshed = self._refresh_active_dram_table(state)
+        self._validate_sparse_dram_rows(
+            input_batch=input_batch,
+            state=state,
+            validate_all_sparse=dram_table_refreshed,
+        )
 
         active_modes = state.row_modes_cpu[:num_reqs]
         if not np.any(active_modes == DSA_ROW_MODE_SPARSE):
@@ -418,7 +427,7 @@ class DSAOffloadRuntime:
     def _refresh_active_dram_table(
         self,
         state: DSAInputBatchCacheLayout,
-    ) -> None:
+    ) -> bool:
         store = self.dram_store
         assert store is not None
         signature = (
@@ -427,7 +436,7 @@ class DSAOffloadRuntime:
             self.active_num_reqs,
         )
         if signature == self._dram_table_signature:
-            return
+            return False
         active_cpu = self.active_dram_block_table.np[
             : self.active_num_reqs
         ]
@@ -446,6 +455,66 @@ class DSAOffloadRuntime:
             non_blocking=True,
         )
         self._dram_table_signature = signature
+        return True
+
+    def _validate_sparse_dram_rows(
+        self,
+        *,
+        input_batch: NPUInputBatch,
+        state: DSAInputBatchCacheLayout,
+        validate_all_sparse: bool,
+    ) -> None:
+        """在低频布局边界拒绝不完整的 sparse DRAM 映射。
+
+        KSC 的 block 0 是合法可寻址的空 arena，因此缺失逻辑映射若不在
+        host 侧拦住，会静默把零 payload 写入 resident HBM。ENTER 每个请求
+        只检查一次；稳定 SPARSE 仅在 pool-row 或 DRAM table 版本变化时
+        检查，不增加 steady decode 的逐 step 扫描。
+        """
+
+        num_reqs = self.active_num_reqs
+        stages = state.stages_cpu[:num_reqs]
+        if validate_all_sparse:
+            rows = np.flatnonzero(
+                stages >= int(
+                    DSARequestCacheStage.ENTER_SPARSE_DECODE
+                )
+            )
+        else:
+            rows = np.flatnonzero(
+                stages == int(
+                    DSARequestCacheStage.ENTER_SPARSE_DECODE
+                )
+            )
+        if rows.size == 0:
+            return
+
+        dram_table = self.active_dram_block_table.np
+        for row_value in rows:
+            row = int(row_value)
+            # LIDU 把最后一个非空块作为 dense tail；只有它之前的完整块
+            # 会成为 KSC 的 DRAM source。
+            required_blocks = (
+                max(0, int(self._tokens_after_schedule[row]) - 1)
+                // self.block_size
+            )
+            if required_blocks == 0:
+                continue
+            missing = np.flatnonzero(
+                dram_table[row, :required_blocks]
+                == DSA_DRAM_NULL_BLOCK_ID
+            )
+            if missing.size:
+                request_id = input_batch.req_ids[row]
+                raise RuntimeError(
+                    "DSA sparse decode has an incomplete DRAM block table: "
+                    f"request_id={request_id!r}, batch_row={row}, "
+                    "resident_pool_row="
+                    f"{int(state.resident_pool_indices_cpu[row])}, "
+                    f"required_blocks={required_blocks}, "
+                    f"first_missing_logical_block={int(missing[0])}. "
+                    "Refusing to let KSC read the null DRAM block."
+                )
 
     def get_lidu_outputs(
         self,

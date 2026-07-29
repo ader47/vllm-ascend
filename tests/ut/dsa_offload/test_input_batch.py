@@ -226,3 +226,74 @@ def test_stable_row_order_uses_bulk_column_refresh() -> None:
     assert state.sparse_budget_tokens_cpu[:2].tolist() == [0, 4096]
     assert state.resident_valid_tokens_cpu[:2].tolist() == [-1, 4097]
     assert state.resident_pool_indices_cpu[:2].tolist() == [0, 1]
+
+
+def test_unscheduled_request_keeps_pool_row_until_finished() -> None:
+    state = _make_state()
+    released_rows: list[int] = []
+    state.set_pool_release_callback(released_rows.append)
+
+    both = _InputBatch(("req-a", "req-b"))
+    both_projection = DSARequestCacheLayoutProjection(
+        request_ids=("req-a", "req-b"),
+        stages=(
+            int(DSARequestCacheStage.DENSE_DECODE),
+            int(DSARequestCacheStage.DENSE_DECODE),
+        ),
+        target_resident_budget_tokens=(2048, 2048),
+        sparse_budget_tokens=(0, 0),
+        resident_valid_tokens=(-1, -1),
+        resident_block_table_replacements=(),
+    )
+    state.refresh(
+        input_batch=both,
+        projection=both_projection,
+    )
+    req_a_pool_row = state.resident_token_pool.get_index("req-a")
+    assert req_a_pool_row is not None
+    state.resident_token_pool.get_cache_slots(0)[
+        req_a_pool_row,
+        0,
+    ] = 123
+
+    # vLLM 会把本轮未调度的 req-a 临时移出 persistent InputBatch。
+    only_b = _InputBatch(("req-b",))
+    only_b_projection = DSARequestCacheLayoutProjection(
+        request_ids=("req-b",),
+        stages=(int(DSARequestCacheStage.DENSE_DECODE),),
+        target_resident_budget_tokens=(2048,),
+        sparse_budget_tokens=(0,),
+        resident_valid_tokens=(-1,),
+        resident_block_table_replacements=(),
+    )
+    state.refresh(
+        input_batch=only_b,
+        projection=only_b_projection,
+    )
+
+    assert state.resident_token_pool.get_index("req-a") == req_a_pool_row
+    assert (
+        state.resident_token_pool.get_cache_slots(0)[
+            req_a_pool_row,
+            0,
+        ].item()
+        == 123
+    )
+    assert released_rows == []
+
+    # 再次调度时复用同一请求级状态；只有真正 finished 才回收。
+    state.refresh(
+        input_batch=both,
+        projection=both_projection,
+    )
+    assert state.resident_pool_indices_cpu[0] == req_a_pool_row
+    state.release_request("req-a")
+    assert state.resident_token_pool.get_index("req-a") is None
+    assert released_rows == [req_a_pool_row]
+
+    # finished 与同一轮同名新请求重叠时，也必须重新绑定 pool row。
+    state.refresh(
+        input_batch=both,
+        projection=both_projection,
+    )
+    assert state.resident_token_pool.get_index("req-a") is not None
