@@ -1,9 +1,9 @@
 # DSA 稀疏卸载当前设计
 
-> - 最后更新：2026-07-28
+> - 最后更新：2026-07-29
 > - 目标基线：vLLM v0.23.0 + vLLM-Ascend v0.23.0
-> - 当前完成度：P0-P4 已完成服务器初验；P5 eager 数据面已实现，
->   等待 910C 编译与端到端生成验证；P6-P7 尚在迁移
+> - 当前完成度：P0-P5 已完成 910C 初验；P6 图数据面已实现，
+>   等待 910C capture/replay 验证；P7 尚未开始
 > - 首要验收模型：GLM-5.1；兼容回归模型：DeepSeek-V3.2
 
 ## 1. 文档定位
@@ -15,7 +15,7 @@
 - 迁移计划回答“新旧基线有什么差异、下一阶段做什么、测试证据是否齐全”。
 
 迁移过程中每完成一个阶段，应先按实际代码更新本文，再在迁移计划中记录
-验收结果。尚未实现的 P6-P7 只列接口边界，不写成可运行能力。
+验收结果。尚未实现的 P7 只列接口边界，不写成可运行能力。
 
 ## 2. 目标与当前边界
 
@@ -42,17 +42,18 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
 - 稳定 resident token pool 与逐层 `cache_slots`；
 - 固定容量 hot DRAM arena 和请求逻辑块 ledger；
 - prefill/dense/sparse 共用的双 plane slot mapping；
-- eager LIDU→KSC→SFA-Offload 与 full-block dump 数据面。
+- eager LIDU→KSC→SFA-Offload 与 full-block dump 数据面；
+- 复用原生 FULL decode capture/replay 的 row-mode 图数据面。
 
 当前尚未完成：
 
-- DSA FULL graph；
 - prefix cache、chunked prefill、prefill/decode mixed、preemption/resume、
   speculative/MTP、async scheduling、KV transfer 和 A5 设备验收。
 
-因此，已有 `cache-init` 和 P4 累计 UT 证明控制面、HBM 物理初始化和
-worker 投影成立。P5 仍需 910C 自定义算子编译与长请求生成验证，不能仅凭
-静态检查宣称稀疏卸载数据面已经可用。
+已有 `cache-init` 和 P4 累计 UT 证明控制面、HBM 物理初始化和 worker
+投影成立；P5 另有 910C 自定义算子编译与长请求 eager 生成初验证据。P6
+当前只完成框架实现和合同 UT，必须通过服务器 graph 编译与 eager/graph
+精度对照后才能标记为可用。
 
 ## 3. 当前总体架构
 
@@ -80,7 +81,9 @@ flowchart TB
     DRAM --> DATA
     DATA --> DUMP["SFA 后 full-block dump"]
     DUMP --> DRAM
-    RUNTIME -. "P6 复用 owner" .-> GRAPH["原生 FULL graph capture/replay"]
+    INPUT --> GATE["DSA row-mode graph gate"]
+    GATE --> GRAPH["原生 FULL graph dispatcher/capture/replay"]
+    RUNTIME --> GRAPH
 ```
 
 当前有三个不同层次的真源：
@@ -138,7 +141,7 @@ additional_config={
         "resident_budget_tokens": [6144, 10240, 12288],
         "max_active_reqs": 256,
         "hot_cpu_block_multiple": 3.0,
-        "enable_row_mode_decode_graph": False,
+        "enable_row_mode_decode_graph": True,
     }
 }
 ```
@@ -329,14 +332,30 @@ P5 已按以下结构接通：
 - 满块边界判定使用 worker-lifetime NumPy scratch；steady 无 dump step
   不构造 job 列，DRAM 表版本未变化时不重复 H2D。
 
-P5 目前只开放 eager active-prefix。graph padding、地址捕获和 PAD 空转在
-P6 接入前显式拒绝，避免静默进入半适配图路径。
+P5 eager 继续只消费 active-prefix；P6 通过同一 owner 的
+captured-prefix + PAD 扩展图执行 view，没有改变 P5 的请求语义。
 
 ### 10.3 P6：图模式
 
-复用 v0.23 原生 FULL decode capture/replay。DSA 只增加固定地址 buffer、
-PAD 行和准入条件，不创建第二套 graph dispatcher 或 graph-only cache
-语义。
+复用 v0.23 原生 FULL decode capture/replay：
+
+- `graph_gate.py` 只读取 P4 InputBatch 投影，允许单 token
+  DENSE/ENTER/SPARSE 混排；prefill、multi-token 和 capture-size miss
+  正常走 true eager；
+- 原生 dispatcher 的最终 uniform FULL keys 是 capture 容量唯一真源，
+  继续负责图形状与向上 padding；仅支持具有独立 decode routine 的模式
+  （例如 `FULL_DECODE_ONLY`），不支持 mixed/decode 共用的精确 `FULL`；
+- DP 以原生全局图模式决议为准：任一 replica 处于 prefill 或
+  capture-size miss 时共同 true eager；DP=1 且没有原生动态 blocker 时，
+  gate 允许却未选中 FULL 才视为合同破坏；
+- `DSAInputBatchCacheLayout` 的 device view 提供 captured-prefix + PAD，
+  CPU 请求真源不变；
+- `DSAResidentTokenPool` 与 `DSAOffloadRuntime` 在 dummy warmup/capture
+  期间临时安装合法 SPARSE first-fill，forward 后统一恢复；
+- graph 的 full-block dump 固定为 captured-row 宽度，未使用行以
+  `src=0, dst=-1` 空转；eager 仍提交紧凑 jobs；
+- `_build_attention_metadata`、attention builder、模型 forward 和 ACLGraph
+  wrapper 均复用基线，不维护 graph-only 元数据类。
 
 ### 10.4 P7：场景扩展
 
@@ -356,6 +375,7 @@ preemption、prefix cache、MTP、chunked/mixed prefill 和 KV transfer 都会
 | `dsa_offload/scheduler.py` | 薄 phase barrier 与输出后释放 |
 | `dsa_offload/scheduler_output.py` | scheduler→worker 最小列式投影 |
 | `dsa_offload/input_batch.py` | worker 固定容量行状态与 ENTER 整表覆盖 |
+| `dsa_offload/graph_gate.py` | 原生 FULL decode graph 的纯准入策略 |
 | `dsa_offload/resident_pool.py` | 稳定 pool row 与逐层 LIDU `cache_slots` |
 | `dsa_offload/dram_store.py` | 固定 DRAM arena、逻辑 block ledger 与整行释放 |
 | `dsa_offload/runtime.py` | eager/graph 共用 metadata owner 与逐层执行上下文 |
@@ -376,10 +396,12 @@ preemption、prefix cache、MTP、chunked/mixed prefill 和 KV transfer 都会
 - HBM 容量报告只打印一次；
 - `async_scheduling=True` 按支持矩阵拒绝；
 - Indexer/MLA 3:1 容量和双 tensor 初始化符合预期。
+- GLM-5.1 W4A8、bsz=4、约 8K prompt 的 P5 eager 生成初验通过。
 
 P3 的请求布局、双 manager 失败原子性与 scheduler 薄适配，以及 P4 的
 projection pickle、最终行序重排、ENTER 整表覆盖、PAD 初始化和 stable
 批量刷新均已在 Linux + Ascend 环境通过 UT。P5 新增 resident pool、
-DRAM store 与 runtime 专项测试，当前本地静态检查通过；完整 910C 编译、
-算子专项测试和长请求端到端稀疏生成待执行。完整命令和逐阶段验收结果维护
-在迁移计划中。
+DRAM store 与 runtime 专项测试，并完成 910C 自定义算子编译和长请求
+eager 初验。P6 已增加 gate、capture dummy 恢复、PAD 和 dump 固定宽度
+合同测试；完整 910C FULL graph capture/replay 与数据集精度回归待执行。
+完整命令和逐阶段验收结果维护在迁移计划中。

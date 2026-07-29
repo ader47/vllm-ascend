@@ -388,3 +388,67 @@ class DSAOffloadConfig:
             raise ValueError(
                 f"sparse_activation_tokens and resident_budget_tokens must be aligned to block_size={block_size}"
             )
+
+    def validate_finalized_graph_contract(
+        self,
+        vllm_config: Any,
+        *,
+        phase: str,
+        require_resolved_mode: bool = False,
+    ) -> None:
+        """在基线完成图模式归一化后校验 DSA 的最终执行合同。
+
+        ``VllmConfig`` 和 Ascend attention backend 都可能继续调整用户输入的
+        compilation/cudagraph 配置，所以不能只在解析
+        ``dsa_sparse_config`` 时依据原始参数作判断。平台归一化和 backend
+        capability 决议后各调用一次本函数，确保错误配置在 capture 前失败。
+        """
+
+        if not self.enabled:
+            return
+
+        from vllm.config import CompilationMode, CUDAGraphMode
+
+        compilation_config = vllm_config.compilation_config
+        cudagraph_mode = compilation_config.cudagraph_mode
+        if self.enable_row_mode_decode_graph:
+            if compilation_config.mode != CompilationMode.VLLM_COMPILE:
+                raise ValueError(
+                    "DSA row-mode decode graph requires "
+                    "compilation_config.mode=VLLM_COMPILE after Ascend "
+                    f"normalization: phase={phase}, "
+                    f"mode={compilation_config.mode}"
+                )
+            if not cudagraph_mode.has_full_cudagraphs():
+                raise ValueError(
+                    "DSA row-mode decode graph requires a cudagraph mode "
+                    "with FULL decode graphs after Ascend normalization: "
+                    f"phase={phase}, cudagraph_mode={cudagraph_mode}"
+                )
+            if (
+                require_resolved_mode
+                and not cudagraph_mode.separate_routine()
+            ):
+                raise ValueError(
+                    "DSA row-mode decode graph requires a separate FULL "
+                    "decode routine (for example FULL_DECODE_ONLY), rather "
+                    "than an exact FULL graph shared with mixed batches: "
+                    f"phase={phase}, cudagraph_mode={cudagraph_mode}"
+                )
+            capture_sizes = compilation_config.cudagraph_capture_sizes
+            if not capture_sizes:
+                raise ValueError(
+                    "DSA row-mode decode graph requires non-empty "
+                    "cudagraph_capture_sizes after Ascend normalization: "
+                    f"phase={phase}"
+                )
+            return
+
+        if cudagraph_mode != CUDAGraphMode.NONE:
+            raise ValueError(
+                "DSA sparse offload with "
+                "enable_row_mode_decode_graph=False requires true eager "
+                "execution (cudagraph_mode=NONE). Set enforce_eager=True or "
+                "enable the DSA row-mode decode graph: "
+                f"phase={phase}, cudagraph_mode={cudagraph_mode}"
+            )

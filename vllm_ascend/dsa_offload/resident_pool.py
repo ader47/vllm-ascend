@@ -12,13 +12,14 @@ LIDU 会在每层、每个 decode step 原址刷新 ``cache_slots``。前 ``W-1`
 
 pool row 独立于 ``InputBatch`` 行号，因此基线对请求行做 condense/reorder 时
 不需要搬运一整行 ``max_model_len`` 状态；每轮只需把最终 batch row 映射为
-一个稳定 pool index。最后额外保留一行给后续图模式 PAD 使用。
+一个稳定 pool index。最后额外保留一行给图模式 PAD 使用。
 """
 
 from __future__ import annotations
 
 from collections import deque
 from collections.abc import Hashable
+from contextlib import suppress
 
 import torch
 
@@ -98,6 +99,7 @@ class DSAResidentTokenPool:
             :,
             self.cache_metadata_index,
         ].zero_()
+        self._graph_capture_row_count = 0
 
     def acquire(self, request_id: Hashable) -> int:
         """返回请求稳定行；首次出现时分配并清空一行。"""
@@ -178,6 +180,85 @@ class DSAResidentTokenPool:
                 f"[0, {self.num_layers})"
             )
         return self._cache_slots[layer_id]
+
+    @property
+    def graph_capture_row_count(self) -> int:
+        """返回当前临时安装的 graph-capture 行数。"""
+
+        return self._graph_capture_row_count
+
+    def prepare_graph_capture(
+        self,
+        *,
+        row_count: int,
+        target_budget_tokens: int,
+    ) -> None:
+        """为原生 FULL-graph dummy-run 安装逐层 first-fill 状态。
+
+        dummy 行直接复用真实 ``cache_slots`` 的前缀地址。捕获结束后统一
+        清空；实际 replay 仍通过 ``req_pool_entries`` 选择请求自己的稳定
+        pool row。
+        """
+
+        row_count = int(row_count)
+        target_budget_tokens = int(target_budget_tokens)
+        if self._graph_capture_row_count:
+            raise RuntimeError(
+                "DSA resident graph-capture rows were installed twice"
+            )
+        if self._request_to_index:
+            raise RuntimeError(
+                "DSA graph capture must complete before serving requests"
+            )
+        if not 0 < row_count <= self.max_num_reqs:
+            raise ValueError(
+                "DSA resident graph-capture row count is outside pool "
+                f"capacity: rows={row_count}, capacity={self.max_num_reqs}"
+            )
+        if not (
+            0
+            < target_budget_tokens
+            <= self.max_resident_budget_tokens
+        ):
+            raise ValueError(
+                "DSA graph-capture budget is outside resident capacity: "
+                f"budget={target_budget_tokens}, "
+                f"capacity={self.max_resident_budget_tokens}"
+            )
+
+        self._graph_capture_row_count = row_count
+        try:
+            self._cache_slots[:, :row_count].fill_(-1)
+            self._cache_slots[
+                :,
+                :row_count,
+                self.cache_metadata_index,
+            ].fill_(-target_budget_tokens)
+        except Exception:
+            # 保留首次安装失败作为根因；后续 capture 会重写完整前缀。
+            with suppress(Exception):
+                self._cache_slots[:, :row_count].fill_(-1)
+                self._cache_slots[
+                    :,
+                    :row_count,
+                    self.cache_metadata_index,
+                ].zero_()
+            self._graph_capture_row_count = 0
+            raise
+
+    def restore_after_graph_capture(self) -> None:
+        """清除 dummy 对逐层 tokenwise 状态的原址修改。"""
+
+        row_count = self._graph_capture_row_count
+        if not row_count:
+            return
+        self._cache_slots[:, :row_count].fill_(-1)
+        self._cache_slots[
+            :,
+            :row_count,
+            self.cache_metadata_index,
+        ].zero_()
+        self._graph_capture_row_count = 0
 
     def _require_index(self, request_id: Hashable) -> int:
         pool_index = self._request_to_index.get(request_id)

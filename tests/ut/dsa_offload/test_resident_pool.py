@@ -63,3 +63,57 @@ def test_padding_row_is_not_allocatable() -> None:
     assert pool.padding_pool_index == pool.max_num_reqs
     assert pool.acquire("req-a") != pool.padding_pool_index
     assert pool.acquire("req-b") != pool.padding_pool_index
+
+
+def test_graph_capture_first_fill_is_cleared_after_dummy_run() -> None:
+    pool = _make_pool()
+
+    pool.prepare_graph_capture(
+        row_count=2,
+        target_budget_tokens=4096,
+    )
+
+    for layer_id in range(pool.num_layers):
+        cache_slots = pool.get_cache_slots(layer_id)
+        assert cache_slots[
+            :2,
+            pool.cache_metadata_index,
+        ].tolist() == [-4096, -4096]
+
+    pool.restore_after_graph_capture()
+
+    for layer_id in range(pool.num_layers):
+        cache_slots = pool.get_cache_slots(layer_id)
+        assert cache_slots[
+            :2,
+            :pool.cache_metadata_index,
+        ].eq(-1).all()
+        assert cache_slots[
+            :2,
+            pool.cache_metadata_index,
+        ].tolist() == [0, 0]
+
+
+def test_graph_capture_reuses_one_resident_owner_across_sizes() -> None:
+    pool = _make_pool()
+    cache_slots_ptr = pool.get_cache_slots(0).data_ptr()
+
+    for row_count in (1, 2, 1):
+        pool.prepare_graph_capture(
+            row_count=row_count,
+            target_budget_tokens=4096,
+        )
+        assert pool.get_cache_slots(0).data_ptr() == cache_slots_ptr
+        for layer_id in range(pool.num_layers):
+            assert pool.get_cache_slots(layer_id)[
+                :row_count,
+                pool.cache_metadata_index,
+            ].tolist() == [-4096] * row_count
+
+        pool.restore_after_graph_capture()
+        assert pool.graph_capture_row_count == 0
+        for layer_id in range(pool.num_layers):
+            assert pool.get_cache_slots(layer_id)[
+                :,
+                pool.cache_metadata_index,
+            ].eq(0).all()

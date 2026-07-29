@@ -11,8 +11,8 @@
 * 本轮满块 dump 的紧凑 src/dst 列。
 
 所有大 tensor 在 model runner 初始化期预分配。steady step 只刷新 active
-prefix；DRAM 逻辑表未变化时不会重复 H2D。P6 图模式将复用这些 owner，
-而不是另建一套 graph-only 语义。
+prefix；DRAM 逻辑表未变化时不会重复 H2D。P6 图模式复用这些 owner 的
+captured-prefix + PAD，而不是另建一套 graph-only 语义。
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.dsa_offload.contracts import (
     DSA_DRAM_NULL_BLOCK_ID,
+    DSA_DUMP_NOOP_DST_BLOCK_ID,
     DSA_LIDU_OUTPUT_CAPACITY,
     DSA_ROW_MODE_SPARSE,
 )
@@ -134,6 +135,10 @@ class DSAOffloadRuntime:
             device=self.device,
             pin_memory=pin_memory,
         )
+        self.active_dram_block_table.np.fill(
+            DSA_DRAM_NULL_BLOCK_ID
+        )
+        self.active_dram_block_table.gpu.zero_()
         max_dump_jobs = (
             cdiv(self.max_num_tokens, self.block_size)
             + self.max_num_reqs
@@ -149,6 +154,14 @@ class DSAOffloadRuntime:
             dtype=torch.int32,
             device=self.device,
             pin_memory=pin_memory,
+        )
+        self.dump_src_block_ids.np.fill(0)
+        self.dump_dst_block_ids.np.fill(
+            DSA_DUMP_NOOP_DST_BLOCK_ID
+        )
+        self.dump_src_block_ids.gpu.zero_()
+        self.dump_dst_block_ids.gpu.fill_(
+            DSA_DUMP_NOOP_DST_BLOCK_ID
         )
         self._dump_pool_indices = np.empty(max_dump_jobs, dtype=np.intp)
         self._dump_logical_indices = np.empty(max_dump_jobs, dtype=np.intp)
@@ -186,7 +199,11 @@ class DSAOffloadRuntime:
 
         self.dram_store: DSAHotDRAMStore | None = None
         self.active_num_reqs = 0
+        self.execution_num_reqs = 0
         self.dump_job_count = 0
+        self.dump_launch_count = 0
+        self._graph_capture_row_count = 0
+        self._dram_table_row_count = 0
         self._dram_table_signature: tuple[int, int, int] | None = None
 
     def bind_dram_store(self, store: DSAHotDRAMStore) -> None:
@@ -242,6 +259,8 @@ class DSAOffloadRuntime:
         # 六列共用一个 owner，仅一次 H2D；后续 tensor 均为该 owner 的 view。
         state.copy_to_device(num_reqs)
         self.active_num_reqs = int(num_reqs)
+        self.execution_num_reqs = 0
+        self.dump_launch_count = 0
 
         self._prepare_dump_plan(
             input_batch=input_batch,
@@ -293,6 +312,139 @@ class DSAOffloadRuntime:
             out=resident_positions,
         )
         return resident_positions
+
+    @property
+    def graph_capture_row_count(self) -> int:
+        return self._graph_capture_row_count
+
+    def prepare_execution_view(
+        self,
+        *,
+        active_num_reqs: int,
+        graph_row_count: int | None,
+    ) -> int:
+        """把 active-prefix 绑定成 eager 或 FULL-graph 的执行 view。
+
+        eager 仅复制紧凑 dump jobs；graph 固定复制 captured-row 宽度，未
+        使用行以 ``dst=-1`` 空转。DRAM table 和请求列仍是同一固定 owner
+        的前缀，不创建 graph 专属副本。
+        """
+
+        if self._graph_capture_row_count:
+            raise RuntimeError(
+                "DSA real execution cannot reuse an active capture dummy"
+            )
+        active_num_reqs = int(active_num_reqs)
+        if active_num_reqs != self.active_num_reqs:
+            raise RuntimeError(
+                "DSA runtime active rows changed before execution view "
+                f"was finalized: prepared={self.active_num_reqs}, "
+                f"requested={active_num_reqs}"
+            )
+
+        if graph_row_count is None:
+            execution_num_reqs = active_num_reqs
+            launch_count = self.dump_job_count
+        else:
+            execution_num_reqs = int(graph_row_count)
+            if not (
+                active_num_reqs
+                <= execution_num_reqs
+                <= self.max_num_reqs
+            ):
+                raise RuntimeError(
+                    "DSA graph rows must cover active rows and fit runtime "
+                    f"capacity: active={active_num_reqs}, "
+                    f"graph={execution_num_reqs}, "
+                    f"capacity={self.max_num_reqs}"
+                )
+            if self.dump_job_count > active_num_reqs:
+                raise RuntimeError(
+                    "DSA single-token graph step produced more dump jobs "
+                    f"than active rows: jobs={self.dump_job_count}, "
+                    f"rows={active_num_reqs}"
+                )
+            launch_count = execution_num_reqs
+            if self.dump_job_count < launch_count:
+                tail = slice(self.dump_job_count, launch_count)
+                self.dump_src_block_ids.np[tail] = 0
+                self.dump_dst_block_ids.np[tail] = (
+                    DSA_DUMP_NOOP_DST_BLOCK_ID
+                )
+
+        if launch_count:
+            self.dump_src_block_ids.gpu[:launch_count].copy_(
+                self.dump_src_block_ids.cpu[:launch_count],
+                non_blocking=True,
+            )
+            self.dump_dst_block_ids.gpu[:launch_count].copy_(
+                self.dump_dst_block_ids.cpu[:launch_count],
+                non_blocking=True,
+            )
+        self.execution_num_reqs = execution_num_reqs
+        self.dump_launch_count = int(launch_count)
+        return execution_num_reqs
+
+    def prepare_graph_capture(self, *, row_count: int) -> None:
+        """为原生 dummy-run 安装固定地址 DRAM/dump 输入。"""
+
+        if self.dram_store is None:
+            raise RuntimeError(
+                "DSA graph capture requires an initialized DRAM store"
+            )
+        row_count = int(row_count)
+        if self._graph_capture_row_count:
+            raise RuntimeError(
+                "DSA runtime graph-capture state was installed twice"
+            )
+        if not 0 < row_count <= self.max_num_reqs:
+            raise ValueError(
+                "DSA runtime graph-capture row count is outside capacity: "
+                f"rows={row_count}, capacity={self.max_num_reqs}"
+            )
+
+        self._graph_capture_row_count = row_count
+        try:
+            self.active_dram_block_table.np[:row_count].fill(
+                DSA_DRAM_NULL_BLOCK_ID
+            )
+            self.active_dram_block_table.gpu[:row_count].zero_()
+            self.dump_src_block_ids.np[:row_count] = 0
+            self.dump_dst_block_ids.np[:row_count] = (
+                DSA_DUMP_NOOP_DST_BLOCK_ID
+            )
+            self.dump_src_block_ids.gpu[:row_count].zero_()
+            self.dump_dst_block_ids.gpu[:row_count].fill_(
+                DSA_DUMP_NOOP_DST_BLOCK_ID
+            )
+            self.active_num_reqs = row_count
+            self.execution_num_reqs = row_count
+            self.dump_job_count = 0
+            self.dump_launch_count = row_count
+        except Exception:
+            try:
+                self.restore_after_graph_capture()
+            except Exception:
+                # 保留首次安装失败作为根因，并至少解除 host 侧 installed 状态。
+                self.active_num_reqs = 0
+                self.execution_num_reqs = 0
+                self.dump_job_count = 0
+                self.dump_launch_count = 0
+                self._graph_capture_row_count = 0
+            raise
+
+    def restore_after_graph_capture(self) -> None:
+        """恢复 dummy-run 之外的空 runtime 状态。"""
+
+        if not self._graph_capture_row_count:
+            return
+        self.active_num_reqs = 0
+        self.execution_num_reqs = 0
+        self.dump_job_count = 0
+        self.dump_launch_count = 0
+        self._graph_capture_row_count = 0
+        self._dram_table_row_count = 0
+        self._dram_table_signature = None
 
     def _prepare_dump_plan(
         self,
@@ -420,8 +572,6 @@ class DSAOffloadRuntime:
                 new_rows,
                 out=self.dump_dst_block_ids.np[:copy_count],
             )
-            self.dump_src_block_ids.copy_to_gpu(copy_count)
-            self.dump_dst_block_ids.copy_to_gpu(copy_count)
         self.dump_job_count = copy_count
 
     def _refresh_active_dram_table(
@@ -437,6 +587,7 @@ class DSAOffloadRuntime:
         )
         if signature == self._dram_table_signature:
             return False
+        previous_row_count = self._dram_table_row_count
         active_cpu = self.active_dram_block_table.np[
             : self.active_num_reqs
         ]
@@ -446,14 +597,23 @@ class DSAOffloadRuntime:
             ],
             output=active_cpu,
         )
+        if self.active_num_reqs < previous_row_count:
+            self.active_dram_block_table.np[
+                self.active_num_reqs:previous_row_count
+            ].fill(DSA_DRAM_NULL_BLOCK_ID)
+        copy_row_count = max(
+            self.active_num_reqs,
+            previous_row_count,
+        )
         self.active_dram_block_table.gpu[
-            : self.active_num_reqs
+            :copy_row_count
         ].copy_(
             self.active_dram_block_table.cpu[
-                : self.active_num_reqs
+                :copy_row_count
             ],
             non_blocking=True,
         )
+        self._dram_table_row_count = self.active_num_reqs
         self._dram_table_signature = signature
         return True
 
@@ -629,7 +789,7 @@ class DSALayerOffloadContext:
         resident_nope_cache: torch.Tensor,
         resident_rope_cache: torch.Tensor,
     ) -> None:
-        job_count = self.runtime.dump_job_count
+        job_count = self.runtime.dump_launch_count
         if job_count == 0:
             return
         store = self.runtime.dram_store

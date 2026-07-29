@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
+from vllm.config import CompilationMode, CUDAGraphMode
 
 from vllm_ascend.dsa_offload.config import (
     DSAOffloadConfig,
@@ -26,6 +27,9 @@ def _vllm_config(
     pipeline_parallel_size: int = 1,
     kv_cache_metrics: bool = False,
     enable_kv_cache_events: bool = False,
+    compilation_mode: CompilationMode = CompilationMode.NONE,
+    cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    cudagraph_capture_sizes: list[int] | None = None,
 ):
     hf_text_config = SimpleNamespace(
         index_topk=2048,
@@ -65,6 +69,15 @@ def _vllm_config(
         ),
         speculative_config=speculative_config,
         kv_transfer_config=kv_transfer_config,
+        compilation_config=SimpleNamespace(
+            mode=compilation_mode,
+            cudagraph_mode=cudagraph_mode,
+            cudagraph_capture_sizes=(
+                []
+                if cudagraph_capture_sizes is None
+                else cudagraph_capture_sizes
+            ),
+        ),
     )
 
 
@@ -191,6 +204,158 @@ def test_block_contract_is_checked_after_backend_refresh() -> None:
 
     vllm_config.cache_config.block_size = 128
     config.validate_finalized_cache_contract(vllm_config)
+
+
+def test_final_graph_contract_accepts_separate_full_decode_routine() -> None:
+    vllm_config = _vllm_config(
+        enforce_eager=False,
+        compilation_mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        cudagraph_capture_sizes=[1, 2, 4],
+    )
+    config = DSAOffloadConfig.from_dict(
+        {
+            "enabled": True,
+            "enable_row_mode_decode_graph": True,
+        },
+        vllm_config=vllm_config,
+    )
+
+    config.validate_finalized_graph_contract(
+        vllm_config,
+        phase="test",
+        require_resolved_mode=True,
+    )
+
+
+def test_platform_graph_contract_allows_full_before_backend_resolution() -> None:
+    vllm_config = _vllm_config(
+        enforce_eager=False,
+        compilation_mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        cudagraph_capture_sizes=[1, 2, 4],
+    )
+    config = DSAOffloadConfig.from_dict(
+        {
+            "enabled": True,
+            "enable_row_mode_decode_graph": True,
+        },
+        vllm_config=vllm_config,
+    )
+
+    # Ascend attention backend may still normalize exact FULL into a
+    # separate decode routine. The stricter check runs after that resolution.
+    config.validate_finalized_graph_contract(
+        vllm_config,
+        phase="platform",
+    )
+
+
+def test_final_graph_contract_rejects_empty_capture_sizes() -> None:
+    vllm_config = _vllm_config(
+        enforce_eager=False,
+        compilation_mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        cudagraph_capture_sizes=[],
+    )
+    config = DSAOffloadConfig.from_dict(
+        {
+            "enabled": True,
+            "enable_row_mode_decode_graph": True,
+        },
+        vllm_config=vllm_config,
+    )
+
+    with pytest.raises(ValueError, match="non-empty"):
+        config.validate_finalized_graph_contract(
+            vllm_config,
+            phase="test",
+            require_resolved_mode=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("compilation_mode", "cudagraph_mode", "message"),
+    [
+        (
+            CompilationMode.NONE,
+            CUDAGraphMode.NONE,
+            "mode=VLLM_COMPILE",
+        ),
+        (
+            CompilationMode.VLLM_COMPILE,
+            CUDAGraphMode.PIECEWISE,
+            "requires a cudagraph mode with FULL",
+        ),
+        (
+            CompilationMode.VLLM_COMPILE,
+            CUDAGraphMode.FULL,
+            "separate FULL decode routine",
+        ),
+    ],
+)
+def test_final_graph_contract_rejects_incompatible_native_mode(
+    compilation_mode: CompilationMode,
+    cudagraph_mode: CUDAGraphMode,
+    message: str,
+) -> None:
+    vllm_config = _vllm_config(
+        enforce_eager=False,
+        compilation_mode=compilation_mode,
+        cudagraph_mode=cudagraph_mode,
+        cudagraph_capture_sizes=[1, 2, 4],
+    )
+    config = DSAOffloadConfig.from_dict(
+        {
+            "enabled": True,
+            "enable_row_mode_decode_graph": True,
+        },
+        vllm_config=vllm_config,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        config.validate_finalized_graph_contract(
+            vllm_config,
+            phase="test",
+            require_resolved_mode=True,
+        )
+
+
+def test_disabled_dsa_graph_requires_true_eager_native_mode() -> None:
+    vllm_config = _vllm_config(
+        enforce_eager=False,
+        compilation_mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        cudagraph_capture_sizes=[1, 2, 4],
+    )
+    config = DSAOffloadConfig.from_dict(
+        {"enabled": True},
+        vllm_config=vllm_config,
+    )
+
+    with pytest.raises(ValueError, match="requires true eager"):
+        config.validate_finalized_graph_contract(
+            vllm_config,
+            phase="test",
+        )
+
+
+def test_disabled_dsa_graph_accepts_true_eager_native_mode() -> None:
+    vllm_config = _vllm_config(
+        enforce_eager=True,
+        compilation_mode=CompilationMode.NONE,
+        cudagraph_mode=CUDAGraphMode.NONE,
+        cudagraph_capture_sizes=[],
+    )
+    config = DSAOffloadConfig.from_dict(
+        {"enabled": True},
+        vllm_config=vllm_config,
+    )
+
+    config.validate_finalized_graph_contract(
+        vllm_config,
+        phase="test",
+    )
 
 
 def test_trace_config_is_parsed_once_into_immutable_filters() -> None:

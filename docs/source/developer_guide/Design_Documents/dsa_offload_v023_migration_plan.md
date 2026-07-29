@@ -1,8 +1,8 @@
 # DSA 稀疏卸载 v0.23 迁移计划
 
-> - 最后更新：2026-07-28
-> - 当前阶段：P0-P4 已通过 Linux + Ascend 单测及 GLM-5.1 910C
->   cache-init/disabled 回归；P5 eager 数据面已接通，等待 910C 编译和生成验证
+> - 最后更新：2026-07-29
+> - 当前阶段：P0-P5 已接通并完成 GLM-5.1 910C 初验；P6 已复用原生
+>   FULL decode capture/replay 完成框架实现，等待服务器图编译与精度验证
 > - 迁移目标：只修改 vLLM-Ascend，不修改 vLLM
 
 ## 1. 文档职责
@@ -184,7 +184,7 @@ v0.23 的平台流程先构造 `AscendConfig`，后执行 `refresh_block_size()`
 | DCP/PCP | 均为 1 |
 | pipeline parallel | 1 |
 | KV-cache metrics/events | 关闭 |
-| 图模式 | P6 完成前仅验证 eager |
+| 图模式 | 原生 `FULL_DECODE_ONLY`；DSA row-mode gate 只放行单 token decode |
 
 这些限制用于隔离核心迁移，不代表最终能力边界。每解除一项限制，必须追加
 独立测试。
@@ -238,8 +238,8 @@ P0 当前状态：合同与矩阵已冻结；910C golden 工件待在 P2 数据�
 | P2 | 0 | Indexer/MLA spec、字节规划、物理 tensor 解耦 | GLM-5.1 910C cache 初始化与容量报告通过；DeepSeek-V3.2 回归待补 |
 | P3 | 0 | 独立 manager/coordinator 与请求 cache 布局合同 | Linux + Ascend 59 项累计 UT 通过 |
 | P4 | 1 | `NPUInputBatch`、block table、统一行状态 | Linux + Ascend UT、GLM-5.1 cache-init/disabled 回归通过 |
-| P5 | 1 | eager 数据面：dump、LIDU、KSC、SFA-Offload | 框架与算子绑定完成，静态检查通过；910C 编译/生成待验证 |
-| P6 | 1 | 复用原生图捕获/replay | 未开始 |
+| P5 | 1 | eager 数据面：dump、LIDU、KSC、SFA-Offload | GLM-5.1 910C、bsz=4、8K prompt eager 初验通过；完整精度矩阵待补 |
+| P6 | 1 | 复用原生图捕获/replay | 框架与合同 UT 已实现；等待 910C capture/replay 验证 |
 | P7 | 2 | 清理、场景扩展、A5 算子验证 | 未开始 |
 
 ## 9. P1：类型化配置与模型能力
@@ -357,8 +357,8 @@ P2 只处理“空间是什么、占多少、如何绑定”，不提前迁移�
 - P2 改变了物理 cache ABI；P5 已在 DSA 开启时把独立 Indexer tensor
   重新连接到 resident SFA forward；
 - 非 DSA 路径仍按原生 packed tuple 消费 cache；
-- P5 在本地已完成静态检查，910C 编译和端到端 `generate` 尚未完成，
-  因此不能把当前代码标记为服务器可用；
+- P5 已在 GLM-5.1 910C 完成自定义算子编译和 bsz=4、约 8K prompt
+  eager 生成初验；完整数据集精度、性能和 DeepSeek-V3.2 回归仍待补；
 - Indexer group 是“有独立物理 cache/block table、无独立 attention
   forward”的寻址 plane。`attn_groups[indexer_gid]` 有意为空；model runner
   对该 group 单独完成 kernel block-size 选择与 4D tensor reshape，并把
@@ -428,9 +428,9 @@ DeepSeek-V3.2 使用相同命令替换模型路径。预期：
 
 1. 待测试机具备权重后，完成 DeepSeek-V3.2 的 `cache-init` 强制回归。
 
-本轮 `cache-init` 成功只证明控制面、物理初始化和 worker 绑定成立；P4
-另有累计 UT 与 disabled 回归证据。它仍不覆盖 P5 的真实
-dump、LIDU/KSC/SFA-Offload 执行，P5 必须单独完成长请求生成验证。
+本轮 `cache-init` 成功只证明控制面、物理初始化和 worker 绑定成立；P5
+已经另用长请求 eager 生成覆盖真实 dump、LIDU/KSC/SFA-Offload。两类证据
+不能互相替代。
 
 ### 10.7 与 v0.19 语义实现的复核结论
 
@@ -651,7 +651,8 @@ python -m pytest \
 
 当前限制：
 
-- P5 仅接通 eager active-prefix，graph padding 在 P6 前显式拒绝；
+- P6 已在同一 owner 上增加 captured-prefix + PAD；P5 本身仍保持
+  active-prefix，不建立 graph-only 状态；
 - 原生 `IndexCache/skip_topk` 与逐层 LIDU resident 状态语义不同，启动绑定
   时显式拒绝；
 - DRAM arena 不扩容；preemption、prefix cache 与跨请求 block 共享留到 P7；
@@ -668,10 +669,88 @@ python -m pytest tests/ut/dsa_offload -vv --tb=short
 计划幂等性。通过 UT 后仍需执行自定义算子编译和 GLM-5.1 长请求 eager
 生成；短 prompt 或 `cache-init` 不能覆盖 P5。
 
+2026-07-29 的 GLM-5.1 W4A8、910C、TP16/EP、bsz=4、约 8K prompt
+eager 对照中，自定义算子链完成生成。修复 persistent InputBatch 临时移除
+请求时误释放 resident pool/DRAM ledger 后，四行输出均保持连贯，未再出现
+单行异常提前 EOS；该结果是 P5 冒烟通过，不替代 QA 数据集精度回归。
+
 ### P6：图模式
 
-复用 v0.23 原生 FULL decode capture/replay。DSA 只增加固定 buffer、逐行
-状态和准入条件；不得创建第二套 graph dispatcher 或 graph-only 语义字段。
+P6 复用 v0.23 原生 FULL decode capture/replay。没有新增 dispatcher，也
+没有复制 `_model_forward` 或 attention metadata builder。实现分为四层：
+
+1. `graph_gate.py` 只读取 P4 已投影的 InputBatch 阶段：
+
+   - 单 token `DENSE/ENTER/SPARSE` 任意混排允许 FULL graph；
+   - prefill、multi-token 和 capture-size miss 是正常 eager；
+   - owner 缺失、行数错位是内部合同破坏，直接报错。
+
+2. 原生 dispatcher 的最终 uniform FULL keys 是图容量唯一真源，仍负责
+   选择 capture size、向上 padding 和 DP 图模式协调：
+
+   - 用户原始 capture-size 会被 `max_num_seqs` 和 attention backend 能力
+     过滤，DSA gate 不读取这份原始列表；
+   - 当前只支持具有独立 decode routine 的模式，例如
+     `FULL_DECODE_ONLY`，拒绝 mixed/decode 共用的精确 `FULL`；
+   - DP replica 本来允许处于不同阶段。任一 replica 需要正常 eager 时，
+     所有 rank 跟随原生全局决议共同 eager；DP=1 且没有 cascade/encoder
+     等动态 blocker 时，gate 允许却未选择 FULL 才 fail-fast；
+   - DSA graph 开关关闭时要求原生 `cudagraph_mode=NONE`，避免启动期仍
+     capture 一组永远不会使用、且缺少 DSA dummy metadata 的基线图。
+3. eager 与 graph 共用以下 owner：
+
+   - `DSAInputBatchCacheLayout`：eager 取 active-prefix，graph 取
+     captured-prefix，尾行保持 PAD；
+   - `DSAResidentTokenPool`：真实请求按稳定 pool row 跨 step 持久化；
+   - `DSAOffloadRuntime`：active DRAM table、LIDU scratch 和 dump 列地址
+     不变。graph dump 采用 captured-row 固定宽度，未使用行写
+     `src=0, dst=-1` 空转；eager 仍只提交紧凑 jobs。
+
+4. 原生 dummy warmup/capture 不经过 `_prepare_inputs()`。P6 只在 dummy
+   生命周期内把上述 owner 的 device-prefix 临时设置为合法 SPARSE
+   first-fill，完整覆盖 attention metadata 构造和 model forward，随后在
+   `finally` 中恢复。CPU 请求语义真源不被 dummy 修改，LIDU 原址刷新过的
+   capture 行也会被清零，不能污染首个真实请求。
+
+真实 replay 的顺序保持基线范式：
+
+```text
+_update_states
+  -> _prepare_inputs（刷新统一 active owner）
+  -> DSA gate
+  -> 原生 dispatcher / padding
+  -> finalize execution view
+  -> 原生 _build_attention_metadata
+  -> 原生 FULL graph replay
+```
+
+P6 新增 UT 覆盖 DENSE/ENTER/SPARSE gate、正常 eager 原因、状态错位拒绝、
+最终图配置合同、多 capture size 共用固定 owner、capture dummy 恢复、
+PAD resident 行，以及 dump `dst=-1` 固定宽度空转。
+Windows 本机缺少已编译的 `vllm_ascend._build_info`，只能完成
+`py_compile`、Ruff 与 diff 检查；完整 UT 和 ACL graph 必须在 Ascend
+安装环境执行。
+
+服务器建议按以下顺序验证：
+
+```bash
+python -m pytest tests/ut/dsa_offload -vv --tb=short
+
+python examples/dsa_demo/simple_prompt_test.py \
+  --model /home/models/GLM-5.1-W4A8 \
+  --mode eager \
+  --max-num-seqs 4 \
+  --result-json /tmp/dsa-p6-eager.json
+
+python examples/dsa_demo/simple_prompt_test.py \
+  --model /home/models/GLM-5.1-W4A8 \
+  --mode graph \
+  --max-num-seqs 4 \
+  --result-json /tmp/dsa-p6-graph.json
+```
+
+随后用长短混合 prompt 覆盖全 DENSE、全 SPARSE、DENSE/ENTER/SPARSE
+混排、新满块 dump、active 3→captured 4 PAD 和请求结束后行复用。
 
 ### P7：扩展
 
@@ -714,6 +793,23 @@ MTP、async scheduling、KV transfer 和 A5 算子实现。
 | A5 算子实现 | P7 | 框架 ABI 保持不变，由算子侧适配 |
 
 ## 16. 变更记录
+
+- 2026-07-29：
+
+  - 完成 GLM-5.1 W4A8、910C、TP16/EP、bsz=4 的 P5 eager 长请求初验；
+  - 修复 persistent InputBatch 临时移除未调度请求时错误释放请求级
+    resident pool 与 DRAM ledger 的生命周期问题；
+  - P6 增加纯 DSA row-mode gate，并复用原生 dispatcher、FULL graph
+    capture/replay 和 attention metadata builder；
+  - DSA 图容量改为读取原生 dispatcher 最终 uniform FULL keys，拒绝共享
+    mixed-batch 的精确 `FULL`，并遵循原生 DP 全局 eager 决议；
+  - `DSAInputBatchCacheLayout`、`DSAResidentTokenPool` 与
+    `DSAOffloadRuntime` 增加 capture-only device-prefix 安装/恢复，
+    不修改 CPU 请求语义真源；
+  - eager 继续使用 active-prefix 与紧凑 dump jobs；graph 使用
+    captured-prefix + PAD，并用 `dst=-1` 固定宽度空转 dump；
+  - 增加 P6 gate、dummy 恢复、PAD 与 dump execution-view UT，并更新
+    demo 的 `graph` 服务器入口。
 
 - 2026-07-28：
 

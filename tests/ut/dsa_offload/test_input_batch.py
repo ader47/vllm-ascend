@@ -297,3 +297,51 @@ def test_unscheduled_request_keeps_pool_row_until_finished() -> None:
         projection=both_projection,
     )
     assert state.resident_token_pool.get_index("req-a") is not None
+
+
+def test_graph_capture_temporarily_reuses_device_owner() -> None:
+    state = _make_state()
+    cpu_before = state.columns.cpu.clone()
+
+    state.prepare_graph_capture(
+        row_count=4,
+        target_budget_tokens=2048,
+        resident_valid_tokens=2049,
+    )
+
+    assert state.graph_capture_row_count == 4
+    assert state.stages[:4].tolist() == [
+        int(DSARequestCacheStage.SPARSE_DECODE)
+    ] * 4
+    assert state.row_modes[:4].tolist() == [2, 2, 2, 2]
+    assert state.resident_pool_indices[:4].tolist() == [0, 1, 2, 3]
+    # capture dummy 不能改写 scheduler/worker 的 CPU 语义真源。
+    assert torch.equal(state.columns.cpu, cpu_before)
+
+    state.restore_after_graph_capture()
+
+    assert state.graph_capture_row_count == 0
+    assert torch.equal(state.columns.gpu, cpu_before)
+
+
+def test_graph_capture_reuses_one_input_owner_across_sizes() -> None:
+    state = _make_state()
+    cpu_before = state.columns.cpu.clone()
+    cpu_ptr = state.columns.cpu.data_ptr()
+    gpu_ptr = state.columns.gpu.data_ptr()
+
+    for row_count in (1, 2, 4, 2):
+        state.prepare_graph_capture(
+            row_count=row_count,
+            target_budget_tokens=2048,
+            resident_valid_tokens=2049,
+        )
+        assert state.columns.cpu.data_ptr() == cpu_ptr
+        assert state.columns.gpu.data_ptr() == gpu_ptr
+        assert state.resident_pool_indices[:row_count].tolist() == list(
+            range(row_count)
+        )
+
+        state.restore_after_graph_capture()
+        assert state.graph_capture_row_count == 0
+        assert torch.equal(state.columns.gpu, cpu_before)
