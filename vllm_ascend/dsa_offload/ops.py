@@ -68,6 +68,20 @@ def _squeeze_cache_head_dim(
     )
 
 
+def _normalize_lidu_weights_layout(weights: torch.Tensor) -> torch.Tensor:
+    """将 v0.23 合并投影产生的 weights view 收敛到 LIDU 连续布局。
+
+    v0.23 的 SFA 通过 ``wk_weights_proj`` 一次生成 key 与 weights，
+    ``kw[:, head_dim:]`` 在 batch size 大于 1 时是带较大行 stride 的列后缀
+    view。原生 lightning-indexer 能接收该 view，但 LIDU AscendC kernel 按
+    紧凑 ``[B, N_idx]`` 布局寻址。这里只规范化这一个小输入；cache 和固定
+    容量元数据仍必须由各自 owner 提供连续 tensor，避免在逐层热路径隐式
+    复制大张量。
+    """
+
+    return weights.contiguous()
+
+
 def lightning_indexer_decode_update(
     *,
     query: torch.Tensor,
@@ -80,6 +94,7 @@ def lightning_indexer_decode_update(
     block_table: torch.Tensor,
     outputs: DSALightningIndexerOutputs,
 ) -> None:
+    weights = _normalize_lidu_weights_layout(weights)
     torch.ops._C_ascend.npu_lightning_indexer_decode_update_out(
         query,
         key,
