@@ -23,7 +23,7 @@ import sys
 import time
 from collections import defaultdict
 from collections.abc import Callable
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
@@ -198,6 +198,10 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSl
 from vllm_ascend.dsa_offload.dram_store import (
     DSAHotDRAMStore,
     calculate_dram_usable_blocks,
+)
+from vllm_ascend.dsa_offload.graph_gate import (
+    DSARowModeGraphDecision,
+    evaluate_dsa_row_mode_decode_graph,
 )
 from vllm_ascend.dsa_offload.input_batch import (
     apply_dsa_cache_layout_projection,
@@ -656,6 +660,10 @@ class NPUModelRunner(GPUModelRunner):
             self.cudagraph_batch_sizes = sorted(self.compilation_config.cudagraph_capture_sizes)
         else:
             self.cudagraph_batch_sizes = []
+        # 这里只初始化占位值；真正的 DSA 图容量必须在 attention backend
+        # 完成 capability 决议、原生 dispatcher 建好 uniform FULL keys 后
+        # 重新计算，不能把用户原始 capture-size 列表当成图真源。
+        self._dsa_row_mode_max_capture_size = 0
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: Any | None = None
         self._mamba_copy_bufs: Any | None = None
@@ -732,12 +740,146 @@ class NPUModelRunner(GPUModelRunner):
             and not self.model_config.enforce_eager
         )
 
+    def _dsa_row_mode_decode_graph_enabled(self) -> bool:
+        """返回 DSA 是否接管原生 uniform-decode FULL graph。"""
+
+        return (
+            self.dsa_offload_enabled
+            and self.ascend_config.dsa_offload_config.enable_row_mode_decode_graph
+        )
+
+    def _evaluate_dsa_row_mode_graph_gate(
+        self,
+        *,
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+        max_num_scheduled_tokens: int,
+    ) -> DSARowModeGraphDecision | None:
+        """在原生 dispatcher 前读取统一 InputBatch 投影做纯准入判断。"""
+
+        if not self._dsa_row_mode_decode_graph_enabled():
+            return None
+        state = self.input_batch.dsa_cache_layout
+        if state is None:
+            return DSARowModeGraphDecision(
+                False,
+                "missing_input_batch_state",
+            )
+        return evaluate_dsa_row_mode_decode_graph(
+            state=state,
+            num_reqs=num_reqs,
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            max_capture_size=self._dsa_row_mode_max_capture_size,
+        )
+
+    @staticmethod
+    def _raise_dsa_row_mode_graph_violation(
+        decision: DSARowModeGraphDecision,
+        phase: str,
+    ) -> None:
+        raise RuntimeError(
+            "DSA row-mode decode graph contract violation: "
+            f"phase={phase}, decision={decision}"
+        )
+
+    def _dsa_graph_dummy_seq_len(self) -> int:
+        """返回能够真实执行 LIDU/KSC/SFA-Offload 的最小 dummy 长度。"""
+
+        target_budget = int(
+            self.ascend_config.dsa_offload_config.resident_budget_tokens[0]
+        )
+        dummy_seq_len = target_budget + 1
+        if dummy_seq_len > self.model_config.max_model_len:
+            raise RuntimeError(
+                "DSA graph capture needs max_model_len to cover the "
+                "smallest resident budget plus one token: "
+                f"required={dummy_seq_len}, "
+                f"max_model_len={self.model_config.max_model_len}"
+            )
+        return dummy_seq_len
+
+    def _prepare_dsa_graph_dummy_state(
+        self,
+        *,
+        row_count: int,
+    ) -> None:
+        """在现有 owner 上安装一次 capture-only SPARSE 前缀。"""
+
+        state = self.input_batch.dsa_cache_layout
+        resident_pool = self.dsa_resident_token_pool
+        runtime = self.dsa_offload_runtime
+        if state is None or resident_pool is None or runtime is None:
+            raise RuntimeError(
+                "DSA graph capture requires initialized InputBatch, "
+                "resident-pool and runtime owners"
+            )
+
+        target_budget = int(
+            self.ascend_config.dsa_offload_config.resident_budget_tokens[0]
+        )
+        dummy_seq_len = self._dsa_graph_dummy_seq_len()
+        pool_ready = False
+        state_ready = False
+        try:
+            resident_pool.prepare_graph_capture(
+                row_count=row_count,
+                target_budget_tokens=target_budget,
+            )
+            pool_ready = True
+            state.prepare_graph_capture(
+                row_count=row_count,
+                target_budget_tokens=target_budget,
+                resident_valid_tokens=dummy_seq_len,
+            )
+            state_ready = True
+            runtime.prepare_graph_capture(row_count=row_count)
+        except Exception:
+            if state_ready:
+                with suppress(Exception):
+                    state.restore_after_graph_capture()
+            if pool_ready:
+                with suppress(Exception):
+                    resident_pool.restore_after_graph_capture()
+            raise
+
+    def _restore_dsa_graph_dummy_state(self) -> None:
+        runtime = self.dsa_offload_runtime
+        state = self.input_batch.dsa_cache_layout
+        resident_pool = self.dsa_resident_token_pool
+        if runtime is None or state is None or resident_pool is None:
+            raise RuntimeError(
+                "DSA graph dummy state cannot be restored because an "
+                "owner disappeared"
+            )
+        try:
+            runtime.restore_after_graph_capture()
+        finally:
+            try:
+                state.restore_after_graph_capture()
+            finally:
+                resident_pool.restore_after_graph_capture()
+
+    @contextmanager
+    def _dsa_graph_dummy_state_scope(
+        self,
+        installed: bool,
+    ):
+        """覆盖 dummy metadata 构造与完整 forward，并在异常时可靠恢复。"""
+
+        try:
+            yield
+        finally:
+            if installed:
+                self._restore_dsa_graph_dummy_state()
+
     def _sync_metadata_across_dp(
         self,
         num_tokens: int,
         is_draft_model: bool = False,
         cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         allow_dp_padding: bool = False,
+        allow_dp_padding_without_cudagraph: bool | None = None,
     ) -> tuple[int, torch.Tensor | None, CUDAGraphMode]:
         # TODO: In vLLM, the only thing that needs to be synced is num_tokens, but in
         # our case, we still need to sync the other two flags as well. So we need to
@@ -771,6 +913,16 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_across_dp = packed_tensor[0, :]
         max_tokens_across_dp = int(num_tokens_across_dp.max().item())
         synced_cudagraph_mode = CUDAGraphMode(_post_process_cudagraph_mode(packed_tensor))
+
+        # DSA 的本地 gate 已体现在各 rank 上报的 graph mode 中。同步后的
+        # mode 才是整个 DP group 的图结论：若任一 replica 需要 eager，
+        # 不能让“本地曾经选中 FULL”继续单方面触发 graph DP padding。
+        # 仍需保留 SP/oproj/embedding 等与图无关的基线 padding 条件。
+        if allow_dp_padding_without_cudagraph is not None:
+            allow_dp_padding = (
+                synced_cudagraph_mode != CUDAGraphMode.NONE
+                or allow_dp_padding_without_cudagraph
+            )
 
         # Create a tensor for num_tokens_after_padding
         if allow_dp_padding or is_draft_model:
@@ -2125,6 +2277,7 @@ class NPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        force_dsa_row_mode_eager = False
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Fix up prev_req_id_to_index for requests that were discarded
@@ -2215,6 +2368,42 @@ class NPUModelRunner(GPUModelRunner):
                         scheduler_output.num_common_prefix_blocks,
                     )
 
+                dsa_graph_decision = (
+                    self._evaluate_dsa_row_mode_graph_gate(
+                        num_reqs=num_reqs,
+                        total_num_scheduled_tokens=num_tokens_unpadded,
+                        max_num_scheduled_tokens=max_num_scheduled_tokens,
+                    )
+                )
+                # DSA 开启但 row-mode graph 未开启时，不能让原生 FULL 图
+                # 捕获只覆盖基线 metadata。图开关开启后，prefill、
+                # multi-token 及 capture-size miss 属于正常 true-eager；
+                # 状态缺失/错位则是内部合同破坏，直接报错。
+                force_dsa_row_mode_eager = self.dsa_offload_enabled
+                if dsa_graph_decision is not None:
+                    if dsa_graph_decision.use_full_graph:
+                        force_dsa_row_mode_eager = False
+                    elif dsa_graph_decision.is_expected_eager:
+                        force_dsa_row_mode_eager = True
+                    else:
+                        self._raise_dsa_row_mode_graph_violation(
+                            dsa_graph_decision,
+                            "gate",
+                        )
+                # DSA gate 只判断自身 row-mode 合同；cascade/encoder 是原生
+                # dispatcher 的动态 FULL blocker。它们属于正常 true-eager
+                # 阶段，必须在 dispatch 前传入 force_eager，不能先得到一张
+                # PIECEWISE 图再把它误报成 DSA 合同破坏。
+                if (
+                    dsa_graph_decision is not None
+                    and dsa_graph_decision.use_full_graph
+                    and (
+                        cascade_attn_prefix_lens is not None
+                        or scheduler_output.scheduled_encoder_inputs
+                    )
+                ):
+                    force_dsa_row_mode_eager = True
+
                 (
                     cudagraph_mode,
                     batch_desc,
@@ -2227,9 +2416,48 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
-                    force_eager=self.model_config.enforce_eager,
+                    force_eager=(
+                        self.model_config.enforce_eager
+                        or force_dsa_row_mode_eager
+                    ),
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
+
+                dsa_graph_row_count: int | None = None
+                if (
+                    dsa_graph_decision is not None
+                    and dsa_graph_decision.use_full_graph
+                    and not force_dsa_row_mode_eager
+                ):
+                    if cudagraph_mode != CUDAGraphMode.FULL:
+                        # 原生 DP 协同以所有 rank 的最低 graph mode 为准。
+                        # 本 rank 即使满足 DSA 合同，只要另一 rank 正在
+                        # prefill 或 capture-size miss，最终也必须共同执行
+                        # eager。这是全局 batch 的正常状态，不是本 rank
+                        # metadata 损坏；DP=1 下仍保持 fail-fast。
+                        if self.dp_size > 1:
+                            force_dsa_row_mode_eager = True
+                            logger.debug(
+                                "DSA local graph candidate follows native DP "
+                                "coordination into eager mode: mode=%s",
+                                cudagraph_mode,
+                            )
+                        else:
+                            self._raise_dsa_row_mode_graph_violation(
+                                dsa_graph_decision,
+                                "native_full_graph_not_selected",
+                            )
+                    else:
+                        captured_row_count = batch_desc.num_reqs
+                        if (
+                            captured_row_count is None
+                            or int(captured_row_count) < num_reqs
+                        ):
+                            self._raise_dsa_row_mode_graph_violation(
+                                dsa_graph_decision,
+                                "invalid_captured_row_count",
+                            )
+                        dsa_graph_row_count = int(captured_row_count)
 
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
@@ -2331,6 +2559,28 @@ class NPUModelRunner(GPUModelRunner):
                         batch_desc.num_reqs,
                     )
 
+                if self.dsa_offload_enabled:
+                    dsa_runtime = self.dsa_offload_runtime
+                    if dsa_runtime is None:
+                        raise RuntimeError(
+                            "DSA runtime is missing while finalizing the "
+                            "model-forward execution view"
+                        )
+                    if (
+                        dsa_graph_row_count is not None
+                        and num_reqs_padded != dsa_graph_row_count
+                    ):
+                        raise RuntimeError(
+                            "DSA/native graph row counts diverged after "
+                            "attention padding: "
+                            f"gate={dsa_graph_row_count}, "
+                            f"metadata={num_reqs_padded}"
+                        )
+                    dsa_runtime.prepare_execution_view(
+                        active_num_reqs=num_reqs,
+                        graph_row_count=dsa_graph_row_count,
+                    )
+
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded
                     if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
@@ -2391,6 +2641,9 @@ class NPUModelRunner(GPUModelRunner):
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
+        skip_compiled_model_forward = (
+            has_encoder_input or force_dsa_row_mode_eager
+        )
 
         # Run forward pass
         defer_kv_connector_finalize = self.speculative_config is not None and (
@@ -2408,7 +2661,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
-                skip_compiled=has_encoder_input,
+                skip_compiled=skip_compiled_model_forward,
                 has_sinks=self._has_sinks,
                 input_ids=input_ids,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
@@ -3094,13 +3347,23 @@ class NPUModelRunner(GPUModelRunner):
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
+            allow_dp_padding_without_cudagraph = (
+                enable_sp(self.vllm_config)
+                or oproj_tp_enable()
+                or embedding_tp_enable()
+            )
             _, num_tokens_across_dp, synced_cudagraph_mode = self._sync_metadata_across_dp(
                 num_tokens=num_tokens_padded,
                 cudagraph_mode=cudagraph_mode,
-                allow_dp_padding=((cudagraph_mode != CUDAGraphMode.NONE)
-                                  or enable_sp(self.vllm_config)
-                                  or oproj_tp_enable()
-                                  or embedding_tp_enable()),
+                allow_dp_padding=(
+                    cudagraph_mode != CUDAGraphMode.NONE
+                    or allow_dp_padding_without_cudagraph
+                ),
+                allow_dp_padding_without_cudagraph=(
+                    allow_dp_padding_without_cudagraph
+                    if self._dsa_row_mode_decode_graph_enabled()
+                    else None
+                ),
             )
 
             # Extract DP padding if there is any
@@ -3272,35 +3535,71 @@ class NPUModelRunner(GPUModelRunner):
             dsa_indexer_block_table = None
             dsa_indexer_slot_mapping = None
         if self.dsa_kv_cache_group_ids is not None:
-            if num_reqs_padded != num_reqs or num_tokens_padded != num_tokens:
-                raise RuntimeError(
-                    "DSA P5 eager metadata does not yet support graph-padded "
-                    "rows/tokens; enable graph after P6 is connected"
-                )
             dsa_state = self.input_batch.dsa_cache_layout
             dsa_runtime = self.dsa_offload_runtime
-            if dsa_state is None or dsa_runtime is None:
+            dsa_resident_pool = self.dsa_resident_token_pool
+            if (
+                dsa_state is None
+                or dsa_runtime is None
+                or dsa_resident_pool is None
+            ):
                 raise RuntimeError(
                     "DSA metadata owner is missing during attention build"
                 )
-            if (
-                not dsa_state.valid
-                or dsa_state.row_count != num_reqs
-                or dsa_runtime.active_num_reqs != num_reqs
+            state_capture_rows = dsa_state.graph_capture_row_count
+            runtime_capture_rows = dsa_runtime.graph_capture_row_count
+            resident_capture_rows = (
+                dsa_resident_pool.graph_capture_row_count
+            )
+            is_capture_dummy = bool(
+                state_capture_rows
+                or runtime_capture_rows
+                or resident_capture_rows
+            )
+            if not (
+                state_capture_rows
+                == runtime_capture_rows
+                == resident_capture_rows
             ):
+                raise RuntimeError(
+                    "DSA graph-capture owners disagree on row count: "
+                    f"state={state_capture_rows}, "
+                    f"runtime={runtime_capture_rows}, "
+                    f"resident={resident_capture_rows}"
+                )
+            if is_capture_dummy:
+                metadata_ready = (
+                    state_capture_rows == num_reqs_padded
+                    and dsa_runtime.execution_num_reqs == num_reqs_padded
+                )
+            else:
+                metadata_ready = (
+                    dsa_state.valid
+                    and dsa_state.row_count == num_reqs
+                    and dsa_runtime.active_num_reqs == num_reqs
+                    and dsa_runtime.execution_num_reqs
+                    == num_reqs_padded
+                )
+            if not metadata_ready:
                 raise RuntimeError(
                     "DSA attention metadata is stale: "
                     f"state_valid={dsa_state.valid}, "
                     f"state_rows={dsa_state.row_count}, "
                     f"runtime_rows={dsa_runtime.active_num_reqs}, "
-                    f"num_reqs={num_reqs}"
+                    "runtime_execution_rows="
+                    f"{dsa_runtime.execution_num_reqs}, "
+                    f"capture_rows={state_capture_rows}, "
+                    f"num_reqs={num_reqs}, "
+                    f"num_reqs_padded={num_reqs_padded}"
                 )
-            dsa_row_modes = dsa_state.row_modes[:num_reqs]
+            dsa_row_modes = dsa_state.row_modes[:num_reqs_padded]
             dsa_resident_pool_indices = (
-                dsa_state.resident_pool_indices[:num_reqs]
+                dsa_state.resident_pool_indices[:num_reqs_padded]
             )
             dsa_dram_block_table = (
-                dsa_runtime.active_dram_block_table.gpu[:num_reqs]
+                dsa_runtime.active_dram_block_table.gpu[
+                    :num_reqs_padded
+                ]
             )
         else:
             dsa_row_modes = None
@@ -3641,6 +3940,14 @@ class NPUModelRunner(GPUModelRunner):
             )
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+        prepare_dsa_graph_dummy = (
+            self._dsa_row_mode_decode_graph_enabled()
+            and uniform_decode
+            and (
+                force_attention
+                or cudagraph_runtime_mode == CUDAGraphMode.FULL
+            )
+        )
         if num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             num_tokens_across_dp[:] = num_tokens_padded
@@ -3652,6 +3959,7 @@ class NPUModelRunner(GPUModelRunner):
         # vllm-ascend does not support ubatch now
         ubatch_slices, ubatch_slices_padded = None, None
         attn_metadata: PerLayerAttnMetadata | None = None
+        dsa_graph_dummy_installed = False
         # Build attention metadata for dummy_run
         if self._should_build_dummy_attn_metadata(force_attention, is_profile, cudagraph_runtime_mode):
             if create_mixed_batch:
@@ -3678,6 +3986,11 @@ class NPUModelRunner(GPUModelRunner):
                     if is_graph_capturing and using_paged_attention(num_tokens, self.vllm_config)
                     else max_query_len
                 )  # type: ignore[assignment]
+            if prepare_dsa_graph_dummy:
+                seq_lens = max(
+                    int(seq_lens),
+                    self._dsa_graph_dummy_seq_len(),
+                )
 
             self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
             self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
@@ -3711,30 +4024,50 @@ class NPUModelRunner(GPUModelRunner):
             if self.use_compress:
                 self.positions.fill_(127)
                 self._dsa_positions_cpu_buf.fill_(127)
-            attn_metadata, _ = self._build_attention_metadata(
-                num_tokens=num_tokens_unpadded,
-                num_tokens_padded=num_tokens_padded,
-                num_reqs=num_reqs,
-                num_reqs_padded=num_reqs_padded,
-                max_query_len=max_query_len,
-                ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
-                for_cudagraph_capture=is_graph_capturing,
-                num_scheduled_tokens_np=num_scheduled_tokens,
-            )
-            if not is_graph_capturing:
-                for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
-                    blk_table = self.input_batch.block_table[kv_cache_gid]
-                    blk_table.slot_mapping.gpu.fill_(-1)
+            if prepare_dsa_graph_dummy:
+                self._prepare_dsa_graph_dummy_state(
+                    row_count=num_reqs_padded,
+                )
+                dsa_graph_dummy_installed = True
+            try:
+                attn_metadata, _ = self._build_attention_metadata(
+                    num_tokens=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded,
+                    max_query_len=max_query_len,
+                    ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
+                    for_cudagraph_capture=is_graph_capturing,
+                    num_scheduled_tokens_np=num_scheduled_tokens,
+                )
+                if not is_graph_capturing:
+                    for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
+                        blk_table = self.input_batch.block_table[kv_cache_gid]
+                        blk_table.slot_mapping.gpu.fill_(-1)
+            except Exception:
+                if dsa_graph_dummy_installed:
+                    self._restore_dsa_graph_dummy_state()
+                    dsa_graph_dummy_installed = False
+                raise
 
-        with self.maybe_dummy_run_with_lora(
-            self.lora_config,
-            num_scheduled_tokens,
-            num_sampled_tokens,
-            remove_lora,
-            # TODO: The next line is a temporary workaround
-            # to fix the accuracy issue of test_llama32_lora.py,
-            # which is introduced by vllm-project/vllm#32005
-            num_active_loras=(self.lora_config.max_loras if self.lora_config is not None else num_active_loras),
+        with (
+            self._dsa_graph_dummy_state_scope(
+                dsa_graph_dummy_installed
+            ),
+            self.maybe_dummy_run_with_lora(
+                self.lora_config,
+                num_scheduled_tokens,
+                num_sampled_tokens,
+                remove_lora,
+                # TODO: The next line is a temporary workaround
+                # to fix the accuracy issue of test_llama32_lora.py,
+                # which is introduced by vllm-project/vllm#32005
+                num_active_loras=(
+                    self.lora_config.max_loras
+                    if self.lora_config is not None
+                    else num_active_loras
+                ),
+            ),
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
@@ -5514,6 +5847,29 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.cudagraph_dispatcher.initialize_cudagraph_keys(
                 cudagraph_mode, self.uniform_decode_query_len
+            )
+        self.ascend_config.dsa_offload_config.validate_finalized_graph_contract(
+            self.vllm_config,
+            phase="attention_backend",
+            require_resolved_mode=True,
+        )
+        self._dsa_row_mode_max_capture_size = max(
+            (
+                int(key.num_reqs)
+                for key in self.cudagraph_dispatcher.cudagraph_keys[
+                    CUDAGraphMode.FULL
+                ]
+                if key.uniform and key.num_reqs is not None
+            ),
+            default=0,
+        )
+        if (
+            self._dsa_row_mode_decode_graph_enabled()
+            and self._dsa_row_mode_max_capture_size <= 0
+        ):
+            raise RuntimeError(
+                "DSA row-mode decode graph requires native uniform FULL "
+                "decode capture keys after attention-backend resolution"
             )
 
         if (

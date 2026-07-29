@@ -1,10 +1,12 @@
 # DSA 稀疏卸载 v0.23 迁移 Demo
 
-本目录用于分别验证迁移阶段的 P2 KV-cache 控制面和 P5 eager 数据面。
+本目录用于分别验证迁移阶段的 P2 KV-cache 控制面、P5 eager 数据面和
+P6 FULL decode graph。
 
 P2 已把 Indexer dense plane 与 MLA resident plane 拆成独立 spec、group、
 tensor 和物理 block pool。P4 已接通 scheduler/worker 请求语义，P5 已接通
-LIDU、KSC、SFA-Offload、固定 DRAM store 和满块 dump；P6 图模式尚未迁移。
+LIDU、KSC、SFA-Offload、固定 DRAM store 和满块 dump；P6 在同一套
+InputBatch/runtime owner 上接入 v0.23 原生 FULL decode capture/replay。
 
 ## 1. 前置条件
 
@@ -18,7 +20,7 @@ LIDU、KSC、SFA-Offload、固定 DRAM store 和满块 dump；P6 图模式尚未
 P5 新增并注册了自定义算子。无论是否使用 editable 安装，首次部署该提交都
 需要完整重编译并重新安装 vLLM-Ascend。
 
-## 2. 四个验收用例
+## 2. 五个验收用例
 
 下面以 GLM-5.1 模型为例。输出分别保存为 JSON，便于核对启动结果和 token
 序列。
@@ -95,14 +97,40 @@ python examples/dsa_demo/simple_prompt_test.py \
 DSA sparse offload currently requires async_scheduling=False
 ```
 
+### 2.5 DSA 开启：P6 FULL decode graph
+
+```bash
+python examples/dsa_demo/simple_prompt_test.py \
+  --model /home/models/GLM-5.1-W4A8 \
+  --mode graph \
+  --max-num-seqs 4 \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 8192 \
+  --result-json /tmp/dsa-p6-graph.json
+```
+
+脚本按 `max_num_seqs` 自动生成原生 FULL decode capture sizes。prefill、
+multi-token 和 capture size 未覆盖属于正常 eager；单 token 的
+DENSE/ENTER/SPARSE 任意混排行复用同一类 FULL 图，active batch 可以向上
+padding，额外行由统一 owner 提供 PAD。必须使用具有独立 decode routine
+的模式（脚本配置为 `FULL_DECODE_ONLY`）；图容量以原生 dispatcher 最终
+保留的 uniform FULL keys 为准，而非用户输入列表。DP 下任一 replica
+处于正常 eager 阶段时，所有 rank 跟随原生全局决议共同 eager。
+
+默认短 prompt 主要验证全 DENSE replay。验证 ENTER/SPARSE、新满块 dump
+与 PAD 时，传入长短混合 prompt，并至少让 `max_num_seqs` 大于实际请求数
+一次，以覆盖 captured rows 大于 active rows。
+
 ## 3. 结果核对
 
-`disabled`、`cache-init` 和 `eager` 都成功后，核对：
+`disabled`、`cache-init`、`eager` 和 `graph` 都成功后，核对：
 
 - 两次使用相同模型、prompt、seed 和采样参数；
 - `disabled` 的输出结构、首 token 和 finish reason 是否合理；
 - `cache-init` 日志中是否恰好包含一份 DSA 容量报告；
 - `eager` 是否真实完成生成，并覆盖预期的 DENSE/ENTER/SPARSE 行；
+- `graph` 是否完成 capture/replay，且与 eager 没有异常 EOS、乱码或行间
+  状态污染；
 - Indexer/MLA block 数、token 容量和总分配字节是否自洽；
 - `reject-async` 是否准确命中预期错误，而不是在更早位置异常退出。
 
@@ -124,5 +152,5 @@ token IDs 不一致视为配置副作用；不能直接用跨进程逐 token 相
 
 v0.19 的 `qa_dataset_test.py` 和 `eval_dataset_acc_score.py` 用于完整 DSA
 数据面的精度回归。P5 服务器冒烟通过后，再迁移这两个脚本并建立
-GLM-5.1 为主、DeepSeek-V3.2 为强制回归的完整精度矩阵；P6 会在同一元数据
-所有权模型上继续接入图模式。
+GLM-5.1 为主、DeepSeek-V3.2 为强制回归的完整精度矩阵；P6 已在同一元数据
+所有权模型上接入图模式，但仍需完成 910C capture/replay 与精度验收。

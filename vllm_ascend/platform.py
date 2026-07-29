@@ -662,6 +662,10 @@ class NPUPlatform(Platform):
 
         refresh_block_size(vllm_config)
         ascend_config.dsa_offload_config.validate_finalized_cache_contract(vllm_config)
+        ascend_config.dsa_offload_config.validate_finalized_graph_contract(
+            vllm_config,
+            phase="platform",
+        )
 
         # Activate custom ops for v1, except on 310P
         if get_ascend_device_type() != AscendDeviceType._310P:

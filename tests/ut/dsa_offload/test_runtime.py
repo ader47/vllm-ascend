@@ -28,20 +28,22 @@ class _ResidentBlockTable:
         return self._rows
 
 
-def _make_runtime() -> tuple[
+def _make_runtime(
+    max_num_reqs: int = 1,
+) -> tuple[
     DSAResidentTokenPool,
     DSAOffloadRuntime,
     DSAHotDRAMStore,
 ]:
     resident_pool = DSAResidentTokenPool(
-        max_num_reqs=1,
+        max_num_reqs=max_num_reqs,
         num_layers=2,
         max_model_len=512,
         max_resident_budget_tokens=256,
         device=torch.device("cpu"),
     )
     runtime = DSAOffloadRuntime(
-        max_num_reqs=1,
+        max_num_reqs=max_num_reqs,
         max_num_tokens=512,
         num_layers=2,
         max_model_len=512,
@@ -189,3 +191,67 @@ def test_enter_rejects_missing_dram_source_blocks() -> None:
         assert "first_missing_logical_block=0" in str(error)
     else:
         raise AssertionError("ENTER must reject a null DRAM source mapping")
+
+
+def test_graph_execution_view_pads_dump_jobs_with_noop_rows() -> None:
+    _, runtime, _ = _make_runtime(max_num_reqs=4)
+    runtime.active_num_reqs = 2
+    runtime.dump_job_count = 1
+    runtime.dump_src_block_ids.np[0] = 7
+    runtime.dump_dst_block_ids.np[0] = 9
+
+    execution_rows = runtime.prepare_execution_view(
+        active_num_reqs=2,
+        graph_row_count=4,
+    )
+
+    assert execution_rows == 4
+    assert runtime.execution_num_reqs == 4
+    assert runtime.dump_launch_count == 4
+    assert runtime.dump_src_block_ids.gpu[:4].tolist() == [7, 0, 0, 0]
+    assert runtime.dump_dst_block_ids.gpu[:4].tolist() == [9, -1, -1, -1]
+
+
+def test_eager_execution_view_keeps_compact_dump_jobs() -> None:
+    _, runtime, _ = _make_runtime(max_num_reqs=4)
+    runtime.active_num_reqs = 2
+    runtime.dump_job_count = 1
+    runtime.dump_src_block_ids.np[0] = 7
+    runtime.dump_dst_block_ids.np[0] = 9
+
+    execution_rows = runtime.prepare_execution_view(
+        active_num_reqs=2,
+        graph_row_count=None,
+    )
+
+    assert execution_rows == 2
+    assert runtime.execution_num_reqs == 2
+    assert runtime.dump_launch_count == 1
+    assert runtime.dump_src_block_ids.gpu[:1].tolist() == [7]
+    assert runtime.dump_dst_block_ids.gpu[:1].tolist() == [9]
+
+
+def test_graph_capture_runtime_can_be_reused_for_multiple_sizes() -> None:
+    _, runtime, _ = _make_runtime(max_num_reqs=4)
+
+    for row_count in (4, 2, 1):
+        runtime.prepare_graph_capture(row_count=row_count)
+
+        assert runtime.graph_capture_row_count == row_count
+        assert runtime.active_num_reqs == row_count
+        assert runtime.execution_num_reqs == row_count
+        assert runtime.dump_launch_count == row_count
+        assert runtime.active_dram_block_table.gpu[
+            :row_count
+        ].eq(0).all()
+        assert runtime.dump_dst_block_ids.gpu[
+            :row_count
+        ].eq(-1).all()
+
+        runtime.restore_after_graph_capture()
+
+        assert runtime.graph_capture_row_count == 0
+        assert runtime.active_num_reqs == 0
+        assert runtime.execution_num_reqs == 0
+        assert runtime.dump_job_count == 0
+        assert runtime.dump_launch_count == 0

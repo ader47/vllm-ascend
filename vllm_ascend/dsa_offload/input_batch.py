@@ -26,6 +26,7 @@ ledger 属于完整请求生命周期，只能在 ``finished_req_ids`` 到达时
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -98,6 +99,15 @@ class DSAInputBatchCacheLayout:
         self.columns.np[_RESIDENT_POOL_INDEX_COLUMN].fill(
             resident_token_pool.padding_pool_index
         )
+        # 图 capture 发生在真实请求到来前，但会直接消费同一组 device
+        # view。初始化时先把 PAD 真值同步到设备，避免首个 dummy capture
+        # 看到 ``torch.empty`` 留下的未定义尾行。
+        self.columns.gpu.copy_(self.columns.cpu)
+        self._capture_pool_indices = torch.arange(
+            self.max_num_reqs,
+            dtype=torch.int32,
+            device=device,
+        )
         self._sparse_row_mask = np.empty(
             self.max_num_reqs,
             dtype=np.bool_,
@@ -107,6 +117,7 @@ class DSAInputBatchCacheLayout:
         self.mapping_version = 0
         self.row_count = 0
         self.valid = False
+        self._graph_capture_row_count = 0
 
     @property
     def stages_cpu(self) -> np.ndarray:
@@ -324,6 +335,69 @@ class DSAInputBatchCacheLayout:
         # 也避免对非连续列 view 逐列 copy 或现场 contiguous。
         self.columns.gpu.copy_(self.columns.cpu, non_blocking=True)
         return self.columns.gpu
+
+    @property
+    def graph_capture_row_count(self) -> int:
+        return self._graph_capture_row_count
+
+    def prepare_graph_capture(
+        self,
+        *,
+        row_count: int,
+        target_budget_tokens: int,
+        resident_valid_tokens: int,
+    ) -> None:
+        """在原生 dummy-run 期间安装合法的 SPARSE captured-prefix。
+
+        capture 只临时改写现有 owner 的 device 值，CPU 请求投影仍保持原样。
+        因此它不会建立第二套 graph 状态；恢复时重新从 CPU owner 同步即可。
+        """
+
+        row_count = int(row_count)
+        if self._graph_capture_row_count:
+            raise RuntimeError(
+                "DSA InputBatch graph-capture state was installed twice"
+            )
+        if not 0 < row_count <= self.max_num_reqs:
+            raise ValueError(
+                "DSA graph-capture row count is outside InputBatch "
+                f"capacity: rows={row_count}, capacity={self.max_num_reqs}"
+            )
+
+        self._graph_capture_row_count = row_count
+        try:
+            self.columns.gpu.copy_(self.columns.cpu)
+            rows = slice(0, row_count)
+            self.stages[rows].fill_(
+                int(DSARequestCacheStage.SPARSE_DECODE)
+            )
+            self.target_resident_budget_tokens[rows].fill_(
+                int(target_budget_tokens)
+            )
+            self.sparse_budget_tokens[rows].fill_(
+                int(target_budget_tokens)
+            )
+            self.resident_valid_tokens[rows].fill_(
+                int(resident_valid_tokens)
+            )
+            self.row_modes[rows].fill_(DSA_ROW_MODE_SPARSE)
+            self.resident_pool_indices[rows].copy_(
+                self._capture_pool_indices[:row_count]
+            )
+        except Exception:
+            # 保留首次安装失败作为根因；后续 capture 会重写完整 owner。
+            with suppress(Exception):
+                self.columns.gpu.copy_(self.columns.cpu)
+            self._graph_capture_row_count = 0
+            raise
+
+    def restore_after_graph_capture(self) -> None:
+        """清除 capture dummy，并恢复当前 CPU 语义真源的 device 镜像。"""
+
+        if not self._graph_capture_row_count:
+            return
+        self.columns.gpu.copy_(self.columns.cpu)
+        self._graph_capture_row_count = 0
 
     def _synchronize_resident_pool_rows(
         self,

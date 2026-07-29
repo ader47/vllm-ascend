@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""验证 v0.23 DSA 迁移的控制面与 P5 eager 数据面。
+"""验证 v0.23 DSA 迁移的控制面、P5 eager 与 P6 graph 数据面。
 
 本脚本只验证：
 
 1. DSA 关闭时，v0.23 原生路径没有受到影响；
 2. DSA 开启时，Indexer/MLA 能形成两个独立 group、tensor 和物理池；
 3. ``eager`` 模式可执行 LIDU/KSC/SFA-Offload 与满块 dump 数据面；
-4. 尚未支持的 async scheduling 会在启动期被明确拒绝。
+4. ``graph`` 模式复用原生 FULL decode capture/replay；
+5. 尚未支持的 async scheduling 会在启动期被明确拒绝。
 
 ``cache-init`` 模式只构造 ``LLM`` 并等待 KV cache 初始化完成，不执行
-``generate``；``eager`` 模式才会执行生成。默认短 prompt 只覆盖 DENSE
-row，验证真实稀疏卸载时应通过 ``--prompt`` 传入超过
+``generate``；``eager``/``graph`` 模式才会执行生成。默认短 prompt 只
+覆盖 DENSE row，验证真实稀疏卸载时应通过 ``--prompt`` 传入超过
 ``sparse_activation_tokens`` 的文本。
 """
 
@@ -43,7 +44,9 @@ DEFAULT_PROMPTS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the v0.23 DSA cache-control or P5 eager data-plane smoke test.",
+        description=(
+            "Run the v0.23 DSA cache-control, eager or graph smoke test."
+        ),
     )
     parser.add_argument(
         "--model",
@@ -52,7 +55,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("disabled", "cache-init", "eager", "reject-async"),
+        choices=(
+            "disabled",
+            "cache-init",
+            "eager",
+            "graph",
+            "reject-async",
+        ),
         default="cache-init",
         help="Migration scenario to execute.",
     )
@@ -113,7 +122,10 @@ def apply_runtime_env() -> None:
         os.environ.setdefault(key, value)
 
 
-def build_dsa_sparse_config() -> dict[str, Any]:
+def build_dsa_sparse_config(
+    *,
+    enable_graph: bool,
+) -> dict[str, Any]:
     return {
         "enabled": True,
         "split_indexer_cache": True,
@@ -123,8 +135,7 @@ def build_dsa_sparse_config() -> dict[str, Any]:
         "resident_budget_tokens": [6144, 10240, 12288],
         "max_active_reqs": 256,
         "hot_cpu_block_multiple": 3.0,
-        # P5 只接通 eager 数据面；图数据面将在 P6 迁移。
-        "enable_row_mode_decode_graph": False,
+        "enable_row_mode_decode_graph": enable_graph,
         "trace_points": {
             "enabled": False,
             "points": ["first_sample"],
@@ -163,7 +174,12 @@ def main() -> None:
     # environment variables are configured first.
     from vllm import LLM, SamplingParams
 
-    dsa_config = None if args.mode == "disabled" else build_dsa_sparse_config()
+    graph_enabled = args.mode == "graph"
+    dsa_config = (
+        None
+        if args.mode == "disabled"
+        else build_dsa_sparse_config(enable_graph=graph_enabled)
+    )
     llm_kwargs: dict[str, Any] = {
         "model": args.model,
         "tensor_parallel_size": args.tensor_parallel_size,
@@ -181,27 +197,43 @@ def main() -> None:
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "block_size": 128,
         "async_scheduling": args.mode == "reject-async",
-        "enforce_eager": True,
+        "enforce_eager": not graph_enabled,
         "disable_log_stats": False,
     }
+    if graph_enabled:
+        capture_sizes = sorted(
+            {
+                size
+                for size in (1, 2, 4, 8, args.max_num_seqs)
+                if size <= args.max_num_seqs
+            }
+        )
+        llm_kwargs["compilation_config"] = {
+            "mode": "VLLM_COMPILE",
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": capture_sizes,
+        }
     if dsa_config is not None:
         llm_kwargs["additional_config"] = {
             "dsa_sparse_config": dsa_config,
         }
 
-    phase = (
-        "P5-eager-data-plane"
-        if args.mode == "eager"
-        else "P2-kv-cache-control-plane"
-    )
-    notice = (
-        "P5 eager data plane is enabled; graph replay remains a P6 task."
-        if args.mode == "eager"
-        else (
+    if args.mode == "graph":
+        phase = "P6-row-mode-decode-graph"
+        notice = (
+            "P6 graph mode is enabled. Single-token DENSE/ENTER/SPARSE "
+            "decode uses native FULL graph; normal prefill and unsupported "
+            "shapes execute eagerly."
+        )
+    elif args.mode == "eager":
+        phase = "P5-eager-data-plane"
+        notice = "P5 eager data plane is enabled."
+    else:
+        phase = "P2-kv-cache-control-plane"
+        notice = (
             "cache-init validates split Indexer/MLA cache construction and "
             "allocation without executing the P5 operator chain."
         )
-    )
     config_payload = {
         "phase": phase,
         "mode": args.mode,
