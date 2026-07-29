@@ -429,6 +429,38 @@ class MultiGroupBlockTable:
             else:
                 block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
 
+    def compute_slot_mapping_for_group(
+        self,
+        group_id: int,
+        num_reqs: int,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """只刷新一个 KV-cache group 的 slot mapping。
+
+        DSA 的 Indexer plane 使用完整序列 position，resident MLA plane
+        在 sparse 行使用 ``budget + tail_offset``。两组仍复用基线
+        ``BlockTable.compute_slot_mapping`` 和其固定 buffer，仅调用时传入
+        不同 position view；这里不创建第二套 block-table 实现。
+        """
+
+        group_id = int(group_id)
+        if not 0 <= group_id < len(self.block_tables):
+            raise IndexError(
+                f"KV-cache group id {group_id} is outside "
+                f"[0, {len(self.block_tables)})"
+            )
+        block_table = self.block_tables[group_id]
+        if block_table.is_mamba_group:
+            raise TypeError(
+                "Attention slot mapping cannot target a Mamba cache group"
+            )
+        block_table.compute_slot_mapping(
+            num_reqs,
+            query_start_loc,
+            positions,
+        )
+
     def compute_slot_mapping_draft(
         self,
         req_indices: np.ndarray | torch.Tensor,

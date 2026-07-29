@@ -195,6 +195,10 @@ else:
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.dsa_offload.dram_store import (
+    DSAHotDRAMStore,
+    calculate_dram_usable_blocks,
+)
 from vllm_ascend.dsa_offload.input_batch import (
     apply_dsa_cache_layout_projection,
 )
@@ -202,8 +206,15 @@ from vllm_ascend.dsa_offload.kv_cache import (
     DSAIndexerKVSpec,
     DSAKVCacheGroupIds,
     DSAResidentMLAAttentionSpec,
+    get_dsa_group_num_blocks,
     get_dsa_kv_cache_binding_order,
     get_dsa_kv_cache_group_ids,
+)
+from vllm_ascend.dsa_offload.ops import require_dsa_offload_ops
+from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
+from vllm_ascend.dsa_offload.runtime import (
+    DSALayerOffloadContext,
+    DSAOffloadRuntime,
 )
 from vllm_ascend.dsa_offload.scheduler_output import (
     DSAOffloadSchedulerOutput,
@@ -351,6 +362,39 @@ class NPUModelRunner(GPUModelRunner):
             self.ascend_config.dsa_offload_config.enabled
         )
         self.dsa_kv_cache_group_ids: DSAKVCacheGroupIds | None = None
+        dsa_config = self.ascend_config.dsa_offload_config
+        self.dsa_resident_token_pool = (
+            DSAResidentTokenPool(
+                max_num_reqs=self.max_num_reqs,
+                num_layers=self.model_config.get_num_layers(
+                    self.parallel_config
+                ),
+                max_model_len=self.model_config.max_model_len,
+                max_resident_budget_tokens=(
+                    dsa_config.max_resident_budget_tokens
+                ),
+                device=self.device,
+            )
+            if self.dsa_offload_enabled
+            else None
+        )
+        self.dsa_offload_runtime = (
+            DSAOffloadRuntime(
+                max_num_reqs=self.max_num_reqs,
+                max_num_tokens=self.max_num_tokens,
+                num_layers=self.model_config.get_num_layers(
+                    self.parallel_config
+                ),
+                max_model_len=self.model_config.max_model_len,
+                block_size=vllm_config.cache_config.block_size,
+                resident_token_pool=self.dsa_resident_token_pool,
+                device=self.device,
+                pin_memory=self.pin_memory,
+            )
+            if self.dsa_resident_token_pool is not None
+            else None
+        )
+        self.dsa_hot_dram_store: DSAHotDRAMStore | None = None
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
@@ -584,6 +628,7 @@ class NPUModelRunner(GPUModelRunner):
             ),
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             dsa_offload_enabled=self.dsa_offload_enabled,
+            dsa_resident_token_pool=self.dsa_resident_token_pool,
         )
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         # here we use int32
@@ -775,7 +820,7 @@ class NPUModelRunner(GPUModelRunner):
                 "DSA is enabled but NPUInputBatch has no cache-layout owner"
             )
         if scheduler_output.total_num_scheduled_tokens == 0:
-            state.clear()
+            state.clear(input_batch=self.input_batch)
             return
         if not isinstance(scheduler_output, DSAOffloadSchedulerOutput):
             raise RuntimeError(
@@ -1283,14 +1328,54 @@ class NPUModelRunner(GPUModelRunner):
         if self._needs_seq_lens_cpu_sync and async_spec_decode_active:
             self._correct_optimistic_seq_lens_cpu(num_reqs)
 
+        dsa_resident_positions = None
+        if self.dsa_offload_enabled:
+            if self.pcp_size > 1:
+                raise RuntimeError(
+                    "DSA sparse offload does not support PCP slot mapping"
+                )
+            runtime = self.dsa_offload_runtime
+            state = self.input_batch.dsa_cache_layout
+            group_ids = self.dsa_kv_cache_group_ids
+            if runtime is None or state is None or group_ids is None:
+                raise RuntimeError(
+                    "DSA offload runtime is not fully initialized before "
+                    "input preparation"
+                )
+            dsa_resident_positions = runtime.prepare_forward(
+                input_batch=self.input_batch,
+                state=state,
+                num_scheduled_tokens=num_scheduled_tokens,
+                req_indices=req_indices_gpu,
+                positions=self.positions,
+                num_reqs=num_reqs,
+                num_tokens=total_num_scheduled_tokens,
+                resident_group_id=group_ids.resident_mla,
+            )
+
         # For non-PCP, compute slot_mapping on GPU. PCP slot_mapping was
         # already computed on GPU before PCP split the positions.
         if self.pcp_size <= 1:
-            self.input_batch.block_table.compute_slot_mapping(
-                num_reqs,
-                self.query_start_loc.gpu[: num_reqs + 1],
-                self.positions[:total_num_scheduled_tokens],
-            )
+            if dsa_resident_positions is None:
+                self.input_batch.block_table.compute_slot_mapping(
+                    num_reqs,
+                    self.query_start_loc.gpu[: num_reqs + 1],
+                    self.positions[:total_num_scheduled_tokens],
+                )
+            else:
+                assert self.dsa_kv_cache_group_ids is not None
+                self.input_batch.block_table.compute_slot_mapping_for_group(
+                    self.dsa_kv_cache_group_ids.indexer,
+                    num_reqs,
+                    self.query_start_loc.gpu[: num_reqs + 1],
+                    self.positions[:total_num_scheduled_tokens],
+                )
+                self.input_batch.block_table.compute_slot_mapping_for_group(
+                    self.dsa_kv_cache_group_ids.resident_mla,
+                    num_reqs,
+                    self.query_start_loc.gpu[: num_reqs + 1],
+                    dsa_resident_positions,
+                )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(
@@ -3174,6 +3259,41 @@ class NPUModelRunner(GPUModelRunner):
         else:
             dsa_indexer_block_table = None
             dsa_indexer_slot_mapping = None
+        if self.dsa_kv_cache_group_ids is not None:
+            if num_reqs_padded != num_reqs or num_tokens_padded != num_tokens:
+                raise RuntimeError(
+                    "DSA P5 eager metadata does not yet support graph-padded "
+                    "rows/tokens; enable graph after P6 is connected"
+                )
+            dsa_state = self.input_batch.dsa_cache_layout
+            dsa_runtime = self.dsa_offload_runtime
+            if dsa_state is None or dsa_runtime is None:
+                raise RuntimeError(
+                    "DSA metadata owner is missing during attention build"
+                )
+            if (
+                not dsa_state.valid
+                or dsa_state.row_count != num_reqs
+                or dsa_runtime.active_num_reqs != num_reqs
+            ):
+                raise RuntimeError(
+                    "DSA attention metadata is stale: "
+                    f"state_valid={dsa_state.valid}, "
+                    f"state_rows={dsa_state.row_count}, "
+                    f"runtime_rows={dsa_runtime.active_num_reqs}, "
+                    f"num_reqs={num_reqs}"
+                )
+            dsa_row_modes = dsa_state.row_modes[:num_reqs]
+            dsa_resident_pool_indices = (
+                dsa_state.resident_pool_indices[:num_reqs]
+            )
+            dsa_dram_block_table = (
+                dsa_runtime.active_dram_block_table.gpu[:num_reqs]
+            )
+        else:
+            dsa_row_modes = None
+            dsa_resident_pool_indices = None
+            dsa_dram_block_table = None
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
         ]
@@ -3217,6 +3337,9 @@ class NPUModelRunner(GPUModelRunner):
             positions_cpu=self._dsa_positions_cpu_buf if self.use_compress else None,
             dsa_indexer_block_table=dsa_indexer_block_table,
             dsa_indexer_slot_mapping=dsa_indexer_slot_mapping,
+            dsa_row_modes=dsa_row_modes,
+            dsa_resident_pool_indices=dsa_resident_pool_indices,
+            dsa_dram_block_table=dsa_dram_block_table,
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
@@ -4027,7 +4150,12 @@ class NPUModelRunner(GPUModelRunner):
         使用上游 binder。
         """
 
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
+
         assert len(self.kv_caches) == 0
+        require_dsa_offload_ops()
         binding_order = get_dsa_kv_cache_binding_order(kv_cache_config)
         expected_layers = set(binding_order)
         actual_layers = set(kv_caches)
@@ -4046,10 +4174,126 @@ class NPUModelRunner(GPUModelRunner):
                 f"{tuple(sorted(missing_context))}"
             )
 
+        layer_specs = self._get_layer_kv_cache_specs(kv_cache_config)
+        resident_names: dict[int, str] = {}
+        indexer_names: dict[int, str] = {}
         for layer_name in binding_order:
             kv_cache = kv_caches[layer_name]
             forward_context[layer_name].kv_cache = kv_cache
             self.kv_caches.append(kv_cache)
+            layer_index = extract_layer_index(layer_name)
+            spec = layer_specs[layer_name]
+            target = (
+                resident_names
+                if isinstance(spec, DSAResidentMLAAttentionSpec)
+                else indexer_names
+            )
+            if layer_index in target:
+                raise RuntimeError(
+                    "DSA has duplicate cache planes for transformer layer "
+                    f"{layer_index}: {target[layer_index]}, {layer_name}"
+                )
+            target[layer_index] = layer_name
+
+        if resident_names.keys() != indexer_names.keys():
+            raise RuntimeError(
+                "DSA resident and Indexer layer sets differ: "
+                f"resident={tuple(sorted(resident_names))}, "
+                f"indexer={tuple(sorted(indexer_names))}"
+            )
+
+        runtime = self.dsa_offload_runtime
+        resident_pool = self.dsa_resident_token_pool
+        cache_layout = self.input_batch.dsa_cache_layout
+        group_ids = self.dsa_kv_cache_group_ids
+        if (
+            runtime is None
+            or resident_pool is None
+            or cache_layout is None
+            or group_ids is None
+        ):
+            raise RuntimeError(
+                "DSA runtime owners are missing during KV-cache binding"
+            )
+
+        indexer_group = kv_cache_config.kv_cache_groups[
+            group_ids.indexer
+        ]
+        indexer_num_blocks = get_dsa_group_num_blocks(
+            kv_cache_config,
+            indexer_group,
+        )
+        store = DSAHotDRAMStore(
+            usable_blocks=calculate_dram_usable_blocks(
+                indexer_num_blocks,
+                self.ascend_config.dsa_offload_config.hot_cpu_block_multiple,
+            ),
+            storage_rows=resident_pool.storage_rows,
+            max_logical_blocks=runtime.max_logical_blocks,
+            device=self.device,
+        )
+
+        ordered_layer_indices = sorted(resident_names)
+        if len(ordered_layer_indices) != runtime.num_layers:
+            raise RuntimeError(
+                "DSA runtime layer capacity does not match cache planes: "
+                f"runtime={runtime.num_layers}, "
+                f"cache_layers={len(ordered_layer_indices)}"
+            )
+        for runtime_layer_id, layer_index in enumerate(
+            ordered_layer_indices
+        ):
+            resident_name = resident_names[layer_index]
+            indexer_name = indexer_names[layer_index]
+            resident_cache = kv_caches[resident_name]
+            indexer_cache = kv_caches[indexer_name]
+            if (
+                not isinstance(resident_cache, tuple)
+                or len(resident_cache) < 2
+            ):
+                raise RuntimeError(
+                    "DSA resident MLA cache must expose NOPE and ROPE "
+                    f"planes: layer={resident_name}"
+                )
+            if not isinstance(indexer_cache, torch.Tensor):
+                raise RuntimeError(
+                    "DSA Indexer cache must be one dense tensor: "
+                    f"layer={indexer_name}"
+                )
+
+            resident_module = forward_context[resident_name]
+            if not isinstance(resident_module, MLAAttention):
+                raise RuntimeError(
+                    "DSA resident cache is not bound to MLAAttention: "
+                    f"layer={resident_name}, "
+                    f"module={type(resident_module).__name__}"
+                )
+            resident_impl = resident_module.impl
+            if not isinstance(resident_impl, AscendSFAImpl):
+                raise RuntimeError(
+                    "DSA sparse offload requires AscendSFAImpl: "
+                    f"layer={resident_name}, "
+                    f"impl={type(resident_impl).__name__}"
+                )
+
+            store.add_layer(
+                layer_id=runtime_layer_id,
+                resident_nope_cache=resident_cache[0],
+                resident_rope_cache=resident_cache[1],
+            )
+            resident_impl.bind_dsa_offload_context(
+                DSALayerOffloadContext(
+                    layer_id=runtime_layer_id,
+                    indexer_cache=indexer_cache,
+                    runtime=runtime,
+                )
+            )
+
+        runtime.bind_dram_store(store)
+        cache_layout.set_pool_release_callback(
+            runtime.release_pool_index
+        )
+        self.dsa_hot_dram_store = store
 
     def _get_layer_kv_cache_specs(self, kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
         layer_kv_cache_spec: dict[str, KVCacheSpec] = {}
@@ -4947,6 +5191,7 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_groups=kv_cache_config.kv_cache_groups,
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                 dsa_offload_enabled=self.dsa_offload_enabled,
+                dsa_resident_token_pool=self.dsa_resident_token_pool,
             )
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:

@@ -249,6 +249,13 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # metadata。它们直接引用 MultiGroupBlockTable 的预分配 buffer。
     dsa_indexer_block_table: torch.Tensor | None = None
     dsa_indexer_slot_mapping: torch.Tensor | None = None
+    # P5 设备数据面继续扩展同一个 common metadata：逐行模式与稳定
+    # resident-pool 行来自 NPUInputBatch 的统一 SoA owner，DRAM 表来自
+    # worker-lifetime runtime 的 active-prefix view。eager/graph 不得各自
+    # 重建一份语义相同的 metadata。
+    dsa_row_modes: torch.Tensor | None = None
+    dsa_resident_pool_indices: torch.Tensor | None = None
+    dsa_dram_block_table: torch.Tensor | None = None
 
     # Current attention state (e.g., ChunkedPrefill, DecodeOnly).
     attn_state: Any = None
@@ -291,6 +298,13 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             positions_cpu=self.positions_cpu,
             dsa_indexer_block_table=self.dsa_indexer_block_table,
             dsa_indexer_slot_mapping=self.dsa_indexer_slot_mapping,
+            dsa_row_modes=_slice_reqs(self.dsa_row_modes),
+            dsa_resident_pool_indices=_slice_reqs(
+                self.dsa_resident_pool_indices
+            ),
+            dsa_dram_block_table=_slice_reqs(
+                self.dsa_dram_block_table
+            ),
             attn_state=self.attn_state,
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
             num_input_tokens=self.num_input_tokens,
