@@ -2,9 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DSA 在 worker ``NPUInputBatch`` 行序上的固定容量 cache 布局投影。
 
-scheduler/core 的 ``DSARequestCachePlanner`` 是跨 step 语义真源；本模块只在
-原生 ``_update_states`` 完成 remove/add/condense/reorder 后，将本轮
-projection 写入最终 InputBatch 行序。它不维护第二套请求生命周期。
+scheduler/core 的 ``DSARequestCachePlanner`` 是跨 step 语义真源；本模块以
+两个很窄的阶段适配 vLLM 原生 ``_update_states``：
+
+* ENTER 前处理把 resident 的“增量追加”改写为“完整替换”，避免原生流程
+  先把新 budget 块追加到旧 dense 表；
+* 原生 remove/add/condense/reorder 完成后，再把 projection 写入最终
+  InputBatch 行序。
+
+它不复制原生 ``_update_states``，也不维护第二套请求生命周期。
 
 六列状态共用一个 ``CpuGpuBuffer``：
 
@@ -48,6 +54,7 @@ from vllm_ascend.dsa_offload.scheduler_output import (
 )
 
 if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import CachedRequestData
     from vllm.v1.worker.gpu_model_runner import CachedRequestState
 
     from vllm_ascend.worker.npu_input_batch import NPUInputBatch
@@ -418,6 +425,103 @@ class DSAInputBatchCacheLayout:
             )
         self._request_ids = request_ids
         self.mapping_version += 1
+
+
+def normalize_dsa_enter_updates_before_base(
+    *,
+    requests: dict[str, CachedRequestState],
+    cached_requests: CachedRequestData,
+    projection: DSARequestCacheLayoutProjection,
+    resident_group_id: int,
+) -> None:
+    """在原生 ``_update_states`` 前归一化 ENTER resident block 更新。
+
+    vLLM cached-request 输出只表达新增 block IDs，原生 worker 会把它们
+    append 到 ``CachedRequestState.block_ids``。DSA ENTER 的语义却是把
+    dense resident 全表收缩为 ``budget + tail``。若等原生更新结束后才
+    替换，旧 dense 表与新 budget 块会形成一个错误的临时长表，既可能
+    越过 ``max_model_len / block_size`` 的固定行宽，也会让重新加入
+    persistent batch 的请求携带错误表。
+
+    这里只有存在 ENTER replacement 时才建立 request-id 索引；稳定
+    DENSE/SPARSE 和普通 prefill/chunk step 只执行一次空 tuple 判断。
+    Indexer group 的原生增量保持不变。
+    """
+
+    replacements = projection.resident_block_table_replacements
+    if not replacements:
+        return
+
+    resident_group_id = int(resident_group_id)
+    cached_row_by_request_id = {
+        request_id: row
+        for row, request_id in enumerate(cached_requests.req_ids)
+    }
+    normalized_request_ids: set[str] = set()
+
+    for replacement in replacements:
+        request_id = replacement.request_id
+        if request_id in normalized_request_ids:
+            raise RuntimeError(
+                "DSA ENTER projection contains a duplicate replacement: "
+                f"request_id={request_id!r}"
+            )
+        normalized_request_ids.add(request_id)
+
+        cached_row = cached_row_by_request_id.get(request_id)
+        request = requests.get(request_id)
+        if cached_row is None or request is None:
+            raise RuntimeError(
+                "DSA ENTER replacement has no matching cached worker "
+                f"request: request_id={request_id!r}, cached_row={cached_row}"
+            )
+        if request_id in cached_requests.resumed_req_ids:
+            raise RuntimeError(
+                "DSA ENTER replacement cannot be combined with request "
+                f"resume: request_id={request_id!r}"
+            )
+        if resident_group_id >= len(request.block_ids):
+            raise RuntimeError(
+                "DSA ENTER replacement resident group is out of range: "
+                f"request_id={request_id!r}, group={resident_group_id}, "
+                f"groups={len(request.block_ids)}"
+            )
+
+        new_block_groups = cached_requests.new_block_ids[cached_row]
+        if new_block_groups is None:
+            raise RuntimeError(
+                "DSA ENTER replacement is missing its resident block delta: "
+                f"request_id={request_id!r}"
+            )
+        if resident_group_id >= len(new_block_groups):
+            raise RuntimeError(
+                "DSA ENTER resident delta group is out of range: "
+                f"request_id={request_id!r}, group={resident_group_id}, "
+                f"groups={len(new_block_groups)}"
+            )
+
+        replacement_block_ids = replacement.block_ids
+        resident_delta = new_block_groups[resident_group_id]
+        delta_count = len(resident_delta)
+        if (
+            delta_count > len(replacement_block_ids)
+            or tuple(resident_delta)
+            != replacement_block_ids[:delta_count]
+        ):
+            raise RuntimeError(
+                "DSA ENTER resident delta is not a prefix of the committed "
+                "replacement table: "
+                f"request_id={request_id!r}, delta={resident_delta}, "
+                f"replacement={replacement_block_ids}"
+            )
+
+        # 先修正请求级真值；原生更新仍负责其他 group 的增量与最终行序。
+        request.block_ids[resident_group_id][:] = replacement_block_ids
+
+        # resident 已经是完整替换表，不能再让原生逻辑 append 新 budget 块。
+        normalized_groups = list(new_block_groups)
+        normalized_groups[resident_group_id] = []
+        cached_requests.new_block_ids[cached_row] = tuple(normalized_groups)
 
 
 def apply_dsa_cache_layout_projection(
