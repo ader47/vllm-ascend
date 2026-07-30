@@ -1,9 +1,10 @@
 # DSA 稀疏卸载当前设计
 
-> - 最后更新：2026-07-29
+> - 最后更新：2026-07-30
 > - 目标基线：vLLM v0.23.0 + vLLM-Ascend v0.23.0
 > - 当前完成度：核心控制面、eager 和 FULL decode graph 已完成 910C 初验；
->   chunked prefill 已实现，待 910C 端到端验收
+>   chunked prefill 已完成分段 prefill/首 token 初验，完整 sparse decode
+>   验收待补
 > - 首要验收模型：GLM-5.1；兼容回归模型：DeepSeek-V3.2
 
 ## 1. 文档定位
@@ -49,12 +50,15 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
   speculative/MTP、async scheduling、KV transfer、KV-cache
   metrics/events 和 A5 设备验收。
 
-当前已在 Linux + Ascend 环境完成 102 项 DSA UT，并取得 GLM-5.1 W4A8、
+当前已在 Linux + Ascend 环境完成 114 项 DSA UT，并取得 GLM-5.1 W4A8、
 TP16/EP 的 disabled、cache-init、eager 与 FULL decode graph 初验证据。
 graph 已覆盖 bsz=4 的同长度约 8K prompt，以及约
 5K/20K/8K/40K 的混合长度与不同 resident budget。该结果证明
 capture/replay 主路径可运行，但仍不替代完整 QA 数据集、长时间连续调度、
-请求结束/行复用和 DeepSeek-V3.2 回归。
+请求结束/行复用和 DeepSeek-V3.2 回归。chunked prefill 已在
+`max_num_batched_tokens=4096/8192/16384` 下完成四条长短混合请求的
+baseline/DSA 首 token 对照；由于该组测试只生成一个 token，它尚不能证明
+后续 sparse decode 的完整正确性。
 
 ## 3. 当前总体架构
 
@@ -814,7 +818,7 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
 
 已获得的 910C 证据：
 
-- `python -m pytest tests/ut/dsa_offload -vv --tb=short` 共 102 项通过；
+- `python -m pytest tests/ut/dsa_offload -vv --tb=short` 共 114 项通过；
 - DSA disabled GLM-5.1 回归通过；
 - DSA `cache-init` 成功，HBM 容量报告只打印一次；
 - `async_scheduling=True` 按支持矩阵拒绝；
@@ -823,7 +827,10 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
 - FULL decode graph 已覆盖 bsz=4 的四条相同约 8K prompt；
 - FULL decode graph 已覆盖约 5K/20K/8K/40K 混合长度和不同预算档位。
 - chunked prefill 的配置、阶段、增量双 pool 分配、连续 chunk dump 和
-  phase barrier 已补 UT，910C 端到端验收待完成。
+  phase barrier 已补 UT；
+- 约 70K/40K/8K/5K 的四条混合请求在
+  `max_num_batched_tokens=4096/8192/16384` 下，DSA 与 baseline 的
+  首 token 均对齐。
 
 这些结果证明当前核心控制面、eager 和 graph 主路径可运行。尚需补齐：
 
@@ -831,7 +838,8 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
 - bsz=1 与 bsz>1、全 DENSE、全 SPARSE、ENTER mixed；
 - active rows 小于 captured rows 的 PAD；
 - 请求完成、行复用和长时间 continuous batching；
-- chunked prefill 的 eager/graph、bsz=1/bsz>1 和 decode 并发调度回归；
+- chunked prefill 在 `max_tokens>=32` 或正式 QA 数据集上的 eager/graph、
+  bsz=1/bsz>1、ENTER/steady sparse decode 与并发调度回归；
 - DeepSeek-V3.2 强制回归；
 - profiling 性能基线；
 - A5 算子编译与运行。
