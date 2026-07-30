@@ -205,6 +205,7 @@ from vllm_ascend.dsa_offload.graph_gate import (
 )
 from vllm_ascend.dsa_offload.input_batch import (
     apply_dsa_cache_layout_projection,
+    normalize_dsa_enter_updates_before_base,
 )
 from vllm_ascend.dsa_offload.kv_cache import (
     DSAIndexerKVSpec,
@@ -966,6 +967,38 @@ class NPUModelRunner(GPUModelRunner):
             # 必须在 super() 消费 finished_req_ids 前显式回收。
             for req_id in scheduler_output.finished_req_ids:
                 state.release_request(req_id)
+            if scheduler_output.total_num_scheduled_tokens:
+                if not isinstance(
+                    scheduler_output,
+                    DSAOffloadSchedulerOutput,
+                ):
+                    raise RuntimeError(
+                        "DSA worker requires DSAOffloadSchedulerOutput, got "
+                        f"{type(scheduler_output).__name__}"
+                    )
+                projection = scheduler_output.dsa_cache_layout
+                if projection is None:
+                    raise RuntimeError(
+                        "DSA scheduler output is missing cache-layout "
+                        "projection"
+                    )
+                # ENTER 是 resident 整表替换，必须在原生增量更新前
+                # 消除旧 dense 表 + 新 budget 块的错误中间态。无 ENTER
+                # 行时 helper 立即返回，不扫描 batch。
+                if projection.resident_block_table_replacements:
+                    group_ids = self.dsa_kv_cache_group_ids
+                    if group_ids is None:
+                        raise RuntimeError(
+                            "DSA worker cache group IDs are not initialized"
+                        )
+                    normalize_dsa_enter_updates_before_base(
+                        requests=self.requests,
+                        cached_requests=(
+                            scheduler_output.scheduled_cached_reqs
+                        ),
+                        projection=projection,
+                        resident_group_id=group_ids.resident_mla,
+                    )
 
         deferred_output_update = super()._update_states(scheduler_output)
         if self.dsa_offload_enabled:

@@ -8,6 +8,7 @@ import torch
 from vllm_ascend.dsa_offload.input_batch import (
     DSAInputBatchCacheLayout,
     apply_dsa_cache_layout_projection,
+    normalize_dsa_enter_updates_before_base,
 )
 from vllm_ascend.dsa_offload.request_cache_layout import (
     DSARequestCacheStage,
@@ -25,6 +26,26 @@ class _BlockTable:
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.added_rows.append((list(block_ids), row_idx))
+
+
+class _BoundedBlockTable:
+    """模拟原生固定行宽，越界时复现 NumPy broadcast 失败。"""
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self.rows: dict[int, list[int]] = {}
+
+    def add_row(self, block_ids: list[int], row_idx: int) -> None:
+        values = list(block_ids)
+        if len(values) > self.capacity:
+            raise ValueError("block-table row capacity exceeded")
+        self.rows[row_idx] = values
+
+    def append_row(self, block_ids: list[int], row_idx: int) -> None:
+        values = self.rows.get(row_idx, []) + list(block_ids)
+        if len(values) > self.capacity:
+            raise ValueError("block-table row capacity exceeded")
+        self.rows[row_idx] = values
 
 
 class _InputBatch:
@@ -69,6 +90,164 @@ def _make_state() -> DSAInputBatchCacheLayout:
         device=torch.device("cpu"),
         pin_memory=False,
         resident_token_pool=resident_token_pool,
+    )
+
+
+def _make_enter_projection() -> DSARequestCacheLayoutProjection:
+    return DSARequestCacheLayoutProjection(
+        request_ids=("enter",),
+        stages=(int(DSARequestCacheStage.ENTER_SPARSE_DECODE),),
+        target_resident_budget_tokens=(256,),
+        sparse_budget_tokens=(256,),
+        resident_valid_tokens=(257,),
+        resident_block_table_replacements=(
+            DSAResidentBlockTableReplacement(
+                request_id="enter",
+                block_ids=(20, 21, 14),
+            ),
+        ),
+    )
+
+
+def _make_enter_cached_data() -> SimpleNamespace:
+    return SimpleNamespace(
+        req_ids=["enter"],
+        resumed_req_ids=set(),
+        # Indexer 仍按原生增量追加；resident 的 20/21 是 replacement 前缀。
+        new_block_ids=[([2], [20, 21])],
+    )
+
+
+def test_enter_normalization_prevents_persistent_row_temporary_overflow() -> None:
+    input_batch = _InputBatch(("enter",))
+    input_batch.block_table = [
+        _BoundedBlockTable(capacity=6),
+        _BoundedBlockTable(capacity=6),
+    ]
+    input_batch.block_table[0].add_row([1], 0)
+    input_batch.block_table[1].add_row([10, 11, 12, 13, 14], 0)
+    requests = {
+        "enter": SimpleNamespace(
+            block_ids=[[1], [10, 11, 12, 13, 14]],
+        ),
+    }
+    cached_data = _make_enter_cached_data()
+    projection = _make_enter_projection()
+
+    # 未归一化时 resident 会先形成 5 + 2 > 6 的错误中间态；
+    # 最终 replacement 只有 3 个 block，本身完全合法。
+    assert (
+        len(requests["enter"].block_ids[1])
+        + len(cached_data.new_block_ids[0][1])
+        > input_batch.block_table[1].capacity
+    )
+
+    normalize_dsa_enter_updates_before_base(
+        requests=requests,
+        cached_requests=cached_data,
+        projection=projection,
+        resident_group_id=1,
+    )
+
+    # 模拟原生 cached-request update：请求状态与 persistent block table
+    # 都只追加剩余的 Indexer 增量。
+    for block_ids, new_ids in zip(
+        requests["enter"].block_ids,
+        cached_data.new_block_ids[0],
+        strict=True,
+    ):
+        block_ids.extend(new_ids)
+    for block_table, new_ids in zip(
+        input_batch.block_table,
+        cached_data.new_block_ids[0],
+        strict=True,
+    ):
+        block_table.append_row(new_ids, 0)
+
+    state = _make_state()
+    apply_dsa_cache_layout_projection(
+        input_batch=input_batch,
+        requests=requests,
+        state=state,
+        projection=projection,
+        resident_group_id=1,
+    )
+
+    assert cached_data.new_block_ids == [([2], [])]
+    assert requests["enter"].block_ids == [[1, 2], [20, 21, 14]]
+    assert input_batch.block_table[0].rows[0] == [1, 2]
+    assert input_batch.block_table[1].rows[0] == [20, 21, 14]
+
+
+def test_enter_normalization_readds_final_table_after_chunk_barrier() -> None:
+    input_batch = _InputBatch(("enter",))
+    input_batch.block_table = [
+        _BoundedBlockTable(capacity=6),
+        _BoundedBlockTable(capacity=6),
+    ]
+    requests = {
+        # 请求仍在 worker cache 中，但已被移出 persistent InputBatch。
+        "enter": SimpleNamespace(
+            block_ids=[[1], [10, 11, 12, 13, 14]],
+        ),
+    }
+    cached_data = _make_enter_cached_data()
+    projection = _make_enter_projection()
+
+    normalize_dsa_enter_updates_before_base(
+        requests=requests,
+        cached_requests=cached_data,
+        projection=projection,
+        resident_group_id=1,
+    )
+
+    # 模拟原生 req_index=None 分支：先消费增量，再用完整请求状态 add row。
+    for block_ids, new_ids in zip(
+        requests["enter"].block_ids,
+        cached_data.new_block_ids[0],
+        strict=True,
+    ):
+        block_ids.extend(new_ids)
+    for block_table, block_ids in zip(
+        input_batch.block_table,
+        requests["enter"].block_ids,
+        strict=True,
+    ):
+        block_table.add_row(block_ids, 0)
+
+    state = _make_state()
+    apply_dsa_cache_layout_projection(
+        input_batch=input_batch,
+        requests=requests,
+        state=state,
+        projection=projection,
+        resident_group_id=1,
+    )
+
+    assert requests["enter"].block_ids == [[1, 2], [20, 21, 14]]
+    assert input_batch.block_table[1].rows[0] == [20, 21, 14]
+
+
+def test_stable_projection_skips_cached_request_scan() -> None:
+    projection = DSARequestCacheLayoutProjection(
+        request_ids=("dense",),
+        stages=(int(DSARequestCacheStage.DENSE_DECODE),),
+        target_resident_budget_tokens=(256,),
+        sparse_budget_tokens=(0,),
+        resident_valid_tokens=(-1,),
+        resident_block_table_replacements=(),
+    )
+
+    class _NoCachedRequestAccess:
+        @property
+        def req_ids(self):
+            raise AssertionError("stable path must not scan cached requests")
+
+    normalize_dsa_enter_updates_before_base(
+        requests={},
+        cached_requests=_NoCachedRequestAccess(),
+        projection=projection,
+        resident_group_id=1,
     )
 
 
