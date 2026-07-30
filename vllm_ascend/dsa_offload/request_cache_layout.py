@@ -158,8 +158,15 @@ class DSARequestCachePlanner:
             int(request.num_tokens),
             int(max_model_len),
         )
+        # chunked prefill 的阶段真源是“还有多少 prompt token 未计算”，
+        # 不能用 output 数量代替。最后一个 chunk 在调用 planner 时仍有
+        # num_computed_tokens < num_prompt_tokens；下一轮 decode 才进入
+        # DENSE/ENTER。这样中间 chunk 不会误触发 resident 收缩。
         dense_stage = (
-            DSARequestCacheStage.PREFILL if int(request.num_output_tokens) == 0 else DSARequestCacheStage.DENSE_DECODE
+            DSARequestCacheStage.PREFILL
+            if int(request.num_computed_tokens)
+            < int(request.num_prompt_tokens)
+            else DSARequestCacheStage.DENSE_DECODE
         )
 
         sparse_budget_tokens = 0

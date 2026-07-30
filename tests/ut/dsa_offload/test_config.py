@@ -17,6 +17,7 @@ def _vllm_config(
     async_scheduling: bool | None = False,
     enable_chunked_prefill: bool = False,
     long_prefill_token_threshold: int = 0,
+    scheduler_reserve_full_isl: bool = True,
     enable_prefix_caching: bool = False,
     enforce_eager: bool = True,
     block_size: int = 128,
@@ -51,6 +52,7 @@ def _vllm_config(
             async_scheduling=async_scheduling,
             enable_chunked_prefill=enable_chunked_prefill,
             long_prefill_token_threshold=long_prefill_token_threshold,
+            scheduler_reserve_full_isl=scheduler_reserve_full_isl,
         ),
         cache_config=SimpleNamespace(
             block_size=block_size,
@@ -149,11 +151,6 @@ def test_invalid_static_config_is_rejected(
     [
         ({"async_scheduling": None}, "async_scheduling=False"),
         ({"async_scheduling": True}, "async_scheduling=False"),
-        ({"enable_chunked_prefill": True}, "chunked prefill"),
-        (
-            {"long_prefill_token_threshold": 1024},
-            "implicit chunked prefill",
-        ),
         ({"enable_prefix_caching": True}, "prefix caching"),
         ({"speculative_config": object()}, "speculative decoding"),
         ({"kv_transfer_config": object()}, "KV transfer connectors"),
@@ -175,6 +172,45 @@ def test_initial_runtime_support_matrix_is_enforced(
     message: str,
 ) -> None:
     with pytest.raises(ValueError, match=message):
+        DSAOffloadConfig.from_dict(
+            {"enabled": True},
+            vllm_config=_vllm_config(**config_updates),
+        )
+
+
+@pytest.mark.parametrize(
+    "config_updates",
+    [
+        {"enable_chunked_prefill": True},
+        {"long_prefill_token_threshold": 1024},
+    ],
+)
+def test_chunked_prefill_modes_are_supported(config_updates) -> None:
+    config = DSAOffloadConfig.from_dict(
+        {"enabled": True},
+        vllm_config=_vllm_config(**config_updates),
+    )
+
+    assert config.enabled
+
+
+@pytest.mark.parametrize(
+    "config_updates",
+    [
+        {
+            "enable_chunked_prefill": True,
+            "scheduler_reserve_full_isl": False,
+        },
+        {
+            "long_prefill_token_threshold": 1024,
+            "scheduler_reserve_full_isl": False,
+        },
+    ],
+)
+def test_chunked_prefill_requires_full_prompt_admission(
+    config_updates,
+) -> None:
+    with pytest.raises(ValueError, match="scheduler_reserve_full_isl=True"):
         DSAOffloadConfig.from_dict(
             {"enabled": True},
             vllm_config=_vllm_config(**config_updates),

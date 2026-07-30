@@ -141,6 +141,66 @@ def test_dump_plan_is_compact_and_idempotent() -> None:
     assert runtime.dump_job_count == 0
 
 
+def test_consecutive_prefill_chunks_dump_only_newly_completed_blocks() -> None:
+    resident_pool, runtime, store = _make_runtime()
+    state = DSAInputBatchCacheLayout(
+        max_num_reqs=1,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        resident_token_pool=resident_pool,
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=["req-0"],
+        req_id_to_index={"req-0": 0},
+        num_computed_tokens_cpu=np.array([0], dtype=np.int32),
+        block_table=[_ResidentBlockTable()],
+    )
+    state.refresh(
+        input_batch=input_batch,
+        projection=DSARequestCacheLayoutProjection(
+            request_ids=("req-0",),
+            stages=(int(DSARequestCacheStage.PREFILL),),
+            target_resident_budget_tokens=(256,),
+            sparse_budget_tokens=(0,),
+            resident_valid_tokens=(-1,),
+            resident_block_table_replacements=(),
+        ),
+    )
+
+    runtime.prepare_forward(
+        input_batch=input_batch,
+        state=state,
+        num_scheduled_tokens=np.array([257], dtype=np.int32),
+        req_indices=torch.zeros(257, dtype=torch.int64),
+        positions=torch.arange(257, dtype=torch.int64),
+        num_reqs=1,
+        num_tokens=257,
+        resident_group_id=0,
+    )
+    assert runtime.dump_job_count == 2
+    first_two_dram_blocks = store.logical_block_table[0, :2].copy()
+
+    input_batch.num_computed_tokens_cpu[0] = 257
+    runtime.prepare_forward(
+        input_batch=input_batch,
+        state=state,
+        num_scheduled_tokens=np.array([128], dtype=np.int32),
+        req_indices=torch.zeros(128, dtype=torch.int64),
+        positions=torch.arange(257, 385, dtype=torch.int64),
+        num_reqs=1,
+        num_tokens=128,
+        resident_group_id=0,
+    )
+
+    assert runtime.dump_job_count == 1
+    assert runtime.dump_src_block_ids.np[0] == 12
+    assert store.logical_block_table[0, :2].tolist() == (
+        first_two_dram_blocks.tolist()
+    )
+    assert store.logical_block_table[0, 2] != 0
+
+
 def test_enter_rejects_missing_dram_source_blocks() -> None:
     resident_pool, runtime, _ = _make_runtime()
     state = DSAInputBatchCacheLayout(

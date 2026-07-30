@@ -35,6 +35,7 @@ DATA_PARALLEL_SIZE = 1
 MAX_NUM_SEQS = 2
 MAX_MODEL_LEN = 8192
 MAX_NUM_BATCHED_TOKENS = 8192
+ENABLE_CHUNKED_PREFILL = False
 MAX_TOKENS = 32
 GPU_MEMORY_UTILIZATION = 0.90
 QUANTIZATION = "ascend"
@@ -107,7 +108,7 @@ def build_llm_kwargs() -> dict[str, Any]:
         "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
         "trust_remote_code": True,
         "enable_prefix_caching": False,
-        "enable_chunked_prefill": False,
+        "enable_chunked_prefill": ENABLE_CHUNKED_PREFILL,
         "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
         "block_size": 128,
         "async_scheduling": False,

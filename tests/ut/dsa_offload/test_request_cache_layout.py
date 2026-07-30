@@ -93,6 +93,41 @@ def test_long_prompt_transitions_prefill_enter_then_sparse() -> None:
     assert not sparse.replace_resident_blocks
 
 
+def test_chunked_prefill_stays_prefill_until_the_next_decode_step() -> None:
+    planner = _make_planner()
+    request = _Request("req", 5000, 0, 0, 5000)
+
+    for computed, chunk_size in (
+        (0, 2048),
+        (2048, 2048),
+        (4096, 904),
+    ):
+        request.num_computed_tokens = computed
+        chunk = planner.plan(
+            request,
+            num_new_tokens=chunk_size,
+            max_model_len=16384,
+        )
+        assert chunk.stage == DSARequestCacheStage.PREFILL
+        assert chunk.indexer_tokens_need_slot == computed + chunk_size
+        planner.commit(chunk)
+        request.num_computed_tokens = computed + chunk_size
+        assert (
+            planner.should_release_resident_after_prefill(request)
+            == (request.num_computed_tokens == request.num_prompt_tokens)
+        )
+
+    request.num_computed_tokens = request.num_prompt_tokens
+    request.num_output_tokens = 1
+    request.num_tokens = request.num_prompt_tokens + 1
+    first_decode = planner.plan(
+        request,
+        num_new_tokens=1,
+        max_model_len=16384,
+    )
+    assert first_decode.stage == DSARequestCacheStage.ENTER_SPARSE_DECODE
+
+
 def test_short_prompt_stays_dense_until_exact_sparse_boundary() -> None:
     planner = _make_planner()
     request = _Request("req", 1000, 0, 0, 1000)

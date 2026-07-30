@@ -4,6 +4,7 @@
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
@@ -15,7 +16,10 @@ from vllm.v1.request import RequestStatus
 from vllm_ascend.dsa_offload.request_cache_layout import (
     DSARequestCacheStage,
 )
-from vllm_ascend.dsa_offload.scheduler import DSAOffloadScheduler
+from vllm_ascend.dsa_offload.scheduler import (
+    DSAOffloadScheduler,
+    _is_prefill_request,
+)
 from vllm_ascend.dsa_offload.scheduler_output import (
     DSAResidentBlockTableReplacement,
 )
@@ -36,6 +40,9 @@ class _Request:
     def num_tokens_with_spec(self) -> int:
         return self.num_tokens
 
+    def is_finished(self) -> bool:
+        return False
+
 
 class _AdmissionGate:
     def __init__(self, can_admit: bool) -> None:
@@ -54,6 +61,7 @@ def _make_scheduler() -> DSAOffloadScheduler:
     scheduler.waiting = create_request_queue(scheduler.policy)
     scheduler.skipped_waiting = create_request_queue(scheduler.policy)
     scheduler.running = []
+    scheduler._inflight_prefills = set()
     scheduler.requests = {}
     scheduler.max_num_running_reqs = 4
     scheduler.max_num_scheduled_tokens = 8192
@@ -62,7 +70,16 @@ def _make_scheduler() -> DSAOffloadScheduler:
         long_prefill_token_threshold=0,
         enable_chunked_prefill=False,
     )
+    scheduler._pause_state = PauseState.UNPAUSED
     return scheduler
+
+
+def test_prefill_detection_uses_uncomputed_prompt_tokens() -> None:
+    partial = _Request("partial", 1000, 512, 1, 1000)
+    boundary = _Request("boundary", 1000, 1000, 0, 1000)
+
+    assert _is_prefill_request(partial)
+    assert not _is_prefill_request(boundary)
 
 
 def test_withhold_decode_restores_original_running_order() -> None:
@@ -108,6 +125,26 @@ def test_waiting_prefill_only_blocks_decode_when_both_pools_can_admit() -> None:
     gate.can_admit = True
     assert scheduler._has_schedulable_waiting_prefill(8192)
     assert gate.calls == 2
+
+
+def test_waiting_prefill_can_advance_one_chunk() -> None:
+    scheduler = _make_scheduler()
+    scheduler.scheduler_config.enable_chunked_prefill = True
+    prefill = _Request(
+        "prefill",
+        4096,
+        0,
+        0,
+        4096,
+        status=RequestStatus.WAITING,
+    )
+    scheduler.requests = {prefill.request_id: prefill}
+    scheduler.waiting.add_request(prefill)
+    gate = _AdmissionGate(True)
+    scheduler.dsa_coordinator = gate  # type: ignore[assignment]
+
+    assert scheduler._has_schedulable_waiting_prefill(1024)
+    assert gate.calls == 1
 
 
 def test_decode_barrier_temporarily_hides_both_waiting_queues() -> None:
@@ -157,6 +194,67 @@ def test_no_waiting_requests_use_the_upstream_schedule_fast_path(
     monkeypatch.setattr(Scheduler, "schedule", lambda self: marker)
 
     assert scheduler.schedule() is marker
+
+
+def test_inflight_prefill_skips_fast_path_and_withholds_decode(
+    monkeypatch,
+) -> None:
+    scheduler = _make_scheduler()
+    prefill = _Request("prefill", 4096, 1024, 0, 4096)
+    decode = _Request("decode", 1000, 1000, 1, 1001)
+    scheduler.running = [decode, prefill]
+    scheduler.requests = {
+        request.request_id: request for request in scheduler.running
+    }
+    scheduler._inflight_prefills.add(prefill)
+    marker = object()
+    observed_running: list[_Request] = []
+
+    def schedule_prefill_only(self) -> object:
+        observed_running.extend(self.running)
+        return marker
+
+    scheduler._attach_dsa_cache_layout = lambda output: output  # type: ignore[method-assign]
+    monkeypatch.setattr(Scheduler, "schedule", schedule_prefill_only)
+
+    assert scheduler.schedule() is marker
+    assert observed_running == [prefill]
+    assert scheduler.running == [decode, prefill]
+
+
+def test_final_prefill_chunk_releases_resident_blocks_after_output(
+    monkeypatch,
+) -> None:
+    scheduler = _make_scheduler()
+    request = _Request("prefill", 1000, 512, 0, 1000)
+    scheduler.requests = {request.request_id: request}
+    scheduler.block_size = 128
+    release_calls: list[tuple[str, bool]] = []
+    scheduler.dsa_coordinator = SimpleNamespace(
+        request_cache_layout=SimpleNamespace(
+            should_release_resident_after_prefill=lambda req: (
+                req.num_computed_tokens >= req.num_prompt_tokens
+            )
+        ),
+        release_prefill_resident_blocks=lambda request_id, preserve_tail_block: (
+            release_calls.append((request_id, preserve_tail_block))
+        ),
+    )
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {request.request_id: 488}
+    parent_result = {0: object()}
+    monkeypatch.setattr(
+        Scheduler,
+        "update_from_output",
+        lambda self, scheduler_output, model_runner_output: parent_result,
+    )
+
+    assert scheduler.update_from_output(output, object()) is parent_result
+    assert not release_calls
+
+    request.num_computed_tokens = request.num_prompt_tokens
+    assert scheduler.update_from_output(output, object()) is parent_result
+    assert release_calls == [(request.request_id, True)]
 
 
 def test_projection_carries_enter_resident_table_and_scalar_state() -> None:

@@ -3,7 +3,7 @@
 > - 最后更新：2026-07-29
 > - 目标基线：vLLM v0.23.0 + vLLM-Ascend v0.23.0
 > - 当前完成度：核心控制面、eager 和 FULL decode graph 已完成 910C 初验；
->   扩展场景尚未开始
+>   chunked prefill 已实现，待 910C 端到端验收
 > - 首要验收模型：GLM-5.1；兼容回归模型：DeepSeek-V3.2
 
 ## 1. 文档定位
@@ -38,12 +38,14 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
 - 稳定 resident token pool 与逐层 `cache_slots`；
 - 固定容量 hot DRAM arena 和请求逻辑块 ledger；
 - prefill/dense/sparse 共用的双 plane slot mapping；
+- 基于 v0.23 原生调度状态的 chunked prefill、增量双 plane 分配与逐 chunk
+  满块 dump；
 - eager LIDU→KSC→SFA-Offload 与 full-block dump 数据面；
 - 复用原生 FULL decode capture/replay 的 row-mode 图数据面。
 
 当前尚未完成：
 
-- prefix cache、chunked prefill、prefill/decode mixed、preemption/resume、
+- prefix cache、prefill/decode mixed、preemption/resume、
   speculative/MTP、async scheduling、KV transfer、KV-cache
   metrics/events 和 A5 设备验收。
 
@@ -203,10 +205,13 @@ additional_config={
 }
 ```
 
-`config.py` 在拉起期完成类型转换、未知字段拒绝和支持矩阵校验。当前首版
-显式拒绝 async scheduling、chunked prefill、prefix cache、speculative
-decode、KV transfer、context/pipeline parallel、KV-cache metrics/events
-等未建立完整合同的组合。
+`config.py` 在拉起期完成类型转换、未知字段拒绝和支持矩阵校验。当前支持
+v0.23 原生显式 chunked prefill，以及
+`long_prefill_token_threshold` 形成的固定上限 prefill chunk；两者都要求
+`scheduler_reserve_full_isl=True`，在首个 chunk 入场前验证完整 prompt 能
+同时容纳于两个 dense cache plane。当前仍显式拒绝 async scheduling、
+prefix cache、speculative decode、KV transfer、context/pipeline parallel、
+KV-cache metrics/events 等未建立完整合同的组合。
 
 | 字段 | 默认值 | 当前语义 |
 |---|---:|---|
@@ -349,13 +354,21 @@ allocation；这些组合在分配边界再次显式拒绝。
 
 `DSAOffloadScheduler` 继承上游 Scheduler，但不复制主循环。它只补充：
 
-1. 首版 prefill/decode phase barrier；
+1. prefill/decode phase barrier；
 2. waiting prefill 只有在两个 pool 都可 admission 时才阻塞 decode；
 3. model output 返回后释放已同步 dump 的 prefill resident 满块；
 4. preemption/resume 尚未支持时显式失败。
 
-没有 waiting/skipped-waiting 的 steady decode 直接进入
-`super().schedule()` 快路径，不做额外队列扫描。
+请求是否仍在 prefill 只由
+`num_computed_tokens < num_prompt_tokens` 判定，不依赖 output 列表更新时序。
+每个 chunk 都复用上游 token budget、`_inflight_prefills` 和
+`_update_after_schedule()`；DSA 不复制 chunk 调度循环。中间 chunk 继续
+保持 PREFILL，两个 cache plane 按本轮结束位置增量扩展。最后一个 chunk
+仍以 PREFILL 数据面执行；output 返回后，scheduler 才释放已经在同一 stream
+完成 dump 的 resident 满块。下一轮才进入 DENSE 或 ENTER decode。
+
+waiting/skipped-waiting 为空且上游 `_inflight_prefills` 也为空的 steady
+decode 直接进入 `super().schedule()` 快路径，不做额外 batch 扫描。
 
 当前满块 dump 目标设计假设与模型 forward 位于同一 NPU stream，stream 内
 保序。未来改为异步多 stream 时，必须新增 event/readiness 协议，不能只凭
@@ -428,6 +441,9 @@ eager 只消费 active-prefix；graph 通过同一 owner 的 captured-prefix + P
 - `graph_gate.py` 只读取统一 InputBatch 投影，允许单 token
   DENSE/ENTER/SPARSE 混排；prefill、multi-token 和 capture-size miss
   正常走 true eager；
+- chunked prefill 不创建独立图或图专属元数据。每个 multi-token chunk
+  复用 eager 数据面；最后一个 chunk 完成后，后续 decode 继续复用原生
+  FULL capture/replay；
 - 原生 dispatcher 的最终 uniform FULL keys 是 capture 容量唯一真源，
   继续负责图形状与向上 padding；仅支持具有独立 decode routine 的模式
   （例如 `FULL_DECODE_ONLY`），不支持 mixed/decode 共用的精确 `FULL`；
@@ -445,8 +461,10 @@ eager 只消费 active-prefix；graph 通过同一 owner 的 captured-prefix + P
 
 ### 10.4 扩展场景边界
 
-preemption、prefix cache、MTP、chunked/mixed prefill 和 KV transfer 都会
-改变 ledger 或状态恢复合同，应在稳定 eager/graph 数据面之后逐项设计。
+chunked prefill 已复用当前 request ledger 和固定 runtime owner；它没有开放
+prefill/decode mixed forward。preemption、prefix cache、MTP、mixed
+prefill/decode 和 KV transfer 仍会改变 ledger 或状态恢复合同，应按独立
+能力继续设计。
 
 ## 11. Decode 数据面与算子 ABI
 
@@ -804,6 +822,8 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
 - GLM-5.1 W4A8、bsz=4、约 8K prompt 的 eager 生成初验通过；
 - FULL decode graph 已覆盖 bsz=4 的四条相同约 8K prompt；
 - FULL decode graph 已覆盖约 5K/20K/8K/40K 混合长度和不同预算档位。
+- chunked prefill 的配置、阶段、增量双 pool 分配、连续 chunk dump 和
+  phase barrier 已补 UT，910C 端到端验收待完成。
 
 这些结果证明当前核心控制面、eager 和 graph 主路径可运行。尚需补齐：
 
@@ -811,6 +831,7 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
 - bsz=1 与 bsz>1、全 DENSE、全 SPARSE、ENTER mixed；
 - active rows 小于 captured rows 的 PAD；
 - 请求完成、行复用和长时间 continuous batching；
+- chunked prefill 的 eager/graph、bsz=1/bsz>1 和 decode 并发调度回归；
 - DeepSeek-V3.2 强制回归；
 - profiling 性能基线；
 - A5 算子编译与运行。

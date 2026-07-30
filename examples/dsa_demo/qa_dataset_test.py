@@ -33,6 +33,7 @@ RUN_MODE = "eager"
 BATCH_SIZE = 4
 MAX_MODEL_LEN = 131072
 MAX_NUM_BATCHED_TOKENS = 131072
+ENABLE_CHUNKED_PREFILL = False
 TENSOR_PARALLEL_SIZE = 16
 GPU_MEMORY_UTILIZATION = 0.90
 MAX_TOKENS = 32
@@ -232,7 +233,7 @@ def build_llm() -> LLM:
         "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
         "trust_remote_code": True,
         "enable_prefix_caching": False,
-        "enable_chunked_prefill": False,
+        "enable_chunked_prefill": ENABLE_CHUNKED_PREFILL,
         "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
         "block_size": 128,
         "async_scheduling": False,
@@ -280,6 +281,7 @@ def print_config(prompt_lengths: list[int]) -> None:
         "batch_size": BATCH_SIZE,
         "max_model_len": MAX_MODEL_LEN,
         "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
+        "enable_chunked_prefill": ENABLE_CHUNKED_PREFILL,
         "prompt_count": len(prompt_lengths),
         "prompt_tokens_min": min(prompt_lengths),
         "prompt_tokens_max": max(prompt_lengths),
@@ -350,11 +352,18 @@ def main() -> None:
                     f"sum={total_prompt_tokens}"
                 )
                 if total_prompt_tokens > MAX_NUM_BATCHED_TOKENS:
-                    print(
-                        "[dsa-dataset] note: this generate batch exceeds "
-                        "max_num_batched_tokens; the scheduler may admit "
-                        "multiple prefill waves because chunked prefill is off"
-                    )
+                    if ENABLE_CHUNKED_PREFILL:
+                        print(
+                            "[dsa-dataset] note: this generate batch exceeds "
+                            "max_num_batched_tokens; prefill will advance in "
+                            "multiple chunks"
+                        )
+                    else:
+                        print(
+                            "[dsa-dataset] note: this generate batch exceeds "
+                            "max_num_batched_tokens; the scheduler may admit "
+                            "multiple prefill waves"
+                        )
 
                 outputs = llm.generate(
                     batch_prompts,

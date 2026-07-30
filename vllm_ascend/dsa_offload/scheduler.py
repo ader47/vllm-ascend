@@ -42,7 +42,9 @@ from vllm_ascend.dsa_offload.scheduler_output import (
 
 
 def _is_prefill_request(request: Request) -> bool:
-    return request.num_output_tokens == 0 and request.num_computed_tokens < request.num_prompt_tokens
+    """按未计算 prompt token 判定 prefill，不依赖输出列表时序。"""
+
+    return request.num_computed_tokens < request.num_prompt_tokens
 
 
 class DSAOffloadScheduler(Scheduler):
@@ -92,7 +94,7 @@ class DSAOffloadScheduler(Scheduler):
 
     def _has_ready_decode_work(self) -> bool:
         for request in self.running:
-            if request.num_output_tokens <= 0:
+            if _is_prefill_request(request) or request.num_output_tokens <= 0:
                 continue
             if (
                 request.num_output_placeholders > 0
@@ -122,7 +124,9 @@ class DSAOffloadScheduler(Scheduler):
         withheld: list[tuple[int, Request]] = []
         kept: list[Request] = []
         for index, request in enumerate(self.running):
-            if request.num_output_tokens > 0:
+            if _is_prefill_request(request):
+                kept.append(request)
+            elif request.num_output_tokens > 0:
                 withheld.append((index, request))
             else:
                 kept.append(request)
@@ -229,11 +233,16 @@ class DSAOffloadScheduler(Scheduler):
         )
 
     def schedule(self) -> SchedulerOutput:
-        # 首版禁用 chunked prefill、async scheduling 和 PP；一次完整
-        # prefill 的 schedule/update_from_output 之间不会再次进入 scheduler。
-        # 因此没有 waiting 请求时不可能在下一轮遗留可调度 prefill，直接
-        # 走上游快路径，避免 steady decode 额外构造空队列或扫描 row。
-        if not self.waiting and not self.skipped_waiting:
+        # vLLM 基线在每个 chunk 后维护 _inflight_prefills。它为空且两个
+        # waiting queue 也为空时，当前 running 必然是 steady decode，
+        # 可直接走上游快路径，避免额外扫描 batch。仍有中间 prefill
+        # chunk 时必须经过下面的 phase barrier，不能与 decode 混进同一
+        # model forward。
+        if (
+            not self.waiting
+            and not self.skipped_waiting
+            and not self._inflight_prefills
+        ):
             return self._attach_dsa_cache_layout(super().schedule())
 
         token_budget = 0 if self._pause_state == PauseState.PAUSED_ALL else self.max_num_scheduled_tokens
