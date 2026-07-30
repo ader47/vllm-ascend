@@ -330,11 +330,18 @@ class DSAOffloadConfig:
 
         if scheduler_config.async_scheduling is not False:
             raise ValueError("DSA sparse offload currently requires async_scheduling=False")
-        if bool(scheduler_config.enable_chunked_prefill):
-            raise ValueError("DSA sparse offload does not yet support chunked prefill")
-        if int(scheduler_config.long_prefill_token_threshold or 0) > 0:
+        chunked_prefill_enabled = (
+            bool(scheduler_config.enable_chunked_prefill)
+            or int(scheduler_config.long_prefill_token_threshold or 0) > 0
+        )
+        if (
+            chunked_prefill_enabled
+            and not bool(scheduler_config.scheduler_reserve_full_isl)
+        ):
             raise ValueError(
-                "DSA sparse offload does not support implicit chunked prefill through long_prefill_token_threshold"
+                "DSA chunked prefill requires scheduler_reserve_full_isl=True "
+                "so the complete prompt can be admitted into both dense "
+                "cache planes before its first chunk"
             )
         if bool(cache_config.enable_prefix_caching):
             raise ValueError("DSA sparse offload does not yet support prefix caching")

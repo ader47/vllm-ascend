@@ -184,6 +184,40 @@ def test_dense_enter_sparse_keeps_indexer_full_and_resident_fixed() -> None:
     assert tuple(block.block_id for block in coordinator.resident_manager.req_to_blocks["req"]) == resident_ids
 
 
+def test_chunked_prefill_grows_both_dense_planes_incrementally() -> None:
+    manager, coordinator = _make_manager()
+    request = _Request("req", 3000, 0, 0, 3000)
+
+    for computed, chunk_size, expected_blocks in (
+        (0, 1024, 8),
+        (1024, 1024, 16),
+        (2048, 952, 24),
+    ):
+        request.num_computed_tokens = computed
+        allocated = allocate_dsa_slots(  # type: ignore[arg-type]
+            manager,
+            request,
+            chunk_size,
+        )
+        assert allocated is not None
+        assert (
+            len(coordinator.indexer_manager.req_to_blocks["req"])
+            == expected_blocks
+        )
+        assert (
+            len(coordinator.resident_manager.req_to_blocks["req"])
+            == expected_blocks
+        )
+        state = coordinator.get_request_cache_state("req")
+        assert state is not None
+        assert state.stage == DSARequestCacheStage.PREFILL
+
+    request.num_computed_tokens = request.num_prompt_tokens
+    assert coordinator.request_cache_layout.should_release_resident_after_prefill(
+        request
+    )
+
+
 def test_enter_capacity_failure_keeps_stage_and_resident_table() -> None:
     manager, coordinator = _make_manager(
         indexer_blocks=16,

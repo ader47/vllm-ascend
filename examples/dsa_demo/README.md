@@ -18,8 +18,8 @@
 - 当前 checkout 的自定义算子已经完整编译并重新安装；
 - Ascend 910C 首版使用 PP=1、DCP=1、PCP=1；
 - `block_size=128`；
-- 关闭 async scheduling、chunked prefill、prefix cache、MTP/speculative
-  decoding、KV transfer 和 KV-cache metrics/events；
+- 关闭 async scheduling、prefix cache、MTP/speculative decoding、KV
+  transfer 和 KV-cache metrics/events；
 - 正式精度和性能测试关闭 DSA trace points。
 
 脚本只设置必要的 vLLM/vLLM-Ascend 原生环境变量。DSA 功能参数全部位于
@@ -49,6 +49,7 @@ PROMPTS = [
 MAX_NUM_SEQS = 2
 MAX_MODEL_LEN = 8192
 MAX_NUM_BATCHED_TOKENS = 8192
+ENABLE_CHUNKED_PREFILL = False
 RESULT_JSON = None  # 需要保存对照 token IDs 时填写路径
 ```
 
@@ -80,6 +81,15 @@ prefill、multi-token、capture-size miss 或其他原生动态 blocker 会被 D
 graph。非法 async 配置由 `tests/ut/dsa_offload/test_config.py` 覆盖，不再
 为了这一项给最小脚本增加独立运行模式。
 
+chunked prefill 复用 vLLM v0.23 原生调度。把
+`ENABLE_CHUNKED_PREFILL=True`，并把 `MAX_NUM_BATCHED_TOKENS` 调到小于
+单条长 prompt 的 token 数，即可覆盖多个 chunk。DSA 仍保持
+prefill/decode phase barrier：每个 prefill chunk 走 eager，最后一个 chunk
+完成并同步 dump 后才释放 resident 满块，后续单 token decode 可正常进入
+FULL graph。`scheduler_reserve_full_isl` 必须保持默认的 `True`，保证首个
+chunk 入场前完整 prompt 能同时容纳于 Indexer 与 resident MLA 两个 dense
+plane。
+
 ## 3. QA 数据集回归
 
 `qa_dataset_test.py` 延续旧项目对测试同事更直接的用法：修改文件顶部“用户
@@ -95,6 +105,7 @@ RUN_MODE = "eager"
 BATCH_SIZE = 4
 MAX_MODEL_LEN = 131072
 MAX_NUM_BATCHED_TOKENS = 131072
+ENABLE_CHUNKED_PREFILL = False
 ```
 
 然后运行：
@@ -123,7 +134,8 @@ python examples/dsa_demo/qa_dataset_test.py
 
 这既可用于自动评分，也可直接定位异常请求。若一批 prompt token 总数超过
 `max_num_batched_tokens`，脚本会提示 scheduler 可能分多轮完成 prefill；
-当前 chunked prefill 仍保持关闭。
+打开 `ENABLE_CHUNKED_PREFILL` 后，单个长 prompt 也可以按 token budget
+切成多个 prefill chunk。
 
 脚本默认 `MIN_TOKENS=0`，不会强制模型绕过正常 EOS。评分器也仅按
 LongBench 官方规则对 `trec/triviaqa/samsum/lsht` 截取首行；QA 和
@@ -159,6 +171,7 @@ python examples/dsa_demo/eval_dataset_acc_score.py \
 | row mode | 全 DENSE、全 SPARSE、DENSE/ENTER/SPARSE mixed |
 | graph | active=captured、active<captured 的 PAD |
 | dump | prefill 多满块、decode 跨满块 |
+| chunked prefill | 中间 chunk、最终 chunk、完成后首个 decode |
 | 生命周期 | 请求结束、InputBatch condense/reorder、stable row 复用 |
 | 模型 | GLM-5.1 主验收、DeepSeek-V3.2 回归 |
 
@@ -191,7 +204,7 @@ python examples/dsa_demo/eval_dataset_acc_score.py \
 
 ## 7. 当前不支持
 
-- chunked prefill 与 prefill/decode mixed batch；
+- prefill/decode mixed batch（chunked prefill 本身已支持）；
 - async scheduling；
 - prefix cache；
 - preemption/resume；
