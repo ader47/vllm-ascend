@@ -27,7 +27,8 @@ Layerwise Prefill offload currently requires:
 - `backend: "memcache"`;
 - `use_layerwise: true`;
 - an MLA or SFA attention backend with the layerwise wait/save integration;
-- identical tensor size for layers that share the same component buffer.
+- identical KV cache specifications and tensor sizes for physical layers that
+  share a buffer.
 
 When graph execution is enabled, AscendStore requests PIECEWISE graph mode for
 layerwise operations. Eager mode is also supported.
@@ -80,7 +81,7 @@ The defaults can normally be used without adjustment.
 
 ## Buffer Layout
 
-Let:
+For a uniform KV cache layout, let:
 
 - `N` be the number of physical layers, including MTP layers;
 - `I` be the number of independent layers;
@@ -110,10 +111,18 @@ Layer 4 reuses layer 1's physical buffer, layer 7 reuses layer 4's buffer, and
 so on. Before loading layer 4, the transfer thread waits until layer 1 has
 finished saving.
 
-For a uniform KV layout, the approximate logical-to-physical memory factor is
-`N / (I + min(B, R))`. For sparse C8, components can have different page
-sizes, so the implementation calculates the factor from the actual main and
-indexer page bytes instead of using the layer count alone.
+When physical layers have different KV cache layouts, the planner first groups
+them by their complete cache signature. Each signature gets its own reusable
+slots, so incompatible layouts never share storage. The physical slot count is
+then:
+
+```text
+I + sum(min(B, reusable layers with signature S) for each signature S)
+```
+
+For a uniform layout, the approximate logical-to-physical memory factor remains
+`N / (I + min(B, R))`. For heterogeneous layouts, the implementation calculates
+the factor from the actual cache page bytes assigned to every physical slot.
 
 ## Request Flow
 
@@ -122,10 +131,11 @@ indexer page bytes instead of using the layer count alone.
 1. The KV cache planner maps logical layer names to physical layer indices.
 2. Base transformer layers keep their normal indices. MTP layers are appended
    after the base layers.
-3. Layers are assigned to independent or shared physical slots.
-4. KV cache tensor descriptors assigned to the same slot are merged by
-   component.
-5. The worker registers the resulting physical buffers with Memcache and
+3. The planner builds the complete KV cache signature of each physical layer.
+4. Compatible layers are assigned to independent or shared physical slots.
+5. Corresponding KV cache tensor descriptors assigned to the same slot are
+   merged.
+6. The worker registers the resulting physical buffers with Memcache and
    adjusts the logical KV cache memory budget according to the bytes saved.
 
 ### Prefill Execution
@@ -160,21 +170,21 @@ transformer layer.
 
 ### Sparse C8
 
-An SFA layer can contain separate cache components:
+An SFA layer can contain separate cache entries:
 
 - the main MLA/SFA KV cache;
 - the sparse indexer cache;
 - their corresponding C8 scale data when enabled.
 
-The planner keeps main and indexer components separate when merging logical
-layers into physical slots. Transfer addresses and allocation sizes are
-derived from each layer's real component offsets and page bytes. This allows
-MTP and sparse C8 layouts to use the same layerwise offload pipeline without
-assuming that every layer has one uniform tensor layout.
+The planner does not identify these entries by model-specific names. It builds
+the physical layer's signature from their actual KV cache specifications and
+only reuses a slot when the complete signature matches. Transfer addresses and
+allocation sizes are derived from each group's real per-layer offsets and page
+bytes. This allows MTP and sparse C8 layouts to use the same layerwise offload
+pipeline without assuming that every layer has one tensor.
 
-Layers sharing one physical slot must have equal page size within each
-component. An incompatible layout is rejected during initialization instead
-of being transferred with incorrect offsets.
+An incompatible layout receives a separate slot pool instead of being
+transferred through an incorrectly sized buffer.
 
 ## Verification
 
@@ -202,5 +212,6 @@ If the first message is absent, check that:
 - TP-size mismatch is not supported with layerwise KV transfer.
 - Context-parallel attention backends do not yet provide the required
   layerwise wait/save integration.
-- Multiple KV cache groups are supported only for separated SFA main/indexer
-  cache layouts. General hybrid or compressed KV layouts are not supported.
+- Multiple non-packed attention KV cache groups are supported. State-cache
+  groups and packed or pre-shared KV cache tensor descriptors are not
+  supported by shared-buffer reuse.
