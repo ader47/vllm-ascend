@@ -11,7 +11,8 @@ from vllm_ascend.ops.mla import AscendMultiHeadLatentAttention, IndexerWrapper
 
 
 class TestIndexerWrapper(TestBase):
-    def test_initialization(self):
+    @patch("vllm_ascend.ops.mla.get_ascend_config")
+    def test_initialization(self, mock_get_ascend_config):
         mock_indexer = MagicMock()
         mock_indexer.n_head = 64
         mock_indexer.head_dim = 128
@@ -22,7 +23,9 @@ class TestIndexerWrapper(TestBase):
         mock_indexer.k_norm = nn.LayerNorm(128)
         mock_indexer.softmax_scale = 0.123
         mock_indexer.topk_indices_buffer = torch.randn(10)
-        mock_indexer.k_cache = torch.randn(10)
+        mock_indexer.k_cache = MagicMock()
+        mock_indexer.k_cache.prefix = "model.layers.0.self_attn.indexer"
+        mock_get_ascend_config.return_value.dsa_offload_config.enabled = False
 
         wrapper = IndexerWrapper(mock_indexer)
 
@@ -38,8 +41,33 @@ class TestIndexerWrapper(TestBase):
         self.assertIsNone(mock_indexer.topk_indices_buffer)
         self.assertIsNone(mock_indexer.k_cache)
 
+    @patch("vllm_ascend.ops.mla.get_current_vllm_config")
+    @patch("vllm_ascend.ops.mla.get_ascend_config")
+    def test_dsa_offload_updates_indexer_cache_layout(
+        self,
+        mock_get_ascend_config,
+        mock_get_vllm_config,
+    ):
+        mock_indexer = MagicMock()
+        mock_indexer.n_head = 64
+        mock_indexer.head_dim = 128
+        mock_indexer.topk_tokens = 2048
+        mock_indexer.q_lora_rank = 1536
+        mock_indexer.k_cache.prefix = "model.layers.0.self_attn.indexer"
+
+        mock_get_ascend_config.return_value.dsa_offload_config.enabled = True
+        mock_get_vllm_config.return_value.model_config.dtype = torch.bfloat16
+
+        indexer_cache = mock_indexer.k_cache
+        IndexerWrapper(mock_indexer)
+
+        self.assertEqual(indexer_cache.head_dim, 128)
+        self.assertEqual(indexer_cache.dtype, torch.bfloat16)
+        self.assertIsNone(mock_indexer.k_cache)
+
     def test_forward(self):
         mock_indexer = MagicMock()
+        mock_indexer.k_cache = None
         wrapper = IndexerWrapper(mock_indexer)
         result = wrapper.forward()
         self.assertIsNone(result)
@@ -59,6 +87,7 @@ class TestAscendMultiHeadLatentAttention(TestBase):
 
         self.mock_mla_modules = MagicMock(spec=MLAModules)
         self.mock_mla_modules.indexer = MagicMock()
+        self.mock_mla_modules.indexer.k_cache = None
         self.mock_mla_modules.is_sparse = False
         self.mock_mla_modules.rotary_emb = MagicMock()
         self.mock_mla_modules.fused_qkv_a_proj = MagicMock()
