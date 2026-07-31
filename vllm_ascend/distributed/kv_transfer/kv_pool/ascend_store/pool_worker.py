@@ -975,6 +975,12 @@ class KVPoolWorker:
                     ret,
                 )
                 if len(request.block_ids_by_group) == 1:
+                    logger.error(
+                        "layerwise_debug: record_invalid_blocks source=sync_backend_get tp_rank=%d req=%s blocks=%s",
+                        self.tp_rank,
+                        request.req_id,
+                        sorted(missing_block_ids),
+                    )
                     self._invalid_block_ids.update(missing_block_ids)
                 elif missing_block_ids:
                     logger.error(
@@ -990,6 +996,14 @@ class KVPoolWorker:
                     [1] * len(block_id_list_c),
                 )
                 if len(request.block_ids_by_group) == 1:
+                    logger.error(
+                        "layerwise_debug: record_invalid_blocks "
+                        "source=sync_backend_get_none tp_rank=%d "
+                        "req=%s blocks=%s",
+                        self.tp_rank,
+                        request.req_id,
+                        sorted(missing_block_ids),
+                    )
                     self._invalid_block_ids.update(missing_block_ids)
                 elif missing_block_ids:
                     logger.error(
@@ -1525,6 +1539,15 @@ class KVPoolWorker:
                 # cache state across groups (see PR #9701 for rationale).
                 if invalid_block_ids:
                     if self.num_kv_cache_groups == 1:
+                        logger.error(
+                            "layerwise_debug: record_invalid_blocks "
+                            "source=prepare_load_gvas tp_rank=%d "
+                            "req=%s group=%d blocks=%s",
+                            self.tp_rank,
+                            request.req_id,
+                            group_id,
+                            sorted(invalid_block_ids),
+                        )
                         with self._invalid_block_ids_lock:
                             self._invalid_block_ids.update(invalid_block_ids)
                     else:
@@ -1739,6 +1762,12 @@ class KVPoolWorker:
         with self._invalid_block_ids_lock:
             invalid_blocks = self._invalid_block_ids.copy()
             self._invalid_block_ids.clear()
+        if invalid_blocks:
+            logger.error(
+                "layerwise_debug: consume_invalid_blocks tp_rank=%d blocks=%s",
+                self.tp_rank,
+                sorted(invalid_blocks),
+            )
         return invalid_blocks
 
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
@@ -2028,10 +2057,20 @@ class KVPoolWorker:
         ret = self.m_store.get(keys_c, addrs_c, sizes_c)
         if ret is not None and any(r != 0 for r in ret):
             missing_block_ids = record_failed_blocks(block_ids_c, ret)
+            logger.error(
+                "layerwise_debug: record_invalid_blocks source=tp_mismatch_get tp_rank=%d blocks=%s",
+                self.tp_rank,
+                sorted(missing_block_ids),
+            )
             with self._invalid_block_ids_lock:
                 self._invalid_block_ids.update(missing_block_ids)
         elif ret is None:
             missing_block_ids = record_failed_blocks(block_ids_c, [1] * len(block_ids_c))
+            logger.error(
+                "layerwise_debug: record_invalid_blocks source=tp_mismatch_get_none tp_rank=%d blocks=%s",
+                self.tp_rank,
+                sorted(missing_block_ids),
+            )
             with self._invalid_block_ids_lock:
                 self._invalid_block_ids.update(missing_block_ids)
         logger.debug(
