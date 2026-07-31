@@ -23,6 +23,9 @@ from vllm_ascend.dsa_offload.kv_cache_coordinator import (
     DSABlockPoolView,
     DSAKVCacheCoordinator,
 )
+from vllm_ascend.patch.platform.patch_kv_cache_utils import (
+    _ascend_get_kv_cache_groups,
+)
 
 
 def _make_specs(
@@ -81,6 +84,25 @@ def test_split_groups_keep_stable_plane_order() -> None:
         DSAResidentMLAAttentionSpec,
     )
     assert len(groups[0].layer_names) == len(groups[1].layer_names) == 2
+
+
+def test_engine_core_grouping_initializes_process_local_ascend_config(
+    monkeypatch,
+) -> None:
+    initialized_with: list[object] = []
+    vllm_config = object()
+    monkeypatch.setattr(
+        "vllm_ascend.ascend_config.init_ascend_config",
+        initialized_with.append,
+    )
+
+    groups = _ascend_get_kv_cache_groups(  # type: ignore[arg-type]
+        vllm_config,
+        _make_specs(),
+    )
+
+    assert initialized_with == [vllm_config]
+    assert len(groups) == 2
 
 
 def test_split_group_ids_follow_spec_identity_not_position() -> None:

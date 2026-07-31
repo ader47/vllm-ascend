@@ -270,6 +270,14 @@ def _ascend_get_kv_cache_groups(
     """保留原生分组策略，仅对显式 DSA split spec 接管分组。"""
 
     if has_dsa_split_kv_cache_specs(kv_cache_spec):
+        # 在线服务会通过 spawn 启动独立 EngineCore 进程；前端进程在
+        # platform 配置阶段初始化的 AscendConfig 不会随之继承。这里是
+        # EngineCore 首个同时持有完整 vllm_config、且确定启用了 DSA split
+        # cache 的控制面边界，必须先初始化该进程自己的配置。后续容量预检、
+        # 容量报告和 DSA coordinator 都发生在此之后。
+        from vllm_ascend.ascend_config import init_ascend_config
+
+        init_ascend_config(vllm_config)
         return build_dsa_kv_cache_groups(kv_cache_spec)
     return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
 
