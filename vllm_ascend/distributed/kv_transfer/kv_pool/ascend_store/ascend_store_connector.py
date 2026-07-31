@@ -240,6 +240,12 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
             # A load-only consumer does not publish KV.
             return
+        logger.info(
+            "layerwise_debug: save_callback layer_name=%s worker_layer=%d/%d",
+            layer_name,
+            self.connector_worker.current_layer,
+            self.connector_worker.num_layers,
+        )
         self.connector_worker.save_kv_layer(self._get_connector_metadata())
 
     def wait_for_save(self):

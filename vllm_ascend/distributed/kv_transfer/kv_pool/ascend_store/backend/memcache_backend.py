@@ -155,6 +155,12 @@ class MemcacheBackend(Backend):
         finish = getattr(self.store, "batch_write_finish", None)
         if finish is None:
             # Older MemCache releases publish writes directly in batch_copy.
+            logger.warning(
+                "layerwise_debug: batch_write_finish is unavailable; "
+                "relying on batch_copy publication for keys=%s results=%s",
+                keys,
+                results,
+            )
             return [0] * len(keys)
         return finish(keys, results)
 

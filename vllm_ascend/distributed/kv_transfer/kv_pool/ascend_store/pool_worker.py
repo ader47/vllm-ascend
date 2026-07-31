@@ -1276,6 +1276,13 @@ class KVPoolWorker:
 
                 if new_keys:
                     new_gvas = self.m_store.batch_alloc(new_keys, [alloc_size] * len(new_keys))
+                    logger.info(
+                        "layerwise_debug: full_block_alloc req=%s group=%d alloc_size=%d allocations=%s",
+                        request.req_id,
+                        group_id,
+                        alloc_size,
+                        list(zip(new_keys, new_gvas)),
+                    )
                     if any(gva <= 0 for gva in new_gvas):
                         logger.error(
                             "alloc_gvas FAIL: req=%s group=%d alloc_size=%d new_keys=%d gvas_sample=%s zero_count=%d",
@@ -1323,6 +1330,17 @@ class KVPoolWorker:
                                 partial_block_index,
                                 partial_gva,
                             )
+                    logger.info(
+                        "layerwise_debug: partial_save_alloc req=%s group=%d "
+                        "key=%s block=%d end_token=%d gva=%d alloc_size=%d",
+                        request.req_id,
+                        group_id,
+                        partial_key,
+                        partial_block_index,
+                        request.target_token_len,
+                        partial_gva,
+                        alloc_size,
+                    )
                     # Partial keys are request-scoped; do not retain them forever.
                     self._allocated_gvas.pop(partial_key, None)
                     request.partial_save_gvas_by_group[group_id] = partial_gva
@@ -1476,15 +1494,25 @@ class KVPoolWorker:
                         if lease_res == 0:
                             leased_keys.append(keys[gva_index])
                         else:
+                            failed_gva = gvas[gva_index]
                             gvas[gva_index] = 0
                             if block_id is not None:
                                 invalid_block_ids.append(block_id)
                             logger.warning(
-                                "load_gvas: req=%s group=%d lease failed result=%d, block_id=%s load failed",
+                                "layerwise_debug: load_gvas lease failed "
+                                "req=%s group=%d key=%s is_partial=%s "
+                                "gva=%d size=%d result=%d block_index=%d "
+                                "block_id=%s cached_tokens=%d load failed",
                                 request.req_id,
                                 group_id,
+                                keys[gva_index],
+                                "@partial@" in keys[gva_index],
+                                failed_gva,
+                                key_infos[gva_index].size(),
                                 lease_res,
+                                block_idx,
                                 block_id,
+                                cached_tokens,
                             )
                 else:
                     lease_results = []
@@ -1629,6 +1657,23 @@ class KVPoolWorker:
     def process_layer_data(self, requests: list[ReqMeta]) -> None:
         if not requests:
             return
+        logger.info(
+            "layerwise_debug: step_plan requests=%s num_layers=%d num_groups=%d",
+            [
+                {
+                    "req_id": request.req_id,
+                    "can_save": request.can_save,
+                    "save_start": request.save_start_token,
+                    "save_end": request.save_end_token,
+                    "target": request.target_token_len,
+                    "load_vllm": (request.load_spec.vllm_cached_tokens if request.load_spec is not None else None),
+                    "load_pool": (request.load_spec.kvpool_cached_tokens if request.load_spec is not None else None),
+                }
+                for request in requests
+            ],
+            self.num_layers,
+            self.num_kv_cache_groups,
+        )
         for physical_layer in range(self.num_layers):
             group_layers = self.physical_layer_to_group_layers.get(physical_layer, [(0, physical_layer)])
             for group_id, layer_idx_in_group in group_layers:
@@ -1698,12 +1743,23 @@ class KVPoolWorker:
 
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
         if self.current_layer >= self.num_layers:
+            logger.warning(
+                "layerwise_debug: ignoring extra save callback current_layer=%d num_layers=%d",
+                self.current_layer,
+                self.num_layers,
+            )
             return
         assert self.sync_save_events is not None
         assert self.layer_save_finished_events is not None
         assert self.kv_send_thread is not None
         send_thread = self.kv_send_thread
         send_thread.raise_if_failed()
+        logger.info(
+            "layerwise_debug: submit_save_layer layer=%d/%d task_groups=%s",
+            self.current_layer,
+            self.num_layers,
+            [(task.group_id, task.layer_idx_in_group) for task in self.layer_save_tasks[self.current_layer]],
+        )
         self.sync_save_events[self.current_layer].record()
         if self.layer_save_tasks[self.current_layer]:
             for task in self.layer_save_tasks[self.current_layer]:

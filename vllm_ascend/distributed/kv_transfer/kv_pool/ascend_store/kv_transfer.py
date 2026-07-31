@@ -1427,19 +1427,41 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 self.max_transfer_blocks,
                 self.max_transfer_bytes,
             )
-            if physical_layer <= 2 or res != 0:
-                logger.info(
-                    "save_thread: layer=%d groups=%d blocks=%d res=%d",
-                    physical_layer,
-                    len(all_gvas),
-                    len(gvas_array),
-                    res,
+            unique_save_keys = list(dict.fromkeys(all_save_keys))
+            gva_ranges = list(
+                zip(
+                    gvas_array.tolist(),
+                    size_array.tolist(),
+                    strict=True,
                 )
+            )
+            gva_ranges_sample = (
+                gva_ranges if len(gva_ranges) <= 8 else [*gva_ranges[:4], ("...", "..."), *gva_ranges[-4:]]
+            )
+            logger.info(
+                "layerwise_debug: save_copy_complete layer=%d "
+                "task_layout=%s transfers=%d total_bytes=%d "
+                "gva_min=%s gva_max_end=%s gva_ranges_sample=%s save_keys=%s "
+                "write_finish_keys=%s res=%d",
+                physical_layer,
+                [
+                    (task.group_id, task.layer_idx_in_group)
+                    for task in transfer_tasks
+                    if task.shared_block_data is not None
+                ],
+                len(gvas_array),
+                int(size_array.sum()),
+                int(gvas_array.min()) if len(gvas_array) else None,
+                int((gvas_array + size_array).max()) if len(gvas_array) else None,
+                gva_ranges_sample,
+                unique_save_keys,
+                list(dict.fromkeys(write_finish_keys)),
+                res,
+            )
             if res != 0:
                 raise RuntimeError(f"Layerwise {physical_layer} save batch_copy failed with return code {res}")
             if all_save_keys:
-                save_keys = list(dict.fromkeys(all_save_keys))
-                for key in save_keys:
+                for key in unique_save_keys:
                     self.write_results[key] = self.write_results.get(key, 0) or res
             if write_finish_keys:
                 finish_keys = list(dict.fromkeys(write_finish_keys))
