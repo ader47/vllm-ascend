@@ -13,7 +13,6 @@ add_ops_compile_options(
     OPTIONS
         --cce-auto-sync=off
         -Wno-deprecated-declarations
-        -Werror
         --op_relocatable_kernel_binary=true
 )
 
