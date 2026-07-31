@@ -241,7 +241,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             # A load-only consumer does not publish KV.
             return
         logger.info(
-            "layerwise_debug: save_callback layer_name=%s worker_layer=%d/%d",
+            "layerwise_debug: save_callback tp_rank=%d layer_name=%s worker_layer=%d/%d",
+            self.connector_worker.tp_rank,
             layer_name,
             self.connector_worker.current_layer,
             self.connector_worker.num_layers,

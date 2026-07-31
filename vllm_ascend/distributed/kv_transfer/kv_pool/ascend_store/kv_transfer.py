@@ -265,6 +265,19 @@ class LayerBatchBuilder:
 
         block_ids_arr, block_gvas_arr = self._dedupe_transfer_blocks(block_ids_slice, block_gvas_slice)
 
+        logger.info(
+            "layerwise_debug: shared_blocks key_index=%d direction=%s "
+            "group=%d req_ids=%s block_ids=%s base_gvas=%s "
+            "save_keys=%s load_keys=%s",
+            self.my_key_index,
+            "save" if is_save else "load",
+            self.group_id,
+            req_ids,
+            block_ids_arr.tolist(),
+            block_gvas_arr.tolist(),
+            list(dict.fromkeys(all_save_keys)),
+            list(dict.fromkeys(all_load_keys)),
+        )
         logger.debug(
             "[KVPOOL] build_shared req_ids=%s block_gvas_arr=%s block_ids_arr=%s",
             req_ids,
@@ -1439,10 +1452,11 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 gva_ranges if len(gva_ranges) <= 8 else [*gva_ranges[:4], ("...", "..."), *gva_ranges[-4:]]
             )
             logger.info(
-                "layerwise_debug: save_copy_complete layer=%d "
+                "layerwise_debug: save_copy_complete tp_rank=%d layer=%d "
                 "task_layout=%s transfers=%d total_bytes=%d "
                 "gva_min=%s gva_max_end=%s gva_ranges_sample=%s save_keys=%s "
                 "write_finish_keys=%s res=%d",
+                self.tp_rank,
                 physical_layer,
                 [
                     (task.group_id, task.layer_idx_in_group)
@@ -1648,6 +1662,35 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             1,
             self.max_transfer_blocks,
             self.max_transfer_bytes,
+        )
+        load_gva_ranges = list(
+            zip(
+                gvas_array.tolist(),
+                size_array.tolist(),
+                strict=True,
+            )
+        )
+        load_gva_ranges_sample = (
+            load_gva_ranges
+            if len(load_gva_ranges) <= 8
+            else [
+                *load_gva_ranges[:4],
+                ("...", "..."),
+                *load_gva_ranges[-4:],
+            ]
+        )
+        logger.info(
+            "layerwise_debug: load_copy_complete tp_rank=%d layer=%d "
+            "task_layout=%s transfers=%d total_bytes=%d "
+            "gva_ranges_sample=%s load_keys=%s res=%d",
+            self.tp_rank,
+            layer_id,
+            [(task.group_id, task.layer_idx_in_group) for task, _ in task_metas],
+            len(gvas_array),
+            int(size_array.sum()),
+            load_gva_ranges_sample,
+            list(dict.fromkeys(all_load_keys)),
+            res,
         )
         if layer_id <= 2 or res != 0:
             logger.debug(

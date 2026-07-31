@@ -731,6 +731,18 @@ class KVPoolWorker:
         self.group_block_stride[group_id] = group_block_strides
         self.group_layer_offsets[group_id] = layer_offsets
         self.group_num_layers[group_id] = len(layer_names_by_physical)
+        logger.info(
+            "layerwise_debug: group_layout tp_rank=%d group=%d "
+            "physical_layers=%s layer_names=%s block_lens=%s "
+            "layer_offsets=%s allocation_size=%d",
+            self.tp_rank,
+            group_id,
+            sorted(layer_names_by_physical),
+            {physical_layer: sorted(names) for physical_layer, names in sorted(layer_names_by_physical.items())},
+            group_block_lens,
+            layer_offsets,
+            sum(group_block_lens),
+        )
 
     def _align_kv_ptrs(self, registered_regions: dict[int, tuple[int, int]]):
         """
@@ -1291,7 +1303,8 @@ class KVPoolWorker:
                 if new_keys:
                     new_gvas = self.m_store.batch_alloc(new_keys, [alloc_size] * len(new_keys))
                     logger.info(
-                        "layerwise_debug: full_block_alloc req=%s group=%d alloc_size=%d allocations=%s",
+                        "layerwise_debug: full_block_alloc tp_rank=%d req=%s group=%d alloc_size=%d allocations=%s",
+                        self.tp_rank,
                         request.req_id,
                         group_id,
                         alloc_size,
@@ -1345,8 +1358,10 @@ class KVPoolWorker:
                                 partial_gva,
                             )
                     logger.info(
-                        "layerwise_debug: partial_save_alloc req=%s group=%d "
-                        "key=%s block=%d end_token=%d gva=%d alloc_size=%d",
+                        "layerwise_debug: partial_save_alloc tp_rank=%d "
+                        "req=%s group=%d key=%s block=%d "
+                        "end_token=%d gva=%d alloc_size=%d",
+                        self.tp_rank,
                         request.req_id,
                         group_id,
                         partial_key,
@@ -1471,6 +1486,33 @@ class KVPoolWorker:
                     continue
 
                 key_infos = self.m_store.batch_get_key_info(keys)
+                logger.info(
+                    "layerwise_debug: load_lookup tp_rank=%d req=%s "
+                    "group=%d cached_tokens=%d load_range=[%d,%d) "
+                    "partial_block=%s key_count=%d info_count=%d entries=%s",
+                    self.tp_rank,
+                    request.req_id,
+                    group_id,
+                    cached_tokens,
+                    load_start_block,
+                    full_blocks,
+                    partial_block_index,
+                    len(keys),
+                    len(key_infos),
+                    [
+                        {
+                            "key": key,
+                            "size": key_info.size(),
+                            "gvas": key_info.gva_list(),
+                            "block_index": block_index,
+                        }
+                        for key, key_info, block_index in zip(
+                            keys,
+                            key_infos,
+                            block_indices,
+                        )
+                    ],
+                )
                 gvas = []
                 valid_gva_indices = []
                 invalid_block_ids: list[int] = []
@@ -1496,6 +1538,17 @@ class KVPoolWorker:
                 valid_keys = [keys[index] for index in valid_gva_indices]
                 if valid_keys:
                     lease_results = self.m_store.batch_add_lease(valid_keys, LAYERWISE_READ_LEASE_TTL_MS)
+                    logger.info(
+                        "layerwise_debug: lease_results tp_rank=%d "
+                        "req=%s group=%d key_count=%d result_count=%d "
+                        "results=%s",
+                        self.tp_rank,
+                        request.req_id,
+                        group_id,
+                        len(valid_keys),
+                        len(lease_results),
+                        list(zip(valid_keys, lease_results)),
+                    )
                     if len(lease_results) != len(valid_keys):
                         raise RuntimeError(
                             "MemCache lease returned unexpected number of results: "
@@ -1514,9 +1567,11 @@ class KVPoolWorker:
                                 invalid_block_ids.append(block_id)
                             logger.warning(
                                 "layerwise_debug: load_gvas lease failed "
-                                "req=%s group=%d key=%s is_partial=%s "
+                                "tp_rank=%d req=%s group=%d "
+                                "key=%s is_partial=%s "
                                 "gva=%d size=%d result=%d block_index=%d "
                                 "block_id=%s cached_tokens=%d load failed",
+                                self.tp_rank,
                                 request.req_id,
                                 group_id,
                                 keys[gva_index],
@@ -1681,7 +1736,8 @@ class KVPoolWorker:
         if not requests:
             return
         logger.info(
-            "layerwise_debug: step_plan requests=%s num_layers=%d num_groups=%d",
+            "layerwise_debug: step_plan tp_rank=%d requests=%s num_layers=%d num_groups=%d",
+            self.tp_rank,
             [
                 {
                     "req_id": request.req_id,
@@ -1773,7 +1829,8 @@ class KVPoolWorker:
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
         if self.current_layer >= self.num_layers:
             logger.warning(
-                "layerwise_debug: ignoring extra save callback current_layer=%d num_layers=%d",
+                "layerwise_debug: ignoring extra save callback tp_rank=%d current_layer=%d num_layers=%d",
+                self.tp_rank,
                 self.current_layer,
                 self.num_layers,
             )
@@ -1784,7 +1841,8 @@ class KVPoolWorker:
         send_thread = self.kv_send_thread
         send_thread.raise_if_failed()
         logger.info(
-            "layerwise_debug: submit_save_layer layer=%d/%d task_groups=%s",
+            "layerwise_debug: submit_save_layer tp_rank=%d layer=%d/%d task_groups=%s",
+            self.tp_rank,
             self.current_layer,
             self.num_layers,
             [(task.group_id, task.layer_idx_in_group) for task in self.layer_save_tasks[self.current_layer]],

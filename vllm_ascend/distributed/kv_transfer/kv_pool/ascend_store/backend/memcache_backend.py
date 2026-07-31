@@ -157,7 +157,9 @@ class MemcacheBackend(Backend):
             # Older MemCache releases publish writes directly in batch_copy.
             logger.warning(
                 "layerwise_debug: batch_write_finish is unavailable; "
-                "relying on batch_copy publication for keys=%s results=%s",
+                "relying on batch_copy publication local_rank=%d "
+                "keys=%s results=%s",
+                self.local_rank,
                 keys,
                 results,
             )
