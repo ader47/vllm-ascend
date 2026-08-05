@@ -132,8 +132,8 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.token_database = MagicMock()
         worker.token_database.get_block_size.return_value = 128
         worker.token_database.group_cache_families = {"kv": {0: "default"}}
-        worker.token_database.process_token_key_strings.side_effect = (
-            lambda *args, chunk_filter, **kwargs: [(0, 128, "key", "ab" * 32)] if chunk_filter(0) else []
+        worker.token_database.process_token_key_strings.side_effect = lambda *args, chunk_filter, **kwargs: (
+            [(0, 128, "key", "ab" * 32)] if chunk_filter(0) else []
         )
 
         hit = worker._lookup_with_coordinator(
@@ -211,6 +211,7 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.group_kv_caches_base_addr = {}
         worker.group_block_len = {}
         worker.group_block_stride = {}
+        worker.group_layer_cache_entry_offsets = {}
         worker.group_num_layers = {}
 
         worker._infer_cache_group_metadata(0, list(worker.kv_caches))
@@ -244,6 +245,72 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         )
         self.assertEqual(worker._extract_physical_layer_index("model.layers.4.self_attn"), 4)
         self.assertEqual(len(worker.layer_load_tasks), 3)
+
+    def test_extract_physical_layer_index_matched_mtp_first(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.num_layers = 4
+        worker.hf_config = MagicMock(num_hidden_layers=4)
+
+        # MTP names map to num_hidden_layers + idx, even when they carry a
+        # "layers.N" substring elsewhere in the path.
+        self.assertEqual(worker._extract_physical_layer_index("model.mtp.0.mtp_block.self_attn.attn"), 4)
+        self.assertEqual(worker._extract_physical_layer_index("model.mtp.1.mtp_block.self_attn.attn"), 5)
+        self.assertEqual(worker._extract_physical_layer_index("mtp.0.self_attn.attn"), 4)
+        # Main attention layers still map to their own index.
+        self.assertEqual(worker._extract_physical_layer_index("model.layers.0.self_attn"), 0)
+        self.assertEqual(worker._extract_physical_layer_index("model.layers.3.self_attn"), 3)
+
+    def test_configure_registered_layerwise_layers_sorts_physical_order(self):
+        # layer_idx_in_group must follow sorted physical order (matching the
+        # byte layout in _infer_cache_group_metadata), not registration order.
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.num_layers = 2
+        worker.hf_config = MagicMock(num_hidden_layers=4)
+        worker.layer_load_tasks = [[], []]
+        worker.layer_save_tasks = [[], []]
+
+        worker._configure_registered_layerwise_layers(
+            [
+                # MTP layer registered before lower-numbered main layers.
+                (0, ["model.mtp.0.self_attn", "model.layers.2.self_attn", "model.layers.3.self_attn"]),
+            ]
+        )
+
+        self.assertEqual(worker.num_layers, 3)
+        self.assertEqual(
+            worker.local_layer_to_group_layers,
+            {
+                0: [(0, 0)],  # phys 2 -> group layer idx 0
+                1: [(0, 1)],  # phys 3 -> group layer idx 1
+                2: [(0, 2)],  # phys 4 (mtp.0) -> group layer idx 2
+            },
+        )
+
+    def test_start_load_kv_drains_stale_save_events(self):
+        # A step that fires fewer than num_layers hooks (MTP with fewer
+        # speculative tokens than draft layers) never reaches the end-of-step
+        # clear in save_kv_layer, leaving set events behind. start_load_kv must
+        # drain them so the next step's save waits / thread asserts are safe.
+        import threading
+
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.use_layerwise = True
+        worker.layer_save_finished_events = [threading.Event() for _ in range(3)]
+        worker.layer_save_finished_events[1].set()  # stale leftover
+        worker.layer_save_finished_events[2].set()  # stale leftover
+        worker.layerwise_retrievers = []
+        # Empty metadata -> start_load_kv returns right after the drain.
+        metadata = MagicMock()
+        metadata.requests = []
+
+        worker.start_load_kv(metadata)
+
+        self.assertFalse(any(e.is_set() for e in worker.layer_save_finished_events))
+        self.assertEqual(worker.current_layer, 0)
+        self.assertEqual(worker.next_layer_to_submit, 0)
 
 
 class TestKVPoolWorkerInit(unittest.TestCase):

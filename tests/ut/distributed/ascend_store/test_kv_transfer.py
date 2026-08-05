@@ -19,6 +19,8 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm.distributed.kv_events import BlockStored
@@ -40,6 +42,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     KVCacheStoreRecvingThread,
     KVCacheStoreSendingThread,
     KVTransferThread,
+    LayerBatchBuilder,
 )
 
 
@@ -658,6 +661,60 @@ class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
         t._handle_request(req)
         self.assertEqual(len(store.get_calls), 1)
         self.assertTrue(get_event.is_set())
+
+
+class TestLayerBatchBuilderEntryOffsets(unittest.TestCase):
+    """The per-layer GVA offset must be the prefix byte sum of the cache entries
+    before that layer, so MTP layers with a different entry count do not shift
+    every later layer's window. Regression test for the layerwise MTP
+    acceptance-rate bug."""
+
+    def _make_db(self):
+        db = ChunkedTokenDatabase([KeyMetadata("m", 0, 0, 0, 0)], [16], None)
+        # 3 physical layers; entry lens per layer are [16,16], [16], [16,16,16]
+        # (e.g. the MTP layer registers a different number of cache tensors).
+        db.set_group_buffers(
+            {0: [100, 200, 300, 400, 500, 600]},
+            {0: [16, 16, 16, 16, 16, 16]},
+            {0: [16, 16, 16, 16, 16, 16]},
+            group_num_layers={0: 3},
+            group_layer_cache_entry_offsets={0: [0, 2, 3, 6]},
+        )
+        return db
+
+    def test_rank_layer_offset_uses_prefix_byte_sum(self):
+        db = self._make_db()
+        builder = LayerBatchBuilder(db, 0, 1, page_size_bytes=48, num_layers=3, group_id=0)
+        block_ids = np.asarray([0], dtype=np.int64)
+        base_gvas = np.asarray([1000], dtype=np.int64)
+
+        # layer 0 -> entries [0,2): offset 0
+        _, _, gvas0 = builder._build_transfer_arrays(block_ids, base_gvas, 0)
+        # layer 1 -> entries [2,3): offset = len[0]+len[1] = 32
+        _, _, gvas1 = builder._build_transfer_arrays(block_ids, base_gvas, 1)
+        # layer 2 -> entries [3,6): offset = len[0..2] = 48
+        _, _, gvas2 = builder._build_transfer_arrays(block_ids, base_gvas, 2)
+
+        self.assertEqual(int(gvas0.min()), 1000 + 0)
+        self.assertEqual(int(gvas1.min()), 1000 + 32)
+        self.assertEqual(int(gvas2.min()), 1000 + 48)
+
+    def test_fallback_even_division_without_offsets(self):
+        db = ChunkedTokenDatabase([KeyMetadata("m", 0, 0, 0, 0)], [16], None)
+        # No entry offsets recorded -> even per-layer division (2 layers, 2 entries).
+        db.set_group_buffers(
+            {0: [100, 200]},
+            {0: [16, 16]},
+            {0: [16, 16]},
+            group_num_layers={0: 2},
+        )
+        builder = LayerBatchBuilder(db, 0, 1, page_size_bytes=16, num_layers=2, group_id=0)
+        block_ids = np.asarray([0], dtype=np.int64)
+        base_gvas = np.asarray([1000], dtype=np.int64)
+        _, _, gvas0 = builder._build_transfer_arrays(block_ids, base_gvas, 0)
+        _, _, gvas1 = builder._build_transfer_arrays(block_ids, base_gvas, 1)
+        self.assertEqual(int(gvas0.min()), 1000 + 0)
+        self.assertEqual(int(gvas1.min()), 1000 + 16)
 
 
 if __name__ == "__main__":

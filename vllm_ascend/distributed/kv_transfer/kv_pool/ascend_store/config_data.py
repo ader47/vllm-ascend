@@ -218,6 +218,7 @@ class ChunkedTokenDatabase:
         self.group_kv_caches_base_addr: dict[int, list[int]] = {}
         self.group_block_len: dict[int, list[int]] = {}
         self.group_block_stride: dict[int, list[int]] = {}
+        self.group_layer_cache_entry_offsets: dict[int, list[int]] = {}
         self.group_cache_families: dict[str, dict[int, str]] = {
             "kv": {},
             "state": {},
@@ -330,6 +331,7 @@ class ChunkedTokenDatabase:
         cache_role: str = "kv",
         group_cache_families: dict[int, str] | None = None,
         group_num_layers: dict[int, int] | None = None,
+        group_layer_cache_entry_offsets: dict[int, list[int]] | None = None,
     ) -> None:
         if cache_role == "state":
             # Keep the interface for future explicit state groups, but this
@@ -339,6 +341,7 @@ class ChunkedTokenDatabase:
             self.group_kv_caches_base_addr = group_kv_caches_base_addr
             self.group_block_len = group_block_len
             self.group_block_stride = group_block_stride or {}
+            self.group_layer_cache_entry_offsets = group_layer_cache_entry_offsets or {}
         if group_cache_families is not None:
             self.group_cache_families[cache_role] = group_cache_families.copy()
             self._key_prefix_cache.clear()

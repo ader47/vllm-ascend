@@ -564,16 +564,17 @@ class KVPoolWorker:
     def _extract_physical_layer_index(self, layer_name: str) -> int:
         import regex as re
 
+        # Match MTP layers first: names like "mtp.0.self_attn.xxx" (and
+        # "...layers.N.mtp_block..."-style paths) map to a synthetic index after
+        # the main layers. Checking this before the generic "layers.N" pattern
+        # avoids mis-indexing an MTP layer whose name also contains "layers.N".
+        m = re.search(r"(?:^|\.)mtp(?:\.layers)?\.(\d+)(?:\.|$)", layer_name)
+        if m:
+            num_hidden_layers = getattr(self.hf_config, "num_hidden_layers", self.num_layers)
+            return num_hidden_layers + int(m.group(1))
         m = re.search(r"layers\.(\d+)", layer_name)
         if m:
             return int(m.group(1))
-        # MTP layers have names like "mtp.0.self_attn.xxx" without "layers."
-        # prefix. Map them after the main model layers.
-        if ".mtp." in f".{layer_name}.":
-            m = re.search(r"mtp\.(\d+)", layer_name)
-            if m:
-                num_hidden_layers = getattr(self.hf_config, "num_hidden_layers", self.num_layers)
-                return num_hidden_layers + int(m.group(1))
         m = re.search(r"(\d+)", layer_name)
         return int(m.group(1)) if m else 0
 
@@ -581,34 +582,45 @@ class KVPoolWorker:
         group_addrs: list[int] = []
         group_block_lens: list[int] = []
         group_block_strides: list[int] = []
-        physical_layers = set()
+        # Group cache entries by physical layer so each layer's window within a
+        # GVA blob can be located by its real prefix-byte offset, not by an
+        # even per-layer division (MTP layers may register a different number
+        # of cache tensors than the main layers).
+        layer_names_by_physical: dict[int, list[str]] = {}
         for layer_name in layer_names:
             phys = self._extract_physical_layer_index(layer_name)
-            physical_layers.add(phys)
-            cache_or_caches = self.kv_caches[layer_name]
-            for cache in self._as_cache_tuple(cache_or_caches):
-                base_addr = cache.data_ptr()
-                block_len, block_stride, _, _ = self._get_cache_block_metadata(cache)
-                group_addrs.append(base_addr)
-                group_block_lens.append(block_len)
-                group_block_strides.append(block_stride)
+            layer_names_by_physical.setdefault(phys, []).append(layer_name)
+
+        layer_cache_entry_offsets = [0]
+        for phys in sorted(layer_names_by_physical):
+            for layer_name in sorted(layer_names_by_physical[phys]):
+                cache_or_caches = self.kv_caches[layer_name]
+                for cache in self._as_cache_tuple(cache_or_caches):
+                    base_addr = cache.data_ptr()
+                    block_len, block_stride, _, _ = self._get_cache_block_metadata(cache)
+                    group_addrs.append(base_addr)
+                    group_block_lens.append(block_len)
+                    group_block_strides.append(block_stride)
+            layer_cache_entry_offsets.append(len(group_addrs))
         self.group_kv_caches_base_addr[group_id] = group_addrs
         self.group_block_len[group_id] = group_block_lens
         self.group_block_stride[group_id] = group_block_strides
-        self.group_num_layers[group_id] = len(physical_layers)
+        self.group_layer_cache_entry_offsets[group_id] = layer_cache_entry_offsets
+        self.group_num_layers[group_id] = len(layer_names_by_physical)
 
     def _configure_registered_layerwise_layers(self, cache_groups: list[tuple[int, list[str]]]) -> None:
         """Map registered physical layers to dense local and group indices."""
         groups_by_physical: dict[int, list[tuple[int, int]]] = {}
 
         for group_id, layer_names in cache_groups:
-            group_physical_layers: list[int] = []
-            seen_in_group: set[int] = set()
-            for layer_name in layer_names:
-                physical_layer = self._extract_physical_layer_index(layer_name)
-                if physical_layer not in seen_in_group:
-                    seen_in_group.add(physical_layer)
-                    group_physical_layers.append(physical_layer)
+            # layer_idx_in_group must follow the same sorted physical-layer order
+            # that _infer_cache_group_metadata uses to lay out the group's cache
+            # entries, otherwise a layer's GVA window is computed for the wrong
+            # physical layer. Registration order is not guaranteed to be sorted
+            # (MTP layers map to a synthetic index after num_hidden_layers).
+            group_physical_layers = sorted(
+                {self._extract_physical_layer_index(layer_name) for layer_name in layer_names}
+            )
 
             for layer_idx_in_group, physical_layer in enumerate(group_physical_layers):
                 groups_by_physical.setdefault(physical_layer, []).append((group_id, layer_idx_in_group))
@@ -668,6 +680,7 @@ class KVPoolWorker:
         self.group_kv_caches_base_addr: dict[int, list[int]] = {}
         self.group_block_len: dict[int, list[int]] = {}
         self.group_block_stride: dict[int, list[int]] = {}
+        self.group_layer_cache_entry_offsets: dict[int, list[int]] = {}
         self.kv_caches = kv_caches
         self.group_kv_cache_families: dict[int, str] = {
             group_id: self._get_group_family(self.kv_cache_group_families, group_id)
@@ -725,6 +738,7 @@ class KVPoolWorker:
             cache_role="kv",
             group_cache_families=self.group_kv_cache_families,
             group_num_layers=self.group_num_layers,
+            group_layer_cache_entry_offsets=self.group_layer_cache_entry_offsets,
         )
         # Initialize store, register buffers, and start transfer threads
         # directly here (like main) — no separate init_backend handshake.
@@ -737,6 +751,14 @@ class KVPoolWorker:
         if self.use_layerwise:
             self.next_layer_to_submit = 0
             reset_attention_compute_start_gate()
+            # Drain any save-finished events left set by a previous step that ran
+            # fewer than num_layers hooks (e.g. MTP with num_speculative_tokens <
+            # num draft layers), so its end-of-step clear in save_kv_layer never
+            # ran. Stale set events would make this step's save waits return early.
+            if self.layer_save_finished_events is not None:
+                for event in self.layer_save_finished_events:
+                    if event.is_set():
+                        event.clear()
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         if len(metadata.requests) == 0:
             return
@@ -1033,13 +1055,13 @@ class KVPoolWorker:
                 cache_family = self._get_group_family(self.kv_cache_group_families, group_id)
                 ratio = max(infer_cache_family_ratio(cache_family), 1)
                 effective_block_size = group_block_size * ratio
-                group_num_layers = self.group_num_layers.get(group_id, self.num_layers)
                 group_block_len = self.group_block_len.get(group_id, self.group_block_len.get(0, []))
-                if group_block_len and group_num_layers > 0:
-                    group_page_size = sum(group_block_len) // group_num_layers
-                else:
-                    group_page_size = self.page_size_bytes
-                alloc_size = group_page_size * group_num_layers
+                # Allocate the real total bytes of the group's cache entries.
+                # The transfer-side per-layer offsets are prefix byte sums over
+                # these same entries (see LayerBatchBuilder), so the blob must
+                # span all of them — an even per-layer division would mismatch
+                # whenever MTP layers register a different entry count.
+                alloc_size = sum(group_block_len) if group_block_len else self.page_size_bytes
 
                 group_block_hashes = get_block_hashes(block_hashes, effective_block_size, self.hash_block_size)
                 block_ids_by_group = (
