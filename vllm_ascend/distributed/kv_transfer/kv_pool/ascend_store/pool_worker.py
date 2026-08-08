@@ -902,7 +902,12 @@ class KVPoolWorker:
             # in the pool (loaded via load_prepare), so re-saving would write
             # to a READABLE blob and fail with MMC_UNMATCHED_KEY.
             if request.load_spec is not None and request.load_spec.can_load:
-                hit_full_blocks = request.load_spec.kvpool_cached_tokens // block_size
+                pool_hit_tokens = (
+                    request.load_spec.kvpool_store_skip_tokens
+                    if request.load_spec.kvpool_store_skip_tokens is not None
+                    else request.load_spec.kvpool_cached_tokens
+                )
+                hit_full_blocks = pool_hit_tokens // block_size
                 save_start_block = max(save_start_block, hit_full_blocks)
             # Skip blocks already saved in previous requests (GVA cached
             # locally). The overall hit_tokens is min(hits_per_group), so
@@ -1053,7 +1058,12 @@ class KVPoolWorker:
                 save_start_block = request.save_start_token // effective_block_size
                 save_end_block = request.save_end_token // effective_block_size
                 if request.load_spec is not None and request.load_spec.can_load:
-                    hit_full_blocks = request.load_spec.kvpool_cached_tokens // effective_block_size
+                    pool_hit_tokens = (
+                        request.load_spec.kvpool_store_skip_tokens
+                        if request.load_spec.kvpool_store_skip_tokens is not None
+                        else request.load_spec.kvpool_cached_tokens
+                    )
+                    hit_full_blocks = pool_hit_tokens // effective_block_size
                     save_start_block = max(save_start_block, hit_full_blocks)
                 # Skip blocks already saved (GVA cached locally from previous
                 # request). See _process_save_for_layer_batch for rationale.

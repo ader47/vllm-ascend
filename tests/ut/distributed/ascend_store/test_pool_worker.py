@@ -1521,6 +1521,28 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         worker._process_save_for_layer_batch([req], 0)
         self.assertEqual(len(worker.layer_save_tasks[0]), 0)
 
+    def test_process_save_uses_raw_pool_hit_extent(self):
+        worker = self._make_worker()
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=32,
+            block_ids=[0, 1],
+            block_hashes=["h0", "h1"],
+            can_save=True,
+            save_start_token=0,
+            save_end_token=32,
+            load_spec=LoadSpec(
+                vllm_cached_tokens=16,
+                kvpool_cached_tokens=16,
+                can_load=True,
+                kvpool_store_skip_tokens=32,
+            ),
+        )
+
+        worker._process_save_for_layer_batch([req], 0)
+
+        self.assertEqual(worker.layer_save_tasks[0], [])
+
     def test_process_load_for_layer_batch_skip_no_load(self):
         worker = self._make_worker()
         req = ReqMeta(req_id="r1", token_len_chunk=32, block_ids=[0, 1], block_hashes=["h0", "h1"], load_spec=None)
