@@ -58,7 +58,7 @@ Then build and install Memcache Hybrid. Its MemFabric submodule must use the
 same `release/1.2` branch:
 
 ```bash
-git clone https://gitcode.com/jieke275/memcache.git
+git clone https://gitcode.com/Ascend/memcache.git
 cd memcache
 git submodule update --init 3rdparty/
 git -c submodule.3rdparty/memfabric_hybrid.branch=release/1.2 \
@@ -76,11 +76,39 @@ source /usr/local/memfabric_hybrid/set_env.sh
 export PYTHONHASHSEED=0
 ```
 
-After updating `mmc-meta.conf` and `mmc-local.conf`, start MetaService in a
-separate process:
+Configure `mmc-meta.conf` with the MetaService and Config Store endpoints:
+
+```ini
+ock.mmc.meta_service_url = tcp://<META_HOST>:5000
+ock.mmc.meta_service.config_store_url = tcp://<CONFIG_STORE_HOST>:6000
+ock.mmc.meta.lease_ttl_ms = 30000
+ock.mmc.log_level = error
+```
+
+Configure `mmc-local.conf` on each Prefill node:
+
+```ini
+ock.mmc.meta_service_url = tcp://<META_HOST>:5000
+ock.mmc.local_service.config_store_url = tcp://<CONFIG_STORE_HOST>:6000
+ock.mmc.log_level = error
+ock.mmc.local_service.world_size = 256
+ock.mmc.local_service.protocol = device_sdma
+ock.mmc.local_service.dram.size = 10GB
+```
+
+The two files must use the same MetaService endpoint, and the LocalService
+Config Store endpoint must match the MetaService Config Store endpoint. Set
+`world_size` to the maximum number of LocalService instances in the deployment.
+Use `device_sdma` on A3 with HCCS, or `device_rdma` on A2 and other systems with
+device RoCE. Set `dram.size` to the host-memory capacity contributed by each
+LocalService.
+
+Export both configuration paths before starting Prefill, and start MetaService
+in a separate process:
 
 ```bash
 export MMC_META_CONFIG_PATH=/usr/local/memcache_hybrid/latest/config/mmc-meta.conf
+export MMC_LOCAL_CONFIG_PATH=/usr/local/memcache_hybrid/latest/config/mmc-local.conf
 python -c "from memcache_hybrid import MetaService; MetaService.main()"
 ```
 
@@ -170,6 +198,23 @@ bash script/build_and_pack_run.sh
 bash output/memfabric_hybrid-1.2.0_linux_aarch64.run
 export MEMFABRIC_HYBRID_EXTEND_LIB_PATH=/usr/local/memfabric_hybrid/1.2.0/aarch64-linux/lib64
 ```
+
+Check whether Clang and OpenMP are available:
+
+```bash
+clang --version
+ls "$(clang --print-resource-dir)/include/omp.h"
+```
+
+If either dependency is missing, install it:
+
+```bash
+apt-get update
+apt-get install -y clang libomp-dev
+```
+
+If the image already provides a specific Clang version but lacks OpenMP,
+install the matching package instead, for example `libomp-17-dev` for Clang 17.
 
 ### Configuration
 
