@@ -3,10 +3,20 @@ import gc
 import torch
 import torch_npu
 
-from vllm_ascend.utils import enable_custom_op
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    enable_custom_op,
+    get_ascend_device_type,
+)
 
-torch_npu.npu.config.allow_internal_format = True
-enable_custom_op()
+_IS_A5 = get_ascend_device_type() == AscendDeviceType.A5
+
+# A5 intentionally disables the generic vllm_ascend_C selection path and
+# invokes the CANN torch_npu operator directly. Other platforms keep testing
+# the _C_ascend adapter, including its optional LSE return contract.
+if not _IS_A5:
+    torch_npu.npu.config.allow_internal_format = True
+    enable_custom_op()
 
 BF16_ATOL = 6e-2
 BF16_RTOL = 7.8125e-3
@@ -188,6 +198,28 @@ def _reference_attention(inputs):
 
 
 def _run_custom_op(inputs, return_softmax_lse=False):
+    if _IS_A5:
+        assert not return_softmax_lse
+        return torch_npu.npu_kv_quant_sparse_flash_attention(
+            query=inputs["query"],
+            key=inputs["key"],
+            value=inputs["value"],
+            sparse_indices=inputs["sparse_indices"],
+            scale_value=inputs["scale_value"],
+            key_quant_mode=inputs["key_quant_mode"],
+            value_quant_mode=inputs["value_quant_mode"],
+            block_table=inputs["block_table"],
+            actual_seq_lengths_query=inputs["actual_seq_lengths_query"],
+            actual_seq_lengths_kv=inputs["actual_seq_lengths_kv"],
+            sparse_block_size=inputs["sparse_block_size"],
+            layout_query=inputs["layout_query"],
+            layout_kv=inputs["layout_kv"],
+            sparse_mode=inputs["sparse_mode"],
+            attention_mode=inputs["attention_mode"],
+            quant_scale_repo_mode=inputs["quant_scale_repo_mode"],
+            tile_size=inputs["tile_size"],
+            rope_head_dim=inputs["rope_head_dim"],
+        )
     return torch.ops._C_ascend.npu_kv_quant_sparse_flash_attention(
         inputs["query"],
         inputs["key"],
@@ -216,27 +248,34 @@ def test_kv_quant_sparse_flash_attention():
     inputs = _make_inputs()
     reference = _reference_attention(inputs)
 
-    output, softmax_max, softmax_sum = _run_custom_op(inputs)
+    result = _run_custom_op(inputs)
+    if _IS_A5:
+        output = result[0] if isinstance(result, tuple) else result
+        softmax_max = softmax_sum = None
+    else:
+        output, softmax_max, softmax_sum = result
 
     assert output.shape == (1, 1, 64, 512)
     assert output.dtype == torch.bfloat16
-    assert softmax_max.numel() == 0
-    assert softmax_sum.numel() == 0
+    if not _IS_A5:
+        assert softmax_max is not None and softmax_max.numel() == 0
+        assert softmax_sum is not None and softmax_sum.numel() == 0
     assert torch.isfinite(output.cpu()).all()
     torch.testing.assert_close(output.cpu().float(), reference, atol=BF16_ATOL, rtol=BF16_RTOL)
 
-    output_lse, softmax_max_lse, softmax_sum_lse = _run_custom_op(inputs, return_softmax_lse=True)
-    assert output_lse.shape == (1, 1, 64, 512)
-    assert softmax_max_lse.shape == (1, 1, 1, 64)
-    assert softmax_sum_lse.shape == (1, 1, 1, 64)
-    assert output_lse.dtype == torch.bfloat16
-    assert softmax_max_lse.dtype == torch.float32
-    assert softmax_sum_lse.dtype == torch.float32
-    assert torch.isfinite(output_lse.cpu()).all()
-    assert torch.isfinite(softmax_max_lse.cpu()).all()
-    assert torch.isfinite(softmax_sum_lse.cpu()).all()
-    torch.testing.assert_close(output_lse.cpu().float(), reference, atol=BF16_ATOL, rtol=BF16_RTOL)
-    torch.testing.assert_close(output_lse.cpu(), output.cpu(), atol=1e-2, rtol=1e-2)
+    if not _IS_A5:
+        output_lse, softmax_max_lse, softmax_sum_lse = _run_custom_op(inputs, return_softmax_lse=True)
+        assert output_lse.shape == (1, 1, 64, 512)
+        assert softmax_max_lse.shape == (1, 1, 1, 64)
+        assert softmax_sum_lse.shape == (1, 1, 1, 64)
+        assert output_lse.dtype == torch.bfloat16
+        assert softmax_max_lse.dtype == torch.float32
+        assert softmax_sum_lse.dtype == torch.float32
+        assert torch.isfinite(output_lse.cpu()).all()
+        assert torch.isfinite(softmax_max_lse.cpu()).all()
+        assert torch.isfinite(softmax_sum_lse.cpu()).all()
+        torch.testing.assert_close(output_lse.cpu().float(), reference, atol=BF16_ATOL, rtol=BF16_RTOL)
+        torch.testing.assert_close(output_lse.cpu(), output.cpu(), atol=1e-2, rtol=1e-2)
 
     gc.collect()
     torch.npu.empty_cache()

@@ -39,9 +39,12 @@
 #include "gmm/grouped_matmul_swiglu_quant_weight_nz_tensor_list/grouped_matmul_swiglu_quant_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_v2/grouped_matmul_swiglu_quant_v2_torch_adpt.h"
 #include "attention/kv_cache_full_block_dump/kv_cache_full_block_dump_torch_adpt.h"
+#include "attention/kv_cache_full_block_dump_c8/kv_cache_full_block_dump_c8_torch_adpt.h"
 #include "attention/kvcache_scatter_copy/kvcache_scatter_copy_torch_adpt.h"
 #include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
 #include "attention/lightning_indexer_decode_update/lightning_indexer_decode_update_torch_adpt.h"
+#include "attention/vllm_a5_li_manage_c8/vllm_a5_li_manage_c8_torch_adpt.h"
+#include "attention/vllm_a5_kvcache_scatter_copy_c8/vllm_a5_kvcache_scatter_copy_c8_torch_adpt.h"
 #include "mc2/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "moe/moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h"
@@ -2425,6 +2428,40 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_kvcache_scatter_copy",
              torch::kPrivateUse1,
              &vllm_ascend::npu_kvcache_scatter_copy);
+
+    // A5 C8 splits native Quant-LI scoring from the mutable resident-state
+    // manager. Both output sets remain caller-owned for eager/graph reuse.
+    ops.def(
+        "npu_dsa_a5_li_manage_c8_out("
+        "Tensor topk_indices, Tensor req_pool_entries, "
+        "Tensor(a!) cache_slots_pool, Tensor row_modes, "
+        "Tensor actual_seq_lengths_key, Tensor(b!) source_ids, "
+        "Tensor(c!) destination_slots, Tensor(d!) miss_counts, "
+        "Tensor(e!) tail_info) -> ()");
+    ops.impl("npu_dsa_a5_li_manage_c8_out",
+             torch::kPrivateUse1,
+             &vllm_ascend::npu_dsa_a5_li_manage_c8_out);
+
+    ops.def(
+        "npu_dsa_a5_kvcache_scatter_copy_c8_out("
+        "Tensor(a!) hbm_kv_bytes, Tensor dram_kv_bytes, "
+        "Tensor hbm_block_table, Tensor dram_block_table, "
+        "Tensor source_token_ids, Tensor destination_slots, "
+        "Tensor copy_counts, Tensor cache_tokens, "
+        "Tensor candidate_lens, Tensor actual_seq_lengths_kv, "
+        "Tensor(b!) attention_slots, "
+        "Tensor(c!) resident_seq_lengths) -> ()");
+    ops.impl("npu_dsa_a5_kvcache_scatter_copy_c8_out",
+             torch::kPrivateUse1,
+             &vllm_ascend::npu_dsa_a5_kvcache_scatter_copy_c8_out);
+
+    ops.def(
+        "kv_cache_full_block_dump_c8(Tensor src_cache, "
+        "Tensor(a!) dst_cache, Tensor src_block_ids, "
+        "Tensor dst_block_ids) -> ()");
+    ops.impl("kv_cache_full_block_dump_c8",
+             torch::kPrivateUse1,
+             &vllm_ascend::npu_kv_cache_full_block_dump_c8);
 
     ops.def(
         "npu_sparse_flash_attention_for_offload("

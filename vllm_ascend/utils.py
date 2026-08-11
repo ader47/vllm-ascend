@@ -56,6 +56,7 @@ ACL_FORMAT_FRACTAL_ND = 2
 ACL_FORMAT_FRACTAL_NZ = 29
 
 _CUSTOM_OP_ENABLED = None
+_CUSTOM_OP_LIBRARY_LOADED = None
 _DEVICE_PRINT_OP_REGISTERED = False
 _CURRENT_STREAM = None
 _PREFETCH_STREAM = None
@@ -406,6 +407,55 @@ def aligned_16(tensor: torch.Tensor):
     return new_tensor
 
 
+def load_custom_op_library() -> bool:
+    """加载自定义算子动态库，但不注册通用 Meta 实现或改变选择策略。
+
+    A5 基线会让 :func:`enable_custom_op` 返回 ``False``，避免通用路径选择
+    尚未适配 A5 的旧算子。DSA 的 A5 专用算子仍需加载同一个扩展来注册
+    ``torch.ops._C_ascend`` schema，因此将“注册动态库”和“全局使能”拆开。
+
+    本函数仍保持延迟加载；调用方必须在设备可见性和当前设备确定后调用。
+    """
+    global _CUSTOM_OP_LIBRARY_LOADED
+
+    if _CUSTOM_OP_LIBRARY_LOADED is not None:
+        return _CUSTOM_OP_LIBRARY_LOADED
+
+    try:
+        if not torch.compiler.is_compiling():
+            bootstrap_custom_op_env()
+        # register custom-op schemas and device implementations
+        import vllm_ascend.vllm_ascend_C  # type: ignore  # noqa: F401
+        _CUSTOM_OP_LIBRARY_LOADED = True
+    except ImportError as e:
+        # Prefer the extension's rpath for vendor op_api loading. Only fall back
+        # to mutating LD_LIBRARY_PATH when the import proves it is still needed.
+        if (not torch.compiler.is_compiling()) and "libcust_opapi.so" in str(e):
+            try:
+                bootstrap_custom_op_env(include_vendor_lib=True)
+                import vllm_ascend.vllm_ascend_C  # type: ignore  # noqa: F401
+                _CUSTOM_OP_LIBRARY_LOADED = True
+            except ImportError as fallback_error:
+                _CUSTOM_OP_LIBRARY_LOADED = False
+                logger.warning(
+                    "Failed to register custom ops, all custom ops will be disabled. "
+                    "error=%s. "
+                    "The custom ops library might not be installed or the environment is not configured correctly. "
+                    "Please check the custom ops installation and environment variables.",
+                    fallback_error,
+                )
+        else:
+            _CUSTOM_OP_LIBRARY_LOADED = False
+            logger.warning(
+                "Failed to register custom ops, all custom ops will be disabled. "
+                "error=%s. "
+                "The custom ops library might not be installed or the environment is not configured correctly. "
+                "Please check the custom ops installation and environment variables.",
+                e,
+            )
+    return bool(_CUSTOM_OP_LIBRARY_LOADED)
+
+
 def enable_custom_op():
     """
     Enable lazy init for vllm_ascend_C to avoid early initialization of CANN's RTS component.
@@ -427,44 +477,22 @@ def enable_custom_op():
         _CUSTOM_OP_ENABLED = False
         return _CUSTOM_OP_ENABLED
 
-    try:
-        if not torch.compiler.is_compiling():
-            bootstrap_custom_op_env()
-        # isort: off
-        # register custom ops into torch_library here
-        import vllm_ascend.vllm_ascend_C  # type: ignore  # noqa: F401
+    if not load_custom_op_library():
+        _CUSTOM_OP_ENABLED = False
+        return _CUSTOM_OP_ENABLED
 
-        # register the meta implementation for custom kernel if necessary
+    try:
+        # register the meta implementation for custom kernels if necessary
         import vllm_ascend.meta_registration  # type: ignore  # noqa: F401
 
-        # isort: on
         _CUSTOM_OP_ENABLED = True
-    except ImportError as e:
-        # Prefer the extension's rpath for vendor op_api loading. Only fall back
-        # to mutating LD_LIBRARY_PATH when the import proves it is still needed.
-        if (not torch.compiler.is_compiling()) and "libcust_opapi.so" in str(e):
-            try:
-                bootstrap_custom_op_env(include_vendor_lib=True)
-                import vllm_ascend.meta_registration  # type: ignore  # noqa: F401
-                import vllm_ascend.vllm_ascend_C  # type: ignore  # noqa: F401
-
-                _CUSTOM_OP_ENABLED = True
-            except ImportError:
-                _CUSTOM_OP_ENABLED = False
-                logger.warning(
-                    "Failed to register custom ops, all custom ops will be disabled. "
-                    "The custom ops library might not be installed or the environment is not configured correctly. "
-                    "Please check the custom ops installation and environment variables."
-                )
-        else:
-            _CUSTOM_OP_ENABLED = False
-            logger.warning(
-                "Failed to register custom ops, all custom ops will be disabled. "
-                "error=%s. "
-                "The custom ops library might not be installed or the environment is not configured correctly. "
-                "Please check the custom ops installation and environment variables.",
-                e,
-            )
+    except (ImportError, RuntimeError) as e:
+        _CUSTOM_OP_ENABLED = False
+        logger.warning(
+            "Failed to register custom-op Meta implementations, all custom ops "
+            "will be disabled. error=%s",
+            e,
+        )
     return _CUSTOM_OP_ENABLED
 
 

@@ -12,16 +12,16 @@ scheduler/core 的 ``DSARequestCachePlanner`` 是跨 step 语义真源；本模�
 
 它不复制原生 ``_update_states``，也不维护第二套请求生命周期。
 
-六列状态共用一个 ``CpuGpuBuffer``：
+七列状态共用一个 ``CpuGpuBuffer``：
 
 ``stage, target_budget, sparse_budget, resident_valid_tokens, row_mode,
-resident_pool_index``
+resident_pool_index, candidate_len``
 
 CPU view 服务 host 控制面，固定地址 device view 由 eager/graph 共同消费。
 ``refresh()`` 在基线最终行序上更新 CPU 投影并修正 ENTER 的 resident block
 table；forward 准备阶段再由同一 owner 批量同步设备镜像。graph capture 只
 临时覆盖 device captured-prefix，不修改 CPU 请求真源，也不另建 graph-only
-metadata。稳定请求行序下六列采用批量刷新；请求增删或重排时，才执行一次
+metadata。稳定请求行序下七列采用批量刷新；请求增删或重排时，才执行一次
 request-id 映射并同步稳定 resident-pool 行。
 
 需要特别区分两种生命周期：vLLM 会把“本轮未调度”的请求临时移出
@@ -44,6 +44,7 @@ from vllm_ascend.dsa_offload.contracts import (
     DSA_ROW_MODE_DENSE,
     DSA_ROW_MODE_PAD,
     DSA_ROW_MODE_SPARSE,
+    DSA_SFA_COMPUTE_TOPK,
 )
 from vllm_ascend.dsa_offload.request_cache_layout import (
     DSARequestCacheStage,
@@ -68,7 +69,8 @@ _SPARSE_BUDGET_COLUMN = 2
 _RESIDENT_VALID_COLUMN = 3
 _ROW_MODE_COLUMN = 4
 _RESIDENT_POOL_INDEX_COLUMN = 5
-_NUM_COLUMNS = 6
+_CANDIDATE_LEN_COLUMN = 6
+_NUM_COLUMNS = 7
 
 
 class DSAInputBatchCacheLayout:
@@ -104,9 +106,11 @@ class DSAInputBatchCacheLayout:
         self.columns.np[_SPARSE_BUDGET_COLUMN].fill(0)
         self.columns.np[_RESIDENT_VALID_COLUMN].fill(_INVALID_RESIDENT_LENGTH)
         self.columns.np[_ROW_MODE_COLUMN].fill(DSA_ROW_MODE_PAD)
-        self.columns.np[_RESIDENT_POOL_INDEX_COLUMN].fill(
-            resident_token_pool.padding_pool_index
-        )
+        self.columns.np[_RESIDENT_POOL_INDEX_COLUMN].fill(resident_token_pool.padding_pool_index)
+        # 原生 A5 Quant-LI 即使对 PAD 行也会先执行，因此 PAD 必须携带一个
+        # 合法的候选长度；其输出随后由 LI manager 丢弃。active 行会在每轮
+        # prepare_forward 中原址覆盖成真实 candidate length。
+        self.columns.np[_CANDIDATE_LEN_COLUMN].fill(DSA_SFA_COMPUTE_TOPK)
         # 图 capture 发生在真实请求到来前，但会直接消费同一组 device
         # view。初始化时先把 PAD 真值同步到设备，避免首个 dummy capture
         # 看到 ``torch.empty`` 留下的未定义尾行。
@@ -152,6 +156,10 @@ class DSAInputBatchCacheLayout:
         return self.columns.np[_RESIDENT_POOL_INDEX_COLUMN]
 
     @property
+    def candidate_lens_cpu(self) -> np.ndarray:
+        return self.columns.np[_CANDIDATE_LEN_COLUMN]
+
+    @property
     def stages(self) -> torch.Tensor:
         return self.columns.gpu[_STAGE_COLUMN]
 
@@ -175,6 +183,10 @@ class DSAInputBatchCacheLayout:
     def resident_pool_indices(self) -> torch.Tensor:
         return self.columns.gpu[_RESIDENT_POOL_INDEX_COLUMN]
 
+    @property
+    def candidate_lens(self) -> torch.Tensor:
+        return self.columns.gpu[_CANDIDATE_LEN_COLUMN]
+
     def set_pool_release_callback(
         self,
         callback: Callable[[int], None],
@@ -187,8 +199,7 @@ class DSAInputBatchCacheLayout:
         """在请求真正结束时释放 resident 行及其 DRAM ledger。"""
 
         released_index = self.resident_token_pool.release(request_id)
-        if (released_index is not None
-                and self._pool_release_callback is not None):
+        if released_index is not None and self._pool_release_callback is not None:
             self._pool_release_callback(released_index)
         # finished_req_ids 可能与同一轮新提交的同名 request 重叠。清空这份
         # 仅用于跳过稳态重映射的行序缓存，确保新请求仍会重新 acquire。
@@ -206,9 +217,8 @@ class DSAInputBatchCacheLayout:
             self.sparse_budget_tokens_cpu[rows] = 0
             self.resident_valid_tokens_cpu[rows] = _INVALID_RESIDENT_LENGTH
             self.row_modes_cpu[rows] = DSA_ROW_MODE_PAD
-            self.resident_pool_indices_cpu[rows] = (
-                self.resident_token_pool.padding_pool_index
-            )
+            self.resident_pool_indices_cpu[rows] = self.resident_token_pool.padding_pool_index
+            self.candidate_lens_cpu[rows] = DSA_SFA_COMPUTE_TOPK
         if input_batch is not None:
             request_ids = tuple(input_batch.req_ids[: input_batch.num_reqs])
             self._synchronize_resident_pool_rows(request_ids)
@@ -246,13 +256,9 @@ class DSAInputBatchCacheLayout:
             # request_id 映射的精确回退，不依赖两侧行序恰好一致。
             rows = slice(0, row_count)
             self.stages_cpu[rows] = projection.stages
-            self.target_resident_budget_tokens_cpu[rows] = (
-                projection.target_resident_budget_tokens
-            )
+            self.target_resident_budget_tokens_cpu[rows] = projection.target_resident_budget_tokens
             self.sparse_budget_tokens_cpu[rows] = projection.sparse_budget_tokens
-            self.resident_valid_tokens_cpu[rows] = (
-                projection.resident_valid_tokens
-            )
+            self.resident_valid_tokens_cpu[rows] = projection.resident_valid_tokens
         else:
             if row_count:
                 self.stages_cpu[:row_count] = _INVALID_STAGE
@@ -265,15 +271,9 @@ class DSAInputBatchCacheLayout:
                         f"request_id={request_id!r}, row={row}"
                     )
                 self.stages_cpu[row] = projection.stages[source_row]
-                self.target_resident_budget_tokens_cpu[row] = (
-                    projection.target_resident_budget_tokens[source_row]
-                )
-                self.sparse_budget_tokens_cpu[row] = (
-                    projection.sparse_budget_tokens[source_row]
-                )
-                self.resident_valid_tokens_cpu[row] = (
-                    projection.resident_valid_tokens[source_row]
-                )
+                self.target_resident_budget_tokens_cpu[row] = projection.target_resident_budget_tokens[source_row]
+                self.sparse_budget_tokens_cpu[row] = projection.sparse_budget_tokens[source_row]
+                self.resident_valid_tokens_cpu[row] = projection.resident_valid_tokens[source_row]
 
         if input_request_ids != self._request_ids:
             self._synchronize_resident_pool_rows(input_request_ids)
@@ -296,15 +296,11 @@ class DSAInputBatchCacheLayout:
 
         # ENTER 只持续一个 step。仅这些转换行需要为所有层写一次 first-fill
         # 负预算；steady DENSE/SPARSE 不再做逐请求 pool 查询。
-        enter_rows = np.flatnonzero(
-            stages == int(DSARequestCacheStage.ENTER_SPARSE_DECODE)
-        )
+        enter_rows = np.flatnonzero(stages == int(DSARequestCacheStage.ENTER_SPARSE_DECODE))
         for row in enter_rows:
             self.resident_token_pool.prepare_sparse_request(
                 input_request_ids[int(row)],
-                target_budget_tokens=int(
-                    self.target_resident_budget_tokens_cpu[int(row)]
-                ),
+                target_budget_tokens=int(self.target_resident_budget_tokens_cpu[int(row)]),
             )
 
         if row_count and np.any(self.stages_cpu[:row_count] == _INVALID_STAGE):
@@ -316,9 +312,8 @@ class DSAInputBatchCacheLayout:
             self.sparse_budget_tokens_cpu[tail] = 0
             self.resident_valid_tokens_cpu[tail] = _INVALID_RESIDENT_LENGTH
             self.row_modes_cpu[tail] = DSA_ROW_MODE_PAD
-            self.resident_pool_indices_cpu[tail] = (
-                self.resident_token_pool.padding_pool_index
-            )
+            self.resident_pool_indices_cpu[tail] = self.resident_token_pool.padding_pool_index
+            self.candidate_lens_cpu[tail] = DSA_SFA_COMPUTE_TOPK
         self.row_count = row_count
         self.valid = True
 
@@ -338,8 +333,8 @@ class DSAInputBatchCacheLayout:
         # 由 active 退回 PAD 的尾部。这里不再每 step 重写
         # [active_rows:max_num_reqs]，保持与基线 persistent batch 一样的
         # 增量更新范式。
-        # 六列采用 SoA 布局，每一列都是可直接传给自定义算子的连续向量。
-        # buffer 只有 6 * max_num_reqs 个 int32，整块复制既保持一次 H2D，
+        # 七列采用 SoA 布局，每一列都是可直接传给自定义算子的连续向量。
+        # buffer 只有 7 * max_num_reqs 个 int32，整块复制既保持一次 H2D，
         # 也避免对非连续列 view 逐列 copy 或现场 contiguous。
         self.columns.gpu.copy_(self.columns.cpu, non_blocking=True)
         return self.columns.gpu
@@ -363,9 +358,7 @@ class DSAInputBatchCacheLayout:
 
         row_count = int(row_count)
         if self._graph_capture_row_count:
-            raise RuntimeError(
-                "DSA InputBatch graph-capture state was installed twice"
-            )
+            raise RuntimeError("DSA InputBatch graph-capture state was installed twice")
         if not 0 < row_count <= self.max_num_reqs:
             raise ValueError(
                 "DSA graph-capture row count is outside InputBatch "
@@ -376,22 +369,15 @@ class DSAInputBatchCacheLayout:
         try:
             self.columns.gpu.copy_(self.columns.cpu)
             rows = slice(0, row_count)
-            self.stages[rows].fill_(
-                int(DSARequestCacheStage.SPARSE_DECODE)
-            )
-            self.target_resident_budget_tokens[rows].fill_(
-                int(target_budget_tokens)
-            )
-            self.sparse_budget_tokens[rows].fill_(
-                int(target_budget_tokens)
-            )
-            self.resident_valid_tokens[rows].fill_(
-                int(resident_valid_tokens)
-            )
+            self.stages[rows].fill_(int(DSARequestCacheStage.SPARSE_DECODE))
+            self.target_resident_budget_tokens[rows].fill_(int(target_budget_tokens))
+            self.sparse_budget_tokens[rows].fill_(int(target_budget_tokens))
+            self.resident_valid_tokens[rows].fill_(int(resident_valid_tokens))
             self.row_modes[rows].fill_(DSA_ROW_MODE_SPARSE)
-            self.resident_pool_indices[rows].copy_(
-                self._capture_pool_indices[:row_count]
-            )
+            self.resident_pool_indices[rows].copy_(self._capture_pool_indices[:row_count])
+            # capture dummy 的 resident_valid_tokens=budget+tail；历史候选区
+            # 正好是 tail 之前的完整 budget。
+            self.candidate_lens[rows].fill_(int(target_budget_tokens))
         except Exception:
             # 保留首次安装失败作为根因；后续 capture 会重写完整 owner。
             with suppress(Exception):
@@ -420,9 +406,7 @@ class DSAInputBatchCacheLayout:
         """
 
         for row, request_id in enumerate(request_ids):
-            self.resident_pool_indices_cpu[row] = (
-                self.resident_token_pool.acquire(request_id)
-            )
+            self.resident_pool_indices_cpu[row] = self.resident_token_pool.acquire(request_id)
         self._request_ids = request_ids
         self.mapping_version += 1
 
@@ -453,19 +437,13 @@ def normalize_dsa_enter_updates_before_base(
         return
 
     resident_group_id = int(resident_group_id)
-    cached_row_by_request_id = {
-        request_id: row
-        for row, request_id in enumerate(cached_requests.req_ids)
-    }
+    cached_row_by_request_id = {request_id: row for row, request_id in enumerate(cached_requests.req_ids)}
     normalized_request_ids: set[str] = set()
 
     for replacement in replacements:
         request_id = replacement.request_id
         if request_id in normalized_request_ids:
-            raise RuntimeError(
-                "DSA ENTER projection contains a duplicate replacement: "
-                f"request_id={request_id!r}"
-            )
+            raise RuntimeError(f"DSA ENTER projection contains a duplicate replacement: request_id={request_id!r}")
         normalized_request_ids.add(request_id)
 
         cached_row = cached_row_by_request_id.get(request_id)
@@ -477,8 +455,7 @@ def normalize_dsa_enter_updates_before_base(
             )
         if request_id in cached_requests.resumed_req_ids:
             raise RuntimeError(
-                "DSA ENTER replacement cannot be combined with request "
-                f"resume: request_id={request_id!r}"
+                f"DSA ENTER replacement cannot be combined with request resume: request_id={request_id!r}"
             )
         if resident_group_id >= len(request.block_ids):
             raise RuntimeError(
@@ -489,10 +466,7 @@ def normalize_dsa_enter_updates_before_base(
 
         new_block_groups = cached_requests.new_block_ids[cached_row]
         if new_block_groups is None:
-            raise RuntimeError(
-                "DSA ENTER replacement is missing its resident block delta: "
-                f"request_id={request_id!r}"
-            )
+            raise RuntimeError(f"DSA ENTER replacement is missing its resident block delta: request_id={request_id!r}")
         if resident_group_id >= len(new_block_groups):
             raise RuntimeError(
                 "DSA ENTER resident delta group is out of range: "
@@ -503,11 +477,7 @@ def normalize_dsa_enter_updates_before_base(
         replacement_block_ids = replacement.block_ids
         resident_delta = new_block_groups[resident_group_id]
         delta_count = len(resident_delta)
-        if (
-            delta_count > len(replacement_block_ids)
-            or tuple(resident_delta)
-            != replacement_block_ids[:delta_count]
-        ):
+        if delta_count > len(replacement_block_ids) or tuple(resident_delta) != replacement_block_ids[:delta_count]:
             raise RuntimeError(
                 "DSA ENTER resident delta is not a prefix of the committed "
                 "replacement table: "

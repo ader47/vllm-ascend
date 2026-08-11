@@ -25,8 +25,12 @@
   transfer 和 KV-cache metrics/events；
 - 正式精度和性能测试关闭 DSA trace points。
 
-脚本只设置必要的 vLLM/vLLM-Ascend 原生环境变量。DSA 功能参数全部位于
+脚本只设置必要的 vLLM/vLLM-Ascend 原生环境变量。DSA 策略参数全部位于
 `additional_config["dsa_sparse_config"]`，不再通过零散 DSA 环境变量控制。
+A5 packed C8 物理布局另外复用 vLLM-Ascend 原生的
+`enable_sparse_sfa_c8` 与 `enable_sparse_li_c8`；示例用一个开关同时控制二者，
+不暴露 DSA 不支持的半开组合。该开关在 `disabled` 模式下也会保留，以便
+使用相同 packed C8 cache 编码公平对照原生路径与 DSA 路径。
 
 首次拉起应看到且只看到一份：
 
@@ -53,6 +57,7 @@ MAX_NUM_SEQS = 2
 MAX_MODEL_LEN = 8192
 MAX_NUM_BATCHED_TOKENS = 8192
 ENABLE_CHUNKED_PREFILL = False
+ENABLE_A5_PACKED_C8_DSA = False  # A5 W4A4C8 设 True；A3 W4A8 保持 False
 RESULT_JSON = None  # 需要保存对照 token IDs 时填写路径
 ```
 
@@ -64,7 +69,8 @@ python examples/dsa_demo/simple_prompt_test.py
 
 四种模式的作用：
 
-- `disabled`：不传 `dsa_sparse_config`，验证 DSA 修改未影响原生路径；
+- `disabled`：不传 `dsa_sparse_config`；A5 C8 开关可独立保留，用于验证 DSA
+  修改未影响相同 cache 编码下的原生路径；
 - `cache-init`：只构造 `LLM`，验证 Indexer/resident MLA 双平面初始化；
 - `eager`：执行 DSA LIDU/KSC/SFA-Offload 和满块 dump；
 - `graph`：执行 `VLLM_COMPILE + FULL_DECODE_ONLY`。

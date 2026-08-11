@@ -1,10 +1,10 @@
 # DSA 稀疏卸载当前设计
 
-> - 最后更新：2026-07-30
+> - 最后更新：2026-08-11
 > - 目标基线：vLLM v0.23.0 + vLLM-Ascend v0.23.0
 > - 当前完成度：核心控制面、eager 和 FULL decode graph 已完成 910C 初验；
 >   chunked prefill 已完成分段 prefill/首 token 初验，完整 sparse decode
->   验收待补
+>   验收待补；A5 packed C8 数据面代码已接通，设备验收待进行
 > - 首要验收模型：GLM-5.1；兼容回归模型：DeepSeek-V3.2
 
 ## 1. 文档定位
@@ -42,7 +42,9 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
 - 基于 v0.23 原生调度状态的 chunked prefill、增量双 plane 分配与逐 chunk
   满块 dump；
 - eager LIDU→KSC→SFA-Offload 与 full-block dump 数据面；
-- 复用原生 FULL decode capture/replay 的 row-mode 图数据面。
+- 复用原生 FULL decode capture/replay 的 row-mode 图数据面；
+- A5 C8 的独立 Indexer key/scale、packed resident/DRAM、社区 Quant-LI/QSFA、
+  resident manager、packed KSC 与 packed dump 源码集成。
 
 当前尚未完成：
 
@@ -549,6 +551,14 @@ SFA-Offload 读取每行前 2048 个 `topk_slots`，SPARSE 行再根据
 是它尚未成为可卸载的完整 block。DENSE 行的 `tail_info=[-1, 0]`，其
 top2048 slot 直接等于完整序列 position。
 
+A5 C8 的物理 ABI 有一处受控差异：packed KSC 在完成 miss copy 的同一
+launch 内，将 `topk_slots + tail_info` 投影为社区 QSFA 直接消费的固定
+`int32[B,1,2176]` slot 行，并输出 `resident_seq_lengths[B]`。它没有引入新的
+request 真源，也不改变 miss-prefix 合同；eager/graph 仍复用同一组固定 buffer。
+DENSE 行是零 IO，只转发 LI slot，resident length 保持完整 `actual_len`，因此
+dense 序列长度不受 2176 限制。详见
+[`dsa_offload_a5_c8_design.md`](dsa_offload_a5_c8_design.md)。
+
 ### 11.5 单行 first-fill 示例
 
 假设 prompt admission 后冻结 `target_budget=6144`，当前完整长度为
@@ -657,7 +667,7 @@ model output 返回后释放已经 dump 的 resident 满块。未来引入异步
 |---|---|---|
 | 拉起期 | 类型化配置、spec、固定容量 tensor | `AscendConfig` / model runner |
 | 请求跨 step | 阶段、冻结预算、resident 有效长度 | scheduler/core planner |
-| worker 跨 step | InputBatch 六列投影、stable pool row、`cache_slots`、DRAM ledger | `NPUInputBatch` / resident pool / DRAM store |
+| worker 跨 step | InputBatch 七列投影、stable pool row、`cache_slots`、DRAM ledger | `NPUInputBatch` / resident pool / DRAM store |
 | 单次 model forward | token row mode、slot mapping position、active DRAM table、dump jobs | `DSAOffloadRuntime` |
 | 单层 | LIDU 四个输出和 SFA selection view | `DSALayerOffloadContext` |
 
@@ -665,9 +675,9 @@ model output 返回后释放已经 dump 的 resident 满块。未来引入异步
 大对象。`DSAOffloadRuntime` 不复制 scheduler 阶段账本，只从 InputBatch
 投影构造本轮设备 view。
 
-### 13.2 六列 InputBatch SoA
+### 13.2 七列 InputBatch SoA
 
-`DSAInputBatchCacheLayout` 持有一个 `[6, max_num_seqs]`
+`DSAInputBatchCacheLayout` 持有一个 `[7, max_num_seqs]`
 `CpuGpuBuffer`：
 
 ```text
@@ -677,10 +687,12 @@ sparse_budget_tokens
 resident_valid_tokens
 row_mode
 resident_pool_index
+candidate_len
 ```
 
 这里的 SoA（Structure of Arrays）表示同一种字段沿 batch 连续，而不是每个
-请求保存一个 Python 对象。scheduler 输出前四列，worker 派生后两列。
+请求保存一个 Python 对象。scheduler 输出前四列；worker 派生 row mode、
+resident pool 行和本轮 LI 候选前缀长度。
 原生 `_update_states()` 完成 add/remove/condense/reorder 后再刷新 DSA
 active-prefix，因此最终行序与基线 `InputBatch` 完全一致。
 

@@ -255,6 +255,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # 重建一份语义相同的 metadata。
     dsa_row_modes: torch.Tensor | None = None
     dsa_resident_pool_indices: torch.Tensor | None = None
+    dsa_sparse_budget_tokens: torch.Tensor | None = None
+    dsa_candidate_lens: torch.Tensor | None = None
     dsa_dram_block_table: torch.Tensor | None = None
 
     # Current attention state (e.g., ChunkedPrefill, DecodeOnly).
@@ -299,12 +301,10 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             dsa_indexer_block_table=self.dsa_indexer_block_table,
             dsa_indexer_slot_mapping=self.dsa_indexer_slot_mapping,
             dsa_row_modes=_slice_reqs(self.dsa_row_modes),
-            dsa_resident_pool_indices=_slice_reqs(
-                self.dsa_resident_pool_indices
-            ),
-            dsa_dram_block_table=_slice_reqs(
-                self.dsa_dram_block_table
-            ),
+            dsa_resident_pool_indices=_slice_reqs(self.dsa_resident_pool_indices),
+            dsa_sparse_budget_tokens=_slice_reqs(self.dsa_sparse_budget_tokens),
+            dsa_candidate_lens=_slice_reqs(self.dsa_candidate_lens),
+            dsa_dram_block_table=_slice_reqs(self.dsa_dram_block_table),
             attn_state=self.attn_state,
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
             num_input_tokens=self.num_input_tokens,

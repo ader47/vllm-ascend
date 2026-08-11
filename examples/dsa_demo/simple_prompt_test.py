@@ -41,6 +41,11 @@ GPU_MEMORY_UTILIZATION = 0.90
 QUANTIZATION = "ascend"
 ENABLE_EXPERT_PARALLEL = True
 
+# A5/950 上的 DSA 首版只支持 LI C8 与 SFA C8 同时开启；A3/910C 保持 False。
+# disabled 模式也会保留这个 vLLM-Ascend 原生物理布局开关，便于用同一 C8
+# cache 编码公平对照“原生 C8”与“DSA C8”。
+ENABLE_A5_PACKED_C8_DSA = False
+
 ENABLE_PROFILE = False
 PROFILE_DIR = "/home/data/vllm_profile/dsa_smoke"
 RESULT_JSON: str | None = None
@@ -115,10 +120,22 @@ def build_llm_kwargs() -> dict[str, Any]:
         "enforce_eager": not graph_enabled,
         "disable_log_stats": False,
     }
+    additional_config: dict[str, Any] = {}
+    if ENABLE_A5_PACKED_C8_DSA:
+        additional_config.update(
+            {
+                "enable_sparse_sfa_c8": ENABLE_A5_PACKED_C8_DSA,
+                "enable_sparse_li_c8": ENABLE_A5_PACKED_C8_DSA,
+            }
+        )
     if RUN_MODE != "disabled":
-        kwargs["additional_config"] = {
-            "dsa_sparse_config": build_dsa_config(graph_enabled),
-        }
+        additional_config.update(
+            {
+                "dsa_sparse_config": build_dsa_config(graph_enabled),
+            }
+        )
+    if additional_config:
+        kwargs["additional_config"] = additional_config
     if graph_enabled:
         capture_sizes = sorted({size for size in (*DSA_GRAPH_CAPTURE_SIZES, MAX_NUM_SEQS) if size <= MAX_NUM_SEQS})
         kwargs["compilation_config"] = {
@@ -161,7 +178,8 @@ def main() -> None:
     print(
         "[dsa-smoke] "
         f"mode={RUN_MODE} model={MODEL_PATH!r} prompts={len(PROMPTS)} "
-        f"max_model_len={MAX_MODEL_LEN} max_num_seqs={MAX_NUM_SEQS}"
+        f"max_model_len={MAX_MODEL_LEN} max_num_seqs={MAX_NUM_SEQS} "
+        f"a5_packed_c8={ENABLE_A5_PACKED_C8_DSA}"
     )
     llm = LLM(**kwargs)
 

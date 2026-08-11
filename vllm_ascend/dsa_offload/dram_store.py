@@ -4,7 +4,7 @@
 
 该 store 只维护两类状态：
 
-* 每层 NOPE/ROPE payload 的 Ascend swapped-memory arena；
+* 每层 A3 NOPE/ROPE 或 A5 packed C8 payload 的 Ascend swapped-memory arena；
 * ``resident pool row -> logical full block -> DRAM block id`` 逻辑表。
 
 首版明确关闭 prefix cache、preemption 和 KV connector，因此不同请求不会
@@ -22,7 +22,10 @@ import numpy as np
 import torch
 from typing_extensions import NamedTuple
 
-from vllm_ascend.dsa_offload.contracts import DSA_DRAM_NULL_BLOCK_ID
+from vllm_ascend.dsa_offload.contracts import (
+    DSA_A5_PACKED_KV_ROW_BYTES,
+    DSA_DRAM_NULL_BLOCK_ID,
+)
 
 ArenaFactory = Callable[
     [tuple[int, ...], torch.dtype, int, torch.device],
@@ -32,10 +35,11 @@ ArenaFactory = Callable[
 
 @dataclass(frozen=True)
 class DSALayerDRAMArenas:
-    """同一 transformer layer 的两张 NPU 可寻址 DRAM arena。"""
+    """同层 DRAM payload；split BF16 与 packed C8 恰有一种布局。"""
 
-    nope: torch.Tensor
-    rope: torch.Tensor
+    nope: torch.Tensor | None = None
+    rope: torch.Tensor | None = None
+    packed: torch.Tensor | None = None
 
 
 class DSADRAMReservation(NamedTuple):
@@ -54,15 +58,9 @@ def calculate_dram_usable_blocks(
     indexer_num_blocks = int(indexer_num_blocks)
     block_multiple = float(block_multiple)
     if indexer_num_blocks <= 0:
-        raise ValueError(
-            "DSA DRAM sizing requires positive Indexer blocks, got "
-            f"{indexer_num_blocks}"
-        )
+        raise ValueError(f"DSA DRAM sizing requires positive Indexer blocks, got {indexer_num_blocks}")
     if not math.isfinite(block_multiple) or block_multiple <= 0:
-        raise ValueError(
-            "DSA hot_cpu_block_multiple must be positive and finite, got "
-            f"{block_multiple}"
-        )
+        raise ValueError(f"DSA hot_cpu_block_multiple must be positive and finite, got {block_multiple}")
     return int(math.ceil(indexer_num_blocks * block_multiple))
 
 
@@ -75,9 +73,7 @@ def _allocate_swapped_arena(
     try:
         import torch_npu
     except ImportError as exc:
-        raise RuntimeError(
-            "DSA sparse offload requires torch_npu swapped-memory arenas"
-        ) from exc
+        raise RuntimeError("DSA sparse offload requires torch_npu swapped-memory arenas") from exc
 
     arena = torch_npu.empty_with_swapped_memory(
         (int(capacity), *block_shape),
@@ -109,9 +105,7 @@ class DSAHotDRAMStore:
         if storage_rows <= 0:
             raise ValueError("DSA DRAM store requires positive row capacity")
         if max_logical_blocks <= 0:
-            raise ValueError(
-                "DSA DRAM store requires positive logical block width"
-            )
+            raise ValueError("DSA DRAM store requires positive logical block width")
 
         self.usable_blocks = int(usable_blocks)
         self.arena_capacity = self.usable_blocks + 1
@@ -150,9 +144,7 @@ class DSAHotDRAMStore:
 
         layer_id = int(layer_id)
         if layer_id in self._layer_arenas:
-            raise RuntimeError(
-                f"DSA DRAM layer {layer_id} was initialized twice"
-            )
+            raise RuntimeError(f"DSA DRAM layer {layer_id} was initialized twice")
         if resident_nope_cache.shape[0] <= 0 or resident_rope_cache.shape[0] <= 0:
             raise ValueError("DSA resident cache must contain physical blocks")
         nope = self._arena_factory(
@@ -175,13 +167,58 @@ class DSAHotDRAMStore:
             rope=rope,
         )
 
+    def add_packed_layer(
+        self,
+        *,
+        layer_id: int,
+        resident_packed_cache: torch.Tensor,
+    ) -> None:
+        """为 A5 packed C8 resident cache 建立 opaque-byte DRAM arena。"""
+
+        layer_id = int(layer_id)
+        if layer_id in self._layer_arenas:
+            raise RuntimeError(f"DSA DRAM layer {layer_id} was initialized twice")
+        if (
+            resident_packed_cache.ndim != 4
+            or resident_packed_cache.shape[0] <= 0
+            or tuple(resident_packed_cache.shape[1:]) != (128, 1, DSA_A5_PACKED_KV_ROW_BYTES)
+        ):
+            raise ValueError(
+                f"DSA packed resident cache must be [blocks,128,1,656], got {tuple(resident_packed_cache.shape)}"
+            )
+        if resident_packed_cache.dtype not in {
+            torch.int8,
+            torch.float8_e4m3fn,
+        }:
+            raise ValueError(
+                f"DSA packed resident cache must use int8/float8 byte storage, got {resident_packed_cache.dtype}"
+            )
+        if not resident_packed_cache.is_contiguous():
+            raise ValueError("DSA packed resident cache must be contiguous")
+        packed = self._arena_factory(
+            tuple(resident_packed_cache.shape[1:]),
+            torch.int8,
+            self.arena_capacity,
+            self.device,
+        )
+        expected_shape = (
+            self.arena_capacity,
+            *resident_packed_cache.shape[1:],
+        )
+        if packed.dtype != torch.int8 or tuple(packed.shape) != expected_shape or not packed.is_contiguous():
+            raise RuntimeError(
+                "DSA packed DRAM arena factory returned an invalid tensor: "
+                f"shape={tuple(packed.shape)}, dtype={packed.dtype}, "
+                f"contiguous={packed.is_contiguous()}"
+            )
+        packed[DSA_DRAM_NULL_BLOCK_ID].zero_()
+        self._layer_arenas[layer_id] = DSALayerDRAMArenas(packed=packed)
+
     def get_layer_arenas(self, layer_id: int) -> DSALayerDRAMArenas:
         try:
             return self._layer_arenas[int(layer_id)]
         except KeyError as exc:
-            raise RuntimeError(
-                f"DSA DRAM arenas are not initialized for layer {layer_id}"
-            ) from exc
+            raise RuntimeError(f"DSA DRAM arenas are not initialized for layer {layer_id}") from exc
 
     def reserve_blocks(
         self,
@@ -201,36 +238,22 @@ class DSAHotDRAMStore:
             or logical_block_indices.ndim != 1
             or pool_indices.shape != logical_block_indices.shape
         ):
-            raise ValueError(
-                "DSA DRAM reservation requires matching one-dimensional rows"
-        )
+            raise ValueError("DSA DRAM reservation requires matching one-dimensional rows")
         if pool_indices.size == 0:
             return DSADRAMReservation(
                 physical_block_ids=np.empty(0, dtype=np.int32),
                 new_mask=np.empty(0, dtype=np.bool_),
             )
-        if (
-            int(pool_indices.min()) < 0
-            or int(pool_indices.max()) >= self.storage_rows
-        ):
+        if int(pool_indices.min()) < 0 or int(pool_indices.max()) >= self.storage_rows:
             raise IndexError("DSA DRAM pool row is outside table capacity")
-        if (
-            int(logical_block_indices.min()) < 0
-            or int(logical_block_indices.max()) >= self.max_logical_blocks
-        ):
-            raise IndexError(
-                "DSA logical block is outside DRAM table capacity"
-            )
+        if int(logical_block_indices.min()) < 0 or int(logical_block_indices.max()) >= self.max_logical_blocks:
+            raise IndexError("DSA logical block is outside DRAM table capacity")
 
-        flat_keys = (
-            pool_indices.astype(np.int64, copy=False)
-            * self.max_logical_blocks
-            + logical_block_indices.astype(np.int64, copy=False)
+        flat_keys = pool_indices.astype(np.int64, copy=False) * self.max_logical_blocks + logical_block_indices.astype(
+            np.int64, copy=False
         )
         if np.unique(flat_keys).size != flat_keys.size:
-            raise RuntimeError(
-                "DSA dump plan contains duplicate request/logical-block rows"
-            )
+            raise RuntimeError("DSA dump plan contains duplicate request/logical-block rows")
 
         physical = self.logical_block_table[
             pool_indices,
@@ -264,9 +287,7 @@ class DSAHotDRAMStore:
 
         pool_index = int(pool_index)
         if not 0 <= pool_index < self.storage_rows:
-            raise IndexError(
-                f"DSA DRAM pool row {pool_index} is outside capacity"
-            )
+            raise IndexError(f"DSA DRAM pool row {pool_index} is outside capacity")
         row = self.logical_block_table[pool_index]
         released = row[row != DSA_DRAM_NULL_BLOCK_ID]
         if released.size == 0:
@@ -274,10 +295,7 @@ class DSAHotDRAMStore:
         released = np.unique(released)
         end = self._free_count + int(released.size)
         if end > self.usable_blocks:
-            raise RuntimeError(
-                "DSA DRAM free-list overflow while releasing pool row "
-                f"{pool_index}"
-            )
+            raise RuntimeError(f"DSA DRAM free-list overflow while releasing pool row {pool_index}")
         self._free_block_ids[self._free_count : end] = released
         self._free_count = end
         row.fill(DSA_DRAM_NULL_BLOCK_ID)

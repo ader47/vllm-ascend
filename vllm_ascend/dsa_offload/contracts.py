@@ -19,6 +19,9 @@ DSA_KV_LORA_RANK = 512
 DSA_QK_ROPE_HEAD_DIM = 64
 DSA_INDEX_HEAD_DIM = 128
 DSA_SUPPORTED_INDEX_HEAD_COUNTS = (32, 64)
+# A5 QSFA 的固定输出列宽，以及 packed C8 每 token 的 opaque record 字节数。
+DSA_A5_ATTENTION_CAPACITY = DSA_SFA_COMPUTE_TOPK + DSA_REQUIRED_CACHE_BLOCK_SIZE
+DSA_A5_PACKED_KV_ROW_BYTES = 656
 
 # LIDU/KSC/SFA-Offload 的逐行执行模式。ENTER 与 steady SPARSE 在设备
 # 数据面上都属于 SPARSE；请求生命周期阶段仍由 request_cache_layout 管理。
