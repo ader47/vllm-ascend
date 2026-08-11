@@ -55,6 +55,24 @@ def test_layer_arenas_follow_resident_cache_block_shapes() -> None:
     assert torch.count_nonzero(arenas.rope[0]).item() == 0
 
 
+def test_packed_c8_layer_uses_an_opaque_byte_arena() -> None:
+    store = _make_store()
+    resident_packed = torch.empty(4, 128, 1, 656, dtype=torch.int8)
+
+    store.add_packed_layer(
+        layer_id=0,
+        resident_packed_cache=resident_packed,
+    )
+    arenas = store.get_layer_arenas(0)
+
+    assert arenas.nope is None
+    assert arenas.rope is None
+    assert arenas.packed is not None
+    assert arenas.packed.shape == (9, 128, 1, 656)
+    assert arenas.packed.dtype == torch.int8
+    assert torch.count_nonzero(arenas.packed[0]).item() == 0
+
+
 def test_reservation_is_idempotent_and_release_reclaims_whole_row() -> None:
     store = _make_store()
     pool_rows = np.array([0, 0, 1], dtype=np.intp)

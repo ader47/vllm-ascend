@@ -10,13 +10,16 @@
 ## 当前能力
 
 - HBM KV cache 拆分为完整 Indexer K 平面和有界 resident MLA 平面；
-- worker 持有固定容量、固定地址的 hot DRAM NOPE/ROPE arena；
+- worker 持有固定容量、固定地址的 hot DRAM arena：A3 为 NOPE/ROPE，A5
+  C8 为 656-byte packed payload；
 - scheduler 统一管理 `PREFILL`、`DENSE_DECODE`、
   `ENTER_SPARSE_DECODE`、`SPARSE_DECODE` 请求布局；
-- decode 整批执行 LIDU -> KSC -> SFA-Offload，不按 dense/sparse
-  拆分子 batch；
+- decode 整批执行 LI/resident-update -> KSC -> sparse attention，不按
+  dense/sparse 拆分子 batch；A5 C8 复用社区 Quant-LI/QSFA；
 - prefill 与 decode 新满 MLA block 通过独立
   `KvCacheFullBlockDump` 算子写入 DRAM；
+- 支持 chunked prefill；完整 prompt 必须先在两个 dense plane 完成容量准入，
+  中间 chunk 保持 PREFILL，下一轮 decode 才允许进入 DENSE/ENTER；
 - eager 与 ACL FULL decode graph 共用同一套 InputBatch 行状态、
   resident pool、DRAM ledger 和算子缓冲；
 - `DENSE`、`ENTER`、`SPARSE` 任意混排、不同 resident budget 和
@@ -28,7 +31,7 @@ flowchart LR
     C["additional_config.dsa_sparse_config"] --> A["AscendConfig"]
     A --> K["Indexer / resident MLA 双平面"]
     A --> S["DSAOffloadScheduler"]
-    S --> I["NPUInputBatch 六列投影"]
+    S --> I["NPUInputBatch 七列投影"]
     I --> R["共享 eager/graph runtime"]
     R --> L["LIDU"]
     L --> X["KSC miss 换入"]
@@ -109,11 +112,31 @@ additional_config={
 首次部署或更新 DSA 自定义算子后，必须完整重编译并重新安装
 vLLM-Ascend。
 
+### A5 C8 增量配置
+
+A5 当前只接通 SFA C8 与 LI C8 同时开启的完整数据面。在上述
+`additional_config` 同级加入：
+
+```python
+additional_config={
+    "enable_sparse_sfa_c8": True,
+    "enable_sparse_li_c8": True,
+    "dsa_sparse_config": {
+        # 其余 DSA 配置同上
+        "enabled": True,
+    },
+}
+```
+
+A5 两个开关全关或半开会在启动期明确拒绝；A3 继续使用既有 BF16/FP16
+算子链。A5 C8 源码已接通，但在真实 A5 上完成构建、单算子 readback、eager
+精度和 graph replay 前仍属于待验收能力。
+
 ## 当前边界
 
 当前版本尚未支持：
 
-- chunked prefill 和 prefill/decode mixed batch；
+- prefill/decode mixed batch；
 - async scheduling；
 - prefix cache；
 - preemption/resume；
@@ -121,16 +144,17 @@ vLLM-Ascend。
 - 外部 KV transfer connector；
 - decode/prefill context parallel 和 pipeline parallel；
 - KV-cache metrics/events；
-- A5 算子验收。
+- A5 C8 算子与端到端验收；
+- A5 BF16 DSA 算子链。
 
 具有显式配置入口的未支持组合会在启动期拒绝，preemption/resume 会在当前
-运行边界明确失败。A5 尚未建立设备类型 fail-fast，只能视为未验收，不能
-假设当前算子与 cache 布局可用。DP 和在线推理属于下一阶段扩展项，当前
-离线验证以 DP=1 为主。
+运行边界明确失败。A5 已建立设备与 C8 布局 fail-fast，但源码接通仍不等于
+设备验收。DP 和在线推理属于下一阶段扩展项，当前离线验证以 DP=1 为主。
 
 ## 文档与测试入口
 
 - [DSA 稀疏卸载详细设计](docs/source/developer_guide/Design_Documents/dsa_offload_design.md)
+- [A5 C8 数据面与算子合同](docs/source/developer_guide/Design_Documents/dsa_offload_a5_c8_design.md)
 - [DSA demo 与测试说明](examples/dsa_demo/README.md)
 - [上游 vLLM-Ascend README](README.upstream.md)
 

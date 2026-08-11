@@ -366,6 +366,35 @@ class NPUModelRunner(GPUModelRunner):
         self.dsa_offload_enabled = (
             self.ascend_config.dsa_offload_config.enabled
         )
+        self.enable_sparse_sfa_c8 = self.ascend_config.enable_sparse_sfa_c8
+        self.enable_sparse_li_c8 = self.ascend_config.enable_sparse_li_c8
+        self.dsa_offload_packed_c8 = False
+        device_type = get_ascend_device_type()
+        if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
+            if device_type == AscendDeviceType.A5:
+                self.c8_k_cache_dtype = torch.float8_e4m3fn
+                self.c8_k_scale_cache_dtype = torch.float32
+            else:
+                self.c8_k_cache_dtype = torch.int8
+                self.c8_k_scale_cache_dtype = torch.float16
+        if self.dsa_offload_enabled:
+            if device_type == AscendDeviceType.A5:
+                if not (
+                    self.enable_sparse_sfa_c8
+                    and self.enable_sparse_li_c8
+                ):
+                    raise RuntimeError(
+                        "DSA sparse offload on A5 currently requires both "
+                        "enable_sparse_sfa_c8=True and "
+                        "enable_sparse_li_c8=True. Mixed C8 layouts and the "
+                        "A5 bf16 operator path are not connected yet."
+                    )
+                self.dsa_offload_packed_c8 = True
+            elif self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
+                raise RuntimeError(
+                    "DSA sparse offload C8 is currently supported only on A5; "
+                    "A3 keeps the existing bf16/fp16 operator path."
+                )
         self.dsa_kv_cache_group_ids: DSAKVCacheGroupIds | None = None
         dsa_config = self.ascend_config.dsa_offload_config
         self.dsa_resident_token_pool = (
@@ -395,6 +424,7 @@ class NPUModelRunner(GPUModelRunner):
                 resident_token_pool=self.dsa_resident_token_pool,
                 device=self.device,
                 pin_memory=self.pin_memory,
+                packed_c8=self.dsa_offload_packed_c8,
             )
             if self.dsa_resident_token_pool is not None
             else None
@@ -451,17 +481,6 @@ class NPUModelRunner(GPUModelRunner):
                     self.model_config.hf_text_config.qk_rope_head_dim,
                     self.model_config.hf_text_config.index_head_dim,
                 )
-        # dsa c8
-        self.enable_sparse_sfa_c8 = self.ascend_config.enable_sparse_sfa_c8
-        self.enable_sparse_li_c8 = self.ascend_config.enable_sparse_li_c8
-        if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
-            if get_ascend_device_type() == AscendDeviceType.A5:
-                self.c8_k_cache_dtype = torch.float8_e4m3fn
-                self.c8_k_scale_cache_dtype = torch.float32
-            else:
-                self.c8_k_cache_dtype = torch.int8
-                self.c8_k_scale_cache_dtype = torch.float16
-
         self.attn_backend = get_attn_backend(
             0,
             self.dtype,
@@ -3629,6 +3648,10 @@ class NPUModelRunner(GPUModelRunner):
             dsa_resident_pool_indices = (
                 dsa_state.resident_pool_indices[:num_reqs_padded]
             )
+            dsa_sparse_budget_tokens = (
+                dsa_state.sparse_budget_tokens[:num_reqs_padded]
+            )
+            dsa_candidate_lens = dsa_state.candidate_lens[:num_reqs_padded]
             dsa_dram_block_table = (
                 dsa_runtime.active_dram_block_table.gpu[
                     :num_reqs_padded
@@ -3637,6 +3660,8 @@ class NPUModelRunner(GPUModelRunner):
         else:
             dsa_row_modes = None
             dsa_resident_pool_indices = None
+            dsa_sparse_budget_tokens = None
+            dsa_candidate_lens = None
             dsa_dram_block_table = None
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
@@ -3683,6 +3708,8 @@ class NPUModelRunner(GPUModelRunner):
             dsa_indexer_slot_mapping=dsa_indexer_slot_mapping,
             dsa_row_modes=dsa_row_modes,
             dsa_resident_pool_indices=dsa_resident_pool_indices,
+            dsa_sparse_budget_tokens=dsa_sparse_budget_tokens,
+            dsa_candidate_lens=dsa_candidate_lens,
             dsa_dram_block_table=dsa_dram_block_table,
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
@@ -4516,7 +4543,10 @@ class NPUModelRunner(GPUModelRunner):
 
     def _bind_dsa_split_kv_caches(
         self,
-        kv_caches: dict[str, torch.Tensor],
+        kv_caches: dict[
+            str,
+            torch.Tensor | tuple[torch.Tensor, ...],
+        ],
         kv_cache_config: KVCacheConfig,
     ) -> None:
         """把同一 transformer layer 的两张 DSA cache 分别绑定到模型。
@@ -4533,7 +4563,7 @@ class NPUModelRunner(GPUModelRunner):
         from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
 
         assert len(self.kv_caches) == 0
-        require_dsa_offload_ops()
+        require_dsa_offload_ops(packed_c8=self.dsa_offload_packed_c8)
         binding_order = get_dsa_kv_cache_binding_order(kv_cache_config)
         expected_layers = set(binding_order)
         actual_layers = set(kv_caches)
@@ -4625,19 +4655,36 @@ class NPUModelRunner(GPUModelRunner):
             indexer_name = indexer_names[layer_index]
             resident_cache = kv_caches[resident_name]
             indexer_cache = kv_caches[indexer_name]
-            if (
-                not isinstance(resident_cache, tuple)
-                or len(resident_cache) < 2
-            ):
+            if not isinstance(resident_cache, tuple):
                 raise RuntimeError(
-                    "DSA resident MLA cache must expose NOPE and ROPE "
-                    f"planes: layer={resident_name}"
+                    "DSA resident MLA cache must be a cache tuple: "
+                    f"layer={resident_name}"
                 )
-            if not isinstance(indexer_cache, torch.Tensor):
-                raise RuntimeError(
-                    "DSA Indexer cache must be one dense tensor: "
-                    f"layer={indexer_name}"
-                )
+            if self.dsa_offload_packed_c8:
+                if len(resident_cache) != 1:
+                    raise RuntimeError(
+                        "DSA A5 resident cache must be one packed C8 tensor: "
+                        f"layer={resident_name}, entries={len(resident_cache)}"
+                    )
+                if (
+                    not isinstance(indexer_cache, tuple)
+                    or len(indexer_cache) != 2
+                ):
+                    raise RuntimeError(
+                        "DSA A5 Indexer cache must contain C8 key and FP32 "
+                        f"scale: layer={indexer_name}"
+                    )
+            else:
+                if len(resident_cache) < 2:
+                    raise RuntimeError(
+                        "DSA resident MLA cache must expose NOPE and ROPE "
+                        f"planes: layer={resident_name}"
+                    )
+                if not isinstance(indexer_cache, torch.Tensor):
+                    raise RuntimeError(
+                        "DSA Indexer cache must be one dense tensor: "
+                        f"layer={indexer_name}"
+                    )
 
             resident_module = forward_context[resident_name]
             if not isinstance(resident_module, MLAAttention):
@@ -4654,16 +4701,23 @@ class NPUModelRunner(GPUModelRunner):
                     f"impl={type(resident_impl).__name__}"
                 )
 
-            store.add_layer(
-                layer_id=runtime_layer_id,
-                resident_nope_cache=resident_cache[0],
-                resident_rope_cache=resident_cache[1],
-            )
+            if self.dsa_offload_packed_c8:
+                store.add_packed_layer(
+                    layer_id=runtime_layer_id,
+                    resident_packed_cache=resident_cache[0],
+                )
+            else:
+                store.add_layer(
+                    layer_id=runtime_layer_id,
+                    resident_nope_cache=resident_cache[0],
+                    resident_rope_cache=resident_cache[1],
+                )
             resident_impl.bind_dsa_offload_context(
                 DSALayerOffloadContext(
                     layer_id=runtime_layer_id,
                     indexer_cache=indexer_cache,
                     runtime=runtime,
+                    packed_c8=self.dsa_offload_packed_c8,
                 )
             )
 
@@ -4787,7 +4841,10 @@ class NPUModelRunner(GPUModelRunner):
 
         return dsa_k_tensor, dsa_k_scale_tensor
 
-    def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
+    def _allocate_kv_cache_tensors(
+        self,
+        kv_cache_config: KVCacheConfig,
+    ) -> dict[str, torch.Tensor | tuple[torch.Tensor, ...]]:
         """
         Initializes the KV cache buffer with the correct size. The buffer needs
         to be reshaped to the desired shape before being used by the models.
@@ -4804,7 +4861,10 @@ class NPUModelRunner(GPUModelRunner):
             to their corresponding memory buffer for K cache and V cache.
         """
         # init kv cache tensors
-        kv_cache_raw_tensors: dict[str, torch.Tensor | torch.Tensor | None | None] = {}
+        kv_cache_raw_tensors: dict[
+            str,
+            torch.Tensor | tuple[torch.Tensor, ...],
+        ] = {}
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
         alignment = 2 * 1024 * 1024
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
@@ -4825,10 +4885,54 @@ class NPUModelRunner(GPUModelRunner):
                 current_layer_spec = layer_kv_cache_spec[layer_name]
                 if isinstance(current_layer_spec, DSAIndexerKVSpec):
                     if layer_name not in kv_cache_raw_tensors:
-                        tensor = self._allocate_int8_cache_tensor(
-                            kv_cache_tensor.size,
-                            alignment,
-                        )
+                        if current_layer_spec.cache_sparse_li_c8:
+                            if (
+                                kv_cache_tensor.size
+                                % current_layer_spec.page_size_bytes
+                            ):
+                                raise RuntimeError(
+                                    "DSA C8 Indexer allocation is not page "
+                                    f"aligned: layer={layer_name}, "
+                                    f"bytes={kv_cache_tensor.size}, "
+                                    "page_size="
+                                    f"{current_layer_spec.page_size_bytes}"
+                                )
+                            num_blocks = (
+                                kv_cache_tensor.size
+                                // current_layer_spec.page_size_bytes
+                            )
+                            num_tokens = (
+                                num_blocks
+                                * current_layer_spec.block_size
+                                * current_layer_spec.num_kv_heads
+                            )
+                            key_bytes = (
+                                num_tokens
+                                * current_layer_spec.head_size
+                                * get_dtype_size(
+                                    current_layer_spec.c8_k_cache_dtype
+                                )
+                            )
+                            scale_bytes = (
+                                num_tokens
+                                * current_layer_spec.c8_scale_dim
+                                * get_dtype_size(
+                                    current_layer_spec.c8_k_scale_cache_dtype
+                                )
+                            )
+                            tensor = self._allocate_sparse_c8_indexer_tensors(
+                                dsa_k_tensor_size=key_bytes,
+                                dsa_k_scale_tensor_size=scale_bytes,
+                                alignment=alignment,
+                                scale_dtype=(
+                                    current_layer_spec.c8_k_scale_cache_dtype
+                                ),
+                            )
+                        else:
+                            tensor = self._allocate_int8_cache_tensor(
+                                kv_cache_tensor.size,
+                                alignment,
+                            )
                         for layer_name_inner in kv_cache_tensor.shared_by:
                             if isinstance(
                                 layer_kv_cache_spec[layer_name_inner],
@@ -5076,8 +5180,11 @@ class NPUModelRunner(GPUModelRunner):
     def _reshape_kv_cache_tensors(
         self,
         kv_cache_config: KVCacheConfig,
-        kv_cache_raw_tensors: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
+        kv_cache_raw_tensors: dict[
+            str,
+            torch.Tensor | tuple[torch.Tensor, ...],
+        ],
+    ) -> dict[str, torch.Tensor | tuple[torch.Tensor, ...]]:
         """
         Reshape the KV cache tensors to the desired shape and dtype.
 
@@ -5089,7 +5196,7 @@ class NPUModelRunner(GPUModelRunner):
             Dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
-        kv_caches: dict[str, torch.Tensor] = {}
+        kv_caches: dict[str, torch.Tensor | tuple[torch.Tensor, ...]] = {}
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
 
         # Indexer plane 只是一张独立的 dense cache，没有自己的 attention
@@ -5100,22 +5207,49 @@ class NPUModelRunner(GPUModelRunner):
                 continue
             raw_tensor = kv_cache_raw_tensors[layer_name]
             assert raw_tensor is not None
-            assert (
-                raw_tensor.numel() % current_kv_cache_spec.page_size_bytes == 0
-            )
-            num_blocks = (
-                raw_tensor.numel() // current_kv_cache_spec.page_size_bytes
-            )
+            if current_kv_cache_spec.cache_sparse_li_c8:
+                if not isinstance(raw_tensor, tuple) or len(raw_tensor) != 2:
+                    raise RuntimeError(
+                        "DSA C8 Indexer raw cache must contain key and scale: "
+                        f"layer={layer_name}"
+                    )
+                raw_key, raw_scale = raw_tensor
+                total_bytes = raw_key.numel() + raw_scale.numel()
+            else:
+                if not isinstance(raw_tensor, torch.Tensor):
+                    raise RuntimeError(
+                        "DSA bf16 Indexer raw cache must be one tensor: "
+                        f"layer={layer_name}"
+                    )
+                total_bytes = raw_tensor.numel()
+            assert total_bytes % current_kv_cache_spec.page_size_bytes == 0
+            num_blocks = total_bytes // current_kv_cache_spec.page_size_bytes
             assert num_blocks >= kv_cache_config.num_blocks
-            kv_cache_shape = (
+            key_shape = (
                 num_blocks,
                 current_kv_cache_spec.block_size,
                 current_kv_cache_spec.num_kv_heads,
                 current_kv_cache_spec.head_size,
             )
-            kv_caches[layer_name] = raw_tensor.view(
-                current_kv_cache_spec.dtype
-            ).view(kv_cache_shape)
+            if current_kv_cache_spec.cache_sparse_li_c8:
+                scale_shape = (
+                    num_blocks,
+                    current_kv_cache_spec.block_size,
+                    current_kv_cache_spec.num_kv_heads,
+                    current_kv_cache_spec.c8_scale_dim,
+                )
+                kv_caches[layer_name] = (
+                    raw_key.view(
+                        current_kv_cache_spec.c8_k_cache_dtype
+                    ).view(key_shape),
+                    raw_scale.view(
+                        current_kv_cache_spec.c8_k_scale_cache_dtype
+                    ).view(scale_shape),
+                )
+            else:
+                kv_caches[layer_name] = raw_tensor.view(
+                    current_kv_cache_spec.dtype
+                ).view(key_shape)
 
         for group in self._kv_cache_spec_attn_group_iterator():
             attn_backend = group.backend
@@ -5721,14 +5855,16 @@ class NPUModelRunner(GPUModelRunner):
                     enable_sparse_li_c8_for_layer = bool(getattr(impl, "enable_sparse_li_c8", False))
 
                     if self.dsa_offload_enabled:
-                        if (
+                        if self.dsa_offload_packed_c8 and not (
                             enable_sparse_sfa_c8_for_layer
-                            or enable_sparse_li_c8_for_layer
+                            and enable_sparse_li_c8_for_layer
                         ):
                             raise RuntimeError(
-                                "The initial DSA Indexer/MLA split migration "
-                                "supports bf16/fp16 cache planes only; sparse "
-                                "SFA/LI C8 cache packing must be disabled."
+                                "Every DSA sparse-attention layer on A5 must "
+                                "enable both packed SFA C8 and LI C8: "
+                                f"layer={layer_name}, "
+                                f"sfa_c8={enable_sparse_sfa_c8_for_layer}, "
+                                f"li_c8={enable_sparse_li_c8_for_layer}."
                             )
                         if not has_indexer:
                             raise RuntimeError(
@@ -5736,11 +5872,21 @@ class NPUModelRunner(GPUModelRunner):
                                 "Indexer cache for every resident MLA layer; "
                                 f"layer={layer_name} has no local indexer."
                             )
-                        resident_head_dim = (
-                            self.model_config.hf_text_config.kv_lora_rank,
-                            self.model_config.hf_text_config.qk_rope_head_dim,
-                            0,
-                        )
+                        if self.dsa_offload_packed_c8:
+                            resident_head_dim = (
+                                get_sfa_qsfa_packed_head_dim(
+                                    self.model_config.hf_text_config.kv_lora_rank,
+                                    self.model_config.hf_text_config.qk_rope_head_dim,
+                                ),
+                                0,
+                                0,
+                            )
+                        else:
+                            resident_head_dim = (
+                                self.model_config.hf_text_config.kv_lora_rank,
+                                self.model_config.hf_text_config.qk_rope_head_dim,
+                                0,
+                            )
                         kv_cache_spec[layer_name] = (
                             DSAResidentMLAAttentionSpec(
                                 block_size=self.block_size,
@@ -5751,6 +5897,10 @@ class NPUModelRunner(GPUModelRunner):
                                 cache_dtype_str=(
                                     self.vllm_config.cache_config.cache_dtype
                                 ),
+                                cache_sparse_sfa_c8=(
+                                    self.dsa_offload_packed_c8
+                                ),
+                                cache_sparse_li_c8=False,
                             )
                         )
                     elif enable_sparse_sfa_c8_for_layer:
@@ -5811,6 +5961,7 @@ class NPUModelRunner(GPUModelRunner):
                         num_kv_heads=1,
                         head_size=attn_module.head_dim,
                         dtype=attn_module.dtype,
+                        cache_sparse_li_c8=self.dsa_offload_packed_c8,
                     )
 
             elif isinstance(attn_module, CacheOnlyAttentionLayer):

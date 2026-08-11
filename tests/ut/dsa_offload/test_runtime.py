@@ -6,13 +6,17 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+import vllm_ascend.dsa_offload.runtime as runtime_module
 from vllm_ascend.dsa_offload.dram_store import DSAHotDRAMStore
 from vllm_ascend.dsa_offload.input_batch import DSAInputBatchCacheLayout
 from vllm_ascend.dsa_offload.request_cache_layout import (
     DSARequestCacheStage,
 )
 from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
-from vllm_ascend.dsa_offload.runtime import DSAOffloadRuntime
+from vllm_ascend.dsa_offload.runtime import (
+    DSALayerOffloadContext,
+    DSAOffloadRuntime,
+)
 from vllm_ascend.dsa_offload.scheduler_output import (
     DSARequestCacheLayoutProjection,
     DSAResidentBlockTableReplacement,
@@ -30,6 +34,8 @@ class _ResidentBlockTable:
 
 def _make_runtime(
     max_num_reqs: int = 1,
+    *,
+    packed_c8: bool = False,
 ) -> tuple[
     DSAResidentTokenPool,
     DSAOffloadRuntime,
@@ -51,6 +57,7 @@ def _make_runtime(
         resident_token_pool=resident_pool,
         device=torch.device("cpu"),
         pin_memory=False,
+        packed_c8=packed_c8,
     )
     store = DSAHotDRAMStore(
         usable_blocks=8,
@@ -76,10 +83,133 @@ def test_lidu_scratch_is_shared_but_cache_slots_remain_per_layer() -> None:
     assert first is second
     assert first.topk_index.data_ptr() == runtime._lidu_topk_index.data_ptr()
     assert first.topk_slots.data_ptr() == runtime._lidu_topk_slots.data_ptr()
-    assert (
-        resident_pool.get_cache_slots(0).data_ptr()
-        != resident_pool.get_cache_slots(1).data_ptr()
+    assert resident_pool.get_cache_slots(0).data_ptr() != resident_pool.get_cache_slots(1).data_ptr()
+
+
+def test_a5_selection_scratch_is_allocated_only_for_packed_c8() -> None:
+    _, bf16_runtime, _ = _make_runtime()
+    _, c8_runtime, _ = _make_runtime(packed_c8=True)
+
+    assert bf16_runtime._a5_attention_slots is None
+    assert bf16_runtime._a5_resident_seq_lengths is None
+    assert c8_runtime._a5_attention_slots is not None
+    assert c8_runtime._a5_attention_slots.shape == (1, 1, 2176)
+    assert c8_runtime._a5_resident_seq_lengths is not None
+    assert c8_runtime._a5_resident_seq_lengths.shape == (1,)
+
+
+def test_candidate_lengths_keep_dense_history_and_exclude_sparse_tail() -> None:
+    resident_pool, runtime, _ = _make_runtime(max_num_reqs=2)
+    state = DSAInputBatchCacheLayout(
+        max_num_reqs=2,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        resident_token_pool=resident_pool,
     )
+    runtime.active_num_reqs = 2
+    runtime._tokens_after_schedule[:2] = [4096, 6273]
+    state.row_modes_cpu[:2] = [1, 2]
+
+    runtime._refresh_candidate_lens(state)
+
+    assert state.candidate_lens_cpu[:2].tolist() == [4096, 6272]
+
+
+def test_sparse_candidate_lengths_preserve_exact_boundary_tail_block() -> None:
+    resident_pool, runtime, _ = _make_runtime(max_num_reqs=3)
+    state = DSAInputBatchCacheLayout(
+        max_num_reqs=3,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        resident_token_pool=resident_pool,
+    )
+    runtime.active_num_reqs = 3
+    runtime._tokens_after_schedule[:3] = [6145, 6272, 6273]
+    state.row_modes_cpu[:3] = [2, 2, 2]
+
+    runtime._refresh_candidate_lens(state)
+
+    assert state.candidate_lens_cpu[:3].tolist() == [6144, 6144, 6272]
+
+
+def test_a5_selection_chain_reuses_preallocated_outputs(monkeypatch) -> None:
+    resident_pool, runtime, store = _make_runtime(
+        max_num_reqs=2,
+        packed_c8=True,
+    )
+    resident_cache = torch.empty(4, 128, 1, 656, dtype=torch.int8)
+    store.add_packed_layer(
+        layer_id=0,
+        resident_packed_cache=resident_cache,
+    )
+    indexer_cache = (
+        torch.empty(8, 128, 1, 128, dtype=torch.int8),
+        torch.empty(8, 128, 1, 1, dtype=torch.float32),
+    )
+    captured: dict[str, torch.Tensor] = {}
+
+    def _fake_quant_li(**kwargs) -> torch.Tensor:
+        captured["candidate_lens"] = kwargs["candidate_lens"]
+        return torch.zeros((2, 1, 2048), dtype=torch.int32)
+
+    def _fake_manage(*, outputs, **kwargs) -> None:
+        outputs.topk_index.fill_(7)
+        outputs.topk_slots.fill_(9)
+        outputs.miss_count.copy_(torch.tensor([0, 3], dtype=torch.int32))
+        outputs.tail_info.zero_()
+        captured["manager_topk_index"] = outputs.topk_index
+
+    def _fake_scatter(*, attention_slots, resident_seq_lengths, **kwargs) -> None:
+        attention_slots.fill_(11)
+        resident_seq_lengths.copy_(torch.tensor([4096, 4224], dtype=torch.int32))
+        captured["attention_slots"] = attention_slots
+        captured["resident_seq_lengths"] = resident_seq_lengths
+
+    monkeypatch.setattr(
+        runtime_module,
+        "quant_lightning_indexer_topk",
+        _fake_quant_li,
+    )
+    monkeypatch.setattr(runtime_module, "a5_li_manage_c8", _fake_manage)
+    monkeypatch.setattr(
+        runtime_module,
+        "a5_kvcache_scatter_copy_c8",
+        _fake_scatter,
+    )
+
+    context = DSALayerOffloadContext(
+        layer_id=0,
+        indexer_cache=indexer_cache,
+        runtime=runtime,
+        packed_c8=True,
+    )
+    candidate_lens = torch.tensor([4096, 6272], dtype=torch.int32)
+    selection = context.execute_decode_selection(
+        query=torch.empty(2, 32, 128),
+        weights=torch.empty(2, 32),
+        row_modes=torch.tensor([1, 2], dtype=torch.int32),
+        resident_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+        actual_seq_lengths_key=torch.tensor([4096, 6273], dtype=torch.int32),
+        actual_seq_lengths_query=torch.tensor([1, 2], dtype=torch.int32),
+        indexer_block_table=torch.zeros(2, 64, dtype=torch.int32),
+        resident_cache=(resident_cache,),
+        resident_block_table=torch.zeros(2, 64, dtype=torch.int32),
+        dram_block_table=torch.zeros(2, 64, dtype=torch.int32),
+        sparse_budget_tokens=torch.tensor([2048, 4096], dtype=torch.int32),
+        candidate_lens=candidate_lens,
+        query_dequant_scale=torch.ones(2, 32),
+        query_shape=(2, 32, 128),
+    )
+
+    assert captured["candidate_lens"].data_ptr() == candidate_lens.data_ptr()
+    assert captured["manager_topk_index"].data_ptr() == (runtime._lidu_topk_index.data_ptr())
+    assert runtime._a5_attention_slots is not None
+    assert selection.sparse_indices.data_ptr() == (runtime._a5_attention_slots.data_ptr())
+    assert selection.sparse_indices.tolist() == [[[11] * 2176]] * 2
+    assert runtime._a5_resident_seq_lengths is not None
+    assert selection.resident_seq_lengths is not None
+    assert selection.resident_seq_lengths.data_ptr() == (runtime._a5_resident_seq_lengths.data_ptr())
+    assert selection.resident_seq_lengths.tolist() == [4096, 4224]
 
 
 def test_dump_plan_is_compact_and_idempotent() -> None:
@@ -195,9 +325,7 @@ def test_consecutive_prefill_chunks_dump_only_newly_completed_blocks() -> None:
 
     assert runtime.dump_job_count == 1
     assert runtime.dump_src_block_ids.np[0] == 12
-    assert store.logical_block_table[0, :2].tolist() == (
-        first_two_dram_blocks.tolist()
-    )
+    assert store.logical_block_table[0, :2].tolist() == (first_two_dram_blocks.tolist())
     assert store.logical_block_table[0, 2] != 0
 
 
@@ -220,9 +348,7 @@ def test_enter_rejects_missing_dram_source_blocks() -> None:
         input_batch=input_batch,
         projection=DSARequestCacheLayoutProjection(
             request_ids=("req-0",),
-            stages=(
-                int(DSARequestCacheStage.ENTER_SPARSE_DECODE),
-            ),
+            stages=(int(DSARequestCacheStage.ENTER_SPARSE_DECODE),),
             target_resident_budget_tokens=(256,),
             sparse_budget_tokens=(256,),
             resident_valid_tokens=(257,),
@@ -301,12 +427,8 @@ def test_graph_capture_runtime_can_be_reused_for_multiple_sizes() -> None:
         assert runtime.active_num_reqs == row_count
         assert runtime.execution_num_reqs == row_count
         assert runtime.dump_launch_count == row_count
-        assert runtime.active_dram_block_table.gpu[
-            :row_count
-        ].eq(0).all()
-        assert runtime.dump_dst_block_ids.gpu[
-            :row_count
-        ].eq(-1).all()
+        assert runtime.active_dram_block_table.gpu[:row_count].eq(0).all()
+        assert runtime.dump_dst_block_ids.gpu[:row_count].eq(-1).all()
 
         runtime.restore_after_graph_capture()
 

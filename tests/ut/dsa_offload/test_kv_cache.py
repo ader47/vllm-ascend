@@ -74,6 +74,50 @@ def test_indexer_spec_accounts_for_one_vector_per_token() -> None:
     assert spec.page_size_bytes == 128 * 1 * 128 * 2
 
 
+def test_c8_indexer_spec_merge_preserves_split_cache_layout() -> None:
+    specs = [
+        DSAIndexerKVSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            cache_sparse_li_c8=True,
+        )
+        for _ in range(2)
+    ]
+
+    merged = DSAIndexerKVSpec.merge(specs)
+
+    assert merged.cache_sparse_li_c8
+    assert merged.c8_k_cache_dtype == torch.float8_e4m3fn
+    assert merged.c8_k_scale_cache_dtype == torch.float32
+    assert merged.page_size_bytes == 128 * (128 + 4)
+
+
+def test_c8_resident_spec_merge_preserves_packed_cache_layout() -> None:
+    specs = [
+        DSAResidentMLAAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=656,
+            sparse_head_dim=(656, 0, 0),
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+            cache_sparse_sfa_c8=True,
+            cache_sparse_li_c8=False,
+        )
+        for _ in range(2)
+    ]
+
+    merged = DSAResidentMLAAttentionSpec.merge(specs)
+
+    assert type(merged) is DSAResidentMLAAttentionSpec
+    assert merged.cache_sparse_sfa_c8
+    assert not merged.cache_sparse_li_c8
+    assert merged.sparse_head_dim == (656, 0, 0)
+    assert merged.page_size_bytes == 128 * 656
+
+
 def test_split_groups_keep_stable_plane_order() -> None:
     groups = build_dsa_kv_cache_groups(_make_specs())
 

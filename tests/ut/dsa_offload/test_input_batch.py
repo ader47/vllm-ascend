@@ -93,6 +93,13 @@ def _make_state() -> DSAInputBatchCacheLayout:
     )
 
 
+def test_pad_rows_keep_a_legal_quant_li_candidate_length() -> None:
+    state = _make_state()
+
+    assert state.candidate_lens_cpu.tolist() == [2048] * 4
+    assert state.candidate_lens.tolist() == [2048] * 4
+
+
 def _make_enter_projection() -> DSARequestCacheLayoutProjection:
     return DSARequestCacheLayoutProjection(
         request_ids=("enter",),
@@ -367,6 +374,7 @@ def test_graph_padding_rows_are_reset_when_active_batch_shrinks() -> None:
     assert state.stages.tolist() == state.stages_cpu.tolist()
     assert state.row_modes_cpu.tolist() == [1, 2, 0, 0]
     assert state.resident_pool_indices_cpu[2:].tolist() == [4, 4]
+    assert state.candidate_lens_cpu[2:].tolist() == [2048, 2048]
 
 
 def test_stable_row_order_uses_bulk_column_refresh() -> None:
@@ -484,8 +492,8 @@ def test_graph_capture_temporarily_reuses_device_owner() -> None:
 
     state.prepare_graph_capture(
         row_count=4,
-        target_budget_tokens=2048,
-        resident_valid_tokens=2049,
+        target_budget_tokens=4096,
+        resident_valid_tokens=4097,
     )
 
     assert state.graph_capture_row_count == 4
@@ -494,6 +502,7 @@ def test_graph_capture_temporarily_reuses_device_owner() -> None:
     ] * 4
     assert state.row_modes[:4].tolist() == [2, 2, 2, 2]
     assert state.resident_pool_indices[:4].tolist() == [0, 1, 2, 3]
+    assert state.candidate_lens[:4].tolist() == [4096] * 4
     # capture dummy 不能改写 scheduler/worker 的 CPU 语义真源。
     assert torch.equal(state.columns.cpu, cpu_before)
 
@@ -501,6 +510,7 @@ def test_graph_capture_temporarily_reuses_device_owner() -> None:
 
     assert state.graph_capture_row_count == 0
     assert torch.equal(state.columns.gpu, cpu_before)
+    assert state.candidate_lens.tolist() == [2048] * 4
 
 
 def test_graph_capture_reuses_one_input_owner_across_sizes() -> None:

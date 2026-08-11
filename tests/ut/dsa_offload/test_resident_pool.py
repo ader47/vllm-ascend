@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm_ascend.dsa_offload.contracts import DSA_LIDU_CACHE_ROW_ALIGNMENT
 from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
 
 
@@ -18,6 +19,9 @@ def _make_pool() -> DSAResidentTokenPool:
 
 def test_pool_row_is_stable_until_request_release() -> None:
     pool = _make_pool()
+
+    assert pool.cache_row_width % DSA_LIDU_CACHE_ROW_ALIGNMENT == 0
+    assert pool.cache_metadata_index >= pool.max_model_len
 
     first = pool.acquire("req-a")
     assert pool.acquire("req-a") == first

@@ -400,6 +400,12 @@ function(add_ops_src_copy)
         set(BELONG_MC2_OPS TRUE)
     endif()
 
+    # The copy stamp must follow the source files themselves.  Depending only
+    # on the generated *.done file leaves incremental custom-op builds using
+    # an old op_kernel tree after the original source changes.
+    file(GLOB_RECURSE SRC_DEP_FILES CONFIGURE_DEPENDS
+        "${SRC_COPY_SRC}/*")
+
     if(NOT BUILD_OPS_RTY_KERNEL AND BELONG_MC2_OPS)
         file(GLOB SRC_FILES ${SRC_COPY_SRC}/* ${SRC_COPY_SRC}/op_kernel/*)
     else()
@@ -424,12 +430,14 @@ function(add_ops_src_copy)
                     COMMAND cp -rf ${SRC_FILES} ${SRC_COPY_DST}
                     COMMAND rm -rf ${SRC_COPY_DST}/op_kernel/
                     COMMAND touch ${_BUILD_FLAG}
+                    DEPENDS ${SRC_DEP_FILES}
             )
         else()
             add_custom_command(OUTPUT ${_BUILD_FLAG}
                     COMMAND mkdir -p ${SRC_COPY_DST}
                     COMMAND cp -rf ${SRC_FILES} ${SRC_COPY_DST}
                     COMMAND touch ${_BUILD_FLAG}
+                    DEPENDS ${SRC_DEP_FILES}
             )
         endif()
 
@@ -470,6 +478,7 @@ function(add_bin_compile_target)
     endforeach()
 
     set(_ops_target_list)
+    set(_binary_source_dependencies)
     set(compile_scripts)
     file(GLOB scripts_list ${GEN_OUT_DIR}/*.sh)
     list(APPEND compile_scripts ${scripts_list})
@@ -484,6 +493,10 @@ function(add_bin_compile_target)
         if (NOT DEFINED ${op_file}_dir)
             continue()
         endif ()
+
+        file(GLOB_RECURSE _op_source_dependencies CONFIGURE_DEPENDS
+            "${${op_file}_dir}/*")
+        list(APPEND _binary_source_dependencies ${_op_source_dependencies})
 
         if (NOT TARGET ${op_file})
             add_custom_target(${op_file})
@@ -623,6 +636,7 @@ function(add_bin_compile_target)
                     COMMAND ${_BUILD_COMMAND}
                     COMMAND touch ${_BUILD_FLAG}
                     WORKING_DIRECTORY ${GEN_OUT_DIR}
+                    DEPENDS ${_op_source_dependencies} ${bin_script}
             )
 
             add_custom_target(${OP_TARGET_NAME}_${op_index}
@@ -638,12 +652,14 @@ function(add_bin_compile_target)
     endforeach()
 
     if (_ops_target_list)
+        list(REMOVE_DUPLICATES _binary_source_dependencies)
         set(OPS_CONFIG_TARGET ops_config_${BINARY_COMPUTE_UNIT})
         set(BINARY_INFO_CONFIG_FILE ${BIN_OUT_DIR}/binary_info_config.json)
         set(RELOCATABLE_KERNEL_INFO_CONFIG_FILE ${BIN_OUT_DIR}/relocatable_kernel_info_config.json)
 
         add_custom_command(OUTPUT ${BINARY_INFO_CONFIG_FILE}
                 COMMAND ${HI_PYTHON} ${ASCENDC_CMAKE_UTIL_DIR}/ascendc_ops_config.py -p ${BIN_OUT_DIR} -s ${BINARY_COMPUTE_UNIT}
+                DEPENDS ${_binary_source_dependencies}
         )
 
         add_custom_target(${OPS_CONFIG_TARGET}

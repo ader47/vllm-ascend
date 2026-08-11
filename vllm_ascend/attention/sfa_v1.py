@@ -41,7 +41,10 @@ from vllm_ascend.attention.utils import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
 from vllm_ascend.distributed.utils import all_gather_async
-from vllm_ascend.dsa_offload.ops import DSAOffloadSelectionOutput
+from vllm_ascend.dsa_offload.ops import (
+    DSAOffloadSelectionOutput,
+    quant_lightning_indexer_topk,
+)
 from vllm_ascend.dsa_offload.runtime import DSALayerOffloadContext
 from vllm_ascend.memcache_comm_fence import (
     record_attention_compute_start,
@@ -254,6 +257,8 @@ class AscendSFAMetadata:
     dsa_indexer_slot_mapping: torch.Tensor | None = None
     dsa_row_modes: torch.Tensor | None = None
     dsa_resident_pool_indices: torch.Tensor | None = None
+    dsa_sparse_budget_tokens: torch.Tensor | None = None
+    dsa_candidate_lens: torch.Tensor | None = None
     dsa_dram_block_table: torch.Tensor | None = None
 
 
@@ -394,13 +399,21 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             else None
         )
         dsa_row_modes = (
-            common_attn_metadata.dsa_row_modes[:num_reqs]
-            if common_attn_metadata.dsa_row_modes is not None
-            else None
+            common_attn_metadata.dsa_row_modes[:num_reqs] if common_attn_metadata.dsa_row_modes is not None else None
         )
         dsa_resident_pool_indices = (
             common_attn_metadata.dsa_resident_pool_indices[:num_reqs]
             if common_attn_metadata.dsa_resident_pool_indices is not None
+            else None
+        )
+        dsa_sparse_budget_tokens = (
+            common_attn_metadata.dsa_sparse_budget_tokens[:num_reqs]
+            if common_attn_metadata.dsa_sparse_budget_tokens is not None
+            else None
+        )
+        dsa_candidate_lens = (
+            common_attn_metadata.dsa_candidate_lens[:num_reqs]
+            if common_attn_metadata.dsa_candidate_lens is not None
             else None
         )
         dsa_dram_block_table = (
@@ -563,6 +576,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             dsa_indexer_slot_mapping=dsa_indexer_slot_mapping,
             dsa_row_modes=dsa_row_modes,
             dsa_resident_pool_indices=dsa_resident_pool_indices,
+            dsa_sparse_budget_tokens=dsa_sparse_budget_tokens,
+            dsa_candidate_lens=dsa_candidate_lens,
             dsa_dram_block_table=dsa_dram_block_table,
         )
 
@@ -770,14 +785,16 @@ class AscendSFAImpl(MLAAttentionImpl):
         """绑定由 model runner 初始化的一份逐层 DSA 稳定资源。"""
 
         if self.dsa_offload_context is not None:
-            raise RuntimeError(
-                f"DSA offload context for {self.layer_name} was bound twice"
-            )
-        if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
-            raise RuntimeError(
-                "DSA offload currently requires bf16/fp16 resident and "
-                "Indexer cache planes"
-            )
+            raise RuntimeError(f"DSA offload context for {self.layer_name} was bound twice")
+        if context.packed_c8:
+            if not (
+                self.enable_sparse_sfa_c8
+                and self.enable_sparse_li_c8
+                and get_ascend_device_type() == AscendDeviceType.A5
+            ):
+                raise RuntimeError("DSA packed C8 context requires A5 with both sparse SFA C8 and LI C8 enabled")
+        elif self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
+            raise RuntimeError("DSA bf16/fp16 context cannot bind a C8 cache layout")
         if self.use_index_cache:
             raise RuntimeError(
                 "DSA sparse offload does not yet support IndexCache or "
@@ -1615,35 +1632,26 @@ class AscendSFAImpl(MLAAttentionImpl):
         record_attention_compute_start()
         dsa_context = self.dsa_offload_context
         if dsa_context is not None:
-            if q_li_scale is not None or self.enable_sparse_li_c8:
-                raise RuntimeError(
-                    "DSA LIDU does not support quantized Indexer cache"
-                )
             indexer_block_table = attn_metadata.dsa_indexer_block_table
             if indexer_block_table is None:
-                raise RuntimeError(
-                    "DSA attention metadata is missing the Indexer block table"
-                )
+                raise RuntimeError("DSA attention metadata is missing the Indexer block table")
 
             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-                if len(kv_cache) < 2:
-                    raise RuntimeError(
-                        "DSA resident MLA cache must contain NOPE and ROPE "
-                        "planes"
-                    )
                 row_modes = attn_metadata.dsa_row_modes
-                resident_pool_indices = (
-                    attn_metadata.dsa_resident_pool_indices
-                )
+                resident_pool_indices = attn_metadata.dsa_resident_pool_indices
                 dram_block_table = attn_metadata.dsa_dram_block_table
+                sparse_budget_tokens = attn_metadata.dsa_sparse_budget_tokens
+                candidate_lens = attn_metadata.dsa_candidate_lens
                 if (
                     row_modes is None
                     or resident_pool_indices is None
                     or dram_block_table is None
+                    or sparse_budget_tokens is None
+                    or candidate_lens is None
                 ):
                     raise RuntimeError(
-                        "DSA decode metadata is missing row mode, resident "
-                        "pool index, or DRAM block table"
+                        "DSA decode metadata is missing row mode, budget, "
+                        "candidate length, resident pool index, or DRAM table"
                     )
                 return dsa_context.execute_decode_selection(
                     query=q_li,
@@ -1651,17 +1659,42 @@ class AscendSFAImpl(MLAAttentionImpl):
                     row_modes=row_modes,
                     resident_pool_indices=resident_pool_indices,
                     actual_seq_lengths_key=actual_seq_lengths_key,
+                    actual_seq_lengths_query=actual_seq_lengths_query,
                     indexer_block_table=indexer_block_table,
-                    resident_nope_cache=kv_cache[0],
-                    resident_rope_cache=kv_cache[1],
+                    resident_cache=kv_cache,
                     resident_block_table=attn_metadata.block_table,
                     dram_block_table=dram_block_table,
+                    sparse_budget_tokens=sparse_budget_tokens,
+                    candidate_lens=candidate_lens,
+                    query_dequant_scale=q_li_scale,
+                    query_shape=(tuple(q_li_shape_ori) if q_li_shape_ori is not None else None),
                 )
 
             # Prefill 仍复用基线 lightning-indexer。区别仅在于 key cache
             # 与 block table 指向独立 Indexer plane；resident MLA metadata
             # 和 SFA builder 不复制第二份。
-            if self.use_torch_npu_lightning_indexer:
+            if dsa_context.packed_c8:
+                if (
+                    not isinstance(dsa_context.indexer_cache, tuple)
+                    or len(dsa_context.indexer_cache) != 2
+                    or q_li_scale is None
+                    or q_li_shape_ori is None
+                ):
+                    raise RuntimeError("DSA A5 C8 prefill requires quantized query and Indexer key/scale caches")
+                indexer_key, indexer_scale = dsa_context.indexer_cache
+                topk_indices = quant_lightning_indexer_topk(
+                    query=q_li.view(q_li_shape_ori),
+                    key=indexer_key,
+                    weights=weights,
+                    query_dequant_scale=q_li_scale.view(q_li_shape_ori[:-1]),
+                    key_dequant_scale=indexer_scale,
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    candidate_lens=actual_seq_lengths_key,
+                    block_table=indexer_block_table,
+                )
+            elif self.use_torch_npu_lightning_indexer:
+                if not isinstance(dsa_context.indexer_cache, torch.Tensor):
+                    raise RuntimeError("DSA bf16 prefill requires one Indexer cache tensor")
                 topk_indices, _ = torch_npu.npu_lightning_indexer(
                     query=q_li,
                     key=dsa_context.indexer_cache,
@@ -1675,21 +1708,19 @@ class AscendSFAImpl(MLAAttentionImpl):
                     sparse_mode=3,
                 )
             else:
-                topk_indices, _ = (
-                    torch.ops._C_ascend.npu_lightning_indexer(
-                        query=q_li,
-                        key=dsa_context.indexer_cache,
-                        weights=weights,
-                        actual_seq_lengths_query=(
-                            actual_seq_lengths_query
-                        ),
-                        actual_seq_lengths_key=actual_seq_lengths_key,
-                        block_table=indexer_block_table,
-                        layout_query="TND",
-                        layout_key="PA_BSND",
-                        sparse_count=2048,
-                        sparse_mode=3,
-                    )
+                if not isinstance(dsa_context.indexer_cache, torch.Tensor):
+                    raise RuntimeError("DSA bf16 prefill requires one Indexer cache tensor")
+                topk_indices, _ = torch.ops._C_ascend.npu_lightning_indexer(
+                    query=q_li,
+                    key=dsa_context.indexer_cache,
+                    weights=weights,
+                    actual_seq_lengths_query=(actual_seq_lengths_query),
+                    actual_seq_lengths_key=actual_seq_lengths_key,
+                    block_table=indexer_block_table,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=2048,
+                    sparse_mode=3,
                 )
             return topk_indices
 
@@ -1733,17 +1764,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         if isinstance(topk_indices, DSAOffloadSelectionOutput):
             dsa_context = self.dsa_offload_context
             if dsa_context is None:
-                raise RuntimeError(
-                    "DSA selection output has no bound layer context"
-                )
-            if len(kv_cache) < 2:
-                raise RuntimeError(
-                    "DSA resident MLA cache must contain NOPE and ROPE "
-                    "planes"
-                )
+                raise RuntimeError("DSA selection output has no bound layer context")
             return dsa_context.execute_sparse_attention(
                 query=ql_nope,
-                resident_nope_cache=kv_cache[0],
+                resident_cache=kv_cache,
                 selection=topk_indices,
                 scale_value=self.scale,
                 resident_block_table=attn_metadata.block_table,
@@ -1751,7 +1775,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # SFA-Offload 的寻址是 resident slot，边界仍是完整序列长度。
                 actual_seq_lengths_kv=actual_seq_lengths_key,
                 query_rope=q_pe,
-                resident_rope_cache=kv_cache[1],
             )
         return DeviceOperator.execute_sparse_flash_attention_process(
             self,
@@ -2061,28 +2084,51 @@ class AscendSFAImpl(MLAAttentionImpl):
             assert k_li is not None
             dsa_context = self.dsa_offload_context
             if dsa_context is not None:
-                indexer_slot_mapping = (
-                    attn_metadata.dsa_indexer_slot_mapping
-                )
+                indexer_slot_mapping = attn_metadata.dsa_indexer_slot_mapping
                 if indexer_slot_mapping is None:
-                    raise RuntimeError(
-                        "DSA Indexer cache write is missing its independent "
-                        "slot mapping"
-                    )
+                    raise RuntimeError("DSA Indexer cache write is missing its independent slot mapping")
                 num_actual_tokens = attn_metadata.num_actual_tokens
-                torch_npu.npu_scatter_nd_update_(
-                    dsa_context.indexer_cache.view(
-                        -1,
-                        k_li.shape[-1],
-                    ),
-                    indexer_slot_mapping[
-                        :num_actual_tokens
-                    ].view(-1, 1),
-                    k_li[:num_actual_tokens].view(
-                        -1,
-                        k_li.shape[-1],
-                    ),
-                )
+                if dsa_context.packed_c8:
+                    if (
+                        not isinstance(dsa_context.indexer_cache, tuple)
+                        or len(dsa_context.indexer_cache) != 2
+                        or k_li_scale is None
+                    ):
+                        raise RuntimeError("DSA A5 C8 Indexer write requires key and scale")
+                    indexer_key, indexer_scale = dsa_context.indexer_cache
+                    torch_npu.npu_scatter_nd_update_(
+                        indexer_key.view(-1, k_li.shape[-1]),
+                        indexer_slot_mapping[:num_actual_tokens].view(-1, 1),
+                        k_li[:num_actual_tokens].view(
+                            -1,
+                            k_li.shape[-1],
+                        ),
+                    )
+                    torch_npu.npu_scatter_nd_update_(
+                        indexer_scale.view(-1, k_li_scale.shape[-1]),
+                        indexer_slot_mapping[:num_actual_tokens].view(-1, 1),
+                        k_li_scale[:num_actual_tokens].view(
+                            -1,
+                            k_li_scale.shape[-1],
+                        ),
+                    )
+                else:
+                    if not isinstance(
+                        dsa_context.indexer_cache,
+                        torch.Tensor,
+                    ):
+                        raise RuntimeError("DSA bf16 Indexer write requires one cache tensor")
+                    torch_npu.npu_scatter_nd_update_(
+                        dsa_context.indexer_cache.view(
+                            -1,
+                            k_li.shape[-1],
+                        ),
+                        indexer_slot_mapping[:num_actual_tokens].view(-1, 1),
+                        k_li[:num_actual_tokens].view(
+                            -1,
+                            k_li.shape[-1],
+                        ),
+                    )
             else:
                 if self.enable_sparse_sfa_c8:
                     dsa_k_cache_idx = 1
@@ -2110,9 +2156,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         k_li.view(-1, k_li.shape[-1]),
                     )  # b, s, n, d
                 if self.enable_sparse_li_c8:
-                    assert len(kv_cache) == (
-                        3 if self.enable_sparse_sfa_c8 else 4
-                    )
+                    assert len(kv_cache) == (3 if self.enable_sparse_sfa_c8 else 4)
                     if k_li_scale is not None:
                         if get_ascend_config().c8_enable_reshape_optim:
                             torch.ops._C_ascend.store_kv_block(
@@ -2125,9 +2169,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                             )
                         else:
                             torch_npu.npu_scatter_nd_update_(
-                                kv_cache[
-                                    dsa_k_scale_cache_idx
-                                ].view(
+                                kv_cache[dsa_k_scale_cache_idx].view(
                                     -1,
                                     k_li_scale.shape[-1],
                                 ),
@@ -2175,17 +2217,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key,
         )
         if self.dsa_offload_context is not None:
-            if kv_cache is None or len(kv_cache) < 2:
-                raise RuntimeError(
-                    "DSA full-block dump requires resident NOPE and ROPE "
-                    "cache planes"
-                )
+            if kv_cache is None:
+                raise RuntimeError("DSA full-block dump requires a resident cache")
             # 当前 DSA 只使用单 stream：本层 SFA 完成后再 dump，下一
             # step 的 LIDU/KSC 才会消费该 DRAM block，因此无需额外完成
             # 状态。若后续引入异步多流 dump，必须增加事件和可见性状态。
             self.dsa_offload_context.dump_full_blocks(
-                resident_nope_cache=kv_cache[0],
-                resident_rope_cache=kv_cache[1],
+                resident_cache=kv_cache,
             )
 
         attn_output = self._v_up_proj(attn_output)

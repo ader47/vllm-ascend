@@ -17,8 +17,9 @@ block 数统一由最终 ``KVCacheTensor.size / spec.page_size_bytes`` 推导。
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
+import torch
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -58,9 +59,35 @@ class DSAIndexerKVSpec(FullAttentionSpec):
     自动合并成同一 KV-cache group。
     """
 
+    cache_sparse_li_c8: bool = False
+    c8_k_cache_dtype: torch.dtype = torch.float8_e4m3fn
+    c8_k_scale_cache_dtype: torch.dtype = torch.float32
+    c8_scale_dim: int = 1
+
+    @classmethod
+    def merge(cls, specs: list[DSAIndexerKVSpec]) -> DSAIndexerKVSpec:
+        """合并同构 Indexer plane，同时保留 DSA/C8 扩展布局字段。
+
+        ``FullAttentionSpec.merge`` 只重建基类字段；直接继承它会静默把
+        ``cache_sparse_li_c8`` 等扩展字段恢复成默认值，导致 engine 侧容量
+        规划与 worker 侧真实分配不一致。
+        """
+
+        assert specs, "Cannot merge an empty DSA Indexer spec list."
+        assert all(type(spec) is cls for spec in specs), "All layers in a DSA Indexer group must use DSAIndexerKVSpec."
+        assert all(spec == specs[0] for spec in specs[1:]), (
+            "All layers in a DSA Indexer group must use the same cache layout."
+        )
+        return replace(specs[0])
+
     @property
     def real_page_size_bytes(self) -> int:
-        return self.block_size * self.num_kv_heads * self.head_size * get_dtype_size(self.dtype)
+        token_bytes = self.head_size * get_dtype_size(self.dtype)
+        if self.cache_sparse_li_c8:
+            token_bytes = self.head_size * get_dtype_size(self.c8_k_cache_dtype) + self.c8_scale_dim * get_dtype_size(
+                self.c8_k_scale_cache_dtype
+            )
+        return self.block_size * self.num_kv_heads * token_bytes
 
 
 @dataclass(frozen=True, kw_only=True)
