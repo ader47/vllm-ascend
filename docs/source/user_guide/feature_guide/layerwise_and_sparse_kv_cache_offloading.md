@@ -45,11 +45,26 @@ implementation uses `AscendStoreConnector` with the Memcache backend.
 - Configure `mmc-meta.conf` and `mmc-local.conf`, and start MetaService before
   starting Prefill.
 
-Install the dependencies in order:
+Build and install MemFabric Hybrid first:
 
 ```bash
-pip install memfabric-hybrid
-pip install memcache-hybrid
+git clone -b release/1.2 https://gitcode.com/Ascend/memfabric_hybrid.git
+cd memfabric_hybrid
+bash script/build_and_pack_run.sh
+bash output/memfabric_hybrid-1.2.0_linux_aarch64.run
+```
+
+Then build and install Memcache Hybrid. Its MemFabric submodule must use the
+same `release/1.2` branch:
+
+```bash
+git clone https://gitcode.com/jieke275/memcache.git
+cd memcache
+git submodule update --init 3rdparty/
+git -c submodule.3rdparty/memfabric_hybrid.branch=release/1.2 \
+    submodule update --remote 3rdparty/memfabric_hybrid
+bash script/build_and_pack_run.sh --build_mode RELEASE
+bash output/memcache_hybrid-1.1.0_linux_aarch64.run
 ```
 
 Prepare the host before starting Prefill:
@@ -61,13 +76,22 @@ source /usr/local/memfabric_hybrid/set_env.sh
 export PYTHONHASHSEED=0
 ```
 
+After updating `mmc-meta.conf` and `mmc-local.conf`, start MetaService in a
+separate process:
+
+```bash
+export MMC_META_CONFIG_PATH=/usr/local/memcache_hybrid/latest/config/mmc-meta.conf
+python -c "from memcache_hybrid import MetaService; MetaService.main()"
+```
+
 ### Configuration
 
-This example keeps layer 0 independent and assigns all other layers to three
-reusable buffers:
+To enable only Layerwise Prefill KV Cache Offload, add the following option to
+the Prefill launch command. This example keeps layer 0 independent and assigns
+all other layers to three reusable buffers:
 
-```json
-{
+```bash
+--kv-transfer-config '{
     "kv_connector": "AscendStoreConnector",
     "kv_role": "kv_producer",
     "kv_connector_extra_config": {
@@ -76,16 +100,25 @@ reusable buffers:
         "layerwise_num_shared_buffers": 3,
         "layerwise_independent_layers": [0]
     }
-}
+}'
 ```
 
 | Parameter | Description |
 | :--- | :--- |
+| `backend` | Host KV Pool backend. Shared-buffer layerwise offload requires `"memcache"`. |
+| `use_layerwise` | Enables layer-by-layer KV transfer and reusable NPU buffers. |
 | `layerwise_num_shared_buffers` | Number of reusable NPU buffers. More buffers use more memory but provide more opportunity to overlap transfer and computation. |
 | `layerwise_independent_layers` | Layers that keep dedicated buffers. The default is `[0]`; `"all"` disables cross-layer reuse. |
 
 The buffer count is workload-dependent. Start with two to four buffers and tune
 it according to NPU memory and transfer bandwidth.
+
+When Sparse KV Cache Offload is also enabled on Decode, replace this
+single-connector configuration with the Prefill `MultiConnector` configuration
+in [chapter 4](#4-use-them-together). `AscendStoreConnector` offloads each layer
+buffer to Memcache,
+while `SfaRemoteD2HConnector` exposes the same buffer for Decode to pull through
+MemFabric. A reusable buffer is released only after both operations complete.
 
 ### Verification and limitations
 
@@ -185,11 +218,11 @@ flowchart LR
 
 ### Prefill configuration
 
-Use `MultiConnector` so Prefill can save KV to Memcache and expose the same
-layer buffer to Decode:
+Add the following option to the Prefill launch command. `MultiConnector` lets
+Prefill save KV to Memcache and expose the same layer buffer to Decode:
 
-```json
-{
+```bash
+--kv-transfer-config '{
     "kv_connector": "MultiConnector",
     "kv_role": "kv_producer",
     "kv_connector_extra_config": {
@@ -214,7 +247,7 @@ layer buffer to Decode:
             }
         ]
     }
-}
+}'
 ```
 
 Do not enable `sparse_kv_offload_config` on Prefill. A reusable Prefill buffer
