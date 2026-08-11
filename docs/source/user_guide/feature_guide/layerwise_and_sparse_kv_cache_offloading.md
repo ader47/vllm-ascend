@@ -286,6 +286,3 @@ inference requests to the proxy port (`9000` in this example).
   `decode_data_parallel_size * decode_tensor_parallel_size` consecutive ports.
   Prefill does not bind these ports; Decode supplies the target through request
   metadata.
-
-For implementation details, see
-[SFA Remote D2H Connector Design](../../developer_guide/Design_Documents/sfa_remote_d2h_connector.md).
