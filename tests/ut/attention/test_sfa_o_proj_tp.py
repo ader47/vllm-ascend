@@ -123,7 +123,7 @@ class TestAscendSFAOProjTPParams(TestBase):
         impl.has_indexer = False
         impl.skip_topk = True
         impl.enable_sparse_sfa_c8 = False
-        impl.is_kv_producer = False
+        impl.is_kv_producer = True
         impl.preprocess_type = PreprocessType.NATIVE
         impl.tp_size = 2
         impl.q_lora_rank = 8
@@ -170,6 +170,7 @@ class TestAscendSFAOProjTPParams(TestBase):
             patch("vllm_ascend.attention.sfa_v1.wait_for_kv_layer_from_connector"),
             patch("vllm_ascend.attention.sfa_v1.record_attention_compute_start") as record_gate,
             patch("vllm_ascend.attention.sfa_v1.maybe_save_kv_layer_to_connector") as save_layer,
+            patch("vllm_ascend.attention.sfa_v1.notify_kv_cache_written") as notify_cache_written,
         ):
             result = impl.forward(
                 layer_name=impl.layer_name,
@@ -180,6 +181,7 @@ class TestAscendSFAOProjTPParams(TestBase):
             )
 
         self.assertIs(result, output)
+        notify_cache_written.assert_called_once_with(impl.layer_name)
         record_gate.assert_called_once_with()
         save_layer.assert_called_once_with(impl.layer_name, list(kv_cache))
         impl.o_proj.assert_not_called()
