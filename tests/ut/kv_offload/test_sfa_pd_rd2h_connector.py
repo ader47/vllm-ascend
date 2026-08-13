@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
 from vllm.distributed.kv_transfer.kv_connector.factory import (  # noqa: E402
@@ -265,6 +265,60 @@ def test_non_tp0_resolves_broadcast_main_gva_without_cpu_tensor():
     assert layer is not None
     assert layer["k_cpu_ptr"] == 3000
     assert layer["v_cpu_ptr"] == 4000
+
+
+def test_consumer_registration_covers_shared_main_gva_and_local_indexer():
+    worker = SFAPDRD2HConsumerWorker.__new__(SFAPDRD2HConsumerWorker)
+    worker.kv_cache_config = SimpleNamespace(num_blocks=8)
+    worker._main_gva_bases = [(3000, 4000)]
+    worker._main_block_lens = [(10, 20)]
+    indexer = torch.empty((8, 4), dtype=torch.uint8)
+    indexer_scale = torch.empty((8,), dtype=torch.float32)
+    worker._indexer_tensors = [indexer]
+    worker._indexer_scale_tensors = [indexer_scale]
+
+    regions = worker._collect_consumer_register_regions()
+    registered = dict(zip(regions.ptrs, regions.lengths))
+
+    # The enclosing main region covers K [3000, 3080) and V [4000, 4160).
+    assert registered[3000] == 1160
+    assert registered[indexer.data_ptr()] == indexer.nbytes
+    assert registered[indexer_scale.data_ptr()] == indexer_scale.nbytes
+
+
+def test_consumer_registration_rejects_invalid_main_gva():
+    worker = SFAPDRD2HConsumerWorker.__new__(SFAPDRD2HConsumerWorker)
+    worker.kv_cache_config = SimpleNamespace(num_blocks=8)
+    worker._main_gva_bases = [(0, 4000)]
+    worker._main_block_lens = [(10, 20)]
+    worker._indexer_tensors = []
+    worker._indexer_scale_tensors = []
+
+    with pytest.raises(RuntimeError, match="invalid region"):
+        worker._collect_consumer_register_regions()
+
+
+def test_consumer_registers_destinations_through_memfabric_singleton():
+    worker = SFAPDRD2HConsumerWorker.__new__(SFAPDRD2HConsumerWorker)
+    regions = SimpleNamespace(
+        ptrs=[1000, 2000],
+        lengths=[100, 200],
+        registered_bytes=300,
+    )
+    worker._collect_consumer_register_regions = MagicMock(return_value=regions)
+
+    with (
+        patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.worker.validate_register_region_count"
+        ) as validate,
+        patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.worker.global_memfabric_te.register_buffer"
+        ) as register_buffer,
+    ):
+        worker._register_memfabric_destinations()
+
+    validate.assert_called_once_with(regions)
+    register_buffer.assert_called_once_with([1000, 2000], [100, 200])
 
 
 @pytest.mark.parametrize(

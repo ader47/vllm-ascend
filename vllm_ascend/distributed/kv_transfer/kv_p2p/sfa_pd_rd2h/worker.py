@@ -53,6 +53,7 @@ from vllm_ascend.distributed.kv_transfer.utils.memfabric_transfer_engine import 
     global_memfabric_te,
 )
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
+    RegisterRegions,
     collect_storage_merged_register_regions,
     get_transfer_timeout_value,
     validate_register_region_count,
@@ -315,6 +316,63 @@ class SFAPDRD2HConsumerWorker:
             get_offload_layer_id=self.offload_manager._get_offload_layer_id,
         )
 
+    def _collect_consumer_register_regions(self) -> RegisterRegions:
+        """Collect the D-side buffers used as MemFabric read destinations.
+
+        Main SFA K/V lives in the TP-shared CPU pool.  Non-zero TP ranks do
+        not own the CPU tensors, but they still issue reads into the broadcast
+        GVA, so build those regions from ``main_gva_bases`` and per-block
+        lengths instead of from tensor objects.  K and V for one layer share
+        one aligned offload allocation; register their enclosing range once.
+
+        Indexer data (and its optional quantization scale) is rank-local HBM,
+        so use storage-aware merging for those tensors.
+        """
+        num_blocks = self.kv_cache_config.num_blocks
+        main_ptrs: list[int] = []
+        main_lengths: list[int] = []
+        for (k_base, v_base), (k_block_len, v_block_len) in zip(
+            self._main_gva_bases,
+            self._main_block_lens,
+            strict=True,
+        ):
+            k_end = k_base + k_block_len * num_blocks
+            v_end = v_base + v_block_len * num_blocks
+            region_start = min(k_base, v_base)
+            region_end = max(k_end, v_end)
+            if region_start <= 0 or region_end <= region_start:
+                raise RuntimeError(
+                    "SFAPD D-side main SFA registration got an invalid "
+                    f"region: k=[{k_base}, {k_end}), v=[{v_base}, {v_end})"
+                )
+            main_ptrs.append(region_start)
+            main_lengths.append(region_end - region_start)
+
+        indexer_regions = collect_storage_merged_register_regions(
+            {
+                "indexer": self._indexer_tensors,
+                "indexer_scale": self._indexer_scale_tensors,
+            }
+        )
+        return RegisterRegions(
+            ptrs=main_ptrs + indexer_regions.ptrs,
+            lengths=main_lengths + indexer_regions.lengths,
+            logical_tensor_count=len(main_ptrs) + (indexer_regions.logical_tensor_count or 0),
+            logical_total_bytes=sum(main_lengths) + (indexer_regions.logical_total_bytes or 0),
+        )
+
+    def _register_memfabric_destinations(self) -> None:
+        """Register D-side main SFA and indexer destinations for RDMA reads."""
+        register_regions = self._collect_consumer_register_regions()
+        validate_register_region_count(register_regions)
+        global_memfabric_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+        logger.info(
+            "MembPull D registered read destinations: main_sfa_regions=%d, indexer_regions=%d, bytes=%d",
+            len(self._main_gva_bases),
+            len(register_regions.ptrs) - len(self._main_gva_bases),
+            register_regions.registered_bytes,
+        )
+
     def _register_memfabric_pull(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -394,8 +452,12 @@ class SFAPDRD2HConsumerWorker:
                 has_indexer=indexer_t is not None,
             )
 
-        # Create memfabric engine (no registration)
+        # Register the actual local destinations before the read thread can
+        # accept work. This is required when MemFabric selects an RDMA path;
+        # registration is also safe for the SDMA path selected on other
+        # topologies.
         self._ensure_engine()
+        self._register_memfabric_destinations()
         read_state = self._build_consumer_read_state()
         # Start MembPullReadThread (ZMQ ROUTER + memfabric read)
         self._mf_read_thread = MembPullReadThread(
