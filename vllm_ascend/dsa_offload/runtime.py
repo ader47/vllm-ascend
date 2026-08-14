@@ -37,12 +37,11 @@ from vllm_ascend.dsa_offload.ops import (
     DSALightningIndexerOutputs,
     DSAOffloadSelectionOutput,
     a5_kvcache_scatter_copy_c8,
-    a5_li_manage_c8,
+    a5_lightning_indexer_decode_update_c8,
     dump_full_kv_cache_blocks,
     dump_full_kv_cache_blocks_c8,
     kvcache_scatter_copy,
     lightning_indexer_decode_update,
-    quant_lightning_indexer_topk,
     sparse_flash_attention_for_offload,
     sparse_flash_attention_for_offload_c8,
 )
@@ -712,7 +711,6 @@ class DSALayerOffloadContext:
         resident_cache: tuple[torch.Tensor, ...],
         resident_block_table: torch.Tensor,
         dram_block_table: torch.Tensor,
-        sparse_budget_tokens: torch.Tensor | None = None,
         candidate_lens: torch.Tensor | None = None,
         query_dequant_scale: torch.Tensor | None = None,
         query_shape: tuple[int, ...] | None = None,
@@ -724,30 +722,30 @@ class DSALayerOffloadContext:
         if self.packed_c8:
             if not isinstance(self.indexer_cache, tuple) or len(self.indexer_cache) != 2 or len(resident_cache) != 1:
                 raise RuntimeError("DSA A5 C8 context requires packed resident cache and Indexer key/scale caches")
-            if (
-                sparse_budget_tokens is None
-                or candidate_lens is None
-                or query_dequant_scale is None
-                or query_shape is None
-            ):
+            if candidate_lens is None or query_dequant_scale is None or query_shape is None:
                 raise RuntimeError("DSA A5 C8 decode metadata is incomplete")
             indexer_key, indexer_scale = self.indexer_cache
-            topk_indices = quant_lightning_indexer_topk(
+            attention_slots_buffer = self.runtime._a5_attention_slots
+            resident_seq_lengths_buffer = self.runtime._a5_resident_seq_lengths
+            if attention_slots_buffer is None or resident_seq_lengths_buffer is None:
+                raise RuntimeError("DSA A5 C8 context has no preallocated selection scratch")
+            attention_slots = attention_slots_buffer[:num_reqs]
+            resident_seq_lengths = resident_seq_lengths_buffer[:num_reqs]
+            a5_lightning_indexer_decode_update_c8(
+                index_weights=weights,
                 query=query.view(query_shape),
-                key=indexer_key,
-                weights=weights,
                 query_dequant_scale=query_dequant_scale.view(query_shape[:-1]),
-                key_dequant_scale=indexer_scale,
                 actual_seq_lengths_query=actual_seq_lengths_query,
+                index_key_cache=indexer_key,
+                index_key_dequant_scale=indexer_scale,
+                index_block_table=indexer_block_table,
                 candidate_lens=candidate_lens,
-                block_table=indexer_block_table,
-            )
-            a5_li_manage_c8(
-                topk_indices=topk_indices,
+                final_seq_lengths_kv=actual_seq_lengths_key,
+                row_modes=row_modes,
                 req_pool_entries=resident_pool_indices,
                 cache_slots=self.runtime.resident_token_pool.get_cache_slots(self.layer_id),
-                row_modes=row_modes,
-                actual_seq_lengths_key=actual_seq_lengths_key,
+                attention_slots=attention_slots,
+                resident_seq_lengths=resident_seq_lengths,
                 outputs=outputs,
             )
             store = self.runtime.dram_store
@@ -756,12 +754,6 @@ class DSALayerOffloadContext:
             packed_arena = store.get_layer_arenas(self.layer_id).packed
             if packed_arena is None:
                 raise RuntimeError("DSA A5 layer has no packed DRAM arena")
-            attention_slots_buffer = self.runtime._a5_attention_slots
-            resident_seq_lengths_buffer = self.runtime._a5_resident_seq_lengths
-            if attention_slots_buffer is None or resident_seq_lengths_buffer is None:
-                raise RuntimeError("DSA A5 C8 context has no preallocated selection scratch")
-            attention_slots = attention_slots_buffer[:num_reqs]
-            resident_seq_lengths = resident_seq_lengths_buffer[:num_reqs]
             a5_kvcache_scatter_copy_c8(
                 resident_packed_cache=resident_cache[0],
                 dram_packed_arena=packed_arena,
@@ -770,11 +762,6 @@ class DSALayerOffloadContext:
                 source_token_ids=outputs.topk_index,
                 destination_slots=outputs.topk_slots,
                 copy_counts=outputs.miss_count,
-                cache_tokens=sparse_budget_tokens,
-                candidate_lens=candidate_lens,
-                actual_seq_lengths_kv=actual_seq_lengths_key,
-                attention_slots=attention_slots,
-                resident_seq_lengths=resident_seq_lengths,
             )
             return DSAOffloadSelectionOutput(
                 sparse_indices=attention_slots,

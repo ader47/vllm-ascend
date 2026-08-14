@@ -12,7 +12,6 @@ struct VllmA5KvcacheScatterCopyC8TilingData {
     uint32_t hbmPhysicalBlockCount;
     uint32_t dramPhysicalBlockCount;
     uint32_t packedRowBytes;
-    uint32_t attentionCapacity;
     uint64_t totalPairSlots;
 };
 

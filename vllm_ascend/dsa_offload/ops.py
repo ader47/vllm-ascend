@@ -22,7 +22,12 @@ from vllm_ascend.utils import load_custom_op_library
 
 
 class DSALightningIndexerOutputs(NamedTuple):
-    """LIDU 的四个 caller-owned 原址输出。"""
+    """逐层复用的 caller-owned LIDU 输出缓冲。
+
+    A3 BF16 路径把四个 buffer 解释为 topK token、resident slot、miss 数与
+    tail；A5 C8 融合路径复用前三个承载 KSC 的 copy src/dst/count，attention
+    slots 与 resident 长度另有固定地址输出，第四列在该路径不消费。
+    """
 
     topk_index: torch.Tensor
     topk_slots: torch.Tensor
@@ -46,7 +51,7 @@ _REQUIRED_OPS = (
 )
 
 _REQUIRED_A5_C8_OPS = (
-    "npu_dsa_a5_li_manage_c8_out",
+    "npu_dsa_a5_li_manage_nomtp_c8_out",
     "npu_dsa_a5_kvcache_scatter_copy_c8_out",
     "kv_cache_full_block_dump_c8",
 )
@@ -78,6 +83,26 @@ def _packed_byte_view(cache: torch.Tensor, *, name: str) -> torch.Tensor:
     return cache.view(torch.int8)
 
 
+def _normalize_a5_indexer_key_scale(
+    key_dequant_scale: torch.Tensor,
+) -> torch.Tensor:
+    """将 A5 Indexer scale cache 统一为原生 Quant-LI 的三维 ABI。"""
+
+    if key_dequant_scale.ndim == 4:
+        if tuple(key_dequant_scale.shape[2:]) != (1, 1):
+            raise ValueError(
+                "A5 Indexer scale cache must end in [1,1], got "
+                f"{tuple(key_dequant_scale.shape)}"
+            )
+        return key_dequant_scale.squeeze(2)
+    if key_dequant_scale.ndim == 3 and key_dequant_scale.shape[2] == 1:
+        return key_dequant_scale
+    raise ValueError(
+        "A5 Indexer scale cache must be [blocks,128,1] or "
+        f"[blocks,128,1,1], got {tuple(key_dequant_scale.shape)}"
+    )
+
+
 def quant_lightning_indexer_topk(
     *,
     query: torch.Tensor,
@@ -100,7 +125,9 @@ def quant_lightning_indexer_topk(
         # wk_weights_proj. Only the A3 custom LIDU requires a compact copy.
         weights=weights,
         query_dequant_scale=query_dequant_scale,
-        key_dequant_scale=key_dequant_scale.squeeze(2),
+        key_dequant_scale=_normalize_a5_indexer_key_scale(
+            key_dequant_scale
+        ),
         actual_seq_lengths_query=actual_seq_lengths_query,
         actual_seq_lengths_key=candidate_lens,
         block_table=block_table,
@@ -136,25 +163,45 @@ def quant_lightning_indexer_topk(
     ).contiguous()
 
 
-def a5_li_manage_c8(
+def a5_lightning_indexer_decode_update_c8(
     *,
-    topk_indices: torch.Tensor,
+    index_weights: torch.Tensor,
+    query: torch.Tensor,
+    query_dequant_scale: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor,
+    index_key_cache: torch.Tensor,
+    index_key_dequant_scale: torch.Tensor,
+    index_block_table: torch.Tensor,
+    candidate_lens: torch.Tensor,
+    final_seq_lengths_kv: torch.Tensor,
+    row_modes: torch.Tensor,
     req_pool_entries: torch.Tensor,
     cache_slots: torch.Tensor,
-    row_modes: torch.Tensor,
-    actual_seq_lengths_key: torch.Tensor,
+    attention_slots: torch.Tensor,
+    resident_seq_lengths: torch.Tensor,
     outputs: DSALightningIndexerOutputs,
 ) -> None:
-    torch.ops._C_ascend.npu_dsa_a5_li_manage_c8_out(
-        topk_indices,
+    index_key_dequant_scale = _normalize_a5_indexer_key_scale(
+        index_key_dequant_scale
+    )
+    torch.ops._C_ascend.npu_dsa_a5_li_manage_nomtp_c8_out(
+        index_weights,
+        query,
+        query_dequant_scale,
+        actual_seq_lengths_query,
+        index_key_cache,
+        index_key_dequant_scale,
+        index_block_table,
+        candidate_lens,
+        final_seq_lengths_kv,
+        row_modes,
         req_pool_entries,
         cache_slots,
-        row_modes,
-        actual_seq_lengths_key,
+        attention_slots,
+        resident_seq_lengths,
         outputs.topk_index,
         outputs.topk_slots,
         outputs.miss_count,
-        outputs.tail_info,
     )
 
 
@@ -167,11 +214,6 @@ def a5_kvcache_scatter_copy_c8(
     source_token_ids: torch.Tensor,
     destination_slots: torch.Tensor,
     copy_counts: torch.Tensor,
-    cache_tokens: torch.Tensor,
-    candidate_lens: torch.Tensor,
-    actual_seq_lengths_kv: torch.Tensor,
-    attention_slots: torch.Tensor,
-    resident_seq_lengths: torch.Tensor,
 ) -> None:
     torch.ops._C_ascend.npu_dsa_a5_kvcache_scatter_copy_c8_out(
         _packed_byte_view(resident_packed_cache, name="resident_packed_cache"),
@@ -181,11 +223,6 @@ def a5_kvcache_scatter_copy_c8(
         source_token_ids,
         destination_slots,
         copy_counts,
-        cache_tokens,
-        candidate_lens,
-        actual_seq_lengths_kv,
-        attention_slots,
-        resident_seq_lengths,
     )
 
 

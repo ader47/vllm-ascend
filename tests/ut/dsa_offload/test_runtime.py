@@ -148,29 +148,24 @@ def test_a5_selection_chain_reuses_preallocated_outputs(monkeypatch) -> None:
     )
     captured: dict[str, torch.Tensor] = {}
 
-    def _fake_quant_li(**kwargs) -> torch.Tensor:
+    def _fake_fused_lidu(*, outputs, attention_slots, resident_seq_lengths, **kwargs) -> None:
         captured["candidate_lens"] = kwargs["candidate_lens"]
-        return torch.zeros((2, 1, 2048), dtype=torch.int32)
-
-    def _fake_manage(*, outputs, **kwargs) -> None:
         outputs.topk_index.fill_(7)
         outputs.topk_slots.fill_(9)
         outputs.miss_count.copy_(torch.tensor([0, 3], dtype=torch.int32))
-        outputs.tail_info.zero_()
-        captured["manager_topk_index"] = outputs.topk_index
-
-    def _fake_scatter(*, attention_slots, resident_seq_lengths, **kwargs) -> None:
         attention_slots.fill_(11)
         resident_seq_lengths.copy_(torch.tensor([4096, 4224], dtype=torch.int32))
+        captured["copy_src_ids"] = outputs.topk_index
+        captured["copy_dst_slots"] = outputs.topk_slots
         captured["attention_slots"] = attention_slots
         captured["resident_seq_lengths"] = resident_seq_lengths
 
-    monkeypatch.setattr(
-        runtime_module,
-        "quant_lightning_indexer_topk",
-        _fake_quant_li,
-    )
-    monkeypatch.setattr(runtime_module, "a5_li_manage_c8", _fake_manage)
+    def _fake_scatter(*, source_token_ids, destination_slots, copy_counts, **kwargs) -> None:
+        captured["scatter_source_token_ids"] = source_token_ids
+        captured["scatter_destination_slots"] = destination_slots
+        captured["scatter_copy_counts"] = copy_counts
+
+    monkeypatch.setattr(runtime_module, "a5_lightning_indexer_decode_update_c8", _fake_fused_lidu)
     monkeypatch.setattr(
         runtime_module,
         "a5_kvcache_scatter_copy_c8",
@@ -195,14 +190,16 @@ def test_a5_selection_chain_reuses_preallocated_outputs(monkeypatch) -> None:
         resident_cache=(resident_cache,),
         resident_block_table=torch.zeros(2, 64, dtype=torch.int32),
         dram_block_table=torch.zeros(2, 64, dtype=torch.int32),
-        sparse_budget_tokens=torch.tensor([2048, 4096], dtype=torch.int32),
         candidate_lens=candidate_lens,
         query_dequant_scale=torch.ones(2, 32),
         query_shape=(2, 32, 128),
     )
 
     assert captured["candidate_lens"].data_ptr() == candidate_lens.data_ptr()
-    assert captured["manager_topk_index"].data_ptr() == (runtime._lidu_topk_index.data_ptr())
+    assert captured["copy_src_ids"].data_ptr() == (runtime._lidu_topk_index.data_ptr())
+    assert captured["scatter_source_token_ids"].data_ptr() == (runtime._lidu_topk_index.data_ptr())
+    assert captured["scatter_destination_slots"].data_ptr() == (runtime._lidu_topk_slots.data_ptr())
+    assert captured["scatter_copy_counts"].data_ptr() == (runtime._lidu_miss_count.data_ptr())
     assert runtime._a5_attention_slots is not None
     assert selection.sparse_indices.data_ptr() == (runtime._a5_attention_slots.data_ptr())
     assert selection.sparse_indices.tolist() == [[[11] * 2176]] * 2

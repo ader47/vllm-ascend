@@ -1,6 +1,6 @@
 # DSA 稀疏卸载当前设计
 
-> - 最后更新：2026-08-11
+> - 最后更新：2026-08-14
 > - 目标基线：vLLM v0.23.0 + vLLM-Ascend v0.23.0
 > - 当前完成度：核心控制面、eager 和 FULL decode graph 已完成 910C 初验；
 >   chunked prefill 已完成分段 prefill/首 token 初验，完整 sparse decode
@@ -43,8 +43,9 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
   满块 dump；
 - eager LIDU→KSC→SFA-Offload 与 full-block dump 数据面；
 - 复用原生 FULL decode capture/replay 的 row-mode 图数据面；
-- A5 C8 的独立 Indexer key/scale、packed resident/DRAM、社区 Quant-LI/QSFA、
-  resident manager、packed KSC 与 packed dump 源码集成。
+- A5 C8 的独立 Indexer key/scale、packed resident/DRAM、decode 融合
+  Quant-LI/resident manager、纯 IO packed KSC、社区 QSFA 与 packed dump
+  源码集成；prefill 仍复用社区 Quant-LI。
 
 当前尚未完成：
 
@@ -506,7 +507,8 @@ DRAM 中的源 token，使用后者定位 resident HBM 的目标槽位。SFA-Off
 
 ### 11.3 LIDU 输出合同
 
-LIDU 使用 caller-owned 固定地址输出：
+下表是 A3 BF16 LIDU 使用的 caller-owned 固定地址输出；这些 buffer 也由
+runtime 按层串行复用：
 
 | 输出 | 形状 | 语义 |
 |---|---|---|
@@ -551,13 +553,14 @@ SFA-Offload 读取每行前 2048 个 `topk_slots`，SPARSE 行再根据
 是它尚未成为可卸载的完整 block。DENSE 行的 `tail_info=[-1, 0]`，其
 top2048 slot 直接等于完整序列 position。
 
-A5 C8 的物理 ABI 有一处受控差异：packed KSC 在完成 miss copy 的同一
-launch 内，将 `topk_slots + tail_info` 投影为社区 QSFA 直接消费的固定
-`int32[B,1,2176]` slot 行，并输出 `resident_seq_lengths[B]`。它没有引入新的
-request 真源，也不改变 miss-prefix 合同；eager/graph 仍复用同一组固定 buffer。
-DENSE 行是零 IO，只转发 LI slot，resident length 保持完整 `actual_len`，因此
-dense 序列长度不受 2176 限制。详见
-[`dsa_offload_a5_c8_design.md`](dsa_offload_a5_c8_design.md)。
+A5 C8 的物理 ABI 有一处受控差异：融合 LIDU 直接生成社区 QSFA 消费的固定
+`int32[B,1,2176]` slot 行与 `resident_seq_lengths[B]`，同时生成 KSC 的
+`copy_src_ids/copy_dst_slots/copy_counts`。packed KSC 只搬运有效 copy-prefix，
+不再承担 attention metadata 构造。该差异没有引入新的 request 真源，也不改变
+miss-prefix 合同；eager/graph 仍复用同一组固定 buffer。DENSE 行是零 IO，
+resident length 保持完整 `actual_len`，因此 dense 序列长度不受 2176 限制。
+A5 路径不消费 A3 的 `tail_info` scratch；融合算子已把有效尾部 slot 直接追加到
+2176 列 QSFA 索引行中。
 
 ### 11.5 单行 first-fill 示例
 
@@ -572,7 +575,8 @@ dense 序列长度不受 2176 限制。详见
    `cache_slots[token_position]=resident_slot`；
 4. `miss_count=6144`，KSC 将 miss-prefix 从 DRAM 换入对应 HBM slot；
 5. 中间已经完成的 256 个 token 位于 DRAM，当前不满尾块有 100 个 token；
-   `tail_info=[6144, 100]`，SFA 使用重要 top2048 加这 100 个尾部 token；
+   A3 ABI 写 `tail_info=[6144, 100]`，A5 融合 ABI 则直接把这 100 个尾部 slot
+   追加到 2176 列 attention row，二者都让 SFA 使用重要 top2048 加完整尾部；
 6. LIDU 把 metadata 改为 `+6144`，下一 step 进入 steady。
 
 后续若 top2048 只有 37 个 token 不在 resident，LIDU 只把这 37 个 miss
@@ -796,10 +800,10 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
 1. scheduler 需要在 `super().schedule()` 返回后对最终 scheduled requests
    做一次 O(B) projection。vLLM v0.23 没有逐请求输出扩展钩子；为了消掉
    这一次遍历去复制 `schedule()` 得不偿失。
-2. v0.23 的 fused Indexer 投影返回带行 stride 的 `weights` 后缀 view，
-   当前 LIDU kernel 要求紧凑 `[B, N_idx]`，因此 `ops.py` 每层执行一次
-   `weights.contiguous()` 小拷贝。后续算子若支持显式 stride/layout，可
-   删除该兼容成本。
+2. v0.23 的 fused Indexer 投影返回带行 stride 的 `weights` 后缀 view。
+   A5 融合 LIDU 已通过 `weight_stride` 直接读取该 view，不再逐层执行
+   `weights.contiguous()`；A3 路径继续沿用社区算子的既有布局合同。后续改动
+   必须保留这一零临时拷贝性质。
 
 ## 16. 代码索引
 
