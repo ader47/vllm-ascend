@@ -107,9 +107,9 @@ class DSAInputBatchCacheLayout:
         self.columns.np[_RESIDENT_VALID_COLUMN].fill(_INVALID_RESIDENT_LENGTH)
         self.columns.np[_ROW_MODE_COLUMN].fill(DSA_ROW_MODE_PAD)
         self.columns.np[_RESIDENT_POOL_INDEX_COLUMN].fill(resident_token_pool.padding_pool_index)
-        # 原生 A5 Quant-LI 即使对 PAD 行也会先执行，因此 PAD 必须携带一个
-        # 合法的候选长度；其输出随后由 LI manager 丢弃。active 行会在每轮
-        # prepare_forward 中原址覆盖成真实 candidate length。
+        # PAD 行仍携带合法候选长度，保证 eager/graph 共用的固定容量元数据
+        # 始终满足算子 ABI；融合 LIDU 会按 row_mode 跳过其 LI 计算。active
+        # 行会在每轮 prepare_forward 中原址覆盖成真实 candidate length。
         self.columns.np[_CANDIDATE_LEN_COLUMN].fill(DSA_SFA_COMPUTE_TOPK)
         # 图 capture 发生在真实请求到来前，但会直接消费同一组 device
         # view。初始化时先把 PAD 真值同步到设备，避免首个 dummy capture

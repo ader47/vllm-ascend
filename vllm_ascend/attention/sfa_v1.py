@@ -1642,6 +1642,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 dram_block_table = attn_metadata.dsa_dram_block_table
                 sparse_budget_tokens = attn_metadata.dsa_sparse_budget_tokens
                 candidate_lens = attn_metadata.dsa_candidate_lens
+                # 融合 A5 LIDU 从 cache_slots 的符号化 budget 读取设备侧
+                # first-fill/steady 状态；这里仍核验 scheduler 的 budget 投影，
+                # 用于尽早发现统一元数据面缺列或错位，而不是重复传给算子。
                 if (
                     row_modes is None
                     or resident_pool_indices is None
@@ -1664,7 +1667,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                     resident_cache=kv_cache,
                     resident_block_table=attn_metadata.block_table,
                     dram_block_table=dram_block_table,
-                    sparse_budget_tokens=sparse_budget_tokens,
                     candidate_lens=candidate_lens,
                     query_dequant_scale=q_li_scale,
                     query_shape=(tuple(q_li_shape_ori) if q_li_shape_ori is not None else None),

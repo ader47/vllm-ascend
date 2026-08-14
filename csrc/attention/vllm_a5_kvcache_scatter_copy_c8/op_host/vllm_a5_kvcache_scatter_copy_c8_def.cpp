@@ -1,4 +1,4 @@
-/** Host definition for the Ascend 950 DSA packed-C8 scatter copy. */
+/** Host definition for the Ascend 950 GLM-5.x packed-C8 scatter copy. */
 
 #include <vector>
 
@@ -22,30 +22,21 @@ public:
             .ParamType(REQUIRED).DataType(ints).Format(formats);
         this->Input("dram_block_table")
             .ParamType(REQUIRED).DataType(ints).Format(formats);
-        this->Input("source_token_ids")
+        this->Input("copy_src_ids")
             .ParamType(REQUIRED).DataType(ints).Format(formats);
-        this->Input("destination_slots")
+        this->Input("copy_dst_slots")
             .ParamType(REQUIRED).DataType(ints).Format(formats);
         this->Input("copy_counts")
             .ParamType(REQUIRED).DataType(ints).Format(formats);
-        this->Input("cache_tokens")
-            .ParamType(REQUIRED).DataType(ints).Format(formats);
-        this->Input("candidate_lens")
-            .ParamType(REQUIRED).DataType(ints).Format(formats);
-        this->Input("actual_seq_lengths_kv")
-            .ParamType(REQUIRED).DataType(ints).Format(formats);
-        // Same-name output declares an in-place update of the packed HBM
-        // cache, matching the established A3 KSC ACLNN contract.
+        // The matching input/output name declares an in-place reference. The
+        // generated ACLNN host API consequently receives hbm_kv only once;
+        // the device kernel still gets the framework-generated output alias.
         this->Output("hbm_kv")
             .ParamType(REQUIRED).DataType(bytes).Format(formats);
-        this->Output("attention_slots")
-            .ParamType(REQUIRED).DataType(ints).Format(formats);
-        this->Output("resident_seq_lengths")
-            .ParamType(REQUIRED).DataType(ints).Format(formats);
 
         this->AICore().AddConfig("ascend950");
     }
 };
 
 OP_ADD(VllmA5KvcacheScatterCopyC8);
-}  // namespace ops
+} // namespace ops

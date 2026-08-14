@@ -1,5 +1,8 @@
+/** Tiling registration for the A5 packed-C8 scatter copy. */
+
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include "../op_kernel/vllm_a5_kvcache_scatter_copy_c8_tiling.h"
 #include "register/op_impl_registry.h"
@@ -10,49 +13,24 @@ constexpr size_t HBM_KV = 0;
 constexpr size_t DRAM_KV = 1;
 constexpr size_t HBM_BLOCK_TABLE = 2;
 constexpr size_t DRAM_BLOCK_TABLE = 3;
-constexpr size_t SOURCE_TOKEN_IDS = 4;
-constexpr size_t DESTINATION_SLOTS = 5;
+constexpr size_t COPY_SRC_IDS = 4;
+constexpr size_t COPY_DST_SLOTS = 5;
 constexpr size_t COPY_COUNTS = 6;
-constexpr size_t CACHE_TOKENS = 7;
-constexpr size_t CANDIDATE_LENS = 8;
-constexpr size_t ACTUAL_SEQ_LENGTHS_KV = 9;
 
 constexpr int64_t BLOCK_SIZE = 128;
 constexpr int64_t KV_HEADS = 1;
 constexpr int64_t PACKED_ROW_BYTES = 656;
-constexpr int64_t SPARSE_COUNT = 2048;
 constexpr int64_t COPY_CAP = 16384;
-constexpr int64_t TAIL_CAP = BLOCK_SIZE;
-constexpr int64_t ATTENTION_CAP = SPARSE_COUNT + TAIL_CAP;
 constexpr int64_t MAX_SOURCE_TOKENS = 1 << 18;
 
 bool IsPackedCache(const gert::Shape &shape)
 {
     return shape.GetDimNum() == 4 &&
-        shape.GetDim(0) > 0 &&
         shape.GetDim(1) == BLOCK_SIZE &&
         shape.GetDim(2) == KV_HEADS &&
         shape.GetDim(3) == PACKED_ROW_BYTES;
 }
-
-bool GetMetadataShape(
-    const gert::Shape &shape,
-    int64_t &batch,
-    int64_t &capacity)
-{
-    if (shape.GetDimNum() == 2) {
-        batch = shape.GetDim(0);
-        capacity = shape.GetDim(1);
-        return true;
-    }
-    if (shape.GetDimNum() == 3 && shape.GetDim(1) == 1) {
-        batch = shape.GetDim(0);
-        capacity = shape.GetDim(2);
-        return true;
-    }
-    return false;
-}
-}  // namespace
+} // namespace
 
 namespace optiling {
 static ge::graphStatus TilingVllmA5KvcacheScatterCopyC8(
@@ -61,7 +39,7 @@ static ge::graphStatus TilingVllmA5KvcacheScatterCopyC8(
     if (context == nullptr || context->GetPlatformInfo() == nullptr) {
         return ge::GRAPH_FAILED;
     }
-    for (size_t index = HBM_KV; index <= ACTUAL_SEQ_LENGTHS_KV; ++index) {
+    for (size_t index = HBM_KV; index <= COPY_COUNTS; ++index) {
         if (context->GetInputShape(index) == nullptr ||
             context->GetInputDesc(index) == nullptr) {
             return ge::GRAPH_FAILED;
@@ -72,8 +50,7 @@ static ge::graphStatus TilingVllmA5KvcacheScatterCopyC8(
         context->GetInputDesc(DRAM_KV)->GetDataType() != ge::DT_INT8) {
         return ge::GRAPH_FAILED;
     }
-    for (size_t index = HBM_BLOCK_TABLE;
-         index <= ACTUAL_SEQ_LENGTHS_KV; ++index) {
+    for (size_t index = HBM_BLOCK_TABLE; index <= COPY_COUNTS; ++index) {
         if (context->GetInputDesc(index)->GetDataType() != ge::DT_INT32) {
             return ge::GRAPH_FAILED;
         }
@@ -87,38 +64,31 @@ static ge::graphStatus TilingVllmA5KvcacheScatterCopyC8(
         context->GetInputShape(HBM_BLOCK_TABLE)->GetStorageShape();
     const gert::Shape dramTable =
         context->GetInputShape(DRAM_BLOCK_TABLE)->GetStorageShape();
-    const gert::Shape sourceIds =
-        context->GetInputShape(SOURCE_TOKEN_IDS)->GetStorageShape();
-    const gert::Shape destinationSlots =
-        context->GetInputShape(DESTINATION_SLOTS)->GetStorageShape();
+    const gert::Shape copySrcIds =
+        context->GetInputShape(COPY_SRC_IDS)->GetStorageShape();
+    const gert::Shape copyDstSlots =
+        context->GetInputShape(COPY_DST_SLOTS)->GetStorageShape();
     const gert::Shape copyCounts =
         context->GetInputShape(COPY_COUNTS)->GetStorageShape();
-    const gert::Shape cacheTokens =
-        context->GetInputShape(CACHE_TOKENS)->GetStorageShape();
-    const gert::Shape candidateLens =
-        context->GetInputShape(CANDIDATE_LENS)->GetStorageShape();
-    const gert::Shape actualKv =
-        context->GetInputShape(ACTUAL_SEQ_LENGTHS_KV)->GetStorageShape();
-
-    int64_t sourceBatch = 0;
-    int64_t sourceCapacity = 0;
-    int64_t destinationBatch = 0;
-    int64_t destinationCapacity = 0;
     if (!IsPackedCache(hbmKv) || !IsPackedCache(dramKv) ||
         hbmTable.GetDimNum() != 2 || dramTable.GetDimNum() != 2 ||
-        copyCounts.GetDimNum() != 1 || cacheTokens.GetDimNum() != 1 ||
-        candidateLens.GetDimNum() != 1 || actualKv.GetDimNum() != 1 ||
-        !GetMetadataShape(sourceIds, sourceBatch, sourceCapacity) ||
-        !GetMetadataShape(
-            destinationSlots, destinationBatch, destinationCapacity)) {
+        copyCounts.GetDimNum() != 1 || copySrcIds.GetDimNum() != 3 ||
+        copySrcIds.GetDim(1) != 1 || copySrcIds.GetDim(2) != COPY_CAP ||
+        copyDstSlots.GetDimNum() != 3 ||
+        copyDstSlots.GetDim(1) != 1 ||
+        copyDstSlots.GetDim(2) != COPY_CAP) {
         return ge::GRAPH_FAILED;
     }
 
     const int64_t batch = copyCounts.GetDim(0);
-    if (batch <= 0 || sourceBatch != batch || destinationBatch != batch ||
-        sourceCapacity != COPY_CAP || destinationCapacity != COPY_CAP ||
-        cacheTokens.GetDim(0) != batch || candidateLens.GetDim(0) != batch ||
-        actualKv.GetDim(0) != batch || hbmTable.GetDim(0) != batch ||
+    if (batch <= 0 || hbmKv.GetDim(0) <= 0 || dramKv.GetDim(0) <= 0 ||
+        static_cast<uint64_t>(hbmKv.GetDim(0)) >
+            std::numeric_limits<uint32_t>::max() ||
+        static_cast<uint64_t>(dramKv.GetDim(0)) >
+            std::numeric_limits<uint32_t>::max() ||
+        copySrcIds.GetDim(0) != batch ||
+        copyDstSlots.GetDim(0) != batch ||
+        hbmTable.GetDim(0) != batch ||
         dramTable.GetDim(0) != batch || hbmTable.GetDim(1) <= 0 ||
         dramTable.GetDim(1) <= 0 ||
         dramTable.GetDim(1) * BLOCK_SIZE > MAX_SOURCE_TOKENS) {
@@ -144,10 +114,11 @@ static ge::graphStatus TilingVllmA5KvcacheScatterCopyC8(
     tiling->copyCap = COPY_CAP;
     tiling->hbmMaxBlockNum = static_cast<uint32_t>(hbmTable.GetDim(1));
     tiling->dramMaxBlockNum = static_cast<uint32_t>(dramTable.GetDim(1));
-    tiling->hbmPhysicalBlockCount = static_cast<uint32_t>(hbmKv.GetDim(0));
-    tiling->dramPhysicalBlockCount = static_cast<uint32_t>(dramKv.GetDim(0));
+    tiling->hbmPhysicalBlockCount =
+        static_cast<uint32_t>(hbmKv.GetDim(0));
+    tiling->dramPhysicalBlockCount =
+        static_cast<uint32_t>(dramKv.GetDim(0));
     tiling->packedRowBytes = PACKED_ROW_BYTES;
-    tiling->attentionCapacity = ATTENTION_CAP;
     tiling->totalPairSlots = totalPairSlots;
     context->SetBlockDim(usedCoreNum);
     return ge::GRAPH_SUCCESS;
@@ -165,4 +136,4 @@ IMPL_OP_OPTILING(VllmA5KvcacheScatterCopyC8)
     .Tiling(TilingVllmA5KvcacheScatterCopyC8)
     .TilingParse<VllmA5KvcacheScatterCopyC8CompileInfo>(
         TilingParseVllmA5KvcacheScatterCopyC8);
-}  // namespace optiling
+} // namespace optiling

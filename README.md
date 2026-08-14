@@ -15,7 +15,8 @@
 - scheduler 统一管理 `PREFILL`、`DENSE_DECODE`、
   `ENTER_SPARSE_DECODE`、`SPARSE_DECODE` 请求布局；
 - decode 整批执行 LI/resident-update -> KSC -> sparse attention，不按
-  dense/sparse 拆分子 batch；A5 C8 复用社区 Quant-LI/QSFA；
+  dense/sparse 拆分子 batch；A5 C8 decode 使用融合 Quant-LI/resident-update，
+  prefill 复用社区 Quant-LI，attention 复用社区 QSFA；
 - prefill 与 decode 新满 MLA block 通过独立
   `KvCacheFullBlockDump` 算子写入 DRAM；
 - 支持 chunked prefill；完整 prompt 必须先在两个 dense plane 完成容量准入，
@@ -33,7 +34,7 @@ flowchart LR
     A --> S["DSAOffloadScheduler"]
     S --> I["NPUInputBatch 七列投影"]
     I --> R["共享 eager/graph runtime"]
-    R --> L["LIDU"]
+    R --> L["A3 LIDU / A5 C8 fused LIDU"]
     L --> X["KSC miss 换入"]
     X --> F["SFA-Offload"]
     D["Hot DRAM arena"] --> X
@@ -129,8 +130,10 @@ additional_config={
 ```
 
 A5 两个开关全关或半开会在启动期明确拒绝；A3 继续使用既有 BF16/FP16
-算子链。A5 C8 源码已接通，但在真实 A5 上完成构建、单算子 readback、eager
-精度和 graph replay 前仍属于待验收能力。
+算子链。A5 C8 的非 MTP decode 已切换为
+`vllm_a5_li_manage_nomtp_c8 -> vllm_a5_kvcache_scatter_copy_c8 -> native QSFA`；
+新融合路径在真实 A5 上完成构建、数值对照、eager 精度和 graph replay 前仍
+属于待验收能力。MTP/LIM 不在本阶段路径内。
 
 ## 当前边界
 
@@ -154,7 +157,6 @@ A5 两个开关全关或半开会在启动期明确拒绝；A3 继续使用既�
 ## 文档与测试入口
 
 - [DSA 稀疏卸载详细设计](docs/source/developer_guide/Design_Documents/dsa_offload_design.md)
-- [A5 C8 数据面与算子合同](docs/source/developer_guide/Design_Documents/dsa_offload_a5_c8_design.md)
 - [DSA demo 与测试说明](examples/dsa_demo/README.md)
 - [上游 vLLM-Ascend README](README.upstream.md)
 
