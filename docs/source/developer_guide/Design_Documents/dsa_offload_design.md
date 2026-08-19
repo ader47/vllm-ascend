@@ -1,11 +1,12 @@
 # DSA 稀疏卸载当前设计
 
-> - 最后更新：2026-08-14
+> - 最后更新：2026-08-19
 > - 目标基线：vLLM v0.23.0 + vLLM-Ascend v0.23.0
 > - 当前完成度：核心控制面、eager 和 FULL decode graph 已完成 910C 初验；
 >   chunked prefill 已完成分段 prefill/首 token 初验，完整 sparse decode
->   验收待补；A5 packed C8 数据面代码已接通，设备验收待进行
-> - 首要验收模型：GLM-5.1；兼容回归模型：DeepSeek-V3.2
+>   验收待补；A5 packed C8 已完成 GLM-5.1 eager/graph 端到端初验；
+>   GLM-5.2 IndexShare 数据面已接通，模型验收待进行
+> - 首要验收模型：GLM-5.1、GLM-5.2；兼容回归模型：DeepSeek-V3.2
 
 ## 1. 文档定位
 
@@ -36,7 +37,7 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
 - 不复制上游 `Scheduler.schedule()` 的薄调度适配；
 - scheduler/core 已提交状态到 worker 最终 `InputBatch` 行序的列式投影；
 - ENTER 的 resident MLA block table 全量替换；
-- 稳定 resident token pool 与逐层 `cache_slots`；
+- 稳定 resident token pool 与逐 selection group 的 `cache_slots`；
 - 固定容量 hot DRAM arena 和请求逻辑块 ledger；
 - prefill/dense/sparse 共用的双 plane slot mapping；
 - 基于 v0.23 原生调度状态的 chunked prefill、增量双 plane 分配与逐 chunk
@@ -46,14 +47,17 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
 - A5 C8 的独立 Indexer key/scale、packed resident/DRAM、decode 融合
   Quant-LI/resident manager、纯 IO packed KSC、社区 QSFA 与 packed dump
   源码集成；prefill 仍复用社区 Quant-LI。
+- GLM-5.2 IndexShare：78 个 resident MLA 层中仅 21 个 full 层创建
+  Indexer cache/LIDU 持久状态，57 个 shared 层复用所属 full 层的 topK、
+  copy plan 与 resident slot 映射，同时保留本层独立 MLA HBM/DRAM payload。
 
 当前尚未完成：
 
 - prefix cache、prefill/decode mixed、preemption/resume、
   speculative/MTP、async scheduling、KV transfer、KV-cache
-  metrics/events 和 A5 设备验收。
+  metrics/events、GLM-5.2 A5 端到端验收和 A5 BF16 算子链。
 
-当前已在 Linux + Ascend 环境完成 114 项 DSA UT，并取得 GLM-5.1 W4A8、
+当前已在 Linux + Ascend 环境完成 DSA UT，并取得 GLM-5.1 W4A8/W4A4C8、
 TP16/EP 的 disabled、cache-init、eager 与 FULL decode graph 初验证据。
 graph 已覆盖 bsz=4 的同长度约 8K prompt，以及约
 5K/20K/8K/40K 的混合长度与不同 resident budget。该结果证明
@@ -255,6 +259,20 @@ KV-cache metrics/events 等未建立完整合同的组合。
 - 与当前 SFA 合同一致的 `index_topk`；
 - DSA 所需的模型维度和 cache dtype。
 
+模型若声明 `indexer_types`，其长度必须与 `num_hidden_layers` 相同且每项只能
+为 `full/shared`。该列表是 checkpoint 物理拓扑的真源，不能只用
+`index_topk_freq` 猜测哪些层缺少 Indexer 权重。GLM-5.2 的真实拓扑为：
+
+```text
+78 resident layers = 21 full Indexer layers + 57 shared followers
+full layer ids      = 0, 1, 2, 6, 10, ..., 74
+shared source       = 其前方最近一个 full layer
+```
+
+层 0、1 各自计算 topK；从层 2 开始，每个 full 层与后续三个 shared 层组成
+一个四层 selection group。当前算子 ABI 仍限制 `max_model_len <= 262144`，
+因此并不等同于已经开放 GLM-5.2 checkpoint 声明的 1M 最大上下文。
+
 ## 6. HBM 双平面
 
 ### 6.1 Spec
@@ -266,6 +284,8 @@ KV-cache metrics/events 等未建立完整合同的组合。
 `sparse_head_dim` 不再包含 Indexer 维度，防止 MLA page 重复核算 Indexer。
 
 两个不同的 spec identity 让 v0.23 registry 将它们保留为独立 cache group。
+普通模型两个 plane 的层集合相同；GLM-5.2 的 Indexer group 只包含 full
+层，是 resident MLA group 的真子集。
 
 ### 6.2 容量与 group
 
@@ -285,14 +305,14 @@ ABI，不等同于 group 顺序。
 
 ### 6.3 Worker tensor
 
-Indexer plane 恢复为：
+每个 full 层的 Indexer plane 恢复为：
 
 ```text
 [num_indexer_blocks, block_size, num_kv_heads, head_size]
 ```
 
-它没有独立 attention backend 或 metadata builder，只作为 resident MLA
-forward 中 LIDU 的 cache 输入。
+它没有独立 attention backend 或 metadata builder，只作为对应 selection
+group 的 full 层 LIDU cache 输入。shared 层不创建空壳 Indexer tensor。
 
 resident MLA 继续复用 Ascend MLA backend 的 tensor 表示，但不再内嵌
 Indexer K。两张 tensor 在初始化后分别绑定到共享模型层。
@@ -419,16 +439,18 @@ host 输出返回释放 HBM 块。
 eager 路径按以下结构接通：
 
 - `DSAResidentTokenPool` 为活跃请求分配与 InputBatch 行号解耦的稳定行；
-- `cache_slots[layer, pool_row, position]` 是 LIDU 跨 step 原址更新的逐层
-  持久状态；最后一列保存未初始化、first-fill 或 steady budget 标记；
+- `cache_slots[selection_group, pool_row, position]` 是 LIDU 跨 step 原址更新
+  的持久状态；普通模型一层一组，GLM-5.2 仅 full Indexer 层占一组；
+  最后一列保存未初始化、first-fill 或 steady budget 标记；
 - pool row 释放时只归还行号，下一次分配前执行唯一一次整行清理，避免
   request release 和 row reuse 重复写同一块大状态 tensor；
 - `DSAHotDRAMStore` 按层持有固定地址 NOPE/ROPE arena，逻辑块表使用
   `pool_row × logical_block`，请求释放时整行回收；
 - `DSAOffloadRuntime` 是 eager/graph 共用的物理 metadata owner，持有
   resident positions、active DRAM table、dump 列和 LIDU scratch；
-- LIDU 的 topK/slot/miss/tail 输出只在当前层算子链内存活，各层串行复用
-  同一套固定地址 scratch；逐层持久状态只保留 `cache_slots`；
+- LIDU 的 topK/slot/miss/tail 输出只在当前 selection group 内存活：full 层
+  写入，shared follower 依次消费，下一 full 层再覆盖；所有 group 串行复用
+  同一套固定地址 scratch；跨 step 持久状态只保留 `cache_slots`；
 - Indexer 和 resident plane 继续调用同一个
   `BlockTable.compute_slot_mapping()`，仅 position view 不同；
 - prefill 使用基线 lightning-indexer 读取独立 Indexer plane；decode
@@ -489,7 +511,7 @@ DRAM 中的源 token，使用后者定位 resident HBM 的目标槽位。SFA-Off
 
 ### 11.2 `cache_slots` 持久状态
 
-每层的状态形状为：
+每个 selection group 的状态形状为：
 
 ```text
 [max_num_seqs + 1 PAD, aligned(max_model_len + 1)]
@@ -502,13 +524,14 @@ DRAM 中的源 token，使用后者定位 resident HBM 的目标槽位。SFA-Off
 - `-budget`：下一次 SPARSE 行执行 first-fill；
 - `+budget`：该层 resident 映射已经建立，进入 steady update。
 
-它是唯一逐层、跨 decode step 的 tokenwise 真源。`DSAOffloadRuntime`
-中的 LIDU 输出只是当前层短生命周期 scratch，不能替代 `cache_slots`。
+它是唯一按 selection group、跨 decode step 的 tokenwise 真源。
+`DSAOffloadRuntime` 中的 LIDU 输出只是当前 group 的短生命周期 scratch，
+不能替代 `cache_slots`。GLM-5.2 的 shared 层没有第二份映射真源。
 
 ### 11.3 LIDU 输出合同
 
-下表是 A3 BF16 LIDU 使用的 caller-owned 固定地址输出；这些 buffer 也由
-runtime 按层串行复用：
+下表是 A3 BF16 LIDU 使用的 caller-owned 固定地址输出；这些 buffer 由
+runtime 按 selection group 串行复用：
 
 | 输出 | 形状 | 语义 |
 |---|---|---|
@@ -562,6 +585,26 @@ resident length 保持完整 `actual_len`，因此 dense 序列长度不受 2176
 A5 路径不消费 A3 的 `tail_info` scratch；融合算子已把有效尾部 slot 直接追加到
 2176 列 QSFA 索引行中。
 
+GLM-5.2 的 full 层仍生成同一份输出。紧随其后的 shared 层不执行 LI/LIDU，
+而是用该输出的 `copy_src_ids/copy_dst_slots/copy_counts` 对自己的 packed
+MLA arena 执行 KSC，再用同一 `attention_slots/resident_seq_lengths` 执行
+QSFA。所有操作在当前单 stream 内按层保序，所以下一 full 层覆盖 scratch
+之前，三个 follower 已经完成消费；图模式捕获的也是这条固定地址依赖链。
+
+这里没有复制基线的 IndexCache 元数据面：prefill、mixed forward 与非 DSA
+路径仍使用模型初始化期已有的 `topk_indices_buffer`，full 层写入、shared 层
+读取。DSA decode 才改用 LIDU scratch，因为基线 buffer 只保存 token topK，
+无法表达卸载额外需要的 miss-prefix、resident slot 和 KSC copy plan。scratch
+仍是 `DSAOffloadRuntime` 中 eager/graph 共用的一份固定地址 owner。
+
+KSC 必须对四层中的每一层执行：四层只共享 token 选择，MLA KV payload 与
+HBM/DRAM arena 仍逐层独立。现有 KSC ABI 一次只接收一层 arena，因此把三个
+follower 的 KSC 提前塞到 full 层只会移动三次调用的位置，不会减少 launch
+数或搬运字节，还会让 full context 越权持有后续层资源。当前选择在每层 SFA
+前就地执行 KSC，保持基线的 layer-local 所有权和最短数据生命周期。若后续
+开发可接收多层 arena 的 batched KSC，才值得评估每个 selection group 一次
+批量换入及多流预取。
+
 ### 11.5 单行 first-fill 示例
 
 假设 prompt admission 后冻结 `target_budget=6144`，当前完整长度为
@@ -594,6 +637,7 @@ attention_finished` hook 对象。当前接入直接落在 vLLM-Ascend 自有
 | model runner cache 初始化 | 为每个 SFA layer 绑定 `DSALayerOffloadContext` |
 | `indexer_select_post_process()` prefill 分支 | 复用基线 lightning-indexer，但读取独立 Indexer plane/table |
 | `indexer_select_post_process()` decode 分支 | 调用该层 context 的 LIDU→KSC，返回 `DSAOffloadSelectionOutput` |
+| shared 层 `skip_topk` decode 分支 | 不执行 LIDU；复用所属 full 层输出，对本层 arena 执行 KSC |
 | `_execute_sparse_flash_attention_process()` | 识别上述 selection，调用 SFA-Offload |
 | SFA 返回后、`v_up_proj` 前 | 调用该层 full-block dump |
 
@@ -848,6 +892,15 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
   `max_num_batched_tokens=4096/8192/16384` 下，DSA 与 baseline 的
   首 token 均对齐。
 
+已获得的 A5 packed-C8 证据：
+
+- `vllm_a5_li_manage_nomtp_c8` 的 DENSE、三档 SPARSE budget、PAD、
+  first-fill/steady 与 graph replay 算子用例通过；
+- packed KSC 的独立搬运及 LIDU→KSC 可见性用例通过；
+- GLM-5.1 W4A4C8 的 eager 与 FULL decode graph 端到端初验通过；
+- GLM-5.2 的 21 full + 57 shared 拓扑、紧凑 selection state、
+  full→shared→next-full 固定地址 graph 链已有 UT/E2E 算子覆盖。
+
 这些结果证明当前核心控制面、eager 和 graph 主路径可运行。尚需补齐：
 
 - QA 数据集 disabled/eager/graph 精度对照；
@@ -858,7 +911,8 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
   bsz=1/bsz>1、ENTER/steady sparse decode 与并发调度回归；
 - DeepSeek-V3.2 强制回归；
 - profiling 性能基线；
-- A5 算子编译与运行。
+- GLM-5.2 W4A4C8 的 disabled/eager/graph、长短混批、三档 budget、
+  请求结束/行复用与正式 QA 精度回归。
 
 完整测试命令和验收要求维护在 `examples/dsa_demo/README.md`。
 

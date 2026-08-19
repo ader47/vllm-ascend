@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# GLM-5.1 DSA 稀疏卸载在线服务最小启动脚本。
+# GLM-5.x DSA 稀疏卸载在线服务最小启动脚本。
 # 修改“用户配置”后直接执行：
 #
 #   bash examples/dsa_demo/serve_dsa.sh
@@ -15,6 +15,11 @@ set -euo pipefail
 MODEL_PATH="/mnt/kv_dpc/weight/GLM-5.1-w4a8"
 SERVED_MODEL_NAME="glm-5.1-dsa"
 RUN_MODE="eager"  # eager / graph
+
+# A5/950 的 W4A4C8 模型设为 true；A3/910C 的 W4A8/BF16 保持 false。
+# A5 DSA 只支持 LI C8 与 SFA C8 同时开启，不提供半开组合。
+ENABLE_A5_PACKED_C8_DSA="false"
+SAFETENSORS_LOAD_STRATEGY="prefetch"
 
 HOST="0.0.0.0"
 PORT="8000"
@@ -62,6 +67,19 @@ case "${RUN_MODE}" in
         ;;
 esac
 
+case "${ENABLE_A5_PACKED_C8_DSA}" in
+    true)
+        A5_PACKED_CONFIG_FIELDS='"enable_sparse_sfa_c8":true,"enable_sparse_li_c8":true,'
+        ;;
+    false)
+        A5_PACKED_CONFIG_FIELDS=""
+        ;;
+    *)
+        echo "ENABLE_A5_PACKED_C8_DSA must be true or false, got: ${ENABLE_A5_PACKED_C8_DSA}" >&2
+        exit 2
+        ;;
+esac
+
 if [[ "${ENABLE_CHUNKED_PREFILL}" == "true" ]]; then
     PREFILL_ARGS=(
         --enable-chunked-prefill
@@ -75,11 +93,12 @@ fi
 
 ADDITIONAL_CONFIG="$(
     cat <<JSON
-{"dsa_sparse_config":{"enabled":true,"split_indexer_cache":true,"indexer_mla_block_ratio":${DSA_INDEXER_MLA_BLOCK_RATIO},"sparse_activation_tokens":${DSA_SPARSE_ACTIVATION_TOKENS},"prompt_budget_thresholds":[32768,65536],"resident_budget_tokens":[6144,10240,12288],"max_active_reqs":${DSA_MAX_ACTIVE_REQS},"hot_cpu_block_multiple":${DSA_HOT_CPU_BLOCK_MULTIPLE},"enable_row_mode_decode_graph":${ENABLE_DSA_GRAPH},"trace_points":{"enabled":false,"points":["first_sample"],"ranks":[0]}}}
+{${A5_PACKED_CONFIG_FIELDS}"dsa_sparse_config":{"enabled":true,"split_indexer_cache":true,"indexer_mla_block_ratio":${DSA_INDEXER_MLA_BLOCK_RATIO},"sparse_activation_tokens":${DSA_SPARSE_ACTIVATION_TOKENS},"prompt_budget_thresholds":[32768,65536],"resident_budget_tokens":[6144,10240,12288],"max_active_reqs":${DSA_MAX_ACTIVE_REQS},"hot_cpu_block_multiple":${DSA_HOT_CPU_BLOCK_MULTIPLE},"enable_row_mode_decode_graph":${ENABLE_DSA_GRAPH},"trace_points":{"enabled":false,"points":["first_sample"],"ranks":[0]}}}
 JSON
 )"
 
 echo "[dsa-online] mode=${RUN_MODE} model=${MODEL_PATH}"
+echo "[dsa-online] a5_packed_c8=${ENABLE_A5_PACKED_C8_DSA} safetensors=${SAFETENSORS_LOAD_STRATEGY}"
 echo "[dsa-online] endpoint=http://${HOST}:${PORT}/v1"
 
 exec vllm serve "${MODEL_PATH}" \
@@ -91,6 +110,7 @@ exec vllm serve "${MODEL_PATH}" \
     --pipeline-parallel-size 1 \
     --data-parallel-size 1 \
     --quantization ascend \
+    --safetensors-load-strategy "${SAFETENSORS_LOAD_STRATEGY}" \
     --seed 1024 \
     --enable-expert-parallel \
     --max-num-seqs "${MAX_NUM_SEQS}" \

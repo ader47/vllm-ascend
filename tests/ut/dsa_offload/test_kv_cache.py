@@ -251,7 +251,7 @@ def test_prefill_admission_uses_weighted_base_block_cost(
     ) == 16 * dsa_pool_bytes_per_base_block(groups)
 
 
-def test_split_groups_reject_missing_per_layer_indexer() -> None:
+def test_split_groups_accept_indexer_subset_for_shared_topology() -> None:
     specs = _make_specs(num_layers=2)
     del specs["model.layers.1.self_attn.indexer.k_cache"]
 

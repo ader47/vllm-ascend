@@ -23,7 +23,7 @@ from vllm_ascend.attention.sfa_v1 import (
     custom_kv_rmsnorm_rope,
 )
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
-from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.device.device_op import BaseDeviceAdaptor
 from vllm_ascend.utils import AscendDeviceType, enable_dsa_cp
 
 
@@ -302,7 +302,9 @@ class TestAscendSFADeviceOperator(TestBase):
             create=True,
             return_value=(attn_output, softmax_max, softmax_sum),
         ) as mock_sfa:
-            output, softmax_lse = DeviceOperator.execute_sparse_flash_attention_process(
+            # 该用例验证 A2/Base adaptor 的 custom-op + LSE 合同，不能通过
+            # 进程全局 DeviceOperator 跟随当前测试机器切换到 A5 adaptor。
+            output, softmax_lse = BaseDeviceAdaptor.execute_sparse_flash_attention_process(
                 impl,
                 ql_nope,
                 q_pe,
@@ -348,7 +350,7 @@ class TestAscendSFADeviceOperator(TestBase):
                 side_effect=AssertionError("C8 SFA with LSE must use the custom op"),
             ),
         ):
-            output, softmax_lse = DeviceOperator.execute_sparse_flash_attention_process(
+            output, softmax_lse = BaseDeviceAdaptor.execute_sparse_flash_attention_process(
                 impl,
                 ql_nope,
                 q_pe,
@@ -430,6 +432,10 @@ class TestAscendSFAKVQuantSparseAttention(TestBase):
                 "vllm_ascend.device.device_op.torch_npu.npu_kv_quant_sparse_flash_attention",
                 create=True,
                 side_effect=AssertionError("Base must use _C_ascend custom op"),
+            ),
+            patch(
+                "vllm_ascend.attention.sfa_v1.DeviceOperator",
+                BaseDeviceAdaptor,
             ),
         ):
             result = impl._execute_sparse_flash_attention_process(

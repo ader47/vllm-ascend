@@ -1,7 +1,8 @@
 # vLLM-Ascend DSA Sparse Offload
 
 本分支在 vLLM-Ascend v0.23.0 上实现 DSA 稀疏卸载，不修改配套的 vLLM
-源码。实现以 GLM-5.1 为首要验收模型，并保留 DeepSeek-V3.2 兼容回归。
+源码。实现以 GLM-5.1/GLM-5.2 为首要验收模型，并保留 DeepSeek-V3.2
+兼容回归。
 
 > 上游 vLLM-Ascend 项目说明原样保存在
 > [README.upstream.md](README.upstream.md) 和
@@ -132,8 +133,9 @@ additional_config={
 A5 两个开关全关或半开会在启动期明确拒绝；A3 继续使用既有 BF16/FP16
 算子链。A5 C8 的非 MTP decode 已切换为
 `vllm_a5_li_manage_nomtp_c8 -> vllm_a5_kvcache_scatter_copy_c8 -> native QSFA`；
-新融合路径在真实 A5 上完成构建、数值对照、eager 精度和 graph replay 前仍
-属于待验收能力。
+新融合路径已在真实 A5 上完成算子数值、eager/graph replay 和 GLM-5.1
+端到端初验。GLM-5.2 的 21 个 full Indexer 与 57 个 shared follower 已接入
+同一数据面，仍需完成模型权重加载及长短序列 eager/graph 回归。
 
 ## 当前边界
 
@@ -147,17 +149,17 @@ A5 两个开关全关或半开会在启动期明确拒绝；A3 继续使用既�
 - 外部 KV transfer connector；
 - decode/prefill context parallel 和 pipeline parallel；
 - KV-cache metrics/events；
-- A5 C8 算子与端到端验收；
+- GLM-5.2 A5 C8 端到端与长上下文精度验收；
 - A5 BF16 DSA 算子链。
 
 具有显式配置入口的未支持组合会在启动期拒绝，preemption/resume 会在当前
-运行边界明确失败。A5 已建立设备与 C8 布局 fail-fast，但源码接通仍不等于
-设备验收。DP 和在线推理属于下一阶段扩展项，当前离线验证以 DP=1 为主。
+运行边界明确失败。A5 GLM-5.1 已完成初验，但 GLM-5.2 仍须以上板模型结果
+而非源码可达性作为最终验收。DP 和在线推理属于下一阶段扩展项，当前离线
+验证以 DP=1 为主。
 
 ## 文档与测试入口
 
 - [DSA 稀疏卸载详细设计](docs/source/developer_guide/Design_Documents/dsa_offload_design.md)
-- [GLM-5.2 A5 DSA 稀疏卸载修复与算子接入方案](docs/source/developer_guide/Design_Documents/glm52_a5_dsa_integration_plan.md)
 - [DSA demo 与测试说明](examples/dsa_demo/README.md)
 - [上游 vLLM-Ascend README](README.upstream.md)
 

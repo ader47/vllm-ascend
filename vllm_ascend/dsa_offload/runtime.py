@@ -86,10 +86,10 @@ class DSAOffloadRuntime:
             self.block_size,
         )
 
-        # LIDU 输出只在“当前层 LIDU -> KSC -> SFA-Offload”之间存活。
-        # 各层存在 hidden-state 数据依赖，不会并发消费两层输出，因此所有
-        # 层复用同一套固定地址 scratch 即可。逐层持久状态只保存在下方
-        # resident_token_pool.cache_slots，不能与这里混为一谈。
+        # LIDU 输出在当前 selection group 内存活：full 层写入，所属 shared
+        # 层依次消费，下一 full 层才允许覆盖。层间存在 hidden-state 数据
+        # 依赖且当前为单流顺序执行，因此所有 group 可复用同一套固定地址
+        # scratch。跨 step 持久状态只保存在 resident_token_pool.cache_slots。
         output_shape = (
             self.max_num_reqs,
             1,
@@ -208,9 +208,8 @@ class DSAOffloadRuntime:
         self._graph_capture_row_count = 0
         self._dram_table_row_count = 0
         self._dram_table_signature: tuple[int, int, int] | None = None
-        # shared indexer 新鲜度守卫：每步自增 epoch，并记录最近一次跑过
-        # LIDU 的 full 层，shared 层据此校验其 top-K 来源在本步已就绪。
-        self._selection_epoch = 0
+        # shared indexer 新鲜度守卫：每个执行 view 先清空，再记录最近一次
+        # 跑过 LIDU 的 full 层；shared 层据此拒绝跨 step 的陈旧输出。
         self._selection_source_layer: int | None = None
 
     def bind_dram_store(self, store: DSAHotDRAMStore) -> None:
@@ -235,9 +234,8 @@ class DSAOffloadRuntime:
         if store is not None:
             store.release_pool_index(pool_index)
 
-    def _begin_selection_epoch(self) -> None:
-        """进入新的一轮逐层 decode 选择：自增 epoch 并清空 full 层来源标记。"""
-        self._selection_epoch += 1
+    def _reset_selection_source(self) -> None:
+        """进入新的执行 view 前清空上一步的 full 层来源标记。"""
         self._selection_source_layer = None
 
     def prepare_forward(
@@ -268,7 +266,6 @@ class DSAOffloadRuntime:
         self.active_num_reqs = int(num_reqs)
         self.execution_num_reqs = 0
         self.dump_launch_count = 0
-        self._begin_selection_epoch()
 
         self._prepare_dump_plan(
             input_batch=input_batch,
@@ -427,7 +424,7 @@ class DSAOffloadRuntime:
             )
         self.execution_num_reqs = execution_num_reqs
         self.dump_launch_count = int(launch_count)
-        self._begin_selection_epoch()
+        self._reset_selection_source()
         return execution_num_reqs
 
     def prepare_graph_capture(self, *, row_count: int) -> None:
@@ -456,7 +453,7 @@ class DSAOffloadRuntime:
             self.execution_num_reqs = row_count
             self.dump_job_count = 0
             self.dump_launch_count = row_count
-            self._begin_selection_epoch()
+            self._reset_selection_source()
         except Exception:
             try:
                 self.restore_after_graph_capture()
@@ -853,8 +850,7 @@ class DSALayerOffloadContext:
                 "DSA shared-indexer selection source is stale: "
                 f"layer_id={self.layer_id}, "
                 f"expected_source={self.selection_source_layer_id}, "
-                f"current_source={self.runtime._selection_source_layer}, "
-                f"epoch={self.runtime._selection_epoch}"
+                f"current_source={self.runtime._selection_source_layer}"
             )
         outputs = self.runtime.get_lidu_outputs(num_reqs=int(num_reqs))
         store = self.runtime.dram_store

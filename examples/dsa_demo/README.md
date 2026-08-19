@@ -1,7 +1,7 @@
 # DSA 稀疏卸载测试入口
 
-本目录是 v0.23 DSA 的 tester-facing 验收入口。脚本默认以 GLM-5.1 为首要
-模型，DeepSeek-V3.2 使用相同配置做强制回归。
+本目录是 v0.23 DSA 的 tester-facing 验收入口。脚本以 GLM-5.1/GLM-5.2
+为首要模型，DeepSeek-V3.2 使用相同配置做强制回归。
 
 | 文件 | 用途 |
 |---|---|
@@ -182,7 +182,7 @@ python examples/dsa_demo/eval_dataset_acc_score.py \
 | dump | prefill 多满块、decode 跨满块 |
 | chunked prefill | 中间 chunk、最终 chunk、完成后首个 decode |
 | 生命周期 | 请求结束、InputBatch condense/reorder、stable row 复用 |
-| 模型 | GLM-5.1 主验收、DeepSeek-V3.2 回归 |
+| 模型 | GLM-5.1/GLM-5.2 主验收、DeepSeek-V3.2 回归 |
 
 不要只看“进程跑完”。至少核对：
 
@@ -216,6 +216,22 @@ python examples/dsa_demo/eval_dataset_acc_score.py \
 先修改 `serve_dsa.sh` 顶部用户配置。首次在线验证建议从
 `RUN_MODE="eager"` 开始，确认请求生命周期、连续请求和流式返回正常后，再
 切换为 `RUN_MODE="graph"`：
+
+对 A5/950 W4A4C8，至少修改：
+
+```bash
+MODEL_PATH="/path/to/GLM-5.1-or-5.2-w4a4c8"
+SERVED_MODEL_NAME="glm-5.2-dsa"
+ENABLE_A5_PACKED_C8_DSA="true"
+SAFETENSORS_LOAD_STRATEGY="prefetch"
+```
+
+该开关会在 `additional_config` 同时写入
+`enable_sparse_sfa_c8=true` 与 `enable_sparse_li_c8=true`。不要只开其中
+一个；当前 A5 DSA 会在初始化期拒绝半开布局。W4A4C8 仍使用
+`--quantization ascend`，当前阶段不要传 `--speculative-config`。
+若修改了 `SERVED_MODEL_NAME`，同步把 `stream_chat_client.py` 顶部的
+`MODEL_NAME` 改成相同值。
 
 ```bash
 bash examples/dsa_demo/serve_dsa.sh 2>&1 | tee dsa-online.log

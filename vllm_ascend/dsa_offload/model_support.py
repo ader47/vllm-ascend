@@ -3,8 +3,9 @@
 """DSA offload 的模型能力识别。
 
 模型架构名称只用于诊断输出，不作为使能白名单。是否支持 DSA offload
-由 vLLM 已解析的 MLA 和 sparse-indexer 能力决定，因此 DeepSeek-V3.2 与
-GLM-5.1 可以自然共享同一条判断路径，后续兼容模型也无需追加名称分支。
+由 vLLM 已解析的 MLA 和 sparse-indexer 能力决定，因此 DeepSeek-V3.2、
+GLM-5.1 与声明 IndexShare 拓扑的 GLM-5.2 可以共享同一条判断路径，后续
+兼容模型也无需追加名称分支。
 """
 
 from __future__ import annotations
@@ -82,7 +83,6 @@ class DSAOffloadModelCapabilities:
     qk_rope_head_dim: int | None
     # 共享 indexer 拓扑（GLM-5.2）。None 表示未声明 → 每层独立 indexer。
     indexer_types: tuple[str, ...] | None = None
-    index_topk_freq: int | None = None
 
     @property
     def missing_requirements(self) -> tuple[str, ...]:
@@ -154,7 +154,6 @@ def get_dsa_offload_model_capabilities(
         kv_lora_rank=_positive_int_or_none(getattr(hf_text_config, "kv_lora_rank", None)),
         qk_rope_head_dim=_positive_int_or_none(getattr(hf_text_config, "qk_rope_head_dim", None)),
         indexer_types=_indexer_types_or_none(getattr(hf_text_config, "indexer_types", None)),
-        index_topk_freq=_positive_int_or_none(getattr(hf_text_config, "index_topk_freq", None)),
     )
 
 

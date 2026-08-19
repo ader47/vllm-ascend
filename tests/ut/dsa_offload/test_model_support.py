@@ -102,7 +102,6 @@ def test_shared_indexer_topology_is_parsed() -> None:
 
     assert capabilities.supported  # 拓扑不影响 supported 判定
     assert capabilities.has_shared_indexer_layers
-    assert capabilities.index_topk_freq == 4
     full = capabilities.full_indexer_layer_indices
     shared = capabilities.shared_indexer_layer_indices
     assert full is not None and shared is not None
@@ -120,7 +119,6 @@ def test_all_full_topology_is_default_and_not_shared() -> None:
     assert not capabilities.has_shared_indexer_layers
     assert capabilities.full_indexer_layer_indices is None
     assert capabilities.shared_indexer_layer_indices is None
-    assert capabilities.index_topk_freq is None
 
 
 def test_malformed_indexer_types_is_rejected() -> None:
@@ -148,7 +146,6 @@ def test_undeclared_topk_freq_topology_is_not_treated_as_shared() -> None:
 
     capabilities = get_dsa_offload_model_capabilities(config)
 
-    assert capabilities.index_topk_freq == 4
     assert capabilities.indexer_types is None
     assert not capabilities.has_shared_indexer_layers
     assert capabilities.full_indexer_layer_indices is None

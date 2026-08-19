@@ -542,7 +542,7 @@ def test_shared_layer_rejects_stale_or_missing_source(monkeypatch) -> None:
 
     shared = _shared_context(layer_id=1, source_id=0, runtime=runtime)
     # 本步尚未有任何 full 层跑 LIDU → 守卫应响。
-    runtime._begin_selection_epoch()
+    runtime._reset_selection_source()
     with pytest.raises(RuntimeError, match="selection source is stale"):
         shared.execute_shared_decode_selection(
             resident_cache=(

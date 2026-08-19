@@ -22,11 +22,13 @@ from vllm_ascend.utils import load_custom_op_library
 
 
 class DSALightningIndexerOutputs(NamedTuple):
-    """逐层复用的 caller-owned LIDU 输出缓冲。
+    """逐个 selection group 复用的 caller-owned LIDU 输出缓冲。
 
     A3 BF16 路径把四个 buffer 解释为 topK token、resident slot、miss 数与
     tail；A5 C8 融合路径复用前三个承载 KSC 的 copy src/dst/count，attention
     slots 与 resident 长度另有固定地址输出，第四列在该路径不消费。
+    GLM-5.2 的 full 层生成一次输出，紧随其后的 shared 层在下一 full 层
+    覆盖该缓冲前复用同一份 copy plan 与 attention metadata。
     """
 
     topk_index: torch.Tensor

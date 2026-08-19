@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DSA 请求行与逐层 token-position→resident-slot 持久状态池。
+"""DSA 请求行与逐 selection group 的 token-position→resident-slot 状态池。
 
-LIDU 会在每层、每个 decode step 原址刷新 ``cache_slots``。前 ``W-1`` 列
+LIDU 会在每个 full selection group、每个 decode step 原址刷新
+``cache_slots``。前 ``W-1`` 列
 保存完整序列 token position 到 resident 逻辑 slot 的映射，最后一列保存
 该行的初始化状态：
 
 * ``0``：尚未进入 sparse resident；
-* ``-budget``：本层下一次 LIDU 需要执行 first-fill；
-* ``+budget``：本层已经建立稳定 resident 映射。
+* ``-budget``：本 group 下一次 LIDU 需要执行 first-fill；
+* ``+budget``：本 group 已经建立稳定 resident 映射。
 
-pool row 独立于 ``InputBatch`` 行号，因此基线对请求行做 condense/reorder 时
+普通模型一个 attention 层对应一个 selection group；GLM-5.2 只为 full
+Indexer 层建立 group，后续 shared 层复用该 group 的映射。pool row 独立于
+``InputBatch`` 行号，因此基线对请求行做 condense/reorder 时
 不需要搬运一整行 ``max_model_len`` 状态；每轮只需把最终 batch row 映射为
 一个稳定 pool index。最后额外保留一行给图模式 PAD 使用。
 """
@@ -125,7 +128,7 @@ class DSAResidentTokenPool:
         *,
         target_budget_tokens: int,
     ) -> None:
-        """在请求首次进入 sparse 时为所有层写入 first-fill 负预算。"""
+        """在请求首次进入 sparse 时为所有 selection group 写入负预算。"""
 
         pool_index = self._require_index(request_id)
         target_budget_tokens = int(target_budget_tokens)
