@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 import vllm_ascend.dsa_offload.runtime as runtime_module
@@ -36,6 +37,8 @@ def _make_runtime(
     max_num_reqs: int = 1,
     *,
     packed_c8: bool = False,
+    resident_layer_count: int = 2,
+    selection_state_count: int = 2,
 ) -> tuple[
     DSAResidentTokenPool,
     DSAOffloadRuntime,
@@ -43,7 +46,7 @@ def _make_runtime(
 ]:
     resident_pool = DSAResidentTokenPool(
         max_num_reqs=max_num_reqs,
-        num_layers=2,
+        num_layers=selection_state_count,
         max_model_len=512,
         max_resident_budget_tokens=256,
         device=torch.device("cpu"),
@@ -51,7 +54,7 @@ def _make_runtime(
     runtime = DSAOffloadRuntime(
         max_num_reqs=max_num_reqs,
         max_num_tokens=512,
-        num_layers=2,
+        num_layers=resident_layer_count,
         max_model_len=512,
         block_size=128,
         resident_token_pool=resident_pool,
@@ -84,6 +87,42 @@ def test_lidu_scratch_is_shared_but_cache_slots_remain_per_layer() -> None:
     assert first.topk_index.data_ptr() == runtime._lidu_topk_index.data_ptr()
     assert first.topk_slots.data_ptr() == runtime._lidu_topk_slots.data_ptr()
     assert resident_pool.get_cache_slots(0).data_ptr() != resident_pool.get_cache_slots(1).data_ptr()
+
+
+def test_shared_topology_allocates_only_full_selection_states() -> None:
+    resident_pool, runtime, _ = _make_runtime(
+        resident_layer_count=2,
+        selection_state_count=1,
+    )
+
+    assert runtime.num_layers == 2
+    assert resident_pool.num_layers == 1
+    assert resident_pool.get_cache_slots(0).shape[0] == resident_pool.storage_rows
+    with pytest.raises(IndexError, match="outside"):
+        resident_pool.get_cache_slots(1)
+
+
+def _register_layer_arenas(store: DSAHotDRAMStore, num_layers: int = 2) -> None:
+    for layer_id in range(num_layers):
+        store.add_layer(
+            layer_id=layer_id,
+            resident_nope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            resident_rope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+        )
+
+
+def _full_context(
+    layer_id: int,
+    runtime: DSAOffloadRuntime,
+    selection_state_id: int | None = None,
+) -> DSALayerOffloadContext:
+    return DSALayerOffloadContext(
+        layer_id=layer_id,
+        indexer_cache=torch.zeros((2, 4, 128), dtype=torch.bfloat16),
+        runtime=runtime,
+        selection_state_id=layer_id if selection_state_id is None else selection_state_id,
+        selection_source_layer_id=None,
+    )
 
 
 def test_a5_selection_scratch_is_allocated_only_for_packed_c8() -> None:
@@ -139,24 +178,24 @@ def test_a5_selection_chain_reuses_preallocated_outputs(monkeypatch) -> None:
     )
     resident_cache = torch.empty(4, 128, 1, 656, dtype=torch.int8)
     store.add_packed_layer(
-        layer_id=0,
+        layer_id=1,
         resident_packed_cache=resident_cache,
     )
     indexer_cache = (
-        torch.empty(8, 128, 1, 128, dtype=torch.int8),
+        torch.empty(8, 128, 1, 128, dtype=torch.float8_e4m3fn),
         torch.empty(8, 128, 1, 1, dtype=torch.float32),
     )
     captured: dict[str, torch.Tensor] = {}
 
     def _fake_fused_lidu(*, outputs, attention_slots, resident_seq_lengths, **kwargs) -> None:
         captured["candidate_lens"] = kwargs["candidate_lens"]
+        captured["cache_slots"] = kwargs["cache_slots"]
         outputs.topk_index.fill_(7)
         outputs.topk_slots.fill_(9)
         outputs.miss_count.copy_(torch.tensor([0, 3], dtype=torch.int32))
         attention_slots.fill_(11)
         resident_seq_lengths.copy_(torch.tensor([4096, 4224], dtype=torch.int32))
         captured["copy_src_ids"] = outputs.topk_index
-        captured["copy_dst_slots"] = outputs.topk_slots
         captured["attention_slots"] = attention_slots
         captured["resident_seq_lengths"] = resident_seq_lengths
 
@@ -173,9 +212,10 @@ def test_a5_selection_chain_reuses_preallocated_outputs(monkeypatch) -> None:
     )
 
     context = DSALayerOffloadContext(
-        layer_id=0,
+        layer_id=1,
         indexer_cache=indexer_cache,
         runtime=runtime,
+        selection_state_id=0,
         packed_c8=True,
     )
     candidate_lens = torch.tensor([4096, 6272], dtype=torch.int32)
@@ -196,10 +236,12 @@ def test_a5_selection_chain_reuses_preallocated_outputs(monkeypatch) -> None:
     )
 
     assert captured["candidate_lens"].data_ptr() == candidate_lens.data_ptr()
+    assert captured["cache_slots"].data_ptr() == resident_pool.get_cache_slots(0).data_ptr()
     assert captured["copy_src_ids"].data_ptr() == (runtime._lidu_topk_index.data_ptr())
     assert captured["scatter_source_token_ids"].data_ptr() == (runtime._lidu_topk_index.data_ptr())
     assert captured["scatter_destination_slots"].data_ptr() == (runtime._lidu_topk_slots.data_ptr())
     assert captured["scatter_copy_counts"].data_ptr() == (runtime._lidu_miss_count.data_ptr())
+    assert runtime._selection_source_layer == 1
     assert runtime._a5_attention_slots is not None
     assert selection.sparse_indices.data_ptr() == (runtime._a5_attention_slots.data_ptr())
     assert selection.sparse_indices.tolist() == [[[11] * 2176]] * 2
@@ -207,6 +249,360 @@ def test_a5_selection_chain_reuses_preallocated_outputs(monkeypatch) -> None:
     assert selection.resident_seq_lengths is not None
     assert selection.resident_seq_lengths.data_ptr() == (runtime._a5_resident_seq_lengths.data_ptr())
     assert selection.resident_seq_lengths.tolist() == [4096, 4224]
+
+
+def test_a5_shared_layer_reuses_full_lidu_and_own_packed_arena(
+    monkeypatch,
+) -> None:
+    resident_pool, runtime, store = _make_runtime(
+        packed_c8=True,
+        resident_layer_count=2,
+        selection_state_count=1,
+    )
+    resident_caches = (
+        torch.empty(4, 128, 1, 656, dtype=torch.int8),
+        torch.empty(4, 128, 1, 656, dtype=torch.int8),
+    )
+    for layer_id, resident_cache in enumerate(resident_caches):
+        store.add_packed_layer(
+            layer_id=layer_id,
+            resident_packed_cache=resident_cache,
+        )
+
+    fused_lidu_calls = 0
+    scatter_calls: list[dict] = []
+
+    def _fake_fused_lidu(*, outputs, attention_slots, resident_seq_lengths, **kwargs) -> None:
+        nonlocal fused_lidu_calls
+        fused_lidu_calls += 1
+        outputs.topk_index.fill_(7)
+        outputs.topk_slots.fill_(9)
+        outputs.miss_count.zero_()
+        attention_slots.fill_(11)
+        resident_seq_lengths.fill_(4096)
+
+    def _fake_scatter(**kwargs) -> None:
+        scatter_calls.append(kwargs)
+
+    monkeypatch.setattr(runtime_module, "a5_lightning_indexer_decode_update_c8", _fake_fused_lidu)
+    monkeypatch.setattr(
+        runtime_module,
+        "a5_kvcache_scatter_copy_c8",
+        _fake_scatter,
+    )
+
+    full = DSALayerOffloadContext(
+        layer_id=0,
+        indexer_cache=(
+            torch.empty(8, 128, 1, 128, dtype=torch.float8_e4m3fn),
+            torch.empty(8, 128, 1, 1, dtype=torch.float32),
+        ),
+        runtime=runtime,
+        selection_state_id=0,
+        packed_c8=True,
+    )
+    common_tables = {
+        "resident_block_table": torch.zeros(1, 64, dtype=torch.int32),
+        "dram_block_table": torch.zeros(1, 64, dtype=torch.int32),
+    }
+    full.execute_decode_selection(
+        query=torch.empty(1, 32, 128),
+        weights=torch.empty(1, 32),
+        row_modes=torch.tensor([1], dtype=torch.int32),
+        resident_pool_indices=torch.tensor([0], dtype=torch.int32),
+        actual_seq_lengths_key=torch.tensor([4096], dtype=torch.int32),
+        actual_seq_lengths_query=torch.tensor([1], dtype=torch.int32),
+        indexer_block_table=torch.zeros(1, 64, dtype=torch.int32),
+        resident_cache=(resident_caches[0],),
+        candidate_lens=torch.tensor([4096], dtype=torch.int32),
+        query_dequant_scale=torch.ones(1, 32),
+        query_shape=(1, 32, 128),
+        **common_tables,
+    )
+
+    shared = DSALayerOffloadContext(
+        layer_id=1,
+        indexer_cache=None,
+        runtime=runtime,
+        selection_source_layer_id=0,
+        packed_c8=True,
+    )
+    selection = shared.execute_shared_decode_selection(
+        resident_cache=(resident_caches[1],),
+        num_reqs=1,
+        **common_tables,
+    )
+
+    assert resident_pool.num_layers == 1
+    assert fused_lidu_calls == 1
+    assert len(scatter_calls) == 2
+    own_arena = store.get_layer_arenas(1).packed
+    assert scatter_calls[1]["dram_packed_arena"] is own_arena
+    outputs = runtime.get_lidu_outputs(num_reqs=1)
+    assert scatter_calls[1]["source_token_ids"] is outputs.topk_index
+    assert runtime._a5_attention_slots is not None
+    assert selection.sparse_indices.data_ptr() == (runtime._a5_attention_slots.data_ptr())
+    assert selection.sparse_indices.tolist() == [[[11] * 2176]]
+    assert selection.resident_seq_lengths is not None
+    assert selection.resident_seq_lengths.tolist() == [4096]
+
+
+def _shared_context(layer_id: int, source_id: int, runtime: DSAOffloadRuntime) -> DSALayerOffloadContext:
+    return DSALayerOffloadContext(
+        layer_id=layer_id,
+        indexer_cache=None,
+        runtime=runtime,
+        selection_source_layer_id=source_id,
+    )
+
+
+def test_full_layer_records_selection_source(monkeypatch) -> None:
+    resident_pool, runtime, store = _make_runtime()
+    _register_layer_arenas(store)
+    lidu_calls: list[dict] = []
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.lightning_indexer_decode_update",
+        lambda **kw: lidu_calls.append(kw),
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.kvcache_scatter_copy",
+        lambda **kw: None,
+    )
+
+    ctx = _full_context(layer_id=0, runtime=runtime)
+    ctx.execute_decode_selection(
+        query=torch.zeros((1, 32, 128), dtype=torch.bfloat16),
+        weights=torch.zeros((1, 32), dtype=torch.bfloat16),
+        row_modes=torch.zeros((1,), dtype=torch.int32),
+        resident_pool_indices=torch.zeros((1,), dtype=torch.int32),
+        actual_seq_lengths_key=torch.ones((1,), dtype=torch.int32),
+        actual_seq_lengths_query=torch.ones((1,), dtype=torch.int32),
+        indexer_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        resident_cache=(
+            torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+        ),
+        resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+    )
+
+    assert lidu_calls, "full 层应跑 LIDU"
+    assert runtime._selection_source_layer == 0
+
+
+def test_shared_layer_reuses_source_outputs_with_own_arenas(monkeypatch) -> None:
+    resident_pool, runtime, store = _make_runtime()
+    _register_layer_arenas(store)
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.lightning_indexer_decode_update",
+        lambda **kw: None,
+    )
+    ksc_calls: list[dict] = []
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.kvcache_scatter_copy",
+        lambda **kw: ksc_calls.append(kw),
+    )
+
+    full = _full_context(layer_id=0, runtime=runtime)
+    full.execute_decode_selection(
+        query=torch.zeros((1, 32, 128), dtype=torch.bfloat16),
+        weights=torch.zeros((1, 32), dtype=torch.bfloat16),
+        row_modes=torch.zeros((1,), dtype=torch.int32),
+        resident_pool_indices=torch.zeros((1,), dtype=torch.int32),
+        actual_seq_lengths_key=torch.ones((1,), dtype=torch.int32),
+        actual_seq_lengths_query=torch.ones((1,), dtype=torch.int32),
+        indexer_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        resident_cache=(
+            torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+        ),
+        resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+    )
+    assert len(ksc_calls) == 1  # full 层的 KSC
+
+    shared = _shared_context(layer_id=1, source_id=0, runtime=runtime)
+    result = shared.execute_shared_decode_selection(
+        resident_cache=(
+            torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+        ),
+        resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        num_reqs=1,
+    )
+
+    assert len(ksc_calls) == 2  # shared 层又跑一次 KSC
+    shared_ksc = ksc_calls[1]
+    # KSC 用的是本层（layer 1）的 arena，不是源 full 层的。
+    own_arenas = store.get_layer_arenas(1)
+    assert shared_ksc["dram_nope_arena"] is own_arenas.nope
+    assert shared_ksc["dram_rope_arena"] is own_arenas.rope
+    # 复用源 full 层的 LIDU 输出作为 KSC 与 SFA 输入。
+    outputs = runtime.get_lidu_outputs(num_reqs=1)
+    assert shared_ksc["dst_slots"] is outputs.topk_slots
+    assert result.sparse_indices is outputs.topk_slots
+
+
+def test_multiple_shared_followers_transition_to_next_full_source(
+    monkeypatch,
+) -> None:
+    _, runtime, store = _make_runtime(
+        resident_layer_count=5,
+        selection_state_count=2,
+    )
+    _register_layer_arenas(store, num_layers=5)
+    lidu_markers = iter((10, 30))
+    ksc_calls: list[dict] = []
+
+    def _fake_lidu(**kwargs) -> None:
+        marker = next(lidu_markers)
+        outputs = kwargs["outputs"]
+        outputs.topk_index.fill_(marker)
+        outputs.topk_slots.fill_(marker + 1)
+        outputs.miss_count.zero_()
+        outputs.tail_info.fill_(marker + 2)
+
+    def _fake_ksc(**kwargs) -> None:
+        ksc_calls.append(
+            {
+                "source_ids": kwargs["src_token_ids"].clone(),
+                "destination_slots": kwargs["dst_slots"].clone(),
+                "dram_nope_arena": kwargs["dram_nope_arena"],
+            }
+        )
+
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.lightning_indexer_decode_update",
+        _fake_lidu,
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.kvcache_scatter_copy",
+        _fake_ksc,
+    )
+
+    resident_cache = (
+        torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+        torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+    )
+    resident_block_table = torch.zeros((1, 4), dtype=torch.int32)
+    dram_block_table = torch.zeros((1, 4), dtype=torch.int32)
+
+    def _execute_full(context: DSALayerOffloadContext) -> None:
+        context.execute_decode_selection(
+            query=torch.zeros((1, 32, 128), dtype=torch.bfloat16),
+            weights=torch.zeros((1, 32), dtype=torch.bfloat16),
+            row_modes=torch.zeros((1,), dtype=torch.int32),
+            resident_pool_indices=torch.zeros((1,), dtype=torch.int32),
+            actual_seq_lengths_key=torch.ones((1,), dtype=torch.int32),
+            actual_seq_lengths_query=torch.ones((1,), dtype=torch.int32),
+            indexer_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            resident_cache=resident_cache,
+            resident_block_table=resident_block_table,
+            dram_block_table=dram_block_table,
+        )
+
+    def _execute_shared(context: DSALayerOffloadContext) -> None:
+        context.execute_shared_decode_selection(
+            resident_cache=resident_cache,
+            resident_block_table=resident_block_table,
+            dram_block_table=dram_block_table,
+            num_reqs=1,
+        )
+
+    full0 = _full_context(layer_id=0, runtime=runtime, selection_state_id=0)
+    shared1 = _shared_context(layer_id=1, source_id=0, runtime=runtime)
+    shared2 = _shared_context(layer_id=2, source_id=0, runtime=runtime)
+    full3 = _full_context(layer_id=3, runtime=runtime, selection_state_id=1)
+    shared4 = _shared_context(layer_id=4, source_id=3, runtime=runtime)
+
+    _execute_full(full0)
+    _execute_shared(shared1)
+    _execute_shared(shared2)
+    _execute_full(full3)
+    _execute_shared(shared4)
+
+    assert [int(call["source_ids"][0, 0, 0]) for call in ksc_calls] == [10, 10, 10, 30, 30]
+    assert [int(call["destination_slots"][0, 0, 0]) for call in ksc_calls] == [11, 11, 11, 31, 31]
+    for layer_id, call in enumerate(ksc_calls):
+        assert call["dram_nope_arena"] is store.get_layer_arenas(layer_id).nope
+    assert runtime._selection_source_layer == 3
+
+    with pytest.raises(RuntimeError, match="selection source is stale"):
+        _execute_shared(shared2)
+
+
+def test_shared_layer_rejects_stale_or_missing_source(monkeypatch) -> None:
+    resident_pool, runtime, store = _make_runtime()
+    _register_layer_arenas(store)
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.kvcache_scatter_copy",
+        lambda **kw: None,
+    )
+
+    shared = _shared_context(layer_id=1, source_id=0, runtime=runtime)
+    # 本步尚未有任何 full 层跑 LIDU → 守卫应响。
+    runtime._begin_selection_epoch()
+    with pytest.raises(RuntimeError, match="selection source is stale"):
+        shared.execute_shared_decode_selection(
+            resident_cache=(
+                torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+                torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            ),
+            resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            num_reqs=1,
+        )
+    # 来源 id 不匹配同样应响。
+    runtime._selection_source_layer = 5
+    with pytest.raises(RuntimeError, match="selection source is stale"):
+        shared.execute_shared_decode_selection(
+            resident_cache=(
+                torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+                torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            ),
+            resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            num_reqs=1,
+        )
+
+
+def test_shared_layer_rejects_lidu_entry() -> None:
+    resident_pool, runtime, store = _make_runtime()
+    _register_layer_arenas(store)
+    shared = _shared_context(layer_id=1, source_id=0, runtime=runtime)
+    with pytest.raises(RuntimeError, match="must not run LIDU"):
+        shared.execute_decode_selection(
+            query=torch.zeros((1, 32, 128), dtype=torch.bfloat16),
+            weights=torch.zeros((1, 32), dtype=torch.bfloat16),
+            row_modes=torch.zeros((1,), dtype=torch.int32),
+            resident_pool_indices=torch.zeros((1,), dtype=torch.int32),
+            actual_seq_lengths_key=torch.ones((1,), dtype=torch.int32),
+            actual_seq_lengths_query=torch.ones((1,), dtype=torch.int32),
+            indexer_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            resident_cache=(
+                torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+                torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            ),
+            resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        )
+
+
+def test_full_layer_rejects_shared_path() -> None:
+    resident_pool, runtime, store = _make_runtime()
+    _register_layer_arenas(store)
+    full = _full_context(layer_id=0, runtime=runtime)
+    with pytest.raises(RuntimeError, match="must use execute_decode_selection"):
+        full.execute_shared_decode_selection(
+            resident_cache=(
+                torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+                torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            ),
+            resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            num_reqs=1,
+        )
 
 
 def test_dump_plan_is_compact_and_idempotent() -> None:

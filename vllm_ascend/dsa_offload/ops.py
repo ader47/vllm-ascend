@@ -56,6 +56,11 @@ _REQUIRED_A5_C8_OPS = (
     "kv_cache_full_block_dump_c8",
 )
 
+_REQUIRED_A5_NATIVE_OPS = (
+    "npu_quant_lightning_indexer",
+    "npu_kv_quant_sparse_flash_attention",
+)
+
 
 def require_dsa_offload_ops(*, packed_c8: bool = False) -> None:
     """在 worker 初始化期确认当前 cache 模式所需设备算子均已部署。"""
@@ -65,6 +70,14 @@ def require_dsa_offload_ops(*, packed_c8: bool = False) -> None:
             "DSA A5 packed-C8 custom operator library failed to load; "
             "check the vllm_ascend_C installation and custom-op runtime libraries"
         )
+    if packed_c8:
+        try:
+            import torch_npu
+        except ImportError as exc:
+            raise RuntimeError("DSA A5 packed-C8 requires torch_npu native Quant-LI and QSFA operators") from exc
+        missing_native = [op_name for op_name in _REQUIRED_A5_NATIVE_OPS if not hasattr(torch_npu, op_name)]
+        if missing_native:
+            raise RuntimeError(f"DSA A5 native operators are unavailable: {tuple(missing_native)}")
     required_ops = _REQUIRED_A5_C8_OPS if packed_c8 else _REQUIRED_OPS
     missing = [op_name for op_name in required_ops if not hasattr(torch.ops._C_ascend, op_name)]
     if missing:
@@ -86,20 +99,16 @@ def _packed_byte_view(cache: torch.Tensor, *, name: str) -> torch.Tensor:
 def _normalize_a5_indexer_key_scale(
     key_dequant_scale: torch.Tensor,
 ) -> torch.Tensor:
-    """将 A5 Indexer scale cache 统一为原生 Quant-LI 的三维 ABI。"""
+    """将 A5 Indexer scale cache 统一为原生 Quant-LI/融合 LIDU 的三维 ABI。"""
 
     if key_dequant_scale.ndim == 4:
         if tuple(key_dequant_scale.shape[2:]) != (1, 1):
-            raise ValueError(
-                "A5 Indexer scale cache must end in [1,1], got "
-                f"{tuple(key_dequant_scale.shape)}"
-            )
+            raise ValueError(f"A5 Indexer scale cache must end in [1,1], got {tuple(key_dequant_scale.shape)}")
         return key_dequant_scale.squeeze(2)
     if key_dequant_scale.ndim == 3 and key_dequant_scale.shape[2] == 1:
         return key_dequant_scale
     raise ValueError(
-        "A5 Indexer scale cache must be [blocks,128,1] or "
-        f"[blocks,128,1,1], got {tuple(key_dequant_scale.shape)}"
+        f"A5 Indexer scale cache must be [blocks,128,1] or [blocks,128,1,1], got {tuple(key_dequant_scale.shape)}"
     )
 
 
@@ -125,9 +134,7 @@ def quant_lightning_indexer_topk(
         # wk_weights_proj. Only the A3 custom LIDU requires a compact copy.
         weights=weights,
         query_dequant_scale=query_dequant_scale,
-        key_dequant_scale=_normalize_a5_indexer_key_scale(
-            key_dequant_scale
-        ),
+        key_dequant_scale=_normalize_a5_indexer_key_scale(key_dequant_scale),
         actual_seq_lengths_query=actual_seq_lengths_query,
         actual_seq_lengths_key=candidate_lens,
         block_table=block_table,
@@ -181,9 +188,7 @@ def a5_lightning_indexer_decode_update_c8(
     resident_seq_lengths: torch.Tensor,
     outputs: DSALightningIndexerOutputs,
 ) -> None:
-    index_key_dequant_scale = _normalize_a5_indexer_key_scale(
-        index_key_dequant_scale
-    )
+    index_key_dequant_scale = _normalize_a5_indexer_key_scale(index_key_dequant_scale)
     torch.ops._C_ascend.npu_dsa_a5_li_manage_nomtp_c8_out(
         index_weights,
         query,

@@ -255,7 +255,41 @@ def test_split_groups_reject_missing_per_layer_indexer() -> None:
     specs = _make_specs(num_layers=2)
     del specs["model.layers.1.self_attn.indexer.k_cache"]
 
-    with pytest.raises(RuntimeError, match="one Indexer cache per"):
+    # GLM-5.2 共享 indexer 拓扑下 indexer 层是 resident 层的真子集，
+    # 不再要求每层都有独立 indexer，分组应通过。
+    groups = build_dsa_kv_cache_groups(specs)
+    assert len(groups) == 2
+    assert len(groups[0].layer_names) == 1  # 仅 layer 0 有 indexer
+    assert len(groups[1].layer_names) == 2
+
+
+def test_split_groups_reject_orphan_indexer_without_resident() -> None:
+    # indexer 指向一个不存在 resident 层的 transformer 下标仍属硬错误。
+    specs = _make_specs(num_layers=1)
+    del specs["model.layers.0.self_attn.indexer.k_cache"]
+    orphan = DSAIndexerKVSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    specs["model.layers.7.self_attn.indexer.k_cache"] = orphan
+
+    with pytest.raises(RuntimeError, match="no matching resident MLA layer"):
+        build_dsa_kv_cache_groups(specs)
+
+
+def test_split_groups_reject_more_indexer_than_resident() -> None:
+    specs = _make_specs(num_layers=1)
+    specs["model.layers.1.self_attn.indexer.k_cache"] = DSAIndexerKVSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    # 保留 layer 0 resident，使入口先命中明确的数量合同。
+
+    with pytest.raises(RuntimeError, match="more Indexer caches than resident"):
         build_dsa_kv_cache_groups(specs)
 
 

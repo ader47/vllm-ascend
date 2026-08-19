@@ -25,6 +25,8 @@ def test_packed_c8_op_check_loads_extension_before_schema_check(monkeypatch) -> 
 
     monkeypatch.setattr(dsa_ops, "load_custom_op_library", _load_custom_op_library)
     monkeypatch.setattr(dsa_ops, "_REQUIRED_A5_C8_OPS", ())
+    monkeypatch.setattr(dsa_ops, "_REQUIRED_A5_NATIVE_OPS", ())
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
 
     dsa_ops.require_dsa_offload_ops(packed_c8=True)
 
@@ -35,6 +37,15 @@ def test_packed_c8_op_check_reports_extension_load_failure(monkeypatch) -> None:
     monkeypatch.setattr(dsa_ops, "load_custom_op_library", lambda: False)
 
     with pytest.raises(RuntimeError, match="operator library failed to load"):
+        dsa_ops.require_dsa_offload_ops(packed_c8=True)
+
+
+def test_packed_c8_op_check_reports_missing_native_ops(monkeypatch) -> None:
+    monkeypatch.setattr(dsa_ops, "load_custom_op_library", lambda: True)
+    monkeypatch.setattr(dsa_ops, "_REQUIRED_A5_C8_OPS", ())
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match="native operators are unavailable"):
         dsa_ops.require_dsa_offload_ops(packed_c8=True)
 
 

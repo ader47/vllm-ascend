@@ -397,12 +397,23 @@ class NPUModelRunner(GPUModelRunner):
                 )
         self.dsa_kv_cache_group_ids: DSAKVCacheGroupIds | None = None
         dsa_config = self.ascend_config.dsa_offload_config
+        resident_layer_count = self.model_config.get_num_layers(
+            self.parallel_config
+        )
+        full_indexer_layers = (
+            dsa_config.model_capabilities.full_indexer_layer_indices
+            if dsa_config.model_capabilities is not None
+            else None
+        )
+        selection_state_count = (
+            len(full_indexer_layers)
+            if full_indexer_layers is not None
+            else resident_layer_count
+        )
         self.dsa_resident_token_pool = (
             DSAResidentTokenPool(
                 max_num_reqs=self.max_num_reqs,
-                num_layers=self.model_config.get_num_layers(
-                    self.parallel_config
-                ),
+                num_layers=selection_state_count,
                 max_model_len=self.model_config.max_model_len,
                 max_resident_budget_tokens=(
                     dsa_config.max_resident_budget_tokens
@@ -416,9 +427,7 @@ class NPUModelRunner(GPUModelRunner):
             DSAOffloadRuntime(
                 max_num_reqs=self.max_num_reqs,
                 max_num_tokens=self.max_num_tokens,
-                num_layers=self.model_config.get_num_layers(
-                    self.parallel_config
-                ),
+                num_layers=resident_layer_count,
                 max_model_len=self.model_config.max_model_len,
                 block_size=vllm_config.cache_config.block_size,
                 resident_token_pool=self.dsa_resident_token_pool,
@@ -4603,12 +4612,30 @@ class NPUModelRunner(GPUModelRunner):
                 )
             target[layer_index] = layer_name
 
-        if resident_names.keys() != indexer_names.keys():
+        # GLM-5.2 共享 indexer 下 indexer 层是 resident 层的真子集（仅 full
+        # 层）。子集之外的方向（indexer 无 resident 对应）仍是硬错误。
+        orphan_indexer = indexer_names.keys() - resident_names.keys()
+        if orphan_indexer:
             raise RuntimeError(
-                "DSA resident and Indexer layer sets differ: "
-                f"resident={tuple(sorted(resident_names))}, "
-                f"indexer={tuple(sorted(indexer_names))}"
+                "DSA Indexer layers have no matching resident MLA layer: "
+                f"orphan_indexer={tuple(sorted(orphan_indexer))}, "
+                f"resident={tuple(sorted(resident_names))}"
             )
+
+        # 配置声明的 shared 拓扑与实际发射的 indexer plane 必须逐层一致，
+        # 以在绑定期抓住 config / module 漂移（比较层下标集合，而非仅计数）。
+        # all-full 模型不声明拓扑则跳过。
+        capabilities = self.ascend_config.dsa_offload_config.model_capabilities
+        if capabilities is not None and capabilities.has_shared_indexer_layers:
+            declared_full = set(capabilities.full_indexer_layer_indices or ())
+            emitted_indexer = set(indexer_names)
+            if emitted_indexer != declared_full:
+                raise RuntimeError(
+                    "DSA emitted Indexer planes do not match declared "
+                    "shared-indexer topology: "
+                    f"missing_indexer={tuple(sorted(declared_full - emitted_indexer))}, "
+                    f"unexpected_indexer={tuple(sorted(emitted_indexer - declared_full))}"
+                )
 
         runtime = self.dsa_offload_runtime
         resident_pool = self.dsa_resident_token_pool
@@ -4648,13 +4675,23 @@ class NPUModelRunner(GPUModelRunner):
                 f"runtime={runtime.num_layers}, "
                 f"cache_layers={len(ordered_layer_indices)}"
             )
+        if resident_pool.num_layers != len(indexer_names):
+            raise RuntimeError(
+                "DSA selection-state capacity does not match full Indexer "
+                f"layers: states={resident_pool.num_layers}, "
+                f"indexers={len(indexer_names)}"
+            )
+        last_full_runtime_layer_id: int | None = None
+        next_selection_state_id = 0
         for runtime_layer_id, layer_index in enumerate(
             ordered_layer_indices
         ):
             resident_name = resident_names[layer_index]
-            indexer_name = indexer_names[layer_index]
+            indexer_name = indexer_names.get(layer_index)
             resident_cache = kv_caches[resident_name]
-            indexer_cache = kv_caches[indexer_name]
+            indexer_cache = (
+                kv_caches[indexer_name] if indexer_name is not None else None
+            )
             if not isinstance(resident_cache, tuple):
                 raise RuntimeError(
                     "DSA resident MLA cache must be a cache tuple: "
@@ -4666,7 +4703,7 @@ class NPUModelRunner(GPUModelRunner):
                         "DSA A5 resident cache must be one packed C8 tensor: "
                         f"layer={resident_name}, entries={len(resident_cache)}"
                     )
-                if (
+                if indexer_cache is not None and (
                     not isinstance(indexer_cache, tuple)
                     or len(indexer_cache) != 2
                 ):
@@ -4674,13 +4711,40 @@ class NPUModelRunner(GPUModelRunner):
                         "DSA A5 Indexer cache must contain C8 key and FP32 "
                         f"scale: layer={indexer_name}"
                     )
+                if indexer_cache is not None:
+                    indexer_key, indexer_scale = indexer_cache
+                    expected_key_tail = (self.block_size, 1, 128)
+                    expected_scale_tail = (self.block_size, 1, 1)
+                    if (
+                        indexer_key.dtype != torch.float8_e4m3fn
+                        or indexer_scale.dtype != torch.float32
+                        or indexer_key.ndim != 4
+                        or indexer_scale.ndim != 4
+                        or tuple(indexer_key.shape[1:])
+                        != expected_key_tail
+                        or tuple(indexer_scale.shape[1:])
+                        != expected_scale_tail
+                        or not indexer_key.is_contiguous()
+                        or not indexer_scale.is_contiguous()
+                    ):
+                        raise RuntimeError(
+                            "DSA A5 Indexer cache violates the fixed "
+                            "FP8-key/FP32-scale ABI: "
+                            f"layer={indexer_name}, "
+                            f"key_shape={tuple(indexer_key.shape)}, "
+                            f"key_dtype={indexer_key.dtype}, "
+                            f"scale_shape={tuple(indexer_scale.shape)}, "
+                            f"scale_dtype={indexer_scale.dtype}"
+                        )
             else:
                 if len(resident_cache) < 2:
                     raise RuntimeError(
                         "DSA resident MLA cache must expose NOPE and ROPE "
                         f"planes: layer={resident_name}"
                     )
-                if not isinstance(indexer_cache, torch.Tensor):
+                if indexer_cache is not None and not isinstance(
+                    indexer_cache, torch.Tensor
+                ):
                     raise RuntimeError(
                         "DSA Indexer cache must be one dense tensor: "
                         f"layer={indexer_name}"
@@ -4700,6 +4764,33 @@ class NPUModelRunner(GPUModelRunner):
                     f"layer={resident_name}, "
                     f"impl={type(resident_impl).__name__}"
                 )
+            if (
+                self.dsa_offload_packed_c8
+                and indexer_cache is not None
+                and not resident_impl.enable_mlapo
+            ):
+                raise RuntimeError(
+                    "DSA A5 full-indexer layer requires effective MLAPO "
+                    "after weight processing: "
+                    f"layer={resident_name}"
+                )
+
+            # shared indexer 层无本层 indexer_cache，记录最近 full 层的
+            # runtime_layer_id 作为其 top-K 选择来源。LIDU cache_slots 仅按
+            # full 层分配紧凑 selection_state_id。
+            selection_state_id: int | None = None
+            selection_source_layer_id: int | None = None
+            if indexer_cache is not None:
+                selection_state_id = next_selection_state_id
+                next_selection_state_id += 1
+                last_full_runtime_layer_id = runtime_layer_id
+            else:
+                if last_full_runtime_layer_id is None:
+                    raise RuntimeError(
+                        "DSA shared-indexer layer precedes any full layer: "
+                        f"layer={resident_name}"
+                    )
+                selection_source_layer_id = last_full_runtime_layer_id
 
             if self.dsa_offload_packed_c8:
                 store.add_packed_layer(
@@ -4717,8 +4808,17 @@ class NPUModelRunner(GPUModelRunner):
                     layer_id=runtime_layer_id,
                     indexer_cache=indexer_cache,
                     runtime=runtime,
+                    selection_state_id=selection_state_id,
+                    selection_source_layer_id=selection_source_layer_id,
                     packed_c8=self.dsa_offload_packed_c8,
                 )
+            )
+
+        if next_selection_state_id != resident_pool.num_layers:
+            raise RuntimeError(
+                "DSA bound selection-state count changed during layer "
+                f"binding: bound={next_selection_state_id}, "
+                f"capacity={resident_pool.num_layers}"
             )
 
         runtime.bind_dram_store(store)
@@ -5819,6 +5919,7 @@ class NPUModelRunner(GPUModelRunner):
         from vllm.model_executor.models.deepseek_v2 import (
             DeepseekV32IndexerCache,
         )
+        from vllm.model_executor.models.utils import extract_layer_index
 
         kv_cache_spec: dict[str, list[KVCacheSpec]] = defaultdict(list)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
@@ -5855,22 +5956,56 @@ class NPUModelRunner(GPUModelRunner):
                     enable_sparse_li_c8_for_layer = bool(getattr(impl, "enable_sparse_li_c8", False))
 
                     if self.dsa_offload_enabled:
-                        if self.dsa_offload_packed_c8 and not (
-                            enable_sparse_sfa_c8_for_layer
-                            and enable_sparse_li_c8_for_layer
-                        ):
+                        skip_topk = bool(getattr(impl, "skip_topk", False))
+                        caps = self.ascend_config.dsa_offload_config.model_capabilities
+                        shared_indices = (
+                            caps.shared_indexer_layer_indices
+                            if caps is not None
+                            else None
+                        )
+                        layer_index = extract_layer_index(layer_name)
+                        declared_shared = bool(
+                            shared_indices is not None
+                            and layer_index in shared_indices
+                        )
+                        if has_indexer and skip_topk:
                             raise RuntimeError(
-                                "Every DSA sparse-attention layer on A5 must "
-                                "enable both packed SFA C8 and LI C8: "
-                                f"layer={layer_name}, "
-                                f"sfa_c8={enable_sparse_sfa_c8_for_layer}, "
-                                f"li_c8={enable_sparse_li_c8_for_layer}."
+                                "DSA sparse offload does not support runtime "
+                                "IndexCache layers that keep a local Indexer "
+                                "while skip_topk is enabled; only checkpoint-"
+                                "declared shared layers without a local Indexer "
+                                f"may reuse LIDU output. layer={layer_name}"
                             )
                         if not has_indexer:
+                            # GLM-5.2 shared indexer 层不建本层 indexer，
+                            # 复用所属 full 层 top-K，以 skip_topk 标识。
+                            # 仅当模型声明确认的 shared 拓扑（indexer_types）
+                            # 时才放行；未声明拓扑的模型（如 DeepSeek 用
+                            # index_topk_freq/pattern 造出的 skip_topk 层）
+                            # 缺 indexer 仍属配置/加载错误，不进入共享复用路径。
+                            if not (skip_topk and declared_shared):
+                                raise RuntimeError(
+                                    "DSA sparse offload requires one independent "
+                                    "Indexer cache for every resident MLA layer; "
+                                    f"layer={layer_name} has no local indexer "
+                                    f"(skip_topk={skip_topk}, declared_shared="
+                                    f"{declared_shared})."
+                                )
+                        if self.dsa_offload_packed_c8 and not enable_sparse_sfa_c8_for_layer:
                             raise RuntimeError(
-                                "DSA sparse offload requires one independent "
-                                "Indexer cache for every resident MLA layer; "
-                                f"layer={layer_name} has no local indexer."
+                                "Every DSA resident layer on A5 must enable "
+                                "packed SFA C8: "
+                                f"layer={layer_name}, "
+                                f"sfa_c8={enable_sparse_sfa_c8_for_layer}."
+                            )
+                        if (
+                            self.dsa_offload_packed_c8
+                            and has_indexer
+                            and not enable_sparse_li_c8_for_layer
+                        ):
+                            raise RuntimeError(
+                                "DSA A5 full-indexer layer must enable LI C8: "
+                                f"layer={layer_name}."
                             )
                         if self.dsa_offload_packed_c8:
                             resident_head_dim = (
@@ -5962,6 +6097,9 @@ class NPUModelRunner(GPUModelRunner):
                         head_size=attn_module.head_dim,
                         dtype=attn_module.dtype,
                         cache_sparse_li_c8=self.dsa_offload_packed_c8,
+                        c8_k_cache_dtype=torch.float8_e4m3fn,
+                        c8_k_scale_cache_dtype=torch.float32,
+                        c8_scale_dim=1,
                     )
 
             elif isinstance(attn_module, CacheOnlyAttentionLayer):

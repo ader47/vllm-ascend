@@ -88,6 +88,18 @@ def _write_swapped_arena(
     torch.npu.synchronize()
 
 
+def _make_unique_packed_rows(num_rows: int) -> torch.Tensor:
+    """Encode the complete source token ID into every opaque packed row."""
+
+    base = torch.arange(_PACKED_ROW_BYTES, dtype=torch.int16).remainder(251).sub(125).to(torch.int8)
+    rows = base.repeat(num_rows, 1)
+    token_ids = torch.arange(num_rows, dtype=torch.int32)
+    rows[:, 0] = token_ids.to(torch.int8)
+    rows[:, 1] = torch.div(token_ids, 256, rounding_mode="floor").to(torch.int8)
+    rows[:, 2] = torch.div(token_ids, 65536, rounding_mode="floor").to(torch.int8)
+    return rows
+
+
 def test_packed_c8_full_block_dump_writes_only_active_rows() -> None:
     source = (
         torch.randint(
@@ -253,6 +265,23 @@ def _launch_fused_lidu(
         inputs["req_entries"],
         cache_slots,
         *outputs,
+    )
+
+
+def _launch_packed_ksc(
+    hbm: torch.Tensor,
+    dram: torch.Tensor,
+    block_table: torch.Tensor,
+    outputs: tuple[torch.Tensor, ...],
+) -> None:
+    torch.ops._C_ascend.npu_dsa_a5_kvcache_scatter_copy_c8_out(
+        hbm,
+        dram,
+        block_table,
+        block_table,
+        outputs[2],
+        outputs[3],
+        outputs[4],
     )
 
 
@@ -467,6 +496,167 @@ def test_packed_c8_fused_lidu_graph_replay_changes_pool_state() -> None:
     )
 
 
+def test_packed_c8_full_shared_next_full_graph_chain() -> None:
+    budget = 6144
+    candidate_len = budget + _BLOCK_SIZE
+    blocks = candidate_len // _BLOCK_SIZE
+    full_inputs = (
+        _make_fused_lidu_inputs(
+            candidate_len=candidate_len,
+            final_len=candidate_len + 1,
+            row_mode=2,
+            seed=41,
+        ),
+        _make_fused_lidu_inputs(
+            candidate_len=candidate_len,
+            final_len=candidate_len + 1,
+            row_mode=2,
+            seed=43,
+        ),
+    )
+    initial_selection_states = torch.full(
+        (2, 2, _cache_row_width(8192)),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    initial_selection_states[:, :, -1].zero_()
+    initial_selection_states[:, 0, -1] = -budget
+
+    expected_states = initial_selection_states.clone()
+    expected_outputs = (
+        _allocate_fused_lidu_outputs(),
+        _allocate_fused_lidu_outputs(),
+    )
+    for state_id in range(2):
+        _launch_fused_lidu(
+            full_inputs[state_id],
+            expected_states[state_id],
+            expected_outputs[state_id],
+        )
+    torch.npu.synchronize()
+    assert [int(outputs[4].cpu()[0]) for outputs in expected_outputs] == [
+        budget,
+        budget,
+    ]
+    assert not torch.equal(
+        expected_outputs[0][2][:, :, :budget],
+        expected_outputs[1][2][:, :, :budget],
+    )
+
+    block_table = torch.arange(
+        blocks,
+        dtype=torch.int32,
+        device="npu",
+    ).view(1, -1)
+    dram_cpu_layers = []
+    dram_layers = []
+    hbm_layers = []
+    for layer_id in range(3):
+        dram_cpu = _make_unique_packed_rows(candidate_len)
+        dram_cpu[:, 3] = layer_id + 1
+        dram_cpu = dram_cpu.view(
+            blocks,
+            _BLOCK_SIZE,
+            1,
+            _PACKED_ROW_BYTES,
+        )
+        dram = _swapped_arena(tuple(dram_cpu.shape))
+        _write_swapped_arena(dram, dram_cpu)
+        dram_cpu_layers.append(dram_cpu)
+        dram_layers.append(dram)
+        hbm_layers.append(torch.zeros_like(dram_cpu, device="npu"))
+
+    graph_states = initial_selection_states.clone()
+    shared_scratch = _allocate_fused_lidu_outputs()
+    shared_attention_snapshot = torch.empty_like(shared_scratch[0])
+    shared_length_snapshot = torch.empty_like(shared_scratch[1])
+    stable_pointers = (
+        graph_states.data_ptr(),
+        *(tensor.data_ptr() for tensor in shared_scratch),
+        shared_attention_snapshot.data_ptr(),
+        shared_length_snapshot.data_ptr(),
+        *(tensor.data_ptr() for tensor in hbm_layers),
+    )
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, pool=torch.npu.graph_pool_handle()):
+        # full 0 produces one complete selection plan. shared 1 consumes the
+        # same scratch but copies from its own DRAM arena into its own HBM.
+        _launch_fused_lidu(
+            full_inputs[0],
+            graph_states[0],
+            shared_scratch,
+        )
+        _launch_packed_ksc(
+            hbm_layers[0],
+            dram_layers[0],
+            block_table,
+            shared_scratch,
+        )
+        _launch_packed_ksc(
+            hbm_layers[1],
+            dram_layers[1],
+            block_table,
+            shared_scratch,
+        )
+        # Snapshot the attention metadata consumed by the shared SFA path so
+        # the following full layer cannot hide an early scratch overwrite.
+        shared_attention_snapshot.copy_(shared_scratch[0])
+        shared_length_snapshot.copy_(shared_scratch[1])
+        # The next full layer owns a different compact selection state and may
+        # overwrite the shared scratch only after the follower consumed it.
+        _launch_fused_lidu(
+            full_inputs[1],
+            graph_states[1],
+            shared_scratch,
+        )
+        _launch_packed_ksc(
+            hbm_layers[2],
+            dram_layers[2],
+            block_table,
+            shared_scratch,
+        )
+
+    graph_states.copy_(initial_selection_states)
+    for hbm in hbm_layers:
+        hbm.zero_()
+    graph.replay()
+    torch.npu.synchronize()
+
+    assert torch.equal(graph_states.cpu(), expected_states.cpu())
+    assert torch.equal(
+        shared_attention_snapshot.cpu(),
+        expected_outputs[0][0].cpu(),
+    )
+    assert torch.equal(
+        shared_length_snapshot.cpu(),
+        expected_outputs[0][1].cpu(),
+    )
+    for actual, expected in zip(shared_scratch, expected_outputs[1]):
+        assert torch.equal(actual.cpu(), expected.cpu())
+    assert stable_pointers == (
+        graph_states.data_ptr(),
+        *(tensor.data_ptr() for tensor in shared_scratch),
+        shared_attention_snapshot.data_ptr(),
+        shared_length_snapshot.data_ptr(),
+        *(tensor.data_ptr() for tensor in hbm_layers),
+    )
+
+    # Layers 0 and 1 consume full 0's plan; layer 2 consumes full 2's plan.
+    source_plans = (expected_outputs[0], expected_outputs[0], expected_outputs[1])
+    probe_indices = (0, budget // 2, budget - 1)
+    for layer_id, outputs in enumerate(source_plans):
+        source_ids = outputs[2][0, 0, :budget].cpu().to(torch.int64)
+        destination_slots = outputs[3][0, 0, :budget].cpu().to(torch.int64)
+        hbm_rows = hbm_layers[layer_id].cpu().view(-1, _PACKED_ROW_BYTES)
+        dram_rows = dram_cpu_layers[layer_id].view(-1, _PACKED_ROW_BYTES)
+        for probe_index in probe_indices:
+            assert torch.equal(
+                hbm_rows[destination_slots[probe_index]],
+                dram_rows[source_ids[probe_index]],
+            )
+
+
 def test_packed_c8_fused_lidu_copy_plan_is_consumed_by_ksc() -> None:
     budget = 6144
     candidate_len = 6272
@@ -488,12 +678,12 @@ def test_packed_c8_fused_lidu_copy_plan_is_consumed_by_ksc() -> None:
     outputs = _allocate_fused_lidu_outputs()
     _launch_fused_lidu(inputs, cache_slots, outputs)
 
-    dram_cpu = torch.randint(
-        -128,
-        128,
-        (blocks, _BLOCK_SIZE, 1, _PACKED_ROW_BYTES),
-        dtype=torch.int16,
-    ).to(torch.int8)
+    dram_cpu = _make_unique_packed_rows(blocks * _BLOCK_SIZE).view(
+        blocks,
+        _BLOCK_SIZE,
+        1,
+        _PACKED_ROW_BYTES,
+    )
     dram = _swapped_arena(tuple(dram_cpu.shape))
     _write_swapped_arena(dram, dram_cpu)
     hbm = torch.zeros_like(dram_cpu, device="npu")
@@ -502,15 +692,7 @@ def test_packed_c8_fused_lidu_copy_plan_is_consumed_by_ksc() -> None:
         dtype=torch.int32,
         device="npu",
     ).view(1, -1)
-    torch.ops._C_ascend.npu_dsa_a5_kvcache_scatter_copy_c8_out(
-        hbm,
-        dram,
-        block_table,
-        block_table,
-        outputs[2],
-        outputs[3],
-        outputs[4],
-    )
+    _launch_packed_ksc(hbm, dram, block_table, outputs)
     torch.npu.synchronize()
 
     source_ids = outputs[2][0, 0, :budget].cpu().to(torch.int64)
