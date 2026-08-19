@@ -19,11 +19,12 @@ from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
     AscendSFAMetadata,
     AscendSFAMetadataBuilder,
+    _should_override_a5_li_cache_dtype,
     custom_kv_rmsnorm_rope,
 )
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.utils import enable_dsa_cp
+from vllm_ascend.utils import AscendDeviceType, enable_dsa_cp
 
 
 class TestAscendSFABackend(TestBase):
@@ -109,6 +110,149 @@ class TestAscendSFABytePackedGather(TestBase):
                 ],
                 async_op=True,
             )
+
+
+class TestAscendSFALICacheABI(TestBase):
+    def test_dsa_keeps_fixed_fp8_fp32_li_cache_abi(self):
+        self.assertFalse(
+            _should_override_a5_li_cache_dtype(
+                enable_sparse_li_c8=True,
+                mlapo_is_quantized=False,
+                dsa_offload_enabled=True,
+            )
+        )
+
+    def test_native_non_dsa_mlapo_keeps_existing_float_fallback(self):
+        self.assertTrue(
+            _should_override_a5_li_cache_dtype(
+                enable_sparse_li_c8=True,
+                mlapo_is_quantized=False,
+                dsa_offload_enabled=False,
+            )
+        )
+
+
+class TestAscendSFAOffloadBinding(TestBase):
+    @staticmethod
+    def _make_impl(*, has_indexer: bool, skip_topk: bool, layer_index: int) -> AscendSFAImpl:
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.dsa_offload_context = None
+        impl.enable_sparse_sfa_c8 = False
+        impl.enable_sparse_li_c8 = False
+        impl.has_indexer = has_indexer
+        impl.skip_topk = skip_topk
+        impl.layer_name = f"model.layers.{layer_index}.self_attn.attn"
+        return impl
+
+    def test_full_context_binds_with_local_indexer(self):
+        impl = self._make_impl(
+            has_indexer=True,
+            skip_topk=False,
+            layer_index=1,
+        )
+        context = SimpleNamespace(indexer_cache=torch.empty(1))
+
+        impl.bind_dsa_offload_context(context)
+
+        self.assertIs(impl.dsa_offload_context, context)
+
+    def test_local_indexer_skip_topk_is_rejected_at_bind(self):
+        impl = self._make_impl(
+            has_indexer=True,
+            skip_topk=True,
+            layer_index=1,
+        )
+        context = SimpleNamespace(indexer_cache=torch.empty(1))
+
+        with self.assertRaisesRegex(RuntimeError, "runtime IndexCache layers"):
+            impl.bind_dsa_offload_context(context)
+
+    @patch("vllm_ascend.attention.sfa_v1.get_ascend_config")
+    def test_shared_context_requires_current_layer_to_be_declared_shared(self, mock_get_ascend_config):
+        mock_get_ascend_config.return_value = SimpleNamespace(
+            dsa_offload_config=SimpleNamespace(
+                model_capabilities=SimpleNamespace(
+                    shared_indexer_layer_indices=(2,),
+                )
+            )
+        )
+        impl = self._make_impl(
+            has_indexer=False,
+            skip_topk=True,
+            layer_index=1,
+        )
+        context = SimpleNamespace(indexer_cache=None)
+
+        with self.assertRaisesRegex(RuntimeError, "declared shared-indexer topology"):
+            impl.bind_dsa_offload_context(context)
+
+    @patch("vllm_ascend.attention.sfa_v1.get_ascend_config")
+    def test_declared_shared_context_binds_without_local_indexer(self, mock_get_ascend_config):
+        mock_get_ascend_config.return_value = SimpleNamespace(
+            dsa_offload_config=SimpleNamespace(
+                model_capabilities=SimpleNamespace(
+                    shared_indexer_layer_indices=(1,),
+                )
+            )
+        )
+        impl = self._make_impl(
+            has_indexer=False,
+            skip_topk=True,
+            layer_index=1,
+        )
+        context = SimpleNamespace(indexer_cache=None)
+
+        impl.bind_dsa_offload_context(context)
+
+        self.assertIs(impl.dsa_offload_context, context)
+
+    @patch(
+        "vllm_ascend.attention.sfa_v1.get_ascend_device_type",
+        return_value=AscendDeviceType.A5,
+    )
+    def test_a5_packed_full_context_requires_li_c8(self, _mock_device):
+        impl = self._make_impl(
+            has_indexer=True,
+            skip_topk=False,
+            layer_index=1,
+        )
+        impl.enable_sparse_sfa_c8 = True
+        context = SimpleNamespace(
+            indexer_cache=(torch.empty(1), torch.empty(1)),
+            packed_c8=True,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "requires sparse LI C8"):
+            impl.bind_dsa_offload_context(context)
+
+    @patch(
+        "vllm_ascend.attention.sfa_v1.get_ascend_device_type",
+        return_value=AscendDeviceType.A5,
+    )
+    @patch("vllm_ascend.attention.sfa_v1.get_ascend_config")
+    def test_a5_packed_shared_context_does_not_require_li_c8(
+        self,
+        mock_get_ascend_config,
+        _mock_device,
+    ):
+        mock_get_ascend_config.return_value = SimpleNamespace(
+            dsa_offload_config=SimpleNamespace(
+                model_capabilities=SimpleNamespace(
+                    shared_indexer_layer_indices=(1,),
+                )
+            )
+        )
+        impl = self._make_impl(
+            has_indexer=False,
+            skip_topk=True,
+            layer_index=1,
+        )
+        impl.enable_sparse_sfa_c8 = True
+        context = SimpleNamespace(indexer_cache=None, packed_c8=True)
+
+        impl.bind_dsa_offload_context(context)
+
+        self.assertIs(impl.dsa_offload_context, context)
 
 
 class TestAscendSFADeviceOperator(TestBase):

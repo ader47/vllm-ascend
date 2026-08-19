@@ -208,6 +208,10 @@ class DSAOffloadRuntime:
         self._graph_capture_row_count = 0
         self._dram_table_row_count = 0
         self._dram_table_signature: tuple[int, int, int] | None = None
+        # shared indexer 新鲜度守卫：每步自增 epoch，并记录最近一次跑过
+        # LIDU 的 full 层，shared 层据此校验其 top-K 来源在本步已就绪。
+        self._selection_epoch = 0
+        self._selection_source_layer: int | None = None
 
     def bind_dram_store(self, store: DSAHotDRAMStore) -> None:
         if self.dram_store is not None:
@@ -230,6 +234,11 @@ class DSAOffloadRuntime:
         store = self.dram_store
         if store is not None:
             store.release_pool_index(pool_index)
+
+    def _begin_selection_epoch(self) -> None:
+        """进入新的一轮逐层 decode 选择：自增 epoch 并清空 full 层来源标记。"""
+        self._selection_epoch += 1
+        self._selection_source_layer = None
 
     def prepare_forward(
         self,
@@ -259,6 +268,7 @@ class DSAOffloadRuntime:
         self.active_num_reqs = int(num_reqs)
         self.execution_num_reqs = 0
         self.dump_launch_count = 0
+        self._begin_selection_epoch()
 
         self._prepare_dump_plan(
             input_batch=input_batch,
@@ -417,6 +427,7 @@ class DSAOffloadRuntime:
             )
         self.execution_num_reqs = execution_num_reqs
         self.dump_launch_count = int(launch_count)
+        self._begin_selection_epoch()
         return execution_num_reqs
 
     def prepare_graph_capture(self, *, row_count: int) -> None:
@@ -445,6 +456,7 @@ class DSAOffloadRuntime:
             self.execution_num_reqs = row_count
             self.dump_job_count = 0
             self.dump_launch_count = row_count
+            self._begin_selection_epoch()
         except Exception:
             try:
                 self.restore_after_graph_capture()
@@ -691,11 +703,21 @@ class DSAOffloadRuntime:
 
 @dataclass(frozen=True)
 class DSALayerOffloadContext:
-    """绑定到一个 ``AscendSFAImpl`` 的逐层稳定资源。"""
+    """绑定到一个 ``AscendSFAImpl`` 的逐层稳定资源。
+
+    full indexer 层持有本层 ``indexer_cache``（``selection_source_layer_id``
+    为 None）；GLM-5.2 的 shared indexer 层 ``indexer_cache`` 为 None，
+    用 ``selection_source_layer_id`` 指向所属 full 层，复用其 LIDU 输出。
+
+    ``selection_state_id`` 只为 full 层分配，用于索引紧凑的 LIDU
+    ``cache_slots``；``layer_id`` 始终索引全部 resident cache/DRAM arena。
+    """
 
     layer_id: int
-    indexer_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    indexer_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None
     runtime: DSAOffloadRuntime
+    selection_state_id: int | None = None
+    selection_source_layer_id: int | None = None
     packed_c8: bool = False
 
     def execute_decode_selection(
@@ -715,6 +737,8 @@ class DSALayerOffloadContext:
         query_dequant_scale: torch.Tensor | None = None,
         query_shape: tuple[int, ...] | None = None,
     ) -> DSAOffloadSelectionOutput:
+        if self.indexer_cache is None or self.selection_state_id is None:
+            raise RuntimeError(f"DSA shared-indexer layer must not run LIDU selection: layer_id={self.layer_id}")
         num_reqs = int(actual_seq_lengths_key.shape[0])
         outputs = self.runtime.get_lidu_outputs(
             num_reqs=num_reqs,
@@ -743,7 +767,7 @@ class DSALayerOffloadContext:
                 final_seq_lengths_kv=actual_seq_lengths_key,
                 row_modes=row_modes,
                 req_pool_entries=resident_pool_indices,
-                cache_slots=self.runtime.resident_token_pool.get_cache_slots(self.layer_id),
+                cache_slots=self.runtime.resident_token_pool.get_cache_slots(self.selection_state_id),
                 attention_slots=attention_slots,
                 resident_seq_lengths=resident_seq_lengths,
                 outputs=outputs,
@@ -763,6 +787,9 @@ class DSALayerOffloadContext:
                 destination_slots=outputs.topk_slots,
                 copy_counts=outputs.miss_count,
             )
+            # KSC 已发射后再公布 full 层来源，shared 层只会消费一份
+            # 同时包含 copy plan 和 attention metadata 的完整融合输出。
+            self.runtime._selection_source_layer = self.layer_id
             return DSAOffloadSelectionOutput(
                 sparse_indices=attention_slots,
                 tail_info=outputs.tail_info,
@@ -778,16 +805,87 @@ class DSALayerOffloadContext:
             key=self.indexer_cache,
             weights=weights,
             req_pool_entries=resident_pool_indices,
-            cache_slots=self.runtime.resident_token_pool.get_cache_slots(self.layer_id),
+            cache_slots=self.runtime.resident_token_pool.get_cache_slots(self.selection_state_id),
             row_modes=row_modes,
             actual_seq_lengths_key=actual_seq_lengths_key,
             block_table=indexer_block_table,
             outputs=outputs,
         )
+        # 记录本步 full 层选择来源，供其 shared 跟随层复用前校验。
+        self.runtime._selection_source_layer = self.layer_id
         store = self.runtime.dram_store
         if store is None:
             raise RuntimeError("DSA layer has no bound DRAM store")
         arenas = store.get_layer_arenas(self.layer_id)
+        kvcache_scatter_copy(
+            resident_nope_cache=resident_cache[0],
+            resident_rope_cache=resident_cache[1],
+            dram_nope_arena=arenas.nope,
+            dram_rope_arena=arenas.rope,
+            resident_block_table=resident_block_table,
+            dram_block_table=dram_block_table,
+            src_token_ids=outputs.topk_index,
+            dst_slots=outputs.topk_slots,
+            copy_counts=outputs.miss_count,
+        )
+        return DSAOffloadSelectionOutput(
+            sparse_indices=outputs.topk_slots,
+            tail_info=outputs.tail_info,
+        )
+
+    def execute_shared_decode_selection(
+        self,
+        *,
+        resident_cache: tuple[torch.Tensor, ...],
+        resident_block_table: torch.Tensor,
+        dram_block_table: torch.Tensor,
+        num_reqs: int,
+    ) -> DSAOffloadSelectionOutput:
+        """shared indexer 层的 decode 选择：复用所属 full 层的 LIDU 输出。
+
+        不跑 LIDU（shared 层无 indexer 权重），只对本层 resident/DRAM
+        arena 跑 KSC。新鲜度守卫确保所属 full 层在本步已先跑过 LIDU。
+        """
+        if self.indexer_cache is not None or self.selection_source_layer_id is None:
+            raise RuntimeError(f"DSA full-indexer layer must use execute_decode_selection: layer_id={self.layer_id}")
+        if self.runtime._selection_source_layer != self.selection_source_layer_id:
+            raise RuntimeError(
+                "DSA shared-indexer selection source is stale: "
+                f"layer_id={self.layer_id}, "
+                f"expected_source={self.selection_source_layer_id}, "
+                f"current_source={self.runtime._selection_source_layer}, "
+                f"epoch={self.runtime._selection_epoch}"
+            )
+        outputs = self.runtime.get_lidu_outputs(num_reqs=int(num_reqs))
+        store = self.runtime.dram_store
+        if store is None:
+            raise RuntimeError("DSA layer has no bound DRAM store")
+        arenas = store.get_layer_arenas(self.layer_id)
+        if self.packed_c8:
+            if len(resident_cache) != 1 or arenas.packed is None:
+                raise RuntimeError("DSA A5 shared layer requires one packed resident cache and packed DRAM arena")
+            attention_slots_buffer = self.runtime._a5_attention_slots
+            resident_seq_lengths_buffer = self.runtime._a5_resident_seq_lengths
+            if attention_slots_buffer is None or resident_seq_lengths_buffer is None:
+                raise RuntimeError("DSA A5 C8 context has no preallocated selection scratch")
+            attention_slots = attention_slots_buffer[:num_reqs]
+            resident_seq_lengths = resident_seq_lengths_buffer[:num_reqs]
+            a5_kvcache_scatter_copy_c8(
+                resident_packed_cache=resident_cache[0],
+                dram_packed_arena=arenas.packed,
+                resident_block_table=resident_block_table,
+                dram_block_table=dram_block_table,
+                source_token_ids=outputs.topk_index,
+                destination_slots=outputs.topk_slots,
+                copy_counts=outputs.miss_count,
+            )
+            return DSAOffloadSelectionOutput(
+                sparse_indices=attention_slots,
+                tail_info=outputs.tail_info,
+                resident_seq_lengths=resident_seq_lengths,
+            )
+        if len(resident_cache) < 2:
+            raise RuntimeError("DSA bf16 shared layer requires NOPE and ROPE resident caches")
         kvcache_scatter_copy(
             resident_nope_cache=resident_cache[0],
             resident_rope_cache=resident_cache[1],

@@ -200,11 +200,23 @@ def build_dsa_kv_cache_groups(
             f"resident_layers={len(resident_specs)}, "
             f"foreign_specs={tuple(sorted(type(spec).__name__ for spec in foreign_specs.values()))}"
         )
-    if len(indexer_specs) != len(resident_specs):
+    if len(indexer_specs) > len(resident_specs):
         raise RuntimeError(
-            "DSA split KV-cache requires one Indexer cache per resident MLA "
-            f"layer: indexer_layers={len(indexer_specs)}, "
+            "DSA split KV-cache cannot host more Indexer caches than resident "
+            f"MLA layers: indexer_layers={len(indexer_specs)}, "
             f"resident_layers={len(resident_specs)}"
+        )
+
+    # GLM-5.2 共享 indexer 拓扑下 indexer 层是 resident 层的真子集（仅 full
+    # 层建 indexer）。无论两个 plane 的层数是否相同，都要校验 Indexer
+    # 下标是 resident 下标的子集，避免等基数但错位的映射被静默接受。
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    resident_indices = {extract_layer_index(name) for name in resident_specs}
+    orphan_indexer = sorted(name for name in indexer_specs if extract_layer_index(name) not in resident_indices)
+    if orphan_indexer:
+        raise RuntimeError(
+            f"DSA Indexer cache has no matching resident MLA layer: orphan_indexer_layers={tuple(orphan_indexer)}"
         )
 
     return [

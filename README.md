@@ -133,7 +133,7 @@ A5 两个开关全关或半开会在启动期明确拒绝；A3 继续使用既�
 算子链。A5 C8 的非 MTP decode 已切换为
 `vllm_a5_li_manage_nomtp_c8 -> vllm_a5_kvcache_scatter_copy_c8 -> native QSFA`；
 新融合路径在真实 A5 上完成构建、数值对照、eager 精度和 graph replay 前仍
-属于待验收能力。MTP/LIM 不在本阶段路径内。
+属于待验收能力。
 
 ## 当前边界
 
@@ -157,6 +157,7 @@ A5 两个开关全关或半开会在启动期明确拒绝；A3 继续使用既�
 ## 文档与测试入口
 
 - [DSA 稀疏卸载详细设计](docs/source/developer_guide/Design_Documents/dsa_offload_design.md)
+- [GLM-5.2 A5 DSA 稀疏卸载修复与算子接入方案](docs/source/developer_guide/Design_Documents/glm52_a5_dsa_integration_plan.md)
 - [DSA demo 与测试说明](examples/dsa_demo/README.md)
 - [上游 vLLM-Ascend README](README.upstream.md)
 

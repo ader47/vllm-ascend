@@ -2,7 +2,10 @@
 
 from types import SimpleNamespace
 
-from vllm_ascend.patch.worker.patch_deepseek_v2 import _should_skip_indexer_init
+from vllm_ascend.patch.worker.patch_deepseek_v2 import (
+    _resolve_skip_topk,
+    _should_skip_indexer_init,
+)
 
 
 def _config(**overrides) -> SimpleNamespace:
@@ -31,6 +34,38 @@ def test_mtp_layer_keeps_indexer():
     indexer_types = ["full"] * 80 + ["shared"]
     assert not _should_skip_indexer_init(
         _config(indexer_types=indexer_types),
+        "model.layers.80.self_attn",
+        skip_topk=True,
+    )
+
+
+def test_declared_shared_topology_overrides_legacy_full_policy():
+    config = _config(
+        indexer_types=["full", "full", "shared"],
+        index_topk_freq=1,
+    )
+
+    assert _resolve_skip_topk(config, "model.layers.2.self_attn")
+
+
+def test_declared_full_topology_overrides_legacy_skip_policy():
+    config = _config(
+        indexer_types=["full", "full", "full"],
+        index_topk_pattern=["F", "F", "S"],
+    )
+
+    assert not _resolve_skip_topk(config, "model.layers.2.self_attn")
+
+
+def test_mtp_layer_computes_topk_on_first_iteration():
+    config = _config(
+        indexer_types=["full"] * 80 + ["shared"],
+        index_topk_pattern=["F"] * 80 + ["S"],
+    )
+
+    assert not _resolve_skip_topk(config, "model.layers.80.self_attn")
+    assert not _should_skip_indexer_init(
+        config,
         "model.layers.80.self_attn",
         skip_topk=True,
     )

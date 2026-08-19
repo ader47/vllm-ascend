@@ -84,6 +84,9 @@ class DSAResidentTokenPool:
         self._free_indices = deque(range(self.max_num_reqs))
         self._request_to_index: dict[Hashable, int] = {}
         self._request_target_budgets: dict[Hashable, int] = {}
+        # ``num_layers`` 是紧凑的 selection-state 数量：未声明共享拓扑时
+        # 等于 resident 层数；GLM-5.2 只为 full Indexer 层分配，shared 层
+        # 复用所属 full 层的状态，不保留死行。
         self._cache_slots = torch.full(
             (
                 self.num_layers,

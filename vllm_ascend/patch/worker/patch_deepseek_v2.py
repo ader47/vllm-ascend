@@ -24,25 +24,64 @@ from vllm.model_executor.models.deepseek_v2 import (
 from vllm.model_executor.models.utils import extract_layer_index
 
 
-def _should_skip_indexer_init(
+def _get_declared_indexer_type(
     config: DeepseekV2Config | DeepseekV3Config,
     prefix: str,
-    skip_topk: bool,
-) -> bool:
-    if not skip_topk:
-        return False
-
+) -> str | None:
     layer_id = extract_layer_index(prefix)
     num_hidden_layers = getattr(config, "num_hidden_layers", None)
     if num_hidden_layers is not None and layer_id >= num_hidden_layers:
-        return False
+        return None
 
     # GLM-5.2 describes checkpoint-level shared indexers explicitly. Runtime
     # IndexCache overrides on GLM-5.1 only skip top-k computation; its
     # checkpoint still contains an Indexer for every layer.
     indexer_types = getattr(config, "indexer_types", None)
     indexer_type = indexer_types[layer_id] if indexer_types is not None and layer_id < len(indexer_types) else None
-    return isinstance(indexer_type, str) and indexer_type.lower() == "shared"
+    if isinstance(indexer_type, str):
+        normalized = indexer_type.lower()
+        if normalized in {"full", "shared"}:
+            return normalized
+    return None
+
+
+def _should_skip_indexer_init(
+    config: DeepseekV2Config | DeepseekV3Config,
+    prefix: str,
+    skip_topk: bool,
+) -> bool:
+    return skip_topk and _get_declared_indexer_type(config, prefix) == "shared"
+
+
+def _resolve_skip_topk(
+    config: DeepseekV2Config | DeepseekV3Config,
+    prefix: str,
+) -> bool:
+    """Resolve whether this layer reuses a preceding layer's top-k.
+
+    ``indexer_types`` describes the checkpoint module topology and therefore
+    takes precedence over the legacy runtime IndexCache frequency/pattern.
+    MTP layers sit outside the base hidden-layer topology. They must start with
+    top-k computation enabled so step 0 initializes their local top-k buffer;
+    the speculative proposer may enable reuse for later MTP iterations.
+    """
+
+    declared_indexer_type = _get_declared_indexer_type(config, prefix)
+    if declared_indexer_type is not None:
+        return declared_indexer_type == "shared"
+
+    layer_id = extract_layer_index(prefix)
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    if num_hidden_layers is not None and layer_id >= num_hidden_layers:
+        return False
+
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    if index_topk_pattern is not None:
+        return 0 <= layer_id < len(index_topk_pattern) and index_topk_pattern[layer_id] == "S"
+
+    index_topk_freq = getattr(config, "index_topk_freq", 1)
+    index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
+    return max(layer_id - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
 
 
 def _deepseek_v2_mla_attention_init(
@@ -184,37 +223,7 @@ def _deepseek_v2_mla_attention_init(
     #
     # skip_topk controls top-k reuse. Indexer initialization is skipped only
     # when the checkpoint marks this layer as sharing another layer's Indexer.
-    _skip_topk = False
-    _index_topk_freq = getattr(
-        config,
-        "index_topk_freq",
-        1,
-    )
-    _index_topk_pattern = getattr(
-        config,
-        "index_topk_pattern",
-        None,
-    )
-    _index_skip_topk_offset = getattr(
-        config,
-        "index_skip_topk_offset",
-        2,
-    )
-
-    layer_id = extract_layer_index(prefix)
-
-    if _index_topk_pattern is None:
-        _skip_topk = (
-            max(
-                layer_id - _index_skip_topk_offset + 1,
-                0,
-            )
-            % _index_topk_freq
-            != 0
-        )
-    elif 0 <= layer_id < len(_index_topk_pattern):
-        _skip_topk = _index_topk_pattern[layer_id] == "S"
-
+    _skip_topk = _resolve_skip_topk(config, prefix)
     skip_indexer_init = _should_skip_indexer_init(config, prefix, _skip_topk)
     if self.is_v32 and not skip_indexer_init:
         self.indexer_rope_emb = get_rope(
