@@ -98,7 +98,11 @@ class _TopManager:
     ) -> None:
         self.coordinator = coordinator
         self.max_model_len = max_model_len
-        self.empty_kv_cache_blocks = SimpleNamespace(blocks=((), ()))
+        self.empty_kv_cache_blocks = SimpleNamespace(
+            blocks=tuple(
+                () for _ in range(coordinator.num_single_type_manager)
+            )
+        )
 
     @staticmethod
     def create_kv_cache_blocks(blocks):
@@ -118,31 +122,45 @@ def _make_manager(
     *,
     indexer_blocks: int = 128,
     resident_blocks: int = 64,
+    mtp_full_blocks: int | None = None,
+    sparse_tail_block_count: int = 1,
 ) -> tuple[_TopManager, DSAKVCacheCoordinator]:
     indexer_pool = _Pool(indexer_blocks, id_base=1000)
     resident_pool = _Pool(resident_blocks, id_base=2000)
     indexer_manager = _SingleTypeManager(indexer_pool)
     resident_manager = _SingleTypeManager(resident_pool)
 
+    managers = [indexer_manager, resident_manager]
+    pools = [indexer_pool, resident_pool]
+    mtp_full_manager = None
+    mtp_full_group_id = None
+    if mtp_full_blocks is not None:
+        mtp_full_pool = _Pool(mtp_full_blocks, id_base=3000)
+        mtp_full_manager = _SingleTypeManager(mtp_full_pool)
+        mtp_full_manager.use_eagle = True
+        mtp_full_group_id = len(managers)
+        managers.append(mtp_full_manager)
+        pools.append(mtp_full_pool)
+
     coordinator = object.__new__(DSAKVCacheCoordinator)
     coordinator.max_model_len = 16384
-    coordinator.num_single_type_manager = 2
-    coordinator.group_ids = SimpleNamespace(indexer=0, resident_mla=1)
+    coordinator.num_single_type_manager = len(managers)
+    coordinator.group_ids = SimpleNamespace(
+        indexer=0,
+        resident_mla=1,
+        mtp_full=mtp_full_group_id,
+    )
     coordinator.indexer_manager = indexer_manager
     coordinator.resident_manager = resident_manager
-    coordinator.single_type_managers = (
-        indexer_manager,
-        resident_manager,
-    )
-    coordinator.physical_block_pools = (
-        indexer_pool,
-        resident_pool,
-    )
+    coordinator.mtp_full_manager = mtp_full_manager
+    coordinator.single_type_managers = tuple(managers)
+    coordinator.physical_block_pools = tuple(pools)
     coordinator.request_cache_layout = DSARequestCachePlanner(
         block_size=128,
         sparse_activation_tokens=2048,
         prompt_budget_thresholds=(),
         resident_budget_tokens=(2048,),
+        sparse_tail_block_count=sparse_tail_block_count,
     )
     return _TopManager(coordinator), coordinator
 
@@ -273,10 +291,114 @@ def test_block_aligned_prefill_enter_allocates_a_new_tail_block() -> None:
     assert len(coordinator.resident_manager.req_to_blocks["req"]) == 17
 
 
+def test_mtp_enter_installs_two_fixed_parity_tail_blocks() -> None:
+    manager, coordinator = _make_manager(
+        mtp_full_blocks=128,
+        sparse_tail_block_count=2,
+    )
+    request = _Request("req", 3000, 0, 0, 3000)
+    allocate_dsa_slots(manager, request, 3000)  # type: ignore[arg-type]
+
+    request.num_computed_tokens = 3000
+    coordinator.release_prefill_resident_blocks(
+        "req",
+        preserve_tail_block=True,
+    )
+    preserved_tail = coordinator.resident_manager.req_to_blocks["req"][0]
+
+    request.num_output_tokens = 1
+    request.num_tokens = 3001
+    allocate_dsa_slots(  # type: ignore[arg-type]
+        manager,
+        request,
+        4,
+        num_lookahead_tokens=3,
+    )
+
+    resident_blocks = coordinator.resident_manager.req_to_blocks["req"]
+    assert len(resident_blocks) == 18
+    # logical block 23 is odd, therefore the preserved dense tail must occupy
+    # the fixed parity-1 column after the 16 budget blocks.
+    assert resident_blocks[17] == preserved_tail
+
+    resident_ids = tuple(block.block_id for block in resident_blocks)
+    request.num_computed_tokens = 3004
+    request.num_output_tokens = 5
+    request.num_tokens = 3005
+    allocate_dsa_slots(  # type: ignore[arg-type]
+        manager,
+        request,
+        4,
+        num_lookahead_tokens=3,
+    )
+    assert tuple(
+        block.block_id
+        for block in coordinator.resident_manager.req_to_blocks["req"]
+    ) == resident_ids
+
+
+def test_mtp_full_plane_stays_dense_after_target_enters_sparse() -> None:
+    manager, coordinator = _make_manager(
+        mtp_full_blocks=128,
+        sparse_tail_block_count=2,
+    )
+    mtp_manager = coordinator.mtp_full_manager
+    assert mtp_manager is not None
+    request = _Request("req", 3000, 0, 0, 3000)
+
+    allocate_dsa_slots(manager, request, 3000)  # type: ignore[arg-type]
+    assert len(coordinator.indexer_manager.req_to_blocks["req"]) == 24
+    assert len(coordinator.resident_manager.req_to_blocks["req"]) == 24
+    assert len(mtp_manager.req_to_blocks["req"]) == 24
+
+    request.num_computed_tokens = 3000
+    coordinator.release_prefill_resident_blocks(
+        "req",
+        preserve_tail_block=True,
+    )
+
+    request.num_output_tokens = 1
+    request.num_tokens = 3001
+    allocate_dsa_slots(  # type: ignore[arg-type]
+        manager,
+        request,
+        4,
+        num_lookahead_tokens=3,
+    )
+    resident_ids = tuple(
+        block.block_id
+        for block in coordinator.resident_manager.req_to_blocks["req"]
+    )
+    assert len(resident_ids) == 18
+    assert len(coordinator.indexer_manager.req_to_blocks["req"]) == 24
+    assert len(mtp_manager.req_to_blocks["req"]) == 24
+
+    request.num_computed_tokens = 3072
+    request.num_output_tokens = 73
+    request.num_tokens = 3073
+    allocated = allocate_dsa_slots(  # type: ignore[arg-type]
+        manager,
+        request,
+        4,
+        num_lookahead_tokens=3,
+    )
+    assert allocated is not None
+    assert len(allocated[0]) == 1
+    assert len(allocated[1]) == 0
+    assert len(allocated[2]) == 1
+    assert len(coordinator.indexer_manager.req_to_blocks["req"]) == 25
+    assert len(mtp_manager.req_to_blocks["req"]) == 25
+    assert tuple(
+        block.block_id
+        for block in coordinator.resident_manager.req_to_blocks["req"]
+    ) == resident_ids
+
+
 def test_dense_component_failure_does_not_allocate_or_commit() -> None:
     manager, coordinator = _make_manager(
         indexer_blocks=32,
         resident_blocks=1,
+        mtp_full_blocks=32,
     )
     request = _Request("req", 256, 0, 0, 256)
 
@@ -291,10 +413,35 @@ def test_dense_component_failure_does_not_allocate_or_commit() -> None:
     assert coordinator.request_cache_layout.get_state("req") is None
     assert not coordinator.indexer_manager.req_to_blocks["req"]
     assert not coordinator.resident_manager.req_to_blocks["req"]
+    assert coordinator.mtp_full_manager is not None
+    assert not coordinator.mtp_full_manager.req_to_blocks["req"]
 
 
-def test_free_clears_both_planes_and_request_cache_state() -> None:
-    manager, coordinator = _make_manager()
+def test_mtp_component_failure_does_not_allocate_or_commit() -> None:
+    manager, coordinator = _make_manager(
+        indexer_blocks=32,
+        resident_blocks=32,
+        mtp_full_blocks=1,
+    )
+    request = _Request("req", 256, 0, 0, 256)
+
+    assert (
+        allocate_dsa_slots(  # type: ignore[arg-type]
+            manager,
+            request,
+            256,
+        )
+        is None
+    )
+    assert coordinator.request_cache_layout.get_state("req") is None
+    assert not coordinator.indexer_manager.req_to_blocks["req"]
+    assert not coordinator.resident_manager.req_to_blocks["req"]
+    assert coordinator.mtp_full_manager is not None
+    assert not coordinator.mtp_full_manager.req_to_blocks["req"]
+
+
+def test_free_clears_all_physical_planes_and_request_cache_state() -> None:
+    manager, coordinator = _make_manager(mtp_full_blocks=64)
     request = _Request("req", 512, 0, 0, 512)
     allocate_dsa_slots(manager, request, 512)  # type: ignore[arg-type]
 
@@ -302,4 +449,6 @@ def test_free_clears_both_planes_and_request_cache_state() -> None:
 
     assert "req" not in coordinator.indexer_manager.req_to_blocks
     assert "req" not in coordinator.resident_manager.req_to_blocks
+    assert coordinator.mtp_full_manager is not None
+    assert "req" not in coordinator.mtp_full_manager.req_to_blocks
     assert coordinator.request_cache_layout.get_state("req") is None

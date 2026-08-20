@@ -392,6 +392,8 @@ _distributed_utils.get_decode_context_model_parallel_rank = MagicMock(  # type: 
 _distributed_utils.get_decode_context_model_parallel_world_size = MagicMock(  # type: ignore[attr-defined]
     return_value=1
 )
+# Other collected UTs import DSA-CP builders through model_runner_v1.
+_distributed_utils.all_gather_async = MagicMock()  # type: ignore[attr-defined]
 sys.modules["vllm_ascend.distributed.utils"] = _distributed_utils
 
 _kv_transfer_init = _make_pkg("vllm_ascend.distributed.kv_transfer")

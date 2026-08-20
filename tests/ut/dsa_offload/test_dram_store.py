@@ -104,7 +104,19 @@ def test_reservation_is_idempotent_and_release_reclaims_whole_row() -> None:
     assert active[1, 0] == first.physical_block_ids[0]
     assert active[1, 2] == first.physical_block_ids[1]
 
+    store.commit_durable_full_block_counts(
+        pool_indices=np.array([0, 1], dtype=np.intp),
+        full_block_counts=np.array([3, 1], dtype=np.int32),
+    )
+    durable = np.empty(2, dtype=np.int32)
+    store.gather_durable_full_block_counts(
+        pool_indices=np.array([1, 0], dtype=np.intp),
+        output=durable,
+    )
+    assert durable.tolist() == [1, 3]
+
     store.release_pool_index(0)
     assert store.num_free_blocks == 7
     assert np.count_nonzero(store.logical_block_table[0]) == 0
+    assert store.durable_full_block_counts[0] == 0
     assert store.logical_block_table[1, 0] != 0

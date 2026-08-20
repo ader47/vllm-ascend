@@ -21,8 +21,9 @@
 - 当前 checkout 的自定义算子已经完整编译并重新安装；
 - Ascend 910C 首版使用 PP=1、DCP=1、PCP=1；
 - `block_size=128`；
-- 关闭 async scheduling、prefix cache、MTP/speculative decoding、KV
-  transfer 和 KV-cache metrics/events；
+- 关闭 async scheduling、prefix cache、KV transfer 和 KV-cache
+  metrics/events；如启用 speculative decoding，只允许 A5 packed-C8
+  下固定 MTP3 与 greedy sampling；
 - 正式精度和性能测试关闭 DSA trace points。
 
 脚本只设置必要的 vLLM/vLLM-Ascend 原生环境变量。DSA 策略参数全部位于
@@ -58,6 +59,7 @@ MAX_MODEL_LEN = 8192
 MAX_NUM_BATCHED_TOKENS = 8192
 ENABLE_CHUNKED_PREFILL = False
 ENABLE_A5_PACKED_C8_DSA = False  # A5 W4A4C8 设 True；A3 W4A8 保持 False
+ENABLE_MTP = False  # A5 C8 上设 True 后固定启用 3 个 draft token
 RESULT_JSON = None  # 需要保存对照 token IDs 时填写路径
 ```
 
@@ -84,11 +86,12 @@ python examples/dsa_demo/simple_prompt_test.py
 `MAX_NUM_BATCHED_TOKENS`。实际阈值覆盖应使用 tokenizer token 长度，不要把
 字符数当 token 数。
 
-graph 模式下，单 token DENSE/ENTER/SPARSE 任意混排可进入统一 FULL graph；
-prefill、multi-token、capture-size miss 或其他原生动态 blocker 会被 DSA
-显式送入 true eager，不会执行一张仅覆盖部分 DSA metadata 的 piecewise
-graph。非法 async 配置由 `tests/ut/dsa_offload/test_config.py` 覆盖，不再
-为了这一项给最小脚本增加独立运行模式。
+graph 模式下，普通 Q=1 或 MTP3 的 uniform Q=4
+DENSE/ENTER/SPARSE 任意混排可进入统一 FULL graph；prefill、非 uniform
+query、capture-size miss 或其他原生动态 blocker 会被 DSA 显式送入 true
+eager，不会执行一张仅覆盖部分 DSA metadata 的 piecewise graph。MTP3 的
+双尾块覆盖跨 128-token 边界，不通过临时降级 Q=1 规避。非法 async 配置由
+`tests/ut/dsa_offload/test_config.py` 覆盖。
 
 chunked prefill 复用 vLLM v0.23 原生调度。把
 `ENABLE_CHUNKED_PREFILL=True`，并把 `MAX_NUM_BATCHED_TOKENS` 调到小于
@@ -229,7 +232,19 @@ SAFETENSORS_LOAD_STRATEGY="prefetch"
 该开关会在 `additional_config` 同时写入
 `enable_sparse_sfa_c8=true` 与 `enable_sparse_li_c8=true`。不要只开其中
 一个；当前 A5 DSA 会在初始化期拒绝半开布局。W4A4C8 仍使用
-`--quantization ascend`，当前阶段不要传 `--speculative-config`。
+`--quantization ascend`。需要验证 MTP3 时再设置：
+
+```bash
+ENABLE_MTP="true"
+```
+
+启动脚本会同时改用 `sparse_activation_tokens=8192`、resident 档位
+`8192/10240/12288`，并传入
+`{"method":"mtp","num_speculative_tokens":3}`。MTP3 只接受
+`temperature=0.0`；target 可复用 uniform FULL graph，GLM proposer 按社区
+基线保持 eager。MTP proposer 使用独立 BF16 full-cache group，不进入 target
+DSA resident/DRAM 数据面；默认 ratio=3 时启动容量报告应显示 target Indexer
+`3N`、target resident `N`、MTP full `3N` 三个物理 pool。
 若修改了 `SERVED_MODEL_NAME`，同步把 `stream_chat_client.py` 顶部的
 `MODEL_NAME` 改成相同值。
 
@@ -370,7 +385,7 @@ LV-Eval 或 CLongEval 官方排行榜分数。正式精度对比应保持相同�
 - async scheduling；
 - prefix cache；
 - preemption/resume；
-- speculative decoding/MTP；
+- 非 MTP speculative method、MTP draft 数不等于 3、非 greedy MTP；
 - KV transfer connector；
 - context parallel 和 pipeline parallel；
 - KV-cache metrics/events；

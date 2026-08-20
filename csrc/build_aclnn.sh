@@ -230,6 +230,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "store_kv_block"
         "store_kv_block_metadata"
         "vllm_a5_li_manage_nomtp_c8"
+        "vllm_a5_li_manage_c8"
         "vllm_a5_kvcache_scatter_copy_c8"
         "kv_cache_full_block_dump_c8"
     )

@@ -37,6 +37,7 @@ def _make_runtime(
     max_num_reqs: int = 1,
     *,
     packed_c8: bool = False,
+    max_decode_query_len: int = 1,
     resident_layer_count: int = 2,
     selection_state_count: int = 2,
 ) -> tuple[
@@ -61,6 +62,7 @@ def _make_runtime(
         device=torch.device("cpu"),
         pin_memory=False,
         packed_c8=packed_c8,
+        max_decode_query_len=max_decode_query_len,
     )
     store = DSAHotDRAMStore(
         usable_blocks=8,
@@ -128,6 +130,10 @@ def _full_context(
 def test_a5_selection_scratch_is_allocated_only_for_packed_c8() -> None:
     _, bf16_runtime, _ = _make_runtime()
     _, c8_runtime, _ = _make_runtime(packed_c8=True)
+    _, mtp_runtime, _ = _make_runtime(
+        packed_c8=True,
+        max_decode_query_len=4,
+    )
 
     assert bf16_runtime._a5_attention_slots is None
     assert bf16_runtime._a5_resident_seq_lengths is None
@@ -135,6 +141,29 @@ def test_a5_selection_scratch_is_allocated_only_for_packed_c8() -> None:
     assert c8_runtime._a5_attention_slots.shape == (1, 1, 2176)
     assert c8_runtime._a5_resident_seq_lengths is not None
     assert c8_runtime._a5_resident_seq_lengths.shape == (1,)
+    assert mtp_runtime._a5_attention_slots is not None
+    assert mtp_runtime._a5_attention_slots.shape == (4, 1, 2176)
+
+
+def test_mtp_sparse_candidate_length_is_the_durable_dram_prefix() -> None:
+    resident_pool, runtime, _ = _make_runtime(
+        max_num_reqs=3,
+        max_decode_query_len=4,
+    )
+    state = DSAInputBatchCacheLayout(
+        max_num_reqs=3,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        resident_token_pool=resident_pool,
+    )
+    runtime.active_num_reqs = 3
+    runtime._tokens_after_schedule[:3] = [2049, 2176, 2177]
+    runtime._durable_full_blocks[:3] = [0, 0, 16]
+    state.row_modes_cpu[:3] = [1, 1, 2]
+
+    runtime._refresh_candidate_lens(state)
+
+    assert state.candidate_lens_cpu[:3].tolist() == [2049, 2176, 2048]
 
 
 def test_candidate_lengths_keep_dense_history_and_exclude_sparse_tail() -> None:
@@ -644,6 +673,7 @@ def test_dump_plan_is_compact_and_idempotent() -> None:
         num_reqs=1,
         num_tokens=257,
         resident_group_id=0,
+        decode_forward=False,
     )
 
     assert returned_positions.data_ptr() == positions.data_ptr()
@@ -660,8 +690,86 @@ def test_dump_plan_is_compact_and_idempotent() -> None:
         num_reqs=1,
         num_tokens=257,
         resident_group_id=0,
+        decode_forward=False,
     )
     assert runtime.dump_job_count == 0
+
+
+def test_mtp_double_tail_crosses_boundary_and_dumps_on_next_outer_step() -> None:
+    resident_pool, runtime, store = _make_runtime(
+        max_decode_query_len=4,
+    )
+    state = DSAInputBatchCacheLayout(
+        max_num_reqs=1,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        resident_token_pool=resident_pool,
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=["req-0"],
+        req_id_to_index={"req-0": 0},
+        num_computed_tokens_cpu=np.array([381], dtype=np.int32),
+        block_table=[_ResidentBlockTable()],
+    )
+    state.refresh(
+        input_batch=input_batch,
+        projection=DSARequestCacheLayoutProjection(
+            request_ids=("req-0",),
+            stages=(int(DSARequestCacheStage.SPARSE_DECODE),),
+            target_resident_budget_tokens=(256,),
+            sparse_budget_tokens=(256,),
+            resident_valid_tokens=(382,),
+            resident_block_table_replacements=(),
+        ),
+    )
+    input_batch.block_table[0]._rows = np.array(
+        [[10, 11, 12, 13]],
+        dtype=np.int32,
+    )
+    input_batch.block_table[0].num_blocks_per_row[0] = 4
+    reservation = store.reserve_blocks(
+        pool_indices=np.array([0, 0], dtype=np.intp),
+        logical_block_indices=np.array([0, 1], dtype=np.intp),
+    )
+    assert reservation.new_mask.tolist() == [True, True]
+    store.commit_durable_full_block_counts(
+        pool_indices=np.array([0], dtype=np.intp),
+        full_block_counts=np.array([2], dtype=np.int32),
+    )
+
+    resident_positions = runtime.prepare_forward(
+        input_batch=input_batch,
+        state=state,
+        num_scheduled_tokens=np.array([4], dtype=np.int32),
+        req_indices=torch.zeros(4, dtype=torch.int64),
+        positions=torch.arange(381, 385, dtype=torch.int64),
+        num_reqs=1,
+        num_tokens=4,
+        resident_group_id=0,
+        decode_forward=True,
+    )
+    assert resident_positions.tolist() == [381, 382, 383, 384]
+    assert runtime.dump_job_count == 0
+
+    # Acceptance advances the durable prefix to logical block 2. The next
+    # outer step persists parity-0 tail block 12 before any new KV write.
+    input_batch.num_computed_tokens_cpu[0] = 384
+    runtime.prepare_forward(
+        input_batch=input_batch,
+        state=state,
+        num_scheduled_tokens=np.array([4], dtype=np.int32),
+        req_indices=torch.zeros(4, dtype=torch.int64),
+        positions=torch.arange(384, 388, dtype=torch.int64),
+        num_reqs=1,
+        num_tokens=4,
+        resident_group_id=0,
+        decode_forward=True,
+    )
+    assert runtime.dump_before_cache_write
+    assert runtime.dump_job_count == 1
+    assert runtime.dump_src_block_ids.np[0] == 12
+    assert store.durable_full_block_counts[0] == 3
 
 
 def test_consecutive_prefill_chunks_dump_only_newly_completed_blocks() -> None:
@@ -700,6 +808,7 @@ def test_consecutive_prefill_chunks_dump_only_newly_completed_blocks() -> None:
         num_reqs=1,
         num_tokens=257,
         resident_group_id=0,
+        decode_forward=False,
     )
     assert runtime.dump_job_count == 2
     first_two_dram_blocks = store.logical_block_table[0, :2].copy()
@@ -714,6 +823,7 @@ def test_consecutive_prefill_chunks_dump_only_newly_completed_blocks() -> None:
         num_reqs=1,
         num_tokens=128,
         resident_group_id=0,
+        decode_forward=False,
     )
 
     assert runtime.dump_job_count == 1
@@ -723,7 +833,7 @@ def test_consecutive_prefill_chunks_dump_only_newly_completed_blocks() -> None:
 
 
 def test_enter_rejects_missing_dram_source_blocks() -> None:
-    resident_pool, runtime, _ = _make_runtime()
+    resident_pool, runtime, store = _make_runtime()
     state = DSAInputBatchCacheLayout(
         max_num_reqs=1,
         device=torch.device("cpu"),
@@ -753,6 +863,9 @@ def test_enter_rejects_missing_dram_source_blocks() -> None:
             ),
         ),
     )
+    # Simulate a broken ledger: the durable watermark says two prompt blocks
+    # were persisted, but their logical DRAM entries are still null.
+    store.durable_full_block_counts[0] = 2
 
     try:
         runtime.prepare_forward(
@@ -764,6 +877,7 @@ def test_enter_rejects_missing_dram_source_blocks() -> None:
             num_reqs=1,
             num_tokens=1,
             resident_group_id=0,
+            decode_forward=True,
         )
     except RuntimeError as error:
         assert "incomplete DRAM block table" in str(error)
@@ -791,7 +905,7 @@ def test_graph_execution_view_pads_dump_jobs_with_noop_rows() -> None:
     assert runtime.dump_dst_block_ids.gpu[:4].tolist() == [9, -1, -1, -1]
 
 
-def test_eager_execution_view_keeps_compact_dump_jobs() -> None:
+def test_eager_execution_view_launches_only_real_dump_jobs() -> None:
     _, runtime, _ = _make_runtime(max_num_reqs=4)
     runtime.active_num_reqs = 2
     runtime.dump_job_count = 1
@@ -808,6 +922,36 @@ def test_eager_execution_view_keeps_compact_dump_jobs() -> None:
     assert runtime.dump_launch_count == 1
     assert runtime.dump_src_block_ids.gpu[:1].tolist() == [7]
     assert runtime.dump_dst_block_ids.gpu[:1].tolist() == [9]
+
+
+def test_layer_claims_one_prewrite_dump_per_outer_forward() -> None:
+    _, runtime, _ = _make_runtime(
+        max_decode_query_len=4,
+        resident_layer_count=3,
+        selection_state_count=3,
+    )
+    runtime.dump_launch_count = 1
+    runtime.dump_before_cache_write = True
+    runtime._forward_epoch = 7
+
+    assert runtime.claim_layer_dump(
+        layer_id=2,
+        before_cache_write=True,
+    )
+    assert not runtime.claim_layer_dump(
+        layer_id=2,
+        before_cache_write=True,
+    )
+    assert not runtime.claim_layer_dump(
+        layer_id=2,
+        before_cache_write=False,
+    )
+
+    runtime._forward_epoch += 1
+    assert runtime.claim_layer_dump(
+        layer_id=2,
+        before_cache_write=True,
+    )
 
 
 def test_graph_capture_runtime_can_be_reused_for_multiple_sizes() -> None:

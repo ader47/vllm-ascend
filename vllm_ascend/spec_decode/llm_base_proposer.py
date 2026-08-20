@@ -576,7 +576,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.block_table_tensor_clone = torch.zeros(
                 (
                     self.runner.max_num_tokens + 2 * self.pcp_size * self.runner.max_num_reqs,
-                    self.runner.input_batch.block_table[0].get_device_tensor().shape[1],
+                    self.runner.input_batch.block_table[
+                        self.kv_cache_gid
+                    ].get_device_tensor().shape[1],
                 ),
                 dtype=torch.int32,
                 device=self.device,

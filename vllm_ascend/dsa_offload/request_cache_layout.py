@@ -7,8 +7,12 @@
 
 * ``PREFILL``：Indexer 与 resident MLA 都按完整上下文分配；
 * ``DENSE_DECODE``：尚未满足稀疏条件，两个 plane 继续按完整上下文增长；
-* ``ENTER_SPARSE_DECODE``：本轮首次把 resident MLA 收缩为 budget + tail；
+* ``ENTER_SPARSE_DECODE``：本轮首次把 resident MLA 收缩为 budget + 固定尾区；
 * ``SPARSE_DECODE``：Indexer 继续保存完整上下文，resident 物理块表保持稳定。
+
+普通 decode 的固定尾区是一块；固定 MTP3 使用两块 parity tail，布局为
+``[budget][tail parity 0][tail parity 1]``。planner 只声明数量，物理重排由
+manager 在 ENTER 时一次完成，steady step 不交换 ping/pong 地址。
 
 planner 采用 plan/commit 两阶段协议。容量检查和物理分配成功前只生成轻量
 候选计划；失败重试不会提前推进请求阶段，也不会留下半更新的 resident
@@ -74,6 +78,7 @@ class DSARequestCachePlan:
     sparse_budget_tokens: int
     resident_valid_tokens: int
     preserve_resident_tail_block: bool
+    resident_tail_block_count: int = 1
 
     @property
     def replace_resident_blocks(self) -> bool:
@@ -100,16 +105,23 @@ class DSARequestCachePlanner:
         sparse_activation_tokens: int,
         prompt_budget_thresholds: tuple[int, ...],
         resident_budget_tokens: tuple[int, ...],
+        sparse_tail_block_count: int = 1,
     ) -> None:
         self.block_size = int(block_size)
         self.sparse_activation_tokens = int(sparse_activation_tokens)
         self.prompt_budget_thresholds = tuple(int(value) for value in prompt_budget_thresholds)
         self.resident_budget_tokens = tuple(int(value) for value in resident_budget_tokens)
+        self.sparse_tail_block_count = int(sparse_tail_block_count)
         if self.block_size <= 0:
             raise ValueError("DSA cache-layout block_size must be positive")
         if len(self.resident_budget_tokens) != (len(self.prompt_budget_thresholds) + 1):
             raise ValueError(
                 "DSA cache-layout resident budgets must contain exactly one more entry than prompt thresholds"
+            )
+        if self.sparse_tail_block_count not in (1, 2):
+            raise ValueError(
+                "DSA sparse tail block count must be one or two, got "
+                f"{self.sparse_tail_block_count}"
             )
         self._states: dict[str, DSARequestCacheState] = {}
 
@@ -138,6 +150,7 @@ class DSARequestCachePlanner:
         request: Request,
         *,
         num_new_tokens: int,
+        num_lookahead_tokens: int = 0,
         max_model_len: int,
     ) -> DSARequestCachePlan:
         """生成本轮布局候选，不修改跨 step 状态。"""
@@ -151,7 +164,9 @@ class DSARequestCachePlanner:
             target_budget = previous_state.target_resident_budget_tokens
 
         indexer_tokens_need_slot = min(
-            int(request.num_computed_tokens) + int(num_new_tokens),
+            int(request.num_computed_tokens)
+            + int(num_new_tokens)
+            + int(num_lookahead_tokens),
             int(max_model_len),
         )
         logical_context_tokens = min(
@@ -208,6 +223,7 @@ class DSARequestCachePlanner:
             sparse_budget_tokens=sparse_budget_tokens,
             resident_valid_tokens=resident_valid_tokens,
             preserve_resident_tail_block=preserve_resident_tail_block,
+            resident_tail_block_count=self.sparse_tail_block_count,
         )
 
     def commit(self, plan: DSARequestCachePlan) -> None:

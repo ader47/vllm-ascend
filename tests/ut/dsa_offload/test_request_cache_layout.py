@@ -180,6 +180,31 @@ def test_plan_does_not_mutate_state_until_commit() -> None:
     assert state.target_resident_budget_tokens == plan.target_resident_budget_tokens
 
 
+def test_mtp_lookahead_expands_the_shared_split_block_table() -> None:
+    planner = DSARequestCachePlanner(
+        block_size=128,
+        sparse_activation_tokens=2048,
+        prompt_budget_thresholds=(4096, 8192),
+        resident_budget_tokens=(2048, 4096, 6144),
+        sparse_tail_block_count=2,
+    )
+    request = _Request("req", 5000, 5000, 1, 5001)
+
+    plan = planner.plan(
+        request,
+        num_new_tokens=4,
+        num_lookahead_tokens=3,
+        max_model_len=16384,
+    )
+
+    assert plan.indexer_tokens_need_slot == 5007
+    assert plan.stage == DSARequestCacheStage.ENTER_SPARSE_DECODE
+    assert plan.resident_tail_block_count == 2
+    # Lifecycle semantics remain tied to the guaranteed request prefix, not
+    # the three provisional draft rows or their lookahead reservation.
+    assert plan.tail_tokens == 9
+
+
 def test_commit_reuses_the_slotted_state_object_across_decode_steps() -> None:
     planner = _make_planner()
     request = _Request("req", 3000, 0, 0, 3000)

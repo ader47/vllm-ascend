@@ -79,6 +79,27 @@ def _vllm_config(
     )
 
 
+def _mtp_config(
+    *,
+    num_speculative_tokens: int = 3,
+    method: str = "mtp",
+    parallel_drafting: bool = False,
+    disable_padded_drafter_batch: bool = False,
+    num_nextn_predict_layers: int = 1,
+):
+    return SimpleNamespace(
+        method=method,
+        num_speculative_tokens=num_speculative_tokens,
+        parallel_drafting=parallel_drafting,
+        disable_padded_drafter_batch=disable_padded_drafter_batch,
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                num_nextn_predict_layers=num_nextn_predict_layers,
+            ),
+        ),
+    )
+
+
 def test_disabled_config_uses_typed_defaults() -> None:
     config = DSAOffloadConfig.from_dict(None)
 
@@ -102,6 +123,17 @@ def test_enabled_config_keeps_fractional_dram_multiplier() -> None:
     assert config.hot_cpu_block_multiple == 1.5
     assert config.model_capabilities is not None
     assert config.model_capabilities.architecture == "GlmMoeDsaForCausalLM"
+
+
+def test_non_mtp_does_not_accept_the_mtp_only_8192_tier() -> None:
+    with pytest.raises(ValueError, match="non-MTP resident budgets"):
+        DSAOffloadConfig.from_dict(
+            {
+                "enabled": True,
+                "resident_budget_tokens": [8192, 10240, 12288],
+            },
+            vllm_config=_vllm_config(),
+        )
 
 
 def test_declared_all_full_topology_still_validates_layer_count() -> None:
@@ -150,7 +182,7 @@ def test_enabled_config_rejects_non_split_layout() -> None:
             "exactly one more",
         ),
         (
-            {"resident_budget_tokens": [6144, 8192, 12288]},
+            {"resident_budget_tokens": [6144, 7168, 12288]},
             "not supported",
         ),
         ({"max_active_reqs": 0}, "must be positive"),
@@ -172,7 +204,10 @@ def test_invalid_static_config_is_rejected(
         ({"async_scheduling": None}, "async_scheduling=False"),
         ({"async_scheduling": True}, "async_scheduling=False"),
         ({"enable_prefix_caching": True}, "prefix caching"),
-        ({"speculative_config": object()}, "speculative decoding"),
+        (
+            {"speculative_config": _mtp_config(method="ngram")},
+            "method='mtp'",
+        ),
         ({"kv_transfer_config": object()}, "KV transfer connectors"),
         (
             {"decode_context_parallel_size": 2},
@@ -212,6 +247,91 @@ def test_chunked_prefill_modes_are_supported(config_updates) -> None:
     )
 
     assert config.enabled
+
+
+def test_compromise_mtp3_contract_is_accepted() -> None:
+    config = DSAOffloadConfig.from_dict(
+        {
+            "enabled": True,
+            "sparse_activation_tokens": 8192,
+            "resident_budget_tokens": [8192, 10240, 12288],
+        },
+        vllm_config=_vllm_config(speculative_config=_mtp_config()),
+    )
+
+    assert config.mtp_enabled
+    assert config.mtp_num_speculative_tokens == 3
+    assert config.mtp_cache_layer_count == 1
+    assert config.uniform_decode_query_len == 4
+    assert config.sparse_tail_block_count == 2
+
+
+def test_mtp_cache_layer_index_range_is_explicit() -> None:
+    config = DSAOffloadConfig(
+        enabled=True,
+        mtp_num_speculative_tokens=3,
+        mtp_cache_layer_count=1,
+    )
+
+    assert not config.is_mtp_cache_layer_index(77, 78)
+    assert config.is_mtp_cache_layer_index(78, 78)
+    assert not config.is_mtp_cache_layer_index(79, 78)
+
+
+@pytest.mark.parametrize(
+    ("speculative_config", "raw_config", "message"),
+    [
+        (
+            _mtp_config(num_speculative_tokens=4),
+            {
+                "sparse_activation_tokens": 8192,
+                "resident_budget_tokens": [8192, 10240, 12288],
+            },
+            "requires exactly num_speculative_tokens=3",
+        ),
+        (
+            _mtp_config(),
+            {},
+            "resident budgets must be one of",
+        ),
+        (
+            _mtp_config(),
+            {
+                "sparse_activation_tokens": 6144,
+                "resident_budget_tokens": [8192, 10240, 12288],
+            },
+            "sparse_activation_tokens",
+        ),
+        (
+            _mtp_config(parallel_drafting=True),
+            {
+                "sparse_activation_tokens": 8192,
+                "resident_budget_tokens": [8192, 10240, 12288],
+            },
+            "parallel_drafting",
+        ),
+        (
+            _mtp_config(num_nextn_predict_layers=0),
+            {
+                "sparse_activation_tokens": 8192,
+                "resident_budget_tokens": [8192, 10240, 12288],
+            },
+            "at least one physical MTP cache layer",
+        ),
+    ],
+)
+def test_compromise_mtp_rejects_unsupported_contracts(
+    speculative_config,
+    raw_config,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        DSAOffloadConfig.from_dict(
+            {"enabled": True, **raw_config},
+            vllm_config=_vllm_config(
+                speculative_config=speculative_config,
+            ),
+        )
 
 
 @pytest.mark.parametrize(

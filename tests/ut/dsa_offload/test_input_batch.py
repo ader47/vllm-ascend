@@ -186,6 +186,71 @@ def test_enter_normalization_prevents_persistent_row_temporary_overflow() -> Non
     assert input_batch.block_table[1].rows[0] == [20, 21, 14]
 
 
+def test_mtp_enter_accepts_nonprefix_delta_when_tail0_is_preserved() -> None:
+    requests = {
+        "enter": SimpleNamespace(
+            block_ids=[[1], [10, 11, 12, 13, 14]],
+        ),
+    }
+    cached_data = SimpleNamespace(
+        req_ids=["enter"],
+        resumed_req_ids=set(),
+        # 20 是新 budget block，21 是新 parity-1 tail；保留块 14
+        # 位于 parity-0，因此 committed replacement 中会夹在二者之间。
+        new_block_ids=[([2], [20, 21])],
+    )
+    projection = DSARequestCacheLayoutProjection(
+        request_ids=("enter",),
+        stages=(int(DSARequestCacheStage.ENTER_SPARSE_DECODE),),
+        target_resident_budget_tokens=(128,),
+        sparse_budget_tokens=(128,),
+        resident_valid_tokens=(129,),
+        resident_block_table_replacements=(
+            DSAResidentBlockTableReplacement(
+                request_id="enter",
+                block_ids=(20, 14, 21),
+            ),
+        ),
+    )
+
+    normalize_dsa_enter_updates_before_base(
+        requests=requests,
+        cached_requests=cached_data,
+        projection=projection,
+        resident_group_id=1,
+    )
+
+    assert requests["enter"].block_ids[1] == [20, 14, 21]
+    assert cached_data.new_block_ids[0][1] == []
+
+
+def test_enter_normalization_preserves_mtp_full_group_delta() -> None:
+    requests = {
+        "enter": SimpleNamespace(
+            block_ids=[
+                [1],
+                [10, 11, 12, 13, 14],
+                [30],
+            ],
+        ),
+    }
+    cached_data = SimpleNamespace(
+        req_ids=["enter"],
+        resumed_req_ids=set(),
+        new_block_ids=[([2], [20, 21], [31])],
+    )
+
+    normalize_dsa_enter_updates_before_base(
+        requests=requests,
+        cached_requests=cached_data,
+        projection=_make_enter_projection(),
+        resident_group_id=1,
+    )
+
+    assert requests["enter"].block_ids[1] == [20, 21, 14]
+    assert cached_data.new_block_ids == [([2], [], [31])]
+
+
 def test_enter_normalization_readds_final_table_after_chunk_barrier() -> None:
     input_batch = _InputBatch(("enter",))
     input_batch.block_table = [

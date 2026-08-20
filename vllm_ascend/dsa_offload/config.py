@@ -19,6 +19,9 @@ from vllm_ascend.dsa_offload.contracts import (
     DSA_KV_LORA_RANK,
     DSA_LIDU_OUTPUT_CAPACITY,
     DSA_LIDU_SUPPORTED_RESIDENT_BUDGETS,
+    DSA_MTP_MAX_SPECULATIVE_TOKENS,
+    DSA_MTP_SUPPORTED_RESIDENT_BUDGETS,
+    DSA_NOMTP_SUPPORTED_RESIDENT_BUDGETS,
     DSA_QK_ROPE_HEAD_DIM,
     DSA_REQUIRED_CACHE_BLOCK_SIZE,
     DSA_SFA_COMPUTE_TOPK,
@@ -168,6 +171,16 @@ class DSAOffloadConfig:
         compare=False,
         repr=False,
     )
+    mtp_num_speculative_tokens: int = field(
+        default=0,
+        compare=False,
+        repr=False,
+    )
+    mtp_cache_layer_count: int = field(
+        default=0,
+        compare=False,
+        repr=False,
+    )
 
     @property
     def split_indexer_cache(self) -> bool:
@@ -177,6 +190,35 @@ class DSAOffloadConfig:
     @property
     def max_resident_budget_tokens(self) -> int:
         return max(self.resident_budget_tokens)
+
+    @property
+    def mtp_enabled(self) -> bool:
+        return self.mtp_num_speculative_tokens > 0
+
+    @property
+    def uniform_decode_query_len(self) -> int:
+        return 1 + self.mtp_num_speculative_tokens
+
+    @property
+    def sparse_tail_block_count(self) -> int:
+        """返回 sparse resident 固定持有的尾块数。"""
+
+        return 2 if self.mtp_enabled else 1
+
+    def is_mtp_cache_layer_index(
+        self,
+        layer_index: int,
+        target_layer_count: int,
+    ) -> bool:
+        """判断物理层下标是否属于全量驻留的 MTP Cache layer。"""
+
+        layer_index = int(layer_index)
+        target_layer_count = int(target_layer_count)
+        return (
+            self.mtp_enabled
+            and target_layer_count <= layer_index
+            < target_layer_count + self.mtp_cache_layer_count
+        )
 
     @classmethod
     def from_dict(
@@ -254,8 +296,19 @@ class DSAOffloadConfig:
         )
         config._validate_static_contract()
         if config.enabled and vllm_config is not None:
-            capabilities = config._validate_runtime_contract(vllm_config)
-            config = replace(config, model_capabilities=capabilities)
+            (
+                capabilities,
+                mtp_num_speculative_tokens,
+                mtp_cache_layer_count,
+            ) = (
+                config._validate_runtime_contract(vllm_config)
+            )
+            config = replace(
+                config,
+                model_capabilities=capabilities,
+                mtp_num_speculative_tokens=mtp_num_speculative_tokens,
+                mtp_cache_layer_count=mtp_cache_layer_count,
+            )
         return config
 
     def _validate_static_contract(self) -> None:
@@ -284,7 +337,7 @@ class DSAOffloadConfig:
     def _validate_runtime_contract(
         self,
         vllm_config: Any,
-    ) -> DSAOffloadModelCapabilities:
+    ) -> tuple[DSAOffloadModelCapabilities, int, int]:
         capabilities = require_dsa_offload_model_support(vllm_config.model_config)
         operator_contract = {
             "index_head_dim": (
@@ -357,13 +410,88 @@ class DSAOffloadConfig:
         if chunked_prefill_enabled and not bool(scheduler_config.scheduler_reserve_full_isl):
             raise ValueError(
                 "DSA chunked prefill requires scheduler_reserve_full_isl=True "
-                "so the complete prompt can be admitted into both dense "
-                "cache planes before its first chunk"
+                "so the complete prompt can be admitted into every active "
+                "full-context cache group before its first chunk"
             )
         if bool(cache_config.enable_prefix_caching):
             raise ValueError("DSA sparse offload does not yet support prefix caching")
-        if vllm_config.speculative_config is not None:
-            raise ValueError("DSA sparse offload does not yet support speculative decoding")
+        speculative_config = vllm_config.speculative_config
+        mtp_num_speculative_tokens = 0
+        mtp_cache_layer_count = 0
+        if speculative_config is not None:
+            method = getattr(speculative_config, "method", None)
+            mtp_num_speculative_tokens = int(
+                getattr(speculative_config, "num_speculative_tokens", 0) or 0
+            )
+            if method != "mtp":
+                raise ValueError(
+                    "DSA sparse offload initially supports only speculative "
+                    f"method='mtp', got {method!r}"
+                )
+            if mtp_num_speculative_tokens != DSA_MTP_MAX_SPECULATIVE_TOKENS:
+                raise ValueError(
+                    "DSA compromise MTP requires exactly "
+                    f"num_speculative_tokens={DSA_MTP_MAX_SPECULATIVE_TOKENS}, "
+                    f"got {mtp_num_speculative_tokens}"
+                )
+            if bool(getattr(speculative_config, "parallel_drafting", False)):
+                raise ValueError(
+                    "DSA compromise MTP does not support parallel_drafting"
+                )
+            if bool(
+                getattr(
+                    speculative_config,
+                    "disable_padded_drafter_batch",
+                    False,
+                )
+            ):
+                raise ValueError(
+                    "DSA compromise MTP requires padded drafter batches"
+                )
+            draft_model_config = speculative_config.draft_model_config
+            draft_hf_config = draft_model_config.hf_config
+            mtp_cache_layer_count = int(
+                getattr(draft_hf_config, "num_nextn_predict_layers", 0)
+                or 0
+            )
+            if mtp_cache_layer_count <= 0:
+                raise ValueError(
+                    "DSA compromise MTP requires at least one physical "
+                    "MTP cache layer, got "
+                    f"num_nextn_predict_layers={mtp_cache_layer_count}"
+                )
+            unsupported_mtp_budgets = tuple(
+                budget
+                for budget in self.resident_budget_tokens
+                if budget not in DSA_MTP_SUPPORTED_RESIDENT_BUDGETS
+            )
+            if unsupported_mtp_budgets:
+                raise ValueError(
+                    "DSA compromise MTP resident budgets must be one of "
+                    f"{DSA_MTP_SUPPORTED_RESIDENT_BUDGETS}; unsupported="
+                    f"{unsupported_mtp_budgets}"
+                )
+            mtp_min_activation_tokens = DSA_MTP_SUPPORTED_RESIDENT_BUDGETS[0]
+            if self.sparse_activation_tokens < mtp_min_activation_tokens:
+                raise ValueError(
+                    "DSA compromise MTP sparse_activation_tokens must be at "
+                    "least the minimum MTP resident tier: "
+                    "required="
+                    f"{mtp_min_activation_tokens}, "
+                    f"got={self.sparse_activation_tokens}"
+                )
+        else:
+            unsupported_nomtp_budgets = tuple(
+                budget
+                for budget in self.resident_budget_tokens
+                if budget not in DSA_NOMTP_SUPPORTED_RESIDENT_BUDGETS
+            )
+            if unsupported_nomtp_budgets:
+                raise ValueError(
+                    "DSA non-MTP resident budgets must be one of "
+                    f"{DSA_NOMTP_SUPPORTED_RESIDENT_BUDGETS}; unsupported="
+                    f"{unsupported_nomtp_budgets}"
+                )
         if vllm_config.kv_transfer_config is not None:
             raise ValueError("DSA sparse offload does not yet support KV transfer connectors")
         if parallel_config.decode_context_parallel_size != 1 or parallel_config.prefill_context_parallel_size != 1:
@@ -383,7 +511,11 @@ class DSAOffloadConfig:
             )
         if self.enable_row_mode_decode_graph and bool(vllm_config.model_config.enforce_eager):
             raise ValueError("enable_row_mode_decode_graph requires enforce_eager=False")
-        return capabilities
+        return (
+            capabilities,
+            mtp_num_speculative_tokens,
+            mtp_cache_layer_count,
+        )
 
     def validate_finalized_cache_contract(self, vllm_config: Any) -> None:
         """校验经过 Ascend 后端刷新后的物理 cache 块契约。

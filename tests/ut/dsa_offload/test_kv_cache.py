@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.dsa_offload import kv_cache as dsa_kv_cache
 from vllm_ascend.dsa_offload.kv_cache import (
     DSAIndexerKVSpec,
@@ -65,6 +67,19 @@ def _make_vllm_config(
             decode_context_parallel_size=1,
             prefill_context_parallel_size=1,
         ),
+    )
+
+
+def _make_mtp_spec() -> AscendMLAAttentionSpec:
+    return AscendMLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=704,
+        sparse_head_dim=(512, 64, 128),
+        dtype=torch.bfloat16,
+        cache_dtype_str="auto",
+        cache_sparse_sfa_c8=False,
+        cache_sparse_li_c8=False,
     )
 
 
@@ -130,6 +145,45 @@ def test_split_groups_keep_stable_plane_order() -> None:
     assert len(groups[0].layer_names) == len(groups[1].layer_names) == 2
 
 
+def test_mtp_draft_layer_forms_native_bf16_full_cache_group() -> None:
+    specs = _make_specs(num_layers=2)
+    specs["model.layers.78.self_attn.attn"] = _make_mtp_spec()
+
+    groups = build_dsa_kv_cache_groups(specs)
+
+    assert len(groups) == 3
+    assert not any("layers.78" in name for name in groups[0].layer_names)
+    assert not any("layers.78" in name for name in groups[1].layer_names)
+    assert groups[2].layer_names == ["model.layers.78.self_attn.attn"]
+    assert type(groups[2].kv_cache_spec) is AscendMLAAttentionSpec
+    assert groups[2].kv_cache_spec.dtype == torch.bfloat16
+    assert groups[2].kv_cache_spec.sparse_head_dim == (512, 64, 128)
+    assert groups[2].is_eagle_group
+
+
+@pytest.mark.parametrize(
+    "mtp_spec",
+    [
+        replace(_make_mtp_spec(), cache_sparse_li_c8=True),
+        replace(
+            _make_mtp_spec(),
+            head_size=576,
+            sparse_head_dim=(512, 64, 0),
+        ),
+        replace(_make_mtp_spec(), compress_ratio=2),
+        replace(_make_mtp_spec(), cache_dtype_str="fp8_ds_mla"),
+    ],
+)
+def test_mtp_full_group_rejects_non_native_cache_layout(
+    mtp_spec: AscendMLAAttentionSpec,
+) -> None:
+    specs = _make_specs(num_layers=1)
+    specs["model.layers.78.self_attn.attn"] = mtp_spec
+
+    with pytest.raises(RuntimeError, match="three-entry BF16"):
+        build_dsa_kv_cache_groups(specs)
+
+
 def test_engine_core_grouping_initializes_process_local_ascend_config(
     monkeypatch,
 ) -> None:
@@ -150,13 +204,16 @@ def test_engine_core_grouping_initializes_process_local_ascend_config(
 
 
 def test_split_group_ids_follow_spec_identity_not_position() -> None:
-    groups = list(reversed(build_dsa_kv_cache_groups(_make_specs())))
+    specs = _make_specs()
+    specs["model.layers.78.self_attn.attn"] = _make_mtp_spec()
+    groups = list(reversed(build_dsa_kv_cache_groups(specs)))
     config = SimpleNamespace(kv_cache_groups=groups)
 
     group_ids = get_dsa_kv_cache_group_ids(config)  # type: ignore[arg-type]
 
-    assert group_ids.indexer == 1
-    assert group_ids.resident_mla == 0
+    assert group_ids.indexer == 2
+    assert group_ids.resident_mla == 1
+    assert group_ids.mtp_full == 0
 
 
 def test_split_cache_binding_orders_each_layer_resident_then_indexer() -> None:
@@ -168,6 +225,18 @@ def test_split_cache_binding_orders_each_layer_resident_then_indexer() -> None:
         "model.layers.0.self_attn.indexer.k_cache",
         "model.layers.1.self_attn.attn",
         "model.layers.1.self_attn.indexer.k_cache",
+    ]
+
+
+def test_split_cache_binding_leaves_mtp_full_group_to_baseline() -> None:
+    specs = _make_specs(num_layers=1)
+    specs["model.layers.78.self_attn.attn"] = _make_mtp_spec()
+    groups = build_dsa_kv_cache_groups(specs)
+    config = SimpleNamespace(kv_cache_groups=groups)
+
+    assert get_dsa_kv_cache_binding_order(config) == [
+        "model.layers.0.self_attn.attn",
+        "model.layers.0.self_attn.indexer.k_cache",
     ]
 
 
@@ -200,6 +269,50 @@ def test_ratio_is_expressed_by_final_tensor_sizes(
     assert not hasattr(groups[1], "dsa_num_blocks")
 
 
+def test_mtp_full_group_uses_dense_three_x_capacity(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 3)
+    specs = _make_specs()
+    specs["model.layers.78.self_attn.attn"] = _make_mtp_spec()
+    groups = build_dsa_kv_cache_groups(specs)
+    bytes_per_base_block = dsa_pool_bytes_per_base_block(groups)
+
+    config = build_dsa_kv_cache_config(
+        _make_vllm_config(),
+        groups,
+        available_memory=bytes_per_base_block * 256,
+    )
+
+    group_ids = get_dsa_kv_cache_group_ids(config)
+    assert group_ids.indexer == 0
+    assert group_ids.resident_mla == 1
+    assert group_ids.mtp_full == 2
+    assert config.num_blocks == 256
+    assert get_dsa_group_num_blocks(config, groups[0]) == 768
+    assert get_dsa_group_num_blocks(config, groups[1]) == 256
+    assert get_dsa_group_num_blocks(config, groups[2]) == 768
+
+
+def test_mtp_full_group_requires_target_indexer_token_coverage(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 3)
+    specs = _make_specs()
+    specs["model.layers.78.self_attn.attn"] = replace(
+        _make_mtp_spec(),
+        block_size=64,
+    )
+    groups = build_dsa_kv_cache_groups(specs)
+
+    with pytest.raises(RuntimeError, match="same token range"):
+        build_dsa_kv_cache_config(
+            _make_vllm_config(override=256),
+            groups,
+            available_memory=1,
+        )
+
+
 def test_num_gpu_blocks_override_keeps_base_block_semantics(
     monkeypatch,
 ) -> None:
@@ -221,7 +334,9 @@ def test_cross_rank_base_capacity_shrink_preserves_plane_ratio(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 3)
-    groups = build_dsa_kv_cache_groups(_make_specs())
+    specs = _make_specs()
+    specs["model.layers.78.self_attn.attn"] = _make_mtp_spec()
+    groups = build_dsa_kv_cache_groups(specs)
     config = build_dsa_kv_cache_config(
         _make_vllm_config(),
         groups,
@@ -236,6 +351,7 @@ def test_cross_rank_base_capacity_shrink_preserves_plane_ratio(
     validate_dsa_kv_cache_config(config)
     assert get_dsa_group_num_blocks(config, groups[0]) == 384
     assert get_dsa_group_num_blocks(config, groups[1]) == 128
+    assert get_dsa_group_num_blocks(config, groups[2]) == 384
 
 
 def test_prefill_admission_uses_weighted_base_block_cost(
@@ -326,10 +442,12 @@ def test_component_admission_checks_each_physical_pool() -> None:
     coordinator.physical_block_pools = (  # type: ignore[attr-defined]
         _Pool(6),
         _Pool(2),
+        _Pool(5),
     )
 
-    assert coordinator.can_allocate((6, 2))
-    assert not coordinator.can_allocate((7, 1))
-    assert not coordinator.can_allocate((1, 3))
+    assert coordinator.can_allocate((6, 2, 5))
+    assert not coordinator.can_allocate((7, 1, 1))
+    assert not coordinator.can_allocate((1, 3, 1))
+    assert not coordinator.can_allocate((1, 1, 6))
     with pytest.raises(RuntimeError, match="reservations"):
-        coordinator.can_allocate((1, 1), reserved_blocks=1)
+        coordinator.can_allocate((1, 1, 1), reserved_blocks=1)

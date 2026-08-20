@@ -34,6 +34,9 @@ BATCH_SIZE = 4
 MAX_MODEL_LEN = 131072
 MAX_NUM_BATCHED_TOKENS = 131072
 ENABLE_CHUNKED_PREFILL = False
+ENABLE_A5_PACKED_C8_DSA = False
+ENABLE_MTP = False
+MTP_NUM_SPECULATIVE_TOKENS = 3
 TENSOR_PARALLEL_SIZE = 16
 GPU_MEMORY_UTILIZATION = 0.90
 MAX_TOKENS = 32
@@ -199,13 +202,21 @@ def filter_oversized_prompts(
 
 
 def build_dsa_config(enable_graph: bool) -> dict[str, Any]:
+    sparse_activation_tokens = (
+        8192 if ENABLE_MTP else DSA_SPARSE_ACTIVATION_TOKENS
+    )
+    resident_budget_tokens = (
+        [8192, 10240, 12288]
+        if ENABLE_MTP
+        else DSA_RESIDENT_BUDGET_TOKENS
+    )
     return {
         "enabled": True,
         "split_indexer_cache": True,
         "indexer_mla_block_ratio": DSA_INDEXER_MLA_BLOCK_RATIO,
-        "sparse_activation_tokens": DSA_SPARSE_ACTIVATION_TOKENS,
+        "sparse_activation_tokens": sparse_activation_tokens,
         "prompt_budget_thresholds": DSA_PROMPT_BUDGET_THRESHOLDS,
-        "resident_budget_tokens": DSA_RESIDENT_BUDGET_TOKENS,
+        "resident_budget_tokens": resident_budget_tokens,
         "max_active_reqs": DSA_MAX_ACTIVE_REQS,
         "hot_cpu_block_multiple": DSA_HOT_CPU_BLOCK_MULTIPLE,
         "enable_row_mode_decode_graph": enable_graph,
@@ -219,6 +230,14 @@ def build_dsa_config(enable_graph: bool) -> dict[str, Any]:
 
 
 def build_llm() -> LLM:
+    if ENABLE_MTP and not ENABLE_A5_PACKED_C8_DSA:
+        raise ValueError(
+            "DSA compromise MTP3 requires ENABLE_A5_PACKED_C8_DSA=True"
+        )
+    if ENABLE_MTP and MTP_NUM_SPECULATIVE_TOKENS != 3:
+        raise ValueError(
+            "DSA compromise MTP requires MTP_NUM_SPECULATIVE_TOKENS=3"
+        )
     graph_enabled = RUN_MODE == "graph"
     llm_kwargs: dict[str, Any] = {
         "model": MODEL_PATH,
@@ -240,12 +259,36 @@ def build_llm() -> LLM:
         "enforce_eager": not graph_enabled,
         "disable_log_stats": False,
     }
+    additional_config: dict[str, Any] = {}
+    if ENABLE_A5_PACKED_C8_DSA:
+        additional_config.update(
+            {
+                "enable_sparse_sfa_c8": True,
+                "enable_sparse_li_c8": True,
+            }
+        )
     if RUN_MODE != "disabled":
-        llm_kwargs["additional_config"] = {
+        additional_config.update({
             "dsa_sparse_config": build_dsa_config(graph_enabled),
+        })
+    if additional_config:
+        llm_kwargs["additional_config"] = additional_config
+    if ENABLE_MTP:
+        llm_kwargs["speculative_config"] = {
+            "method": "mtp",
+            "num_speculative_tokens": MTP_NUM_SPECULATIVE_TOKENS,
         }
     if graph_enabled:
-        capture_sizes = sorted({size for size in (*DSA_GRAPH_CAPTURE_SIZES, BATCH_SIZE) if size <= BATCH_SIZE})
+        decode_query_len = (
+            1 + MTP_NUM_SPECULATIVE_TOKENS if ENABLE_MTP else 1
+        )
+        capture_sizes = sorted(
+            {
+                size * decode_query_len
+                for size in (*DSA_GRAPH_CAPTURE_SIZES, BATCH_SIZE)
+                if size <= BATCH_SIZE
+            }
+        )
         llm_kwargs["compilation_config"] = {
             "mode": "VLLM_COMPILE",
             "cudagraph_mode": "FULL_DECODE_ONLY",
@@ -282,6 +325,8 @@ def print_config(prompt_lengths: list[int]) -> None:
         "max_model_len": MAX_MODEL_LEN,
         "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
         "enable_chunked_prefill": ENABLE_CHUNKED_PREFILL,
+        "a5_packed_c8": ENABLE_A5_PACKED_C8_DSA,
+        "mtp3": ENABLE_MTP,
         "prompt_count": len(prompt_lengths),
         "prompt_tokens_min": min(prompt_lengths),
         "prompt_tokens_max": max(prompt_lengths),

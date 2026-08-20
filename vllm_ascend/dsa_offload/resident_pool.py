@@ -12,7 +12,9 @@ LIDU 会在每个 full selection group、每个 decode step 原址刷新
 * ``+budget``：本 group 已经建立稳定 resident 映射。
 
 普通模型一个 attention 层对应一个 selection group；GLM-5.2 只为 full
-Indexer 层建立 group，后续 shared 层复用该 group 的映射。pool row 独立于
+Indexer 层建立 group，后续 shared 层复用该 group 的映射。启用 MTP3 时，
+这里仍只管理 target 验算路径的 selection group；MTP proposer 的 BF16
+Indexer 使用独立 full-cache group，不占用本池。pool row 独立于
 ``InputBatch`` 行号，因此基线对请求行做 condense/reorder 时
 不需要搬运一整行 ``max_model_len`` 状态；每轮只需把最终 batch row 映射为
 一个稳定 pool index。最后额外保留一行给图模式 PAD 使用。

@@ -11,6 +11,7 @@ from vllm_ascend.dsa_offload.ops import (
     DSALightningIndexerOutputs,
     _normalize_lidu_weights_layout,
     a5_lightning_indexer_decode_update_c8,
+    a5_lightning_indexer_decode_update_mtp_c8,
     quant_lightning_indexer_topk,
 )
 
@@ -181,3 +182,76 @@ def test_a5_fused_lidu_preserves_weight_stride_and_squeezes_key_scale(
     assert args[14].data_ptr() == outputs.topk_index.data_ptr()
     assert args[15].data_ptr() == outputs.topk_slots.data_ptr()
     assert args[16].data_ptr() == outputs.miss_count.data_ptr()
+
+
+def test_a5_mtp_lim_keeps_request_and_query_axes_separate(
+    monkeypatch,
+) -> None:
+    captured: dict[str, tuple[torch.Tensor, ...]] = {}
+
+    def _fake_mtp_op(*args: torch.Tensor) -> None:
+        captured["args"] = args
+
+    monkeypatch.setattr(
+        torch.ops._C_ascend,
+        "npu_dsa_a5_li_manage_c8_out",
+        _fake_mtp_op,
+        raising=False,
+    )
+    batch = 2
+    total_query_rows = 8
+    weights_storage = torch.empty(
+        (total_query_rows, 160),
+        dtype=torch.bfloat16,
+    )
+    weights = weights_storage[:, 128:]
+    outputs = DSALightningIndexerOutputs(
+        topk_index=torch.empty((batch, 1, 16384), dtype=torch.int32),
+        topk_slots=torch.empty((batch, 1, 16384), dtype=torch.int32),
+        miss_count=torch.empty((batch,), dtype=torch.int32),
+        tail_info=torch.empty((batch, 2), dtype=torch.int32),
+    )
+    attention_slots = torch.empty(
+        (total_query_rows, 1, 2176),
+        dtype=torch.int32,
+    )
+    resident_seq_lengths = torch.empty((batch,), dtype=torch.int32)
+
+    a5_lightning_indexer_decode_update_mtp_c8(
+        index_weights=weights,
+        query=torch.empty(
+            (total_query_rows, 32, 128),
+            dtype=torch.float8_e4m3fn,
+        ),
+        query_dequant_scale=torch.empty(
+            (total_query_rows, 32),
+            dtype=torch.float32,
+        ),
+        actual_seq_lengths_query=torch.tensor([4, 8], dtype=torch.int32),
+        index_key_cache=torch.empty(
+            (8, 128, 1, 128),
+            dtype=torch.float8_e4m3fn,
+        ),
+        index_key_dequant_scale=torch.empty(
+            (8, 128, 1, 1),
+            dtype=torch.float32,
+        ),
+        index_block_table=torch.zeros((batch, 64), dtype=torch.int32),
+        candidate_lens=torch.tensor([8192, 8192], dtype=torch.int32),
+        final_seq_lengths_kv=torch.tensor([8196, 8196], dtype=torch.int32),
+        row_modes=torch.tensor([2, 2], dtype=torch.int32),
+        req_pool_entries=torch.tensor([0, 1], dtype=torch.int32),
+        cache_slots=torch.empty((2, 65537), dtype=torch.int32),
+        attention_slots=attention_slots,
+        resident_seq_lengths=resident_seq_lengths,
+        outputs=outputs,
+    )
+
+    args = captured["args"]
+    assert args[0] is weights
+    assert args[0].stride() == (160, 1)
+    assert args[12] is attention_slots
+    assert args[12].shape[0] == total_query_rows
+    assert args[13] is resident_seq_lengths
+    assert args[14].shape[0] == batch
+    assert args[16].shape[0] == batch

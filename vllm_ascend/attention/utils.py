@@ -258,6 +258,10 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     dsa_sparse_budget_tokens: torch.Tensor | None = None
     dsa_candidate_lens: torch.Tensor | None = None
     dsa_dram_block_table: torch.Tensor | None = None
+    # 单 token 的最后一个 prefill chunk 在原生 MTP 状态机里也可能标成
+    # SpecDecoding。该标量由 model runner 基于既有 with_prefill 真源一次
+    # 计算，避免 attention 层把它误送进 LIM。
+    dsa_decode_forward: bool = False
 
     # Current attention state (e.g., ChunkedPrefill, DecodeOnly).
     attn_state: Any = None
@@ -305,6 +309,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             dsa_sparse_budget_tokens=_slice_reqs(self.dsa_sparse_budget_tokens),
             dsa_candidate_lens=_slice_reqs(self.dsa_candidate_lens),
             dsa_dram_block_table=_slice_reqs(self.dsa_dram_block_table),
+            dsa_decode_forward=self.dsa_decode_forward,
             attn_state=self.attn_state,
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
             num_input_tokens=self.num_input_tokens,

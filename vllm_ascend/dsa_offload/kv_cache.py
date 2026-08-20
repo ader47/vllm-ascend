@@ -102,10 +102,11 @@ class DSAResidentMLAAttentionSpec(AscendMLAAttentionSpec):
 
 @dataclass(frozen=True)
 class DSAKVCacheGroupIds:
-    """finalized KVCacheConfig 中两个物理 plane 的稳定 group id。"""
+    """finalized KVCacheConfig 中 DSA/MTP 物理 plane 的稳定 group id。"""
 
     indexer: int
     resident_mla: int
+    mtp_full: int | None = None
 
 
 def is_dsa_indexer_spec(spec: KVCacheSpec) -> bool:
@@ -114,6 +115,45 @@ def is_dsa_indexer_spec(spec: KVCacheSpec) -> bool:
 
 def is_dsa_resident_mla_spec(spec: KVCacheSpec) -> bool:
     return isinstance(spec, DSAResidentMLAAttentionSpec)
+
+
+def is_dsa_mtp_full_spec(spec: KVCacheSpec) -> bool:
+    """MTP 使用基线原生 BF16 MLA+Indexer full-cache spec。"""
+
+    return type(spec) is AscendMLAAttentionSpec
+
+
+def _validate_mtp_full_spec(
+    spec: AscendMLAAttentionSpec,
+    *,
+    layer_name: str,
+) -> None:
+    sparse_head_dim = spec.sparse_head_dim
+    valid_native_dims = (
+        sparse_head_dim is not None
+        and len(sparse_head_dim) == 3
+        and all(int(dim) > 0 for dim in sparse_head_dim)
+        and sum(sparse_head_dim) == spec.head_size
+    )
+    if (
+        spec.dtype != torch.bfloat16
+        or spec.cache_sparse_sfa_c8
+        or spec.cache_sparse_li_c8
+        or spec.scale_dim != 0
+        or spec.compress_ratio != 1
+        or spec.cache_dtype_str not in (None, "auto", "bfloat16")
+        or not valid_native_dims
+    ):
+        raise RuntimeError(
+            "DSA MTP full Cache must preserve the baseline three-entry BF16 "
+            "MLA+Indexer layout: "
+            f"layer={layer_name}, dtype={spec.dtype}, "
+            f"sparse_head_dim={sparse_head_dim}, head_size={spec.head_size}, "
+            f"scale_dim={spec.scale_dim}, compress_ratio={spec.compress_ratio}, "
+            f"cache_dtype_str={spec.cache_dtype_str!r}, "
+            f"sfa_c8={spec.cache_sparse_sfa_c8}, "
+            f"li_c8={spec.cache_sparse_li_c8}"
+        )
 
 
 def has_dsa_split_kv_cache_specs(
@@ -151,16 +191,27 @@ def get_dsa_kv_cache_group_ids(
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
         if is_dsa_resident_mla_spec(group.kv_cache_spec)
     ]
-    if len(indexer_group_ids) != 1 or len(resident_group_ids) != 1:
+    mtp_group_ids = [
+        group_id
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+        if is_dsa_mtp_full_spec(group.kv_cache_spec)
+    ]
+    if (
+        len(indexer_group_ids) != 1
+        or len(resident_group_ids) != 1
+        or len(mtp_group_ids) > 1
+    ):
         raise RuntimeError(
             "DSA KV-cache config must contain exactly one Indexer group and "
-            "one resident MLA group: "
+            "one resident MLA group, plus at most one MTP full group: "
             f"indexer_group_ids={indexer_group_ids}, "
-            f"resident_group_ids={resident_group_ids}"
+            f"resident_group_ids={resident_group_ids}, "
+            f"mtp_group_ids={mtp_group_ids}"
         )
     return DSAKVCacheGroupIds(
         indexer=indexer_group_ids[0],
         resident_mla=resident_group_ids[0],
+        mtp_full=mtp_group_ids[0] if mtp_group_ids else None,
     )
 
 
@@ -177,27 +228,33 @@ def _merge_group_specs(
 def build_dsa_kv_cache_groups(
     kv_cache_specs: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
-    """按 plane 构造两个稳定有序的 KV-cache group。
-
-    Indexer group 固定在前、resident MLA group 固定在后。稳定顺序不仅便于
-    容量报告，也为 ``DSAKVCacheCoordinator`` 的 component-wise block
-    table 语义提供确定的 group id。
-    """
+    """构造 target 两平面与可选 MTP BF16 full-cache group。"""
 
     indexer_specs = {name: spec for name, spec in kv_cache_specs.items() if is_dsa_indexer_spec(spec)}
     resident_specs = {name: spec for name, spec in kv_cache_specs.items() if is_dsa_resident_mla_spec(spec)}
+    mtp_specs = {
+        name: spec
+        for name, spec in kv_cache_specs.items()
+        if is_dsa_mtp_full_spec(spec)
+    }
     foreign_specs = {
         name: spec
         for name, spec in kv_cache_specs.items()
-        if not is_dsa_indexer_spec(spec) and not is_dsa_resident_mla_spec(spec)
+        if (
+            not is_dsa_indexer_spec(spec)
+            and not is_dsa_resident_mla_spec(spec)
+            and not is_dsa_mtp_full_spec(spec)
+        )
     }
 
     if not indexer_specs or not resident_specs or foreign_specs:
         raise RuntimeError(
             "DSA split KV-cache requires exactly one Indexer plane and one "
-            "resident MLA plane: "
+            "resident MLA plane, optionally followed by one native MTP "
+            "full-cache plane: "
             f"indexer_layers={len(indexer_specs)}, "
             f"resident_layers={len(resident_specs)}, "
+            f"mtp_layers={len(mtp_specs)}, "
             f"foreign_specs={tuple(sorted(type(spec).__name__ for spec in foreign_specs.values()))}"
         )
     if len(indexer_specs) > len(resident_specs):
@@ -219,7 +276,10 @@ def build_dsa_kv_cache_groups(
             f"DSA Indexer cache has no matching resident MLA layer: orphan_indexer_layers={tuple(orphan_indexer)}"
         )
 
-    return [
+    for layer_name, spec in mtp_specs.items():
+        _validate_mtp_full_spec(spec, layer_name=layer_name)
+
+    groups = [
         KVCacheGroupSpec(
             layer_names=list(indexer_specs),
             kv_cache_spec=_merge_group_specs(indexer_specs),
@@ -229,6 +289,15 @@ def build_dsa_kv_cache_groups(
             kv_cache_spec=_merge_group_specs(resident_specs),
         ),
     ]
+    if mtp_specs:
+        groups.append(
+            KVCacheGroupSpec(
+                layer_names=list(mtp_specs),
+                kv_cache_spec=_merge_group_specs(mtp_specs),
+                is_eagle_group=True,
+            )
+        )
+    return groups
 
 
 def _get_dsa_ratio() -> int:
@@ -240,20 +309,30 @@ def _get_dsa_ratio() -> int:
     return ratio
 
 
+def dsa_group_block_multiplier(group: KVCacheGroupSpec) -> int:
+    """返回相对 resident base-N 的物理 block 倍数。"""
+
+    if is_dsa_resident_mla_spec(group.kv_cache_spec):
+        return 1
+    if (
+        is_dsa_indexer_spec(group.kv_cache_spec)
+        or is_dsa_mtp_full_spec(group.kv_cache_spec)
+    ):
+        return _get_dsa_ratio()
+    raise TypeError(
+        "Unexpected KV-cache spec in DSA layout: "
+        f"{type(group.kv_cache_spec).__name__}"
+    )
+
+
 def dsa_pool_bytes_per_base_block(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
     """返回一个 MLA base block 对应的总物理字节数。"""
 
-    ratio = _get_dsa_ratio()
     total = 0
     for group in kv_cache_groups:
-        if is_dsa_indexer_spec(group.kv_cache_spec):
-            weight = ratio
-        elif is_dsa_resident_mla_spec(group.kv_cache_spec):
-            weight = 1
-        else:
-            raise TypeError(f"Unexpected KV-cache spec in DSA split layout: {type(group.kv_cache_spec).__name__}")
+        weight = dsa_group_block_multiplier(group)
         total += group.kv_cache_spec.page_size_bytes * len(group.layer_names) * weight
     if total <= 0:
         raise ValueError("DSA KV-cache groups contain no physical layers")
@@ -267,7 +346,6 @@ def build_dsa_kv_cache_config(
 ) -> KVCacheConfig:
     """为 worker 构造 ratio 解耦的最终物理 tensor 布局。"""
 
-    ratio = _get_dsa_ratio()
     bytes_per_base_block = dsa_pool_bytes_per_base_block(kv_cache_groups)
     num_base_blocks = available_memory // bytes_per_base_block
     num_base_blocks = num_base_blocks // DSA_KV_BLOCK_COUNT_ALIGNMENT * DSA_KV_BLOCK_COUNT_ALIGNMENT
@@ -284,7 +362,9 @@ def build_dsa_kv_cache_config(
 
     tensors: list[KVCacheTensor] = []
     for group in kv_cache_groups:
-        group_num_blocks = num_base_blocks * ratio if is_dsa_indexer_spec(group.kv_cache_spec) else num_base_blocks
+        group_num_blocks = (
+            num_base_blocks * dsa_group_block_multiplier(group)
+        )
         for layer_name in group.layer_names:
             tensors.append(
                 KVCacheTensor(
@@ -374,17 +454,27 @@ def get_dsa_group_num_blocks(
 def validate_dsa_kv_cache_config(
     kv_cache_config: KVCacheConfig,
 ) -> None:
-    """校验最终物理 tensor 是否仍满足两 plane 的容量契约。"""
+    """校验最终物理 tensor 是否满足 target/MTP 容量契约。"""
 
     indexer_groups = [group for group in kv_cache_config.kv_cache_groups if is_dsa_indexer_spec(group.kv_cache_spec)]
     resident_groups = [
         group for group in kv_cache_config.kv_cache_groups if is_dsa_resident_mla_spec(group.kv_cache_spec)
     ]
-    if len(indexer_groups) != 1 or len(resident_groups) != 1:
+    mtp_groups = [
+        group
+        for group in kv_cache_config.kv_cache_groups
+        if is_dsa_mtp_full_spec(group.kv_cache_spec)
+    ]
+    if (
+        len(indexer_groups) != 1
+        or len(resident_groups) != 1
+        or len(mtp_groups) > 1
+    ):
         raise RuntimeError(
             "DSA KV-cache config must contain exactly one Indexer group and "
-            f"one resident MLA group, got indexer={len(indexer_groups)}, "
-            f"resident={len(resident_groups)}"
+            "one resident MLA group, plus at most one MTP full group: "
+            f"indexer={len(indexer_groups)}, "
+            f"resident={len(resident_groups)}, mtp={len(mtp_groups)}"
         )
 
     indexer_blocks = get_dsa_group_num_blocks(kv_cache_config, indexer_groups[0])
@@ -402,12 +492,43 @@ def validate_dsa_kv_cache_config(
             f"indexer={indexer_blocks}, resident={resident_blocks}, "
             f"ratio={ratio}"
         )
+    if mtp_groups:
+        mtp_group = mtp_groups[0]
+        _validate_mtp_full_spec(
+            mtp_group.kv_cache_spec,
+            layer_name=",".join(mtp_group.layer_names),
+        )
+        mtp_blocks = get_dsa_group_num_blocks(
+            kv_cache_config,
+            mtp_group,
+        )
+        if not mtp_group.is_eagle_group:
+            raise RuntimeError(
+                "DSA MTP full Cache group must retain is_eagle_group=True"
+            )
+        if mtp_blocks != resident_blocks * ratio:
+            raise RuntimeError(
+                "DSA MTP full/MLA capacity ratio mismatch: "
+                f"mtp={mtp_blocks}, resident={resident_blocks}, "
+                f"ratio={ratio}"
+            )
+        indexer_token_capacity = (
+            indexer_blocks * indexer_groups[0].kv_cache_spec.block_size
+        )
+        mtp_token_capacity = mtp_blocks * mtp_group.kv_cache_spec.block_size
+        if mtp_token_capacity != indexer_token_capacity:
+            raise RuntimeError(
+                "DSA MTP full cache must cover the same token range as the "
+                "target Indexer: "
+                f"mtp_tokens={mtp_token_capacity}, "
+                f"indexer_tokens={indexer_token_capacity}"
+            )
 
 
 def get_dsa_kv_cache_binding_order(
     kv_cache_config: KVCacheConfig,
 ) -> list[str]:
-    """返回同层双 plane cache 的稳定绑定顺序。
+    """返回 target 同层双 plane cache 的稳定绑定顺序。
 
     vLLM 的通用 ``bind_kv_cache`` 会把 cache 名先折叠为 transformer layer
     index；非 CUDA/XPU/CPU 平台若同一 layer index 对应多个 cache 名会直接
@@ -431,6 +552,9 @@ def get_dsa_kv_cache_binding_order(
             plane_order = 0
         elif is_dsa_indexer_spec(spec):
             plane_order = 1
+        elif is_dsa_mtp_full_spec(spec):
+            # MTP full Cache 由 vLLM-Ascend 基线通用绑定路径负责。
+            continue
         else:
             raise RuntimeError(f"Unexpected KV-cache group in DSA binding: {type(spec).__name__}")
         for layer_name in group.layer_names:
@@ -461,10 +585,28 @@ def report_dsa_kv_cache_config(
     resident_group = next(
         group for group in kv_cache_config.kv_cache_groups if is_dsa_resident_mla_spec(group.kv_cache_spec)
     )
+    mtp_group = next(
+        (
+            group
+            for group in kv_cache_config.kv_cache_groups
+            if is_dsa_mtp_full_spec(group.kv_cache_spec)
+        ),
+        None,
+    )
     indexer_blocks = get_dsa_group_num_blocks(kv_cache_config, indexer_group)
     resident_blocks = get_dsa_group_num_blocks(kv_cache_config, resident_group)
+    mtp_blocks = (
+        get_dsa_group_num_blocks(kv_cache_config, mtp_group)
+        if mtp_group is not None
+        else 0
+    )
     indexer_tokens = indexer_blocks * indexer_group.kv_cache_spec.block_size
     resident_tokens = resident_blocks * resident_group.kv_cache_spec.block_size
+    mtp_tokens = (
+        mtp_blocks * mtp_group.kv_cache_spec.block_size
+        if mtp_group is not None
+        else 0
+    )
     max_model_len = int(vllm_config.model_config.max_model_len)
     max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
     block_size = int(resident_group.kv_cache_spec.block_size)
@@ -472,31 +614,93 @@ def report_dsa_kv_cache_config(
     from vllm_ascend.ascend_config import get_ascend_config
 
     dsa_config = get_ascend_config().dsa_offload_config
-    resident_slots_per_request = cdiv(dsa_config.max_resident_budget_tokens, block_size) * block_size + block_size
+    actual_mtp_layer_count = (
+        len(mtp_group.layer_names) if mtp_group is not None else 0
+    )
+    if dsa_config.mtp_enabled != (mtp_group is not None) or (
+        dsa_config.mtp_enabled
+        and actual_mtp_layer_count != dsa_config.mtp_cache_layer_count
+    ):
+        raise RuntimeError(
+            "DSA capacity report found an MTP config/cache-group mismatch: "
+            f"mtp_enabled={dsa_config.mtp_enabled}, "
+            f"configured_layers={dsa_config.mtp_cache_layer_count}, "
+            f"physical_layers={actual_mtp_layer_count}"
+        )
+    resident_slots_per_request = (
+        cdiv(dsa_config.max_resident_budget_tokens, block_size)
+        * block_size
+        + dsa_config.sparse_tail_block_count * block_size
+    )
     decode_by_mla = resident_tokens // resident_slots_per_request
     indexer_blocks_per_request = cdiv(max_model_len, indexer_group.kv_cache_spec.block_size)
     decode_by_indexer = indexer_blocks // indexer_blocks_per_request
+    decode_by_mtp = (
+        mtp_blocks
+        // cdiv(max_model_len, mtp_group.kv_cache_spec.block_size)
+        if mtp_group is not None
+        else max_num_seqs
+    )
     configured_decode_limit = min(
         decode_by_mla,
         decode_by_indexer,
+        decode_by_mtp,
         max_num_seqs,
     )
+    dense_token_limits = [resident_tokens, indexer_tokens]
+    if mtp_group is not None:
+        dense_token_limits.append(mtp_tokens)
     total_bytes = sum(int(tensor.size) for tensor in kv_cache_config.kv_cache_tensors)
+    layer_tensor_sizes = _layer_tensor_sizes(kv_cache_config)
+    mtp_bytes = (
+        sum(layer_tensor_sizes[layer_name] for layer_name in mtp_group.layer_names)
+        if mtp_group is not None
+        else 0
+    )
+    mtp_hbm_percent = (
+        100.0 * mtp_bytes / total_bytes
+        if total_bytes > 0
+        else 0.0
+    )
+    if mtp_group is None:
+        mtp_plane_summary = "disabled"
+        mtp_bytes_summary = "disabled"
+        mtp_limit_summary = "disabled"
+    else:
+        mtp_plane_summary = (
+            f"{mtp_tokens:,} tokens "
+            f"({mtp_blocks:,} blocks x "
+            f"{mtp_group.kv_cache_spec.block_size:,} tokens)"
+        )
+        mtp_bytes_summary = (
+            f"{mtp_bytes:,} bytes ({format_gib(mtp_bytes)} GiB, "
+            f"{mtp_hbm_percent:.2f}% of KV HBM)"
+        )
+        mtp_limit_summary = (
+            f"{decode_by_mtp:,} requests at max_model_len={max_model_len:,}"
+        )
 
     logger.info_once(
         "\n"
         "================ DSA HBM CACHE CAPACITY REPORT ================\n"
         "  Split ratio             : indexer:mla = %d:1; base blocks = %s\n"
+        "  Physical cache layers   : indexer=%s, resident=%s, mtp=%s\n"
         "  Allocated HBM KV bytes  : %s bytes (%s GiB)\n"
         "  MLA resident plane      : %s tokens (%s blocks x %s tokens)\n"
         "  Indexer dense plane     : %s tokens (%s blocks x %s tokens)\n"
-        "  Batched prefill limit   : %s tokens (dense cache required in both planes)\n"
+        "  MTP full BF16 plane     : %s\n"
+        "  MTP full BF16 bytes     : %s\n"
+        "  Batched prefill limit   : %s tokens (all physical planes)\n"
         "  Sparse decode MLA limit : %s requests (%s resident slots/request)\n"
         "  Dense Indexer limit     : %s requests at max_model_len=%s\n"
+        "  MTP full-cache limit    : %s\n"
         "  Configured decode limit : %s requests (max_num_seqs=%s)\n"
         "=================================================================",
         _get_dsa_ratio(),
         f"{resident_blocks:,}",
+        f"{len(indexer_group.layer_names):,}",
+        f"{len(resident_group.layer_names):,}",
+        f"{actual_mtp_layer_count:,}",
         f"{total_bytes:,}",
         format_gib(total_bytes),
         f"{resident_tokens:,}",
@@ -505,11 +709,14 @@ def report_dsa_kv_cache_config(
         f"{indexer_tokens:,}",
         f"{indexer_blocks:,}",
         f"{indexer_group.kv_cache_spec.block_size:,}",
-        f"{min(resident_tokens, indexer_tokens):,}",
+        mtp_plane_summary,
+        mtp_bytes_summary,
+        f"{min(dense_token_limits):,}",
         f"{decode_by_mla:,}",
         f"{resident_slots_per_request:,}",
         f"{decode_by_indexer:,}",
         f"{max_model_len:,}",
+        mtp_limit_summary,
         f"{configured_decode_limit:,}",
         f"{max_num_seqs:,}",
     )

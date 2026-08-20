@@ -57,6 +57,7 @@ _REQUIRED_A5_C8_OPS = (
     "npu_dsa_a5_kvcache_scatter_copy_c8_out",
     "kv_cache_full_block_dump_c8",
 )
+_REQUIRED_A5_MTP_OPS = ("npu_dsa_a5_li_manage_c8_out",)
 
 _REQUIRED_A5_NATIVE_OPS = (
     "npu_quant_lightning_indexer",
@@ -64,7 +65,11 @@ _REQUIRED_A5_NATIVE_OPS = (
 )
 
 
-def require_dsa_offload_ops(*, packed_c8: bool = False) -> None:
+def require_dsa_offload_ops(
+    *,
+    packed_c8: bool = False,
+    mtp: bool = False,
+) -> None:
     """在 worker 初始化期确认当前 cache 模式所需设备算子均已部署。"""
 
     if packed_c8 and not load_custom_op_library():
@@ -81,6 +86,8 @@ def require_dsa_offload_ops(*, packed_c8: bool = False) -> None:
         if missing_native:
             raise RuntimeError(f"DSA A5 native operators are unavailable: {tuple(missing_native)}")
     required_ops = _REQUIRED_A5_C8_OPS if packed_c8 else _REQUIRED_OPS
+    if packed_c8 and mtp:
+        required_ops = (*required_ops, *_REQUIRED_A5_MTP_OPS)
     missing = [op_name for op_name in required_ops if not hasattr(torch.ops._C_ascend, op_name)]
     if missing:
         raise RuntimeError(f"DSA sparse offload custom operators are not installed: {tuple(missing)}")
@@ -192,6 +199,56 @@ def a5_lightning_indexer_decode_update_c8(
 ) -> None:
     index_key_dequant_scale = _normalize_a5_indexer_key_scale(index_key_dequant_scale)
     torch.ops._C_ascend.npu_dsa_a5_li_manage_nomtp_c8_out(
+        index_weights,
+        query,
+        query_dequant_scale,
+        actual_seq_lengths_query,
+        index_key_cache,
+        index_key_dequant_scale,
+        index_block_table,
+        candidate_lens,
+        final_seq_lengths_kv,
+        row_modes,
+        req_pool_entries,
+        cache_slots,
+        attention_slots,
+        resident_seq_lengths,
+        outputs.topk_index,
+        outputs.topk_slots,
+        outputs.miss_count,
+    )
+
+
+def a5_lightning_indexer_decode_update_mtp_c8(
+    *,
+    index_weights: torch.Tensor,
+    query: torch.Tensor,
+    query_dequant_scale: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor,
+    index_key_cache: torch.Tensor,
+    index_key_dequant_scale: torch.Tensor,
+    index_block_table: torch.Tensor,
+    candidate_lens: torch.Tensor,
+    final_seq_lengths_kv: torch.Tensor,
+    row_modes: torch.Tensor,
+    req_pool_entries: torch.Tensor,
+    cache_slots: torch.Tensor,
+    attention_slots: torch.Tensor,
+    resident_seq_lengths: torch.Tensor,
+    outputs: DSALightningIndexerOutputs,
+) -> None:
+    """调用 A5 多 query LIM；copy plan 保持请求轴，attention 保持 TND 轴。
+
+    ``candidate_lens`` 对 SPARSE 行表示 durable DRAM prefix。算子根据
+    ``actual_seq_lengths_query``/``final_seq_lengths_kv`` 为每条 query
+    独立推导 LI candidate，并把两块 parity tail 内的命中直接映射为
+    resident slot。
+    """
+
+    index_key_dequant_scale = _normalize_a5_indexer_key_scale(
+        index_key_dequant_scale
+    )
+    torch.ops._C_ascend.npu_dsa_a5_li_manage_c8_out(
         index_weights,
         query,
         query_dequant_scale,

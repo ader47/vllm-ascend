@@ -109,7 +109,8 @@ class DSAInputBatchCacheLayout:
         self.columns.np[_RESIDENT_POOL_INDEX_COLUMN].fill(resident_token_pool.padding_pool_index)
         # PAD 行仍携带合法候选长度，保证 eager/graph 共用的固定容量元数据
         # 始终满足算子 ABI；融合 LIDU 会按 row_mode 跳过其 LI 计算。active
-        # 行会在每轮 prepare_forward 中原址覆盖成真实 candidate length。
+        # 行会在每轮 prepare_forward 中原址覆盖。MTP SPARSE 行保存的是
+        # durable DRAM prefix；逐 query LI 边界由 LIM 在设备侧推导。
         self.columns.np[_CANDIDATE_LEN_COLUMN].fill(DSA_SFA_COMPUTE_TOPK)
         # 图 capture 发生在真实请求到来前，但会直接消费同一组 device
         # view。初始化时先把 PAD 真值同步到设备，避免首个 dummy capture
@@ -477,9 +478,13 @@ def normalize_dsa_enter_updates_before_base(
         replacement_block_ids = replacement.block_ids
         resident_delta = new_block_groups[resident_group_id]
         delta_count = len(resident_delta)
-        if delta_count > len(replacement_block_ids) or tuple(resident_delta) != replacement_block_ids[:delta_count]:
+        if (
+            delta_count > len(replacement_block_ids)
+            or len(set(resident_delta)) != delta_count
+            or not set(resident_delta).issubset(replacement_block_ids)
+        ):
             raise RuntimeError(
-                "DSA ENTER resident delta is not a prefix of the committed "
+                "DSA ENTER resident delta is not a subset of the committed "
                 "replacement table: "
                 f"request_id={request_id!r}, delta={resident_delta}, "
                 f"replacement={replacement_block_ids}"

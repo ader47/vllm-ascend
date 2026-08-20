@@ -1,17 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DSA Indexer/MLA 双物理池 coordinator。
+"""DSA target 双物理池与可选 MTP full-cache 池 coordinator。
 
 vLLM v0.23 的多 group coordinator 仍默认所有 manager 共用一个
 ``BlockPool``，这适用于“不同逻辑 cache 共享同一物理 block id 空间”的
-hybrid cache。DSA 的 Indexer dense plane 与 MLA resident plane 容量不同，
-block id 也分别索引各自 tensor，因此必须为每个 group 建立独立 BlockPool，
-并在 admission 时逐 component 检查。
+hybrid cache。DSA target 的 Indexer dense plane、MLA resident plane，
+以及方案二中可选的 MTP 原生 BF16 full-cache plane 容量不同，block id 也
+分别索引各自 tensor，因此必须为每个 group 建立独立 BlockPool，并在
+admission 时逐 component 检查。
 
 本模块同时持有请求 cache 布局 planner：manager 先生成不可变布局计划，完成
-双 pool 容量检查和物理修改后再 commit；prefill 输出返回后，薄 Scheduler
+各 pool 容量检查和物理修改后再 commit；prefill 输出返回后，薄 Scheduler
 也通过这里释放已卸载的 resident 满块。它仍不复制 Scheduler 主循环，
-prefix cache、KV connector 和 speculative decode 由首版配置合同提前拒绝。
+prefix cache 与 KV connector 由配置合同提前拒绝。固定 MTP3 的 target
+验算仍由 resident 双尾块承接 provisional 写入；MTP proposer 自身则使用
+第三个原生 full-cache group，不进入 DSA resident/DRAM 数据面。
 
 这里的 block table 是 scheduler/core 侧逻辑真源。v0.23 原生
 ``SchedulerOutput`` 对 cached request 只表达“追加的新块”，尚不能表达
@@ -33,6 +36,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    FullAttentionManager,
     get_manager_for_kv_cache_spec,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -49,7 +53,7 @@ from vllm_ascend.dsa_offload.request_cache_layout import (
 
 
 class DSABlockPoolView:
-    """向 vLLM 顶层暴露两个物理 BlockPool 的只读聚合视图。
+    """向 vLLM 顶层暴露多个物理 BlockPool 的只读聚合视图。
 
     single-type manager 不通过该对象分配，而是直接持有各自的真实 pool。
     聚合视图仅服务于 usage、reset、event 等 ``KVCacheManager`` 公共接口；
@@ -80,9 +84,9 @@ class DSABlockPoolView:
         return all(results)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
-        # 两个物理池的 block id 均从 0 开始。首版禁用 KV connector 和
+        # 各物理池的 block id 均从 0 开始。首版禁用 KV connector 和
         # prefix cache；若未来开放按 block-id 驱逐，接口必须增加 group id，
-        # 不能把同一组裸 block id 无差别广播给两个 pool。
+        # 不能把同一组裸 block id 无差别广播给各 pool。
         if block_ids:
             raise RuntimeError("DSA split KV-cache eviction requires group-qualified block ids")
 
@@ -94,7 +98,7 @@ class DSABlockPoolView:
 
 
 class DSAKVCacheCoordinator(KVCacheCoordinator):
-    """为每个 DSA cache group 构造独立 BlockPool 和 manager。"""
+    """为 DSA layout 中每个物理 cache group 构造独立 pool/manager。"""
 
     def __init__(
         self,
@@ -112,8 +116,9 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
     ) -> None:
         if enable_caching:
             raise ValueError("DSA split KV-cache does not yet support prefix caching")
-        if use_eagle:
-            raise ValueError("DSA split KV-cache does not yet support speculative decode")
+        # DSA 配置层只会放行固定 MTP3。prefix cache 仍关闭，因此上游
+        # ``use_eagle`` 的 last-block-drop 语义在这里没有可命中的 cache
+        # block；lookahead 的物理容量由 allocate_dsa_slots 显式处理。
         if enable_kv_cache_events:
             raise ValueError(
                 "DSA split KV-cache does not yet support KV-cache events: "
@@ -137,8 +142,6 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
         self.enable_caching = False
         self.scheduler_block_size = scheduler_block_size
         self.retention_interval = None
-        self.eagle_group_ids: set[int] = set()
-
         physical_pools = tuple(
             BlockPool(
                 num_gpu_blocks=get_dsa_group_num_blocks(
@@ -171,6 +174,11 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
         )
         self.num_single_type_manager = len(self.single_type_managers)
         self.group_ids = get_dsa_kv_cache_group_ids(kv_cache_config)
+        self.eagle_group_ids = (
+            {self.group_ids.mtp_full}
+            if self.group_ids.mtp_full is not None
+            else set()
+        )
 
         from vllm_ascend.ascend_config import get_ascend_config
         from vllm_ascend.dsa_offload.kv_cache_manager import (
@@ -195,13 +203,53 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
             )
         self.indexer_manager = indexer_manager
         self.resident_manager = resident_manager
+        self.mtp_full_manager: FullAttentionManager | None = None
+        if self.group_ids.mtp_full is not None:
+            mtp_full_manager = self.single_type_managers[
+                self.group_ids.mtp_full
+            ]
+            if not isinstance(mtp_full_manager, FullAttentionManager):
+                raise RuntimeError(
+                    "DSA MTP full group did not resolve to "
+                    "FullAttentionManager: "
+                    f"{type(mtp_full_manager).__name__}"
+                )
+            mtp_full_manager.use_eagle = True
+            self.mtp_full_manager = mtp_full_manager
 
         dsa_config = get_ascend_config().dsa_offload_config
+        if bool(use_eagle) != dsa_config.mtp_enabled:
+            raise RuntimeError(
+                "DSA coordinator Eagle mode disagrees with MTP config: "
+                f"use_eagle={use_eagle}, mtp_enabled={dsa_config.mtp_enabled}"
+            )
+        if dsa_config.mtp_enabled != (self.mtp_full_manager is not None):
+            raise RuntimeError(
+                "DSA MTP config and finalized full-cache group disagree: "
+                f"mtp_enabled={dsa_config.mtp_enabled}, "
+                f"mtp_group_id={self.group_ids.mtp_full}"
+            )
+        if (
+            self.group_ids.mtp_full is not None
+            and len(
+                kv_cache_config.kv_cache_groups[
+                    self.group_ids.mtp_full
+                ].layer_names
+            )
+            != dsa_config.mtp_cache_layer_count
+        ):
+            raise RuntimeError(
+                "DSA MTP full-cache layer count disagrees with config: "
+                f"configured={dsa_config.mtp_cache_layer_count}, "
+                "group_layers="
+                f"{len(kv_cache_config.kv_cache_groups[self.group_ids.mtp_full].layer_names)}"
+            )
         self.request_cache_layout = DSARequestCachePlanner(
             block_size=scheduler_block_size,
             sparse_activation_tokens=(dsa_config.sparse_activation_tokens),
             prompt_budget_thresholds=(dsa_config.prompt_budget_thresholds),
             resident_budget_tokens=dsa_config.resident_budget_tokens,
+            sparse_tail_block_count=dsa_config.sparse_tail_block_count,
         )
 
     def get_num_blocks_to_allocate_by_group(
@@ -291,7 +339,7 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
         num_tokens: int,
         total_computed_tokens: int = 0,
     ) -> bool:
-        """检查一个 prefill 请求能否同时装入两个 dense plane。"""
+        """检查一个 prefill 请求能否同时装入所有 full-context group。"""
 
         empty_blocks = tuple(() for _ in range(self.num_single_type_manager))
         requirements = self.get_num_blocks_to_allocate_by_group(

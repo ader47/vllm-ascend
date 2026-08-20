@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from vllm.sampling_params import SamplingType
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
@@ -57,13 +58,28 @@ class DSAOffloadScheduler(Scheduler):
             raise RuntimeError(f"DSAOffloadScheduler requires DSAKVCacheCoordinator, got {type(coordinator).__name__}")
         self.dsa_coordinator = coordinator
 
+    def add_request(self, request: Request) -> None:
+        """首版 MTP 只接受 greedy，避免未验证的随机 rejection 语义。"""
+
+        sampling_params = request.sampling_params
+        if (
+            self.num_spec_tokens
+            and sampling_params is not None
+            and sampling_params.sampling_type is not SamplingType.GREEDY
+        ):
+            raise ValueError(
+                "DSA compromise MTP currently requires greedy sampling "
+                "(temperature=0.0)"
+            )
+        super().add_request(request)
+
     def _has_running_prefill_work(self) -> bool:
         return any(_is_prefill_request(request) for request in self.running)
 
     def _has_schedulable_waiting_prefill(self, token_budget: int) -> bool:
         """判断队首 prefill 是否真能推进，避免阻塞可运行的 decode。
 
-        仅仅看见 waiting prefill 就暂停 decode 会造成死锁：当两个物理池
+        仅仅看见 waiting prefill 就暂停 decode 会造成死锁：当任一物理池
         暂时装不下该 prompt 时，必须先允许已有 decode 完成并释放空间。
         """
 

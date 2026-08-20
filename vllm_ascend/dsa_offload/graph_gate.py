@@ -6,9 +6,10 @@
 是否允许复用 vLLM/vLLM-Ascend 原生 FULL decode 图。它不创建图、不持有
 buffer，也不修改请求生命周期：
 
-* 单 token 的 DENSE/ENTER/SPARSE 任意混排可以入图；
+* 原生 uniform decode（普通 Q=1 或 MTP Q=1+D）的
+  DENSE/ENTER/SPARSE 任意混排可以入图；
 * active batch 可以向上匹配 capture size，额外行由统一 owner 提供 PAD；
-* prefill、multi-token 和 capture size 未覆盖属于正常 true-eager 阶段；
+* prefill、非 uniform query 和 capture size 未覆盖属于正常 true-eager；
 * 状态缺失、行数错位等内部合同破坏必须显式失败。
 """
 
@@ -32,7 +33,7 @@ if TYPE_CHECKING:
 _EXPECTED_EAGER_REASONS = frozenset(
     {
         "empty_batch",
-        "non_single_token_decode",
+        "non_uniform_decode",
         "non_decode_stage",
         "capture_size_miss",
     }
@@ -57,6 +58,7 @@ def evaluate_dsa_row_mode_decode_graph(
     num_reqs: int,
     total_num_scheduled_tokens: int,
     max_num_scheduled_tokens: int,
+    uniform_decode_query_len: int,
     max_capture_size: int,
 ) -> DSARowModeGraphDecision:
     """判断当前 forward 是否满足 DSA row-mode FULL graph 合同。"""
@@ -75,15 +77,24 @@ def evaluate_dsa_row_mode_decode_graph(
     if num_reqs <= 0:
         return DSARowModeGraphDecision(False, "empty_batch")
 
-    # speculative decoding 当前在启动期已被拒绝。这里仍同时核对总 token
-    # 和单行最大 token 数，避免异常 projection 被误判为 uniform decode。
+    uniform_decode_query_len = int(uniform_decode_query_len)
+    if uniform_decode_query_len <= 0:
+        return DSARowModeGraphDecision(
+            False,
+            "invalid_uniform_decode_query_len",
+        )
+    # 直接复用原生 dispatcher 的 uniform query 定义。MTP3 的稳定图是
+    # 每请求四条 target query；双尾块覆盖 128-token 边界，不需要为了
+    # cache 布局把请求降级为 Q=1。只有基线实际给出的变长 query batch
+    # 才按原生范式走 eager。
     if (
-        int(total_num_scheduled_tokens) != num_reqs
-        or int(max_num_scheduled_tokens) != 1
+        int(total_num_scheduled_tokens)
+        != num_reqs * uniform_decode_query_len
+        or int(max_num_scheduled_tokens) != uniform_decode_query_len
     ):
         return DSARowModeGraphDecision(
             False,
-            "non_single_token_decode",
+            "non_uniform_decode",
         )
     if int(max_capture_size) <= 0:
         return DSARowModeGraphDecision(

@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
+import pytest
+from vllm.sampling_params import SamplingType
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import (
@@ -35,10 +37,12 @@ class _Request:
     status: RequestStatus = RequestStatus.RUNNING
     num_output_placeholders: int = 0
     max_tokens: int = 128
+    spec_token_ids: list[int] = field(default_factory=list)
+    sampling_params: object | None = None
 
     @property
     def num_tokens_with_spec(self) -> int:
-        return self.num_tokens
+        return self.num_tokens + len(self.spec_token_ids)
 
     def is_finished(self) -> bool:
         return False
@@ -66,6 +70,8 @@ def _make_scheduler() -> DSAOffloadScheduler:
     scheduler.max_num_running_reqs = 4
     scheduler.max_num_scheduled_tokens = 8192
     scheduler.max_model_len = 16384
+    scheduler.block_size = 128
+    scheduler.num_spec_tokens = 0
     scheduler.scheduler_config = SimpleNamespace(
         long_prefill_token_threshold=0,
         enable_chunked_prefill=False,
@@ -177,6 +183,28 @@ def test_ready_decode_detection_ignores_prefill_rows() -> None:
 
     scheduler.running.append(_Request("decode", 1000, 1000, 1, 1001))
     assert scheduler._has_ready_decode_work()
+
+
+def test_compromise_mtp_rejects_non_greedy_request(monkeypatch) -> None:
+    scheduler = _make_scheduler()
+    scheduler.num_spec_tokens = 3
+    request = _Request(
+        "random",
+        100,
+        0,
+        0,
+        100,
+        status=RequestStatus.WAITING,
+        sampling_params=SimpleNamespace(sampling_type=SamplingType.RANDOM),
+    )
+    monkeypatch.setattr(
+        Scheduler,
+        "add_request",
+        lambda self, req: None,
+    )
+
+    with pytest.raises(ValueError, match="temperature=0.0"):
+        scheduler.add_request(request)  # type: ignore[arg-type]
 
 
 def test_no_waiting_requests_use_the_upstream_schedule_fast_path(

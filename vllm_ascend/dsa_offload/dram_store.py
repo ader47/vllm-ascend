@@ -7,6 +7,11 @@
 * 每层 A3 NOPE/ROPE 或 A5 packed C8 payload 的 Ascend swapped-memory arena；
 * ``resident pool row -> logical full block -> DRAM block id`` 逻辑表。
 
+该 store 只保存 target transformer 层的 payload。方案二中的 MTP draft
+层使用独立原生 BF16 full cache，不注册 DRAM arena。MTP provisional token
+只会影响 target 的 HBM 双尾块；只有下一 outer step 看到 scheduler 已确认
+长度后，target durable full-block 水位才会推进并规划对应 dump。
+
 首版明确关闭 prefix cache、preemption 和 KV connector，因此不同请求不会
 共享 DRAM block，也不需要 hash/refcount 体系。block 0 保留为空映射，有效
 物理 block id 从 1 开始；初始化后 arena 地址和容量均不可变化。
@@ -127,6 +132,13 @@ class DSAHotDRAMStore:
             dtype=np.int32,
         )
         self._free_count = self.usable_blocks
+        # 每个 resident-pool 行已经持久化到 DRAM 的连续完整块前缀。
+        # MTP provisional token 只会写 target HBM 双尾块；只有下一 outer
+        # step scheduler 已确认的前缀才能推进该水位。
+        self.durable_full_block_counts = np.zeros(
+            self.storage_rows,
+            dtype=np.int32,
+        )
         self.table_version = 0
 
     @property
@@ -291,6 +303,7 @@ class DSAHotDRAMStore:
         row = self.logical_block_table[pool_index]
         released = row[row != DSA_DRAM_NULL_BLOCK_ID]
         if released.size == 0:
+            self.durable_full_block_counts[pool_index] = 0
             return
         released = np.unique(released)
         end = self._free_count + int(released.size)
@@ -299,7 +312,49 @@ class DSAHotDRAMStore:
         self._free_block_ids[self._free_count : end] = released
         self._free_count = end
         row.fill(DSA_DRAM_NULL_BLOCK_ID)
+        self.durable_full_block_counts[pool_index] = 0
         self.table_version += 1
+
+    def gather_durable_full_block_counts(
+        self,
+        *,
+        pool_indices: np.ndarray,
+        output: np.ndarray,
+    ) -> None:
+        """按 active request 行序读取 durable full-block 水位。"""
+
+        pool_indices = np.asarray(pool_indices, dtype=np.intp)
+        if output.shape != pool_indices.shape:
+            raise ValueError(
+                "DSA durable watermark output shape mismatch: "
+                f"output={output.shape}, rows={pool_indices.shape}"
+            )
+        np.take(
+            self.durable_full_block_counts,
+            pool_indices,
+            out=output,
+        )
+
+    def commit_durable_full_block_counts(
+        self,
+        *,
+        pool_indices: np.ndarray,
+        full_block_counts: np.ndarray,
+    ) -> None:
+        """在 dump job 已完整规划后推进请求级 durable 水位。"""
+
+        pool_indices = np.asarray(pool_indices, dtype=np.intp)
+        full_block_counts = np.asarray(full_block_counts, dtype=np.int32)
+        if pool_indices.shape != full_block_counts.shape:
+            raise ValueError(
+                "DSA durable watermark update requires matching rows"
+            )
+        previous = self.durable_full_block_counts[pool_indices]
+        if np.any(full_block_counts < previous):
+            raise RuntimeError(
+                "DSA durable full-block watermark cannot move backwards"
+            )
+        self.durable_full_block_counts[pool_indices] = full_block_counts
 
     def gather_rows(
         self,

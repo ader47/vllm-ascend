@@ -44,6 +44,7 @@
 #include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
 #include "attention/lightning_indexer_decode_update/lightning_indexer_decode_update_torch_adpt.h"
 #include "attention/vllm_a5_li_manage_nomtp_c8/vllm_a5_li_manage_nomtp_c8_torch_adpt.h"
+#include "attention/vllm_a5_li_manage_c8/vllm_a5_li_manage_c8_torch_adpt.h"
 #include "attention/vllm_a5_kvcache_scatter_copy_c8/vllm_a5_kvcache_scatter_copy_c8_torch_adpt.h"
 #include "mc2/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
@@ -2446,6 +2447,23 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_dsa_a5_li_manage_nomtp_c8_out",
              torch::kPrivateUse1,
              &vllm_ascend::npu_dsa_a5_li_manage_nomtp_c8_out);
+
+    // MTP target verification keeps request-level resident/copy state on B
+    // rows while emitting query-level attention slots on compact TND rows.
+    ops.def(
+        "npu_dsa_a5_li_manage_c8_out("
+        "Tensor index_weights, Tensor query, Tensor query_dequant_scale, "
+        "Tensor actual_seq_lengths_query, Tensor index_key_cache, "
+        "Tensor index_key_dequant_scale, Tensor index_block_table, "
+        "Tensor candidate_lens, Tensor final_seq_lengths_kv, "
+        "Tensor row_modes, Tensor req_pool_entries, "
+        "Tensor(a!) cache_slots_pool, "
+        "Tensor(b!) sparse_and_tail_slots, "
+        "Tensor(c!) resident_seq_lengths, Tensor(d!) copy_src_ids, "
+        "Tensor(e!) copy_dst_slots, Tensor(f!) copy_counts) -> ()");
+    ops.impl("npu_dsa_a5_li_manage_c8_out",
+             torch::kPrivateUse1,
+             &vllm_ascend::npu_dsa_a5_li_manage_c8_out);
 
     ops.def(
         "npu_dsa_a5_kvcache_scatter_copy_c8_out("

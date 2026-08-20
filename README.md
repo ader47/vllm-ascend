@@ -20,7 +20,7 @@
   prefill 复用社区 Quant-LI，attention 复用社区 QSFA；
 - prefill 与 decode 新满 MLA block 通过独立
   `KvCacheFullBlockDump` 算子写入 DRAM；
-- 支持 chunked prefill；完整 prompt 必须先在两个 dense plane 完成容量准入，
+- 支持 chunked prefill；完整 prompt 必须先在所有启用的 full-context group 完成容量准入，
   中间 chunk 保持 PREFILL，下一轮 decode 才允许进入 DENSE/ENTER；
 - eager 与 ACL FULL decode graph 共用同一套 InputBatch 行状态、
   resident pool、DRAM ledger 和算子缓冲；
@@ -31,7 +31,7 @@
 ```mermaid
 flowchart LR
     C["additional_config.dsa_sparse_config"] --> A["AscendConfig"]
-    A --> K["Indexer / resident MLA 双平面"]
+    A --> K["Target split cache / optional MTP full cache"]
     A --> S["DSAOffloadScheduler"]
     S --> I["NPUInputBatch 七列投影"]
     I --> R["共享 eager/graph runtime"]
@@ -133,9 +133,34 @@ additional_config={
 A5 两个开关全关或半开会在启动期明确拒绝；A3 继续使用既有 BF16/FP16
 算子链。A5 C8 的非 MTP decode 已切换为
 `vllm_a5_li_manage_nomtp_c8 -> vllm_a5_kvcache_scatter_copy_c8 -> native QSFA`；
+妥协版 MTP target 路径使用
+`vllm_a5_li_manage_c8 -> vllm_a5_kvcache_scatter_copy_c8 -> native QSFA`，
+框架与算子代码已接入，仍处于 A5 编译和端到端验收阶段。MTP proposer
+保持社区基线的 BF16 Indexer+MLA forward，不进入 DSA resident/DRAM 数据面；
+其 Cache 作为第三个原生 full-cache group 全量驻留 HBM，并与 target
+Indexer 使用相同的 `indexer_mla_block_ratio` token coverage。默认 ratio=3
+时，三个物理 pool 的容量为 target Indexer `3N`、target resident `N`、
+MTP full cache `3N`。
 新融合路径已在真实 A5 上完成算子数值、eager/graph replay 和 GLM-5.1
 端到端初验。GLM-5.2 的 21 个 full Indexer 与 57 个 shared follower 已接入
-同一数据面，仍需完成模型权重加载及长短序列 eager/graph 回归。
+同一 target 数据面；MTP BF16 第三组已完成 UT、离线 eager/FULL graph 与
+在线 FULL graph 冒烟，其中 FULL graph 覆盖单条约 40K 及
+8K/5K/70K/40K 四请求混合长度。
+
+妥协版 MTP3 还需同时设置：
+
+```python
+speculative_config={"method": "mtp", "num_speculative_tokens": 3}
+
+# dsa_sparse_config 内
+"sparse_activation_tokens": 8192,
+"resident_budget_tokens": [8192, 10240, 12288],
+```
+
+首版只接受 `temperature=0.0`。FULL graph 的 capture size 仍使用 token 数；
+MTP3 下 B 个请求对应 `4 * B` 个 target query token。SPARSE resident 固定为
+`[budget blocks][tail parity 0][tail parity 1]`，跨 128-token 边界不会临时
+退回非 MTP。
 
 ## 当前边界
 
@@ -145,17 +170,16 @@ A5 两个开关全关或半开会在启动期明确拒绝；A3 继续使用既�
 - async scheduling；
 - prefix cache；
 - preemption/resume；
-- speculative decoding 与 MTP；
+- 非 MTP speculative method、MTP draft 数不等于 3、非 greedy MTP；
 - 外部 KV transfer connector；
 - decode/prefill context parallel 和 pipeline parallel；
 - KV-cache metrics/events；
-- GLM-5.2 A5 C8 端到端与长上下文精度验收；
+- GLM-5.2 A5 C8 的正式 QA、长稳并发与性能验收；
 - A5 BF16 DSA 算子链。
 
 具有显式配置入口的未支持组合会在启动期拒绝，preemption/resume 会在当前
-运行边界明确失败。A5 GLM-5.1 已完成初验，但 GLM-5.2 仍须以上板模型结果
-而非源码可达性作为最终验收。DP 和在线推理属于下一阶段扩展项，当前离线
-验证以 DP=1 为主。
+运行边界明确失败。A5 GLM-5.1 与 GLM-5.2 MTP 已取得上板冒烟结果，但仍以
+DP=1 为主；DP 扩展、完整数据集与性能验收属于下一阶段。
 
 ## 文档与测试入口
 

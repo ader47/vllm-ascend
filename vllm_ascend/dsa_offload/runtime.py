@@ -10,6 +10,11 @@
 * 所有层串行复用的 caller-owned LIDU scratch 输出；
 * 本轮满块 dump 的紧凑 src/dst 列。
 
+固定 MTP3 使用两块 parity tail，位置映射化简为 ``position % 256``。
+已确认满块在下一 outer step、当前 target 层写 KV 前 dump；每个 target
+物理层只发射一次，同一请求的 logical block ledger 在 target arena 间共享。
+MTP proposer 使用原生 BF16 full cache，不绑定本 runtime。
+
 所有大 tensor 在 model runner 初始化期预分配。steady step 只刷新 active
 prefix；DRAM 逻辑表未变化时不会重复 H2D。图模式复用这些 owner 的
 captured-prefix + PAD view，而不是另建一套 graph-only 语义。
@@ -38,6 +43,7 @@ from vllm_ascend.dsa_offload.ops import (
     DSAOffloadSelectionOutput,
     a5_kvcache_scatter_copy_c8,
     a5_lightning_indexer_decode_update_c8,
+    a5_lightning_indexer_decode_update_mtp_c8,
     dump_full_kv_cache_blocks,
     dump_full_kv_cache_blocks_c8,
     kvcache_scatter_copy,
@@ -72,6 +78,7 @@ class DSAOffloadRuntime:
         device: torch.device,
         pin_memory: bool,
         packed_c8: bool = False,
+        max_decode_query_len: int = 1,
     ) -> None:
         self.max_num_reqs = int(max_num_reqs)
         self.max_num_tokens = int(max_num_tokens)
@@ -80,7 +87,16 @@ class DSAOffloadRuntime:
         self.block_size = int(block_size)
         self.device = torch.device(device)
         self.packed_c8 = bool(packed_c8)
+        self.max_decode_query_len = int(max_decode_query_len)
+        if self.max_decode_query_len <= 0:
+            raise ValueError("DSA max_decode_query_len must be positive")
         self.resident_token_pool = resident_token_pool
+        self.sparse_tail_block_count = (
+            2 if self.max_decode_query_len > 1 else 1
+        )
+        self.sparse_tail_capacity_tokens = (
+            self.sparse_tail_block_count * self.block_size
+        )
         self.max_logical_blocks = cdiv(
             self.max_model_len,
             self.block_size,
@@ -120,7 +136,7 @@ class DSAOffloadRuntime:
         if self.packed_c8:
             self._a5_attention_slots = torch.empty(
                 (
-                    self.max_num_reqs,
+                    self.max_num_reqs * self.max_decode_query_len,
                     1,
                     DSA_A5_ATTENTION_CAPACITY,
                 ),
@@ -192,12 +208,18 @@ class DSAOffloadRuntime:
         )
         self._computed_tokens_i64 = np.empty_like(self._scheduled_tokens_i64)
         self._tokens_after_schedule = np.empty_like(self._scheduled_tokens_i64)
-        self._first_logical_blocks = np.empty_like(self._scheduled_tokens_i64)
         self._completed_after_blocks = np.empty_like(self._scheduled_tokens_i64)
         self._completed_block_counts = np.empty_like(self._scheduled_tokens_i64)
         self._dump_boundary_mask = np.empty(
             self.max_num_reqs,
             dtype=np.bool_,
+        )
+        self._durable_full_blocks = np.empty(
+            self.max_num_reqs,
+            dtype=np.int32,
+        )
+        self._target_durable_full_blocks = np.empty_like(
+            self._durable_full_blocks
         )
 
         self.dram_store: DSAHotDRAMStore | None = None
@@ -205,6 +227,13 @@ class DSAOffloadRuntime:
         self.execution_num_reqs = 0
         self.dump_job_count = 0
         self.dump_launch_count = 0
+        self.dump_before_cache_write = False
+        self._forward_epoch = 0
+        self._layer_dump_epochs = np.full(
+            self.num_layers,
+            -1,
+            dtype=np.int64,
+        )
         self._graph_capture_row_count = 0
         self._dram_table_row_count = 0
         self._dram_table_signature: tuple[int, int, int] | None = None
@@ -249,6 +278,7 @@ class DSAOffloadRuntime:
         num_reqs: int,
         num_tokens: int,
         resident_group_id: int,
+        decode_forward: bool,
     ) -> torch.Tensor:
         """刷新本轮统一元数据并返回 resident slot-mapping positions。"""
 
@@ -266,6 +296,10 @@ class DSAOffloadRuntime:
         self.active_num_reqs = int(num_reqs)
         self.execution_num_reqs = 0
         self.dump_launch_count = 0
+        self.dump_before_cache_write = bool(
+            self.max_decode_query_len > 1 and decode_forward
+        )
+        self._forward_epoch += 1
 
         self._prepare_dump_plan(
             input_batch=input_batch,
@@ -287,36 +321,69 @@ class DSAOffloadRuntime:
         if not np.any(active_modes == DSA_ROW_MODE_SPARSE):
             return positions[:num_tokens]
 
+        return self.map_resident_positions(
+            positions=positions[:num_tokens],
+            row_modes=state.row_modes,
+            sparse_budgets=state.sparse_budget_tokens,
+            req_indices=req_indices[:num_tokens],
+        )
+
+    def map_resident_positions(
+        self,
+        *,
+        positions: torch.Tensor,
+        row_modes: torch.Tensor,
+        sparse_budgets: torch.Tensor,
+        req_indices: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """把真实序列位置映射到 dense 或 parity-tail 逻辑位置。
+
+        target TND 通过 ``req_indices`` 展开请求列；普通 Q=1 与 MTP target
+        Q=4 验算复用同一组固定 scratch，双尾公式可化简为
+        ``position % (2 * block_size)``。MTP proposer 不调用该函数。
+        """
+
+        num_tokens = int(positions.shape[0])
+        if num_tokens > self.max_num_tokens:
+            raise RuntimeError(
+                "DSA resident position capacity exceeded: "
+                f"tokens={num_tokens}, capacity={self.max_num_tokens}"
+            )
         token_modes = self._token_row_modes[:num_tokens]
         token_budgets = self._token_sparse_budgets[:num_tokens]
-        torch.index_select(
-            state.row_modes,
-            0,
-            req_indices[:num_tokens],
-            out=token_modes,
-        )
-        torch.index_select(
-            state.sparse_budget_tokens,
-            0,
-            req_indices[:num_tokens],
-            out=token_budgets,
-        )
+        if req_indices is None:
+            token_modes.copy_(row_modes[:num_tokens])
+            token_budgets.copy_(sparse_budgets[:num_tokens])
+        else:
+            torch.index_select(
+                row_modes,
+                0,
+                req_indices,
+                out=token_modes,
+            )
+            torch.index_select(
+                sparse_budgets,
+                0,
+                req_indices,
+                out=token_budgets,
+            )
         resident_positions = self.resident_positions[:num_tokens]
         torch.remainder(
-            positions[:num_tokens],
-            self.block_size,
+            positions,
+            self.sparse_tail_capacity_tokens,
             out=resident_positions,
         )
         resident_positions.add_(token_budgets)
+        sparse_mask = self._sparse_token_mask[:num_tokens]
         torch.eq(
             token_modes,
             DSA_ROW_MODE_SPARSE,
-            out=self._sparse_token_mask[:num_tokens],
+            out=sparse_mask,
         )
         torch.where(
-            self._sparse_token_mask[:num_tokens],
+            sparse_mask,
             resident_positions,
-            positions[:num_tokens],
+            positions,
             out=resident_positions,
         )
         return resident_positions
@@ -327,14 +394,41 @@ class DSAOffloadRuntime:
     ) -> None:
         """刷新 LI/KSC 共享的历史候选长度，不创建逐 step 临时数组。
 
-        DENSE 行的候选区就是当前完整序列。SPARSE 行最后一个物理块是
-        resident tail，因此候选区只覆盖它之前的完整逻辑块：
-        ``floor((actual_len - 1) / block_size) * block_size``。
+        普通 Q=1 的 DENSE 行候选区是当前完整序列，SPARSE 行只覆盖最后
+        一个物理 tail 之前的完整逻辑块。MTP target Q=4 验算时，DENSE 写
+        完整可见长度；SPARSE 的该列专门表示已经持久化到 DRAM 的 durable
+        prefix。每个 query 真正的 LI candidate 由 LIM 根据 final length 在
+        设备侧独立推导，避免 graph prepare 构造 T=4B 的 host 元数据。
         """
 
         num_reqs = self.active_num_reqs
         tokens_after = self._tokens_after_schedule[:num_reqs]
         candidate_lens = state.candidate_lens_cpu[:num_reqs]
+        if self.max_decode_query_len > 1:
+            np.copyto(
+                candidate_lens,
+                tokens_after,
+                casting="unsafe",
+            )
+            sparse_mask = self._dump_boundary_mask[:num_reqs]
+            np.equal(
+                state.row_modes_cpu[:num_reqs],
+                DSA_ROW_MODE_SPARSE,
+                out=sparse_mask,
+            )
+            completed_before_tail = self._completed_after_blocks[:num_reqs]
+            np.multiply(
+                self._durable_full_blocks[:num_reqs],
+                self.block_size,
+                out=completed_before_tail,
+            )
+            np.copyto(
+                candidate_lens,
+                completed_before_tail,
+                where=sparse_mask,
+                casting="unsafe",
+            )
+            return
         np.copyto(candidate_lens, tokens_after, casting="unsafe")
 
         sparse_mask = self._dump_boundary_mask[:num_reqs]
@@ -453,6 +547,8 @@ class DSAOffloadRuntime:
             self.execution_num_reqs = row_count
             self.dump_job_count = 0
             self.dump_launch_count = row_count
+            self.dump_before_cache_write = self.max_decode_query_len > 1
+            self._forward_epoch += 1
             self._reset_selection_source()
         except Exception:
             try:
@@ -475,6 +571,7 @@ class DSAOffloadRuntime:
         self.execution_num_reqs = 0
         self.dump_job_count = 0
         self.dump_launch_count = 0
+        self.dump_before_cache_write = False
         self._graph_capture_row_count = 0
         self._dram_table_row_count = 0
         self._dram_table_signature = None
@@ -487,7 +584,12 @@ class DSAOffloadRuntime:
         num_scheduled_tokens: np.ndarray,
         resident_group_id: int,
     ) -> None:
-        """只遍历本轮跨满块边界的行，构造紧凑 dump jobs。"""
+        """按 durable 水位差构造本轮紧凑 dump jobs。
+
+        普通 decode/prefill 在本层 attention 后持久化本轮新满块；MTP
+        target 验算只持久化 forward 开始时已经由 scheduler 确认的前缀，
+        且必须在本层写入新 KV 前执行，防止 parity tail 被复用后覆盖源块。
+        """
 
         store = self.dram_store
         assert store is not None
@@ -495,8 +597,8 @@ class DSAOffloadRuntime:
         scheduled = self._scheduled_tokens_i64[:num_reqs]
         computed = self._computed_tokens_i64[:num_reqs]
         tokens_after = self._tokens_after_schedule[:num_reqs]
-        first_logical = self._first_logical_blocks[:num_reqs]
-        completed_after = self._completed_after_blocks[:num_reqs]
+        durable_before = self._durable_full_blocks[:num_reqs]
+        durable_target = self._target_durable_full_blocks[:num_reqs]
         completed_counts = self._completed_block_counts[:num_reqs]
         boundary_mask = self._dump_boundary_mask[:num_reqs]
 
@@ -510,22 +612,29 @@ class DSAOffloadRuntime:
             input_batch.num_computed_tokens_cpu[:num_reqs],
             casting="unsafe",
         )
-        np.floor_divide(
-            computed,
-            self.block_size,
-            out=first_logical,
-        )
         np.add(computed, scheduled, out=tokens_after)
+        pool_indices = state.resident_pool_indices_cpu[:num_reqs]
+        store.gather_durable_full_block_counts(
+            pool_indices=pool_indices,
+            output=durable_before,
+        )
+        durable_source_tokens = (
+            computed if self.dump_before_cache_write else tokens_after
+        )
         np.floor_divide(
-            tokens_after,
+            durable_source_tokens,
             self.block_size,
-            out=completed_after,
+            out=durable_target,
         )
         np.subtract(
-            completed_after,
-            first_logical,
+            durable_target,
+            durable_before,
             out=completed_counts,
         )
+        if np.any(completed_counts < 0):
+            raise RuntimeError(
+                "DSA durable full-block watermark moved backwards"
+            )
         np.greater(completed_counts, 0, out=boundary_mask)
         if not np.any(boundary_mask):
             self.dump_job_count = 0
@@ -539,7 +648,7 @@ class DSAOffloadRuntime:
         for row_value in boundary_rows:
             row = int(row_value)
             count = int(completed_counts[row])
-            logical_start = int(first_logical[row])
+            logical_start = int(durable_before[row])
             logical_end = logical_start + count
             next_job_count = job_count + count
             if next_job_count > self._dump_pool_indices.size:
@@ -553,17 +662,31 @@ class DSAOffloadRuntime:
             self._dump_pool_indices[jobs] = state.resident_pool_indices_cpu[row]
             self._dump_logical_indices[jobs] = self._logical_block_indices[logical_start:logical_end]
             if state.row_modes_cpu[row] == DSA_ROW_MODE_SPARSE:
-                if count != 1:
+                if count > 1:
                     raise RuntimeError(
-                        f"DSA sparse decode completed more than one full block in one step: row={row}, count={count}"
+                        "DSA sparse decode advanced by more than one durable "
+                        f"full block: row={row}, count={count}"
                     )
-                tail_column = int(resident_row_widths[row]) - 1
-                if tail_column < 0:
-                    raise RuntimeError(f"DSA sparse row {row} has no resident tail block")
-                self._dump_source_blocks[jobs] = resident_blocks[
-                    row,
-                    tail_column,
-                ]
+                budget_blocks = (
+                    int(state.sparse_budget_tokens_cpu[row])
+                    // self.block_size
+                )
+                for local_job, logical_block in enumerate(
+                    range(logical_start, logical_end)
+                ):
+                    tail_column = (
+                        budget_blocks
+                        + logical_block % self.sparse_tail_block_count
+                    )
+                    if tail_column >= int(resident_row_widths[row]):
+                        raise RuntimeError(
+                            "DSA sparse dump tail column is unallocated: "
+                            f"row={row}, column={tail_column}, "
+                            f"resident_blocks={int(resident_row_widths[row])}"
+                        )
+                    self._dump_source_blocks[job_count + local_job] = (
+                        resident_blocks[row, tail_column]
+                    )
             else:
                 if logical_end > int(resident_row_widths[row]):
                     raise RuntimeError(
@@ -585,20 +708,47 @@ class DSAOffloadRuntime:
             pool_indices=self._dump_pool_indices[:job_count],
             logical_block_indices=self._dump_logical_indices[:job_count],
         )
-        new_rows = np.flatnonzero(reservation.new_mask)
-        copy_count = int(new_rows.size)
-        if copy_count:
-            np.take(
-                self._dump_source_blocks[:job_count],
-                new_rows,
-                out=self.dump_src_block_ids.np[:copy_count],
+        if not np.all(reservation.new_mask):
+            raise RuntimeError(
+                "DSA durable watermark is behind its DRAM logical table"
             )
-            np.take(
-                reservation.physical_block_ids,
-                new_rows,
-                out=self.dump_dst_block_ids.np[:copy_count],
+        self.dump_src_block_ids.np[:job_count] = (
+            self._dump_source_blocks[:job_count]
+        )
+        self.dump_dst_block_ids.np[:job_count] = (
+            reservation.physical_block_ids
+        )
+        store.commit_durable_full_block_counts(
+            pool_indices=pool_indices[boundary_rows],
+            full_block_counts=durable_target[boundary_rows],
+        )
+        np.copyto(
+            durable_before,
+            durable_target,
+            where=boundary_mask,
+            casting="unsafe",
+        )
+        self.dump_job_count = job_count
+
+    def claim_layer_dump(
+        self,
+        *,
+        layer_id: int,
+        before_cache_write: bool,
+    ) -> bool:
+        """同一 outer forward 内让每个物理层只发射一次 dump。"""
+
+        layer_id = int(layer_id)
+        if bool(before_cache_write) != self.dump_before_cache_write:
+            return False
+        if not 0 <= layer_id < self.num_layers:
+            raise IndexError(
+                f"DSA dump layer {layer_id} is outside runtime capacity"
             )
-        self.dump_job_count = copy_count
+        if self._layer_dump_epochs[layer_id] == self._forward_epoch:
+            return False
+        self._layer_dump_epochs[layer_id] = self._forward_epoch
+        return True
 
     def _refresh_active_dram_table(
         self,
@@ -662,7 +812,9 @@ class DSAOffloadRuntime:
             row = int(row_value)
             # LIDU 把最后一个非空块作为 dense tail；只有它之前的完整块
             # 会成为 KSC 的 DRAM source。
-            required_blocks = max(0, int(self._tokens_after_schedule[row]) - 1) // self.block_size
+            required_blocks = (
+                int(state.candidate_lens_cpu[row]) // self.block_size
+            )
             if required_blocks == 0:
                 continue
             missing = np.flatnonzero(dram_table[row, :required_blocks] == DSA_DRAM_NULL_BLOCK_ID)
@@ -707,7 +859,8 @@ class DSALayerOffloadContext:
     用 ``selection_source_layer_id`` 指向所属 full 层，复用其 LIDU 输出。
 
     ``selection_state_id`` 只为 full 层分配，用于索引紧凑的 LIDU
-    ``cache_slots``；``layer_id`` 始终索引全部 resident cache/DRAM arena。
+    ``cache_slots``；``layer_id`` 始终索引全部 target resident cache/DRAM
+    arena。MTP draft 层使用独立的原生 BF16 full cache，不绑定本上下文。
     """
 
     layer_id: int
@@ -737,6 +890,7 @@ class DSALayerOffloadContext:
         if self.indexer_cache is None or self.selection_state_id is None:
             raise RuntimeError(f"DSA shared-indexer layer must not run LIDU selection: layer_id={self.layer_id}")
         num_reqs = int(actual_seq_lengths_key.shape[0])
+        num_query_rows = int(query_shape[0]) if query_shape is not None else num_reqs
         outputs = self.runtime.get_lidu_outputs(
             num_reqs=num_reqs,
         )
@@ -750,9 +904,20 @@ class DSALayerOffloadContext:
             resident_seq_lengths_buffer = self.runtime._a5_resident_seq_lengths
             if attention_slots_buffer is None or resident_seq_lengths_buffer is None:
                 raise RuntimeError("DSA A5 C8 context has no preallocated selection scratch")
-            attention_slots = attention_slots_buffer[:num_reqs]
+            if num_query_rows > int(attention_slots_buffer.shape[0]):
+                raise RuntimeError(
+                    "DSA A5 query-row capacity exceeded: "
+                    f"required={num_query_rows}, "
+                    f"capacity={int(attention_slots_buffer.shape[0])}"
+                )
+            attention_slots = attention_slots_buffer[:num_query_rows]
             resident_seq_lengths = resident_seq_lengths_buffer[:num_reqs]
-            a5_lightning_indexer_decode_update_c8(
+            a5_lidu = (
+                a5_lightning_indexer_decode_update_mtp_c8
+                if self.runtime.max_decode_query_len > 1
+                else a5_lightning_indexer_decode_update_c8
+            )
+            a5_lidu(
                 index_weights=weights,
                 query=query.view(query_shape),
                 query_dequant_scale=query_dequant_scale.view(query_shape[:-1]),
@@ -837,6 +1002,7 @@ class DSALayerOffloadContext:
         resident_block_table: torch.Tensor,
         dram_block_table: torch.Tensor,
         num_reqs: int,
+        num_query_rows: int | None = None,
     ) -> DSAOffloadSelectionOutput:
         """shared indexer 层的 decode 选择：复用所属 full 层的 LIDU 输出。
 
@@ -852,6 +1018,8 @@ class DSALayerOffloadContext:
                 f"expected_source={self.selection_source_layer_id}, "
                 f"current_source={self.runtime._selection_source_layer}"
             )
+        if num_query_rows is None:
+            num_query_rows = int(num_reqs)
         outputs = self.runtime.get_lidu_outputs(num_reqs=int(num_reqs))
         store = self.runtime.dram_store
         if store is None:
@@ -864,7 +1032,13 @@ class DSALayerOffloadContext:
             resident_seq_lengths_buffer = self.runtime._a5_resident_seq_lengths
             if attention_slots_buffer is None or resident_seq_lengths_buffer is None:
                 raise RuntimeError("DSA A5 C8 context has no preallocated selection scratch")
-            attention_slots = attention_slots_buffer[:num_reqs]
+            if num_query_rows > int(attention_slots_buffer.shape[0]):
+                raise RuntimeError(
+                    "DSA A5 shared query-row capacity exceeded: "
+                    f"required={num_query_rows}, "
+                    f"capacity={int(attention_slots_buffer.shape[0])}"
+                )
+            attention_slots = attention_slots_buffer[:num_query_rows]
             resident_seq_lengths = resident_seq_lengths_buffer[:num_reqs]
             a5_kvcache_scatter_copy_c8(
                 resident_packed_cache=resident_cache[0],
@@ -944,9 +1118,15 @@ class DSALayerOffloadContext:
         self,
         *,
         resident_cache: tuple[torch.Tensor, ...],
+        before_cache_write: bool,
     ) -> None:
         job_count = self.runtime.dump_launch_count
         if job_count == 0:
+            return
+        if not self.runtime.claim_layer_dump(
+            layer_id=self.layer_id,
+            before_cache_write=before_cache_write,
+        ):
             return
         store = self.runtime.dram_store
         if store is None:

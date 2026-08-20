@@ -35,12 +35,13 @@ def _state(*stages: DSARequestCacheStage):
         ),
     ],
 )
-def test_all_single_token_decode_stages_share_full_graph(stages) -> None:
+def test_all_uniform_decode_stages_share_full_graph(stages) -> None:
     decision = evaluate_dsa_row_mode_decode_graph(
         state=_state(*stages),
         num_reqs=len(stages),
         total_num_scheduled_tokens=len(stages),
         max_num_scheduled_tokens=1,
+        uniform_decode_query_len=1,
         max_capture_size=8,
     )
 
@@ -65,7 +66,7 @@ def test_all_single_token_decode_stages_share_full_graph(stages) -> None:
             2,
             2,
             8,
-            "non_single_token_decode",
+            "non_uniform_decode",
         ),
         (
             _state(
@@ -93,6 +94,7 @@ def test_normal_non_graph_phases_are_expected_eager(
         num_reqs=num_reqs,
         total_num_scheduled_tokens=total_tokens,
         max_num_scheduled_tokens=max_tokens,
+        uniform_decode_query_len=1,
         max_capture_size=capture,
     )
 
@@ -110,6 +112,7 @@ def test_stale_input_batch_state_is_not_a_fallback() -> None:
         num_reqs=1,
         total_num_scheduled_tokens=1,
         max_num_scheduled_tokens=1,
+        uniform_decode_query_len=1,
         max_capture_size=8,
     )
 
@@ -124,9 +127,44 @@ def test_enabled_graph_without_capture_sizes_is_not_a_fallback() -> None:
         num_reqs=1,
         total_num_scheduled_tokens=1,
         max_num_scheduled_tokens=1,
+        uniform_decode_query_len=1,
         max_capture_size=0,
     )
 
     assert not decision.use_full_graph
     assert not decision.is_expected_eager
     assert decision.reason == "missing_capture_sizes"
+
+
+def test_uniform_mtp3_decode_uses_the_same_full_graph_gate() -> None:
+    decision = evaluate_dsa_row_mode_decode_graph(
+        state=_state(
+            DSARequestCacheStage.DENSE_DECODE,
+            DSARequestCacheStage.SPARSE_DECODE,
+        ),
+        num_reqs=2,
+        total_num_scheduled_tokens=8,
+        max_num_scheduled_tokens=4,
+        uniform_decode_query_len=4,
+        max_capture_size=8,
+    )
+
+    assert decision.use_full_graph
+
+
+def test_mixed_mtp_query_lengths_fall_back_to_true_eager() -> None:
+    decision = evaluate_dsa_row_mode_decode_graph(
+        state=_state(
+            DSARequestCacheStage.DENSE_DECODE,
+            DSARequestCacheStage.SPARSE_DECODE,
+        ),
+        num_reqs=2,
+        total_num_scheduled_tokens=5,
+        max_num_scheduled_tokens=4,
+        uniform_decode_query_len=4,
+        max_capture_size=8,
+    )
+
+    assert not decision.use_full_graph
+    assert decision.is_expected_eager
+    assert decision.reason == "non_uniform_decode"

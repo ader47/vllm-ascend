@@ -21,7 +21,11 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
-from vllm_ascend.utils import enable_custom_op
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    enable_custom_op,
+    get_ascend_device_type,
+)
 from vllm_ascend.worker.pcp_utils import PCPManager, PCPSpecDecodeFirstPassInputs
 
 enable_custom_op()
@@ -1590,7 +1594,14 @@ class TestEagleProposerPropose:
         assert hasattr(RunnerCls, "_sync_metadata_across_dp")
         sig = inspect.signature(RunnerCls._sync_metadata_across_dp)
         sig_name = self.get_param_names(sig)
-        assert sig_name == ['self', 'num_tokens', 'is_draft_model', 'cudagraph_mode', 'allow_dp_padding']
+        assert sig_name == [
+            'self',
+            'num_tokens',
+            'is_draft_model',
+            'cudagraph_mode',
+            'allow_dp_padding',
+            'allow_dp_padding_without_cudagraph',
+        ]
 
         assert hasattr(RunnerCls, "_pad_query_start_loc_for_fia")
         sig = inspect.signature(RunnerCls._pad_query_start_loc_for_fia)
@@ -3982,6 +3993,10 @@ class TestEagleProposerSetInputsFirstPass:
 
         assert out_cad.prefill_context_parallel_metadata == long_seq_metadata
 
+    @pytest.mark.skipif(
+        get_ascend_device_type() == AscendDeviceType.A5,
+        reason="copy_and_expand_eagle_inputs is not built for A5",
+    )
     def test_set_inputs_first_pass_parallel_drafting(self):
         """
         Test for set_inputs_first_pass with parallel drafting (extra input slots,
@@ -4136,6 +4151,10 @@ class TestEagleProposerSetInputsFirstPass:
         for attrition in attrs_from_cad:
             assert_attr_equal(attrition, expected_cad, out_cad)
 
+    @pytest.mark.skipif(
+        get_ascend_device_type() == AscendDeviceType.A5,
+        reason="copy_and_expand_eagle_inputs is not built for A5",
+    )
     def test_set_inputs_first_pass_draft_model(self):
         """
         Test for set_inputs_first_pass with a draft model (extra input slots,

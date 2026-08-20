@@ -40,6 +40,8 @@ MAX_TOKENS = 32
 GPU_MEMORY_UTILIZATION = 0.90
 QUANTIZATION = "ascend"
 ENABLE_EXPERT_PARALLEL = True
+ENABLE_MTP = False
+MTP_NUM_SPECULATIVE_TOKENS = 3
 
 # A5/950 上的 DSA 首版只支持 LI C8 与 SFA C8 同时开启；A3/910C 保持 False。
 # disabled 模式也会保留这个 vLLM-Ascend 原生物理布局开关，便于用同一 C8
@@ -84,13 +86,21 @@ from vllm.config import ProfilerConfig  # noqa: E402
 
 
 def build_dsa_config(enable_graph: bool) -> dict[str, Any]:
+    sparse_activation_tokens = (
+        8192 if ENABLE_MTP else DSA_SPARSE_ACTIVATION_TOKENS
+    )
+    resident_budget_tokens = (
+        [8192, 10240, 12288]
+        if ENABLE_MTP
+        else DSA_RESIDENT_BUDGET_TOKENS
+    )
     return {
         "enabled": True,
         "split_indexer_cache": True,
         "indexer_mla_block_ratio": DSA_INDEXER_MLA_BLOCK_RATIO,
-        "sparse_activation_tokens": DSA_SPARSE_ACTIVATION_TOKENS,
+        "sparse_activation_tokens": sparse_activation_tokens,
         "prompt_budget_thresholds": DSA_PROMPT_BUDGET_THRESHOLDS,
-        "resident_budget_tokens": DSA_RESIDENT_BUDGET_TOKENS,
+        "resident_budget_tokens": resident_budget_tokens,
         "max_active_reqs": DSA_MAX_ACTIVE_REQS,
         "hot_cpu_block_multiple": DSA_HOT_CPU_BLOCK_MULTIPLE,
         "enable_row_mode_decode_graph": enable_graph,
@@ -99,6 +109,14 @@ def build_dsa_config(enable_graph: bool) -> dict[str, Any]:
 
 
 def build_llm_kwargs() -> dict[str, Any]:
+    if ENABLE_MTP and not ENABLE_A5_PACKED_C8_DSA:
+        raise ValueError(
+            "DSA compromise MTP3 requires ENABLE_A5_PACKED_C8_DSA=True"
+        )
+    if ENABLE_MTP and MTP_NUM_SPECULATIVE_TOKENS != 3:
+        raise ValueError(
+            "DSA compromise MTP requires MTP_NUM_SPECULATIVE_TOKENS=3"
+        )
     graph_enabled = RUN_MODE == "graph"
     kwargs: dict[str, Any] = {
         "model": MODEL_PATH,
@@ -136,8 +154,22 @@ def build_llm_kwargs() -> dict[str, Any]:
         )
     if additional_config:
         kwargs["additional_config"] = additional_config
+    if ENABLE_MTP:
+        kwargs["speculative_config"] = {
+            "method": "mtp",
+            "num_speculative_tokens": MTP_NUM_SPECULATIVE_TOKENS,
+        }
     if graph_enabled:
-        capture_sizes = sorted({size for size in (*DSA_GRAPH_CAPTURE_SIZES, MAX_NUM_SEQS) if size <= MAX_NUM_SEQS})
+        decode_query_len = (
+            1 + MTP_NUM_SPECULATIVE_TOKENS if ENABLE_MTP else 1
+        )
+        capture_sizes = sorted(
+            {
+                size * decode_query_len
+                for size in (*DSA_GRAPH_CAPTURE_SIZES, MAX_NUM_SEQS)
+                if size <= MAX_NUM_SEQS
+            }
+        )
         kwargs["compilation_config"] = {
             "mode": "VLLM_COMPILE",
             "cudagraph_mode": "FULL_DECODE_ONLY",
@@ -179,7 +211,7 @@ def main() -> None:
         "[dsa-smoke] "
         f"mode={RUN_MODE} model={MODEL_PATH!r} prompts={len(PROMPTS)} "
         f"max_model_len={MAX_MODEL_LEN} max_num_seqs={MAX_NUM_SEQS} "
-        f"a5_packed_c8={ENABLE_A5_PACKED_C8_DSA}"
+        f"a5_packed_c8={ENABLE_A5_PACKED_C8_DSA} mtp={ENABLE_MTP}"
     )
     llm = LLM(**kwargs)
 

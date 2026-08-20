@@ -215,6 +215,7 @@ from vllm_ascend.dsa_offload.kv_cache import (
     get_dsa_group_num_blocks,
     get_dsa_kv_cache_binding_order,
     get_dsa_kv_cache_group_ids,
+    is_dsa_mtp_full_spec,
 )
 from vllm_ascend.dsa_offload.ops import require_dsa_offload_ops
 from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
@@ -364,9 +365,8 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
-        self.dsa_offload_enabled = (
-            self.ascend_config.dsa_offload_config.enabled
-        )
+        dsa_config = self.ascend_config.dsa_offload_config
+        self.dsa_offload_enabled = dsa_config.enabled
         self.enable_sparse_sfa_c8 = self.ascend_config.enable_sparse_sfa_c8
         self.enable_sparse_li_c8 = self.ascend_config.enable_sparse_li_c8
         self.dsa_offload_packed_c8 = False
@@ -396,11 +396,17 @@ class NPUModelRunner(GPUModelRunner):
                     "DSA sparse offload C8 is currently supported only on A5; "
                     "A3 keeps the existing bf16/fp16 operator path."
                 )
+            if dsa_config.mtp_enabled and not self.dsa_offload_packed_c8:
+                raise RuntimeError(
+                    "DSA compromise MTP target validation initially requires "
+                    "the A5 packed-C8 LIM/KSC/QSFA path; the MTP proposer "
+                    "itself keeps its native BF16 full cache"
+                )
         self.dsa_kv_cache_group_ids: DSAKVCacheGroupIds | None = None
-        dsa_config = self.ascend_config.dsa_offload_config
-        resident_layer_count = self.model_config.get_num_layers(
+        target_resident_layer_count = self.model_config.get_num_layers(
             self.parallel_config
         )
+        resident_layer_count = target_resident_layer_count
         full_indexer_layers = (
             dsa_config.model_capabilities.full_indexer_layer_indices
             if dsa_config.model_capabilities is not None
@@ -409,7 +415,7 @@ class NPUModelRunner(GPUModelRunner):
         selection_state_count = (
             len(full_indexer_layers)
             if full_indexer_layers is not None
-            else resident_layer_count
+            else target_resident_layer_count
         )
         self.dsa_resident_token_pool = (
             DSAResidentTokenPool(
@@ -435,11 +441,13 @@ class NPUModelRunner(GPUModelRunner):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 packed_c8=self.dsa_offload_packed_c8,
+                max_decode_query_len=self.uniform_decode_query_len,
             )
             if self.dsa_resident_token_pool is not None
             else None
         )
         self.dsa_hot_dram_store: DSAHotDRAMStore | None = None
+        self._dsa_decode_forward = False
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
@@ -800,6 +808,7 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs=num_reqs,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             max_num_scheduled_tokens=max_num_scheduled_tokens,
+            uniform_decode_query_len=self.uniform_decode_query_len,
             max_capture_size=self._dsa_row_mode_max_capture_size,
         )
 
@@ -819,11 +828,12 @@ class NPUModelRunner(GPUModelRunner):
         target_budget = int(
             self.ascend_config.dsa_offload_config.resident_budget_tokens[0]
         )
-        dummy_seq_len = target_budget + 1
+        dummy_seq_len = target_budget + self.uniform_decode_query_len
         if dummy_seq_len > self.model_config.max_model_len:
             raise RuntimeError(
                 "DSA graph capture needs max_model_len to cover the "
-                "smallest resident budget plus one token: "
+                "smallest resident budget plus one uniform decode query "
+                "group: "
                 f"required={dummy_seq_len}, "
                 f"max_model_len={self.model_config.max_model_len}"
             )
@@ -1208,6 +1218,14 @@ class NPUModelRunner(GPUModelRunner):
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+        if self.dsa_offload_enabled:
+            # DSA scheduler 保证 prefill/decode 不混批，因此读取第一行即可
+            # 区分“最后一个单-token prefill chunk”和真正 decode，无需再
+            # 扫描 batch 或创建临时 mask。
+            self._dsa_decode_forward = bool(
+                self.input_batch.num_computed_tokens_cpu[0]
+                >= self.input_batch.num_prompt_tokens[0]
+            )
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -1629,6 +1647,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs=num_reqs,
                 num_tokens=total_num_scheduled_tokens,
                 resident_group_id=group_ids.resident_mla,
+                decode_forward=self._dsa_decode_forward,
             )
 
         # For non-PCP, compute slot_mapping on GPU. PCP slot_mapping was
@@ -1654,6 +1673,18 @@ class NPUModelRunner(GPUModelRunner):
                     self.query_start_loc.gpu[: num_reqs + 1],
                     dsa_resident_positions,
                 )
+                mtp_full_group_id = self.dsa_kv_cache_group_ids.mtp_full
+                if mtp_full_group_id is not None:
+                    # MTP 保持基线原生 full-cache 寻址，不使用 target
+                    # resident budget 的压缩 position。其 block table 虽由
+                    # DSA coordinator 独立分池，但 slot mapping 语义仍与
+                    # 普通 Eagle/MTP group 完全一致。
+                    self.input_batch.block_table.compute_slot_mapping_for_group(
+                        mtp_full_group_id,
+                        num_reqs,
+                        self.query_start_loc.gpu[: num_reqs + 1],
+                        self.positions[:total_num_scheduled_tokens],
+                    )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(
@@ -3775,6 +3806,10 @@ class NPUModelRunner(GPUModelRunner):
             dsa_sparse_budget_tokens=dsa_sparse_budget_tokens,
             dsa_candidate_lens=dsa_candidate_lens,
             dsa_dram_block_table=dsa_dram_block_table,
+            dsa_decode_forward=(
+                self.dsa_offload_enabled
+                and (is_capture_dummy or self._dsa_decode_forward)
+            ),
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
@@ -4619,7 +4654,8 @@ class NPUModelRunner(GPUModelRunner):
         但二者的名字包含相同 layer index。vLLM 通用 binder 在昇腾平台会
         将这种情况视作不受支持的同层多 attention cache，因此 DSA 在这里
         按最终 KVCacheConfig 的类型化 group 明确绑定。非 DSA 路径仍完整
-        使用上游 binder。
+        使用上游 binder。可选 MTP full group 只有一个原生 attention cache
+        identity，在同一函数中按基线语义直接绑定，不进入逐层 DSA context。
         """
 
         from vllm.model_executor.models.utils import extract_layer_index
@@ -4627,9 +4663,31 @@ class NPUModelRunner(GPUModelRunner):
         from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
 
         assert len(self.kv_caches) == 0
-        require_dsa_offload_ops(packed_c8=self.dsa_offload_packed_c8)
+        require_dsa_offload_ops(
+            packed_c8=self.dsa_offload_packed_c8,
+            mtp=self.ascend_config.dsa_offload_config.mtp_enabled,
+        )
         binding_order = get_dsa_kv_cache_binding_order(kv_cache_config)
-        expected_layers = set(binding_order)
+        expected_dsa_layers = set(binding_order)
+        mtp_full_group = next(
+            (
+                group
+                for group in kv_cache_config.kv_cache_groups
+                if is_dsa_mtp_full_spec(group.kv_cache_spec)
+            ),
+            None,
+        )
+        mtp_full_layers = (
+            set(mtp_full_group.layer_names)
+            if mtp_full_group is not None
+            else set()
+        )
+        mtp_full_num_blocks = (
+            get_dsa_group_num_blocks(kv_cache_config, mtp_full_group)
+            if mtp_full_group is not None
+            else 0
+        )
+        expected_layers = expected_dsa_layers | mtp_full_layers
         actual_layers = set(kv_caches)
         if actual_layers != expected_layers:
             raise RuntimeError(
@@ -4666,6 +4724,50 @@ class NPUModelRunner(GPUModelRunner):
                     f"{layer_index}: {target[layer_index]}, {layer_name}"
                 )
             target[layer_index] = layer_name
+
+        for layer_name in sorted(mtp_full_layers):
+            kv_cache = kv_caches[layer_name]
+            forward_context[layer_name].kv_cache = kv_cache
+            self.kv_caches.append(kv_cache)
+            if not isinstance(kv_cache, tuple) or len(kv_cache) != 3:
+                raise RuntimeError(
+                    "DSA MTP full Cache must expose native BF16 "
+                    "MLA+Indexer entries: "
+                    f"layer={layer_name}, "
+                    f"entries={len(kv_cache) if isinstance(kv_cache, tuple) else 0}"
+                )
+            if any(tensor.dtype != torch.bfloat16 for tensor in kv_cache):
+                raise RuntimeError(
+                    "DSA MTP full Cache must preserve BF16 payloads: "
+                    f"layer={layer_name}, "
+                    f"dtypes={tuple(tensor.dtype for tensor in kv_cache)}"
+                )
+            spec = layer_specs[layer_name]
+            if (
+                not is_dsa_mtp_full_spec(spec)
+                or not isinstance(spec, AscendMLAAttentionSpec)
+                or spec.sparse_head_dim is None
+            ):
+                raise RuntimeError(
+                    "DSA MTP full Cache lost its native layer spec: "
+                    f"layer={layer_name}, spec={type(spec).__name__}"
+                )
+            expected_shapes = tuple(
+                (
+                    mtp_full_num_blocks,
+                    spec.block_size,
+                    spec.num_kv_heads,
+                    int(head_dim),
+                )
+                for head_dim in spec.sparse_head_dim
+            )
+            actual_shapes = tuple(tuple(tensor.shape) for tensor in kv_cache)
+            if actual_shapes != expected_shapes:
+                raise RuntimeError(
+                    "DSA MTP full Cache violates the native MLA+Indexer "
+                    f"shape contract: layer={layer_name}, "
+                    f"actual={actual_shapes}, expected={expected_shapes}"
+                )
 
         # GLM-5.2 共享 indexer 下 indexer 层是 resident 层的真子集（仅 full
         # 层）。子集之外的方向（indexer 无 resident 对应）仍是硬错误。
@@ -5976,6 +6078,9 @@ class NPUModelRunner(GPUModelRunner):
         )
         from vllm.model_executor.models.utils import extract_layer_index
 
+        target_resident_layer_count = self.model_config.get_num_layers(
+            self.parallel_config
+        )
         kv_cache_spec: dict[str, list[KVCacheSpec]] = defaultdict(list)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         # NOTE: Must process Attention/MLAAttention before MambaBase to maintain
@@ -6010,7 +6115,27 @@ class NPUModelRunner(GPUModelRunner):
                     enable_sparse_sfa_c8_for_layer = bool(getattr(impl, "enable_sparse_sfa_c8", False))
                     enable_sparse_li_c8_for_layer = bool(getattr(impl, "enable_sparse_li_c8", False))
 
-                    if self.dsa_offload_enabled:
+                    layer_index = extract_layer_index(layer_name)
+                    is_mtp_full_cache_layer = (
+                        self.dsa_offload_enabled
+                        and self.ascend_config.dsa_offload_config.is_mtp_cache_layer_index(
+                            layer_index,
+                            target_resident_layer_count,
+                        )
+                    )
+                    if is_mtp_full_cache_layer != bool(
+                        impl.is_dsa_mtp_full_cache_layer
+                    ):
+                        raise RuntimeError(
+                            "DSA MTP cache-layer classification drifted "
+                            "between attention construction and KV spec: "
+                            f"layer={layer_name}, layer_index={layer_index}"
+                        )
+                    apply_dsa_to_layer = (
+                        self.dsa_offload_enabled
+                        and not is_mtp_full_cache_layer
+                    )
+                    if apply_dsa_to_layer:
                         skip_topk = bool(getattr(impl, "skip_topk", False))
                         caps = self.ascend_config.dsa_offload_config.model_capabilities
                         shared_indices = (
@@ -6018,7 +6143,6 @@ class NPUModelRunner(GPUModelRunner):
                             if caps is not None
                             else None
                         )
-                        layer_index = extract_layer_index(layer_name)
                         declared_shared = bool(
                             shared_indices is not None
                             and layer_index in shared_indices
@@ -6093,6 +6217,17 @@ class NPUModelRunner(GPUModelRunner):
                                 cache_sparse_li_c8=False,
                             )
                         )
+                    elif is_mtp_full_cache_layer:
+                        if not has_indexer:
+                            raise RuntimeError(
+                                "DSA MTP full-cache layer must keep its local "
+                                f"baseline Indexer: layer={layer_name}"
+                            )
+                        sparse_head_dim = (
+                            int(impl.kv_lora_rank),
+                            int(impl.qk_rope_head_dim),
+                            int(impl.head_dim),
+                        )
                     elif enable_sparse_sfa_c8_for_layer:
                         packed_kv_head_dim = get_sfa_qsfa_packed_head_dim(
                             self.model_config.hf_text_config.kv_lora_rank,
@@ -6114,7 +6249,7 @@ class NPUModelRunner(GPUModelRunner):
                             0,
                         )
 
-                    if not self.dsa_offload_enabled:
+                    if not apply_dsa_to_layer:
                         kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
                             block_size=self.block_size,
                             num_kv_heads=1,
@@ -6145,7 +6280,14 @@ class NPUModelRunner(GPUModelRunner):
                 mamba_layers[layer_name] = attn_module
 
             elif isinstance(attn_module, DeepseekV32IndexerCache):
-                if self.dsa_offload_enabled:
+                layer_index = extract_layer_index(layer_name)
+                if (
+                    self.dsa_offload_enabled
+                    and not self.ascend_config.dsa_offload_config.is_mtp_cache_layer_index(
+                        layer_index,
+                        target_resident_layer_count,
+                    )
+                ):
                     kv_cache_spec[layer_name] = DSAIndexerKVSpec(
                         block_size=attn_module.cache_config.block_size,
                         num_kv_heads=1,

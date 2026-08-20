@@ -52,7 +52,7 @@ def _load_a5_dsa_custom_ops() -> None:
     if get_ascend_device_type() != AscendDeviceType.A5:
         pytest.skip("packed-C8 DSA operators require Ascend A5")
     try:
-        require_dsa_offload_ops(packed_c8=True)
+        require_dsa_offload_ops(packed_c8=True, mtp=True)
     except RuntimeError as error:
         pytest.fail(str(error))
 
@@ -211,9 +211,12 @@ def _make_fused_lidu_inputs(
 
 def _allocate_fused_lidu_outputs(
     batch: int = 1,
+    total_query_rows: int | None = None,
 ) -> tuple[torch.Tensor, ...]:
+    if total_query_rows is None:
+        total_query_rows = batch
     attention_slots = torch.full(
-        (batch, 1, _ATTENTION_CAPACITY),
+        (total_query_rows, 1, _ATTENTION_CAPACITY),
         -77,
         dtype=torch.int32,
         device="npu",
@@ -252,6 +255,28 @@ def _launch_fused_lidu(
     outputs: tuple[torch.Tensor, ...],
 ) -> None:
     torch.ops._C_ascend.npu_dsa_a5_li_manage_nomtp_c8_out(
+        inputs["weights"],
+        inputs["query"],
+        inputs["query_scale"],
+        inputs["query_ends"],
+        inputs["key"],
+        inputs["key_scale"],
+        inputs["block_table"],
+        inputs["candidate_lens"],
+        inputs["final_lens"],
+        inputs["row_modes"],
+        inputs["req_entries"],
+        cache_slots,
+        *outputs,
+    )
+
+
+def _launch_mtp_lim(
+    inputs: dict[str, torch.Tensor],
+    cache_slots: torch.Tensor,
+    outputs: tuple[torch.Tensor, ...],
+) -> None:
+    torch.ops._C_ascend.npu_dsa_a5_li_manage_c8_out(
         inputs["weights"],
         inputs["query"],
         inputs["query_scale"],
@@ -336,6 +361,306 @@ def test_packed_c8_fused_lidu_dense_matches_framework_semantics(
     assert resident_lengths.tolist() == [dense_len] * batch
     assert counts.tolist() == [0] * batch
     assert torch.equal(cache_slots, before)
+
+
+def test_packed_c8_mtp_lim_dense_short_rows_are_causal() -> None:
+    batch = 2
+    queries_per_request = 4
+    total_query_rows = batch * queries_per_request
+    final_len = 16
+    inputs = _make_fused_lidu_inputs(
+        candidate_len=final_len,
+        final_len=final_len,
+        row_mode=1,
+        batch=total_query_rows,
+        seed=29,
+    )
+    inputs["query_ends"] = torch.tensor(
+        [4, 8],
+        dtype=torch.int32,
+        device="npu",
+    )
+    for name in (
+        "block_table",
+        "candidate_lens",
+        "final_lens",
+        "row_modes",
+        "req_entries",
+    ):
+        inputs[name] = inputs[name][:batch]
+    cache_slots = torch.full(
+        (batch + 1, _cache_row_width(8192)),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    cache_slots[:, -1].zero_()
+    before = cache_slots.clone()
+    outputs = _allocate_fused_lidu_outputs(
+        batch,
+        total_query_rows,
+    )
+
+    _launch_mtp_lim(inputs, cache_slots, outputs)
+    torch.npu.synchronize()
+
+    attention, resident_lengths, _, _, counts = (
+        tensor.cpu() for tensor in outputs
+    )
+    for query_row in range(total_query_rows):
+        local_query = query_row % queries_per_request
+        visible_len = final_len - (
+            queries_per_request - 1 - local_query
+        )
+        _assert_exact_int_tensor(
+            attention[query_row, 0, :visible_len],
+            torch.arange(visible_len, dtype=torch.int32),
+        )
+        assert torch.all(
+            attention[query_row, 0, visible_len:] == -1
+        )
+    assert resident_lengths.tolist() == [final_len] * batch
+    assert counts.tolist() == [0] * batch
+    assert torch.equal(cache_slots, before)
+
+
+def test_packed_c8_mtp_lim_dense_long_rows_are_causal() -> None:
+    batch = 2
+    queries_per_request = 4
+    total_query_rows = batch * queries_per_request
+    final_len = 2180
+    inputs = _make_fused_lidu_inputs(
+        candidate_len=final_len,
+        final_len=final_len,
+        row_mode=1,
+        batch=total_query_rows,
+        seed=31,
+    )
+    # Request-level tensors keep B rows while query/weight/scale keep T rows.
+    inputs["query_ends"] = torch.tensor(
+        [4, 8],
+        dtype=torch.int32,
+        device="npu",
+    )
+    inputs["block_table"] = inputs["block_table"][:batch]
+    inputs["candidate_lens"] = inputs["candidate_lens"][:batch]
+    inputs["final_lens"] = inputs["final_lens"][:batch]
+    inputs["row_modes"] = inputs["row_modes"][:batch]
+    inputs["req_entries"] = inputs["req_entries"][:batch]
+    # This is the exact native target-model call shape: compact TND Q rows,
+    # per-request final KV lengths, and sparse_mode=3 for causal visibility.
+    expected_topk = _native_topk(inputs).cpu().reshape(
+        total_query_rows,
+        _TOPK,
+    )
+    cache_slots = torch.full(
+        (batch + 1, _cache_row_width(8192)),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    cache_slots[:, -1].zero_()
+    before = cache_slots.clone()
+    outputs = _allocate_fused_lidu_outputs(
+        batch,
+        total_query_rows,
+    )
+
+    _launch_mtp_lim(inputs, cache_slots, outputs)
+    torch.npu.synchronize()
+
+    attention, resident_lengths, raw_topk, error_metadata, counts = (
+        tensor.cpu() for tensor in outputs
+    )
+    if any(count < 0 for count in counts.tolist()):
+        diagnostics = []
+        for request, count in enumerate(counts.tolist()):
+            if count >= 0:
+                continue
+            raw = raw_topk[request, 0, :_TOPK]
+            query_row = int(error_metadata[request, 0, 0])
+            visible_len = int(error_metadata[request, 0, 1])
+            invalid = torch.nonzero(
+                (raw < 0) | (raw >= visible_len),
+                as_tuple=False,
+            ).view(-1)
+            diagnostics.append(
+                {
+                    "request": request,
+                    "query_row": query_row,
+                    "visible_len": visible_len,
+                    "invalid_count": int(invalid.numel()),
+                    "first_invalid_indices": invalid[:16].tolist(),
+                    "raw_prefix": raw[:16].tolist(),
+                    "raw_suffix": raw[-16:].tolist(),
+                    "valid_unique": int(
+                        torch.unique(
+                            raw[(raw >= 0) & (raw < visible_len)]
+                        ).numel()
+                    ),
+                }
+            )
+        pytest.fail(f"MTP LIM dense selection error: {diagnostics}")
+    for query_row in range(total_query_rows):
+        actual_row = attention[query_row, 0, :_TOPK]
+        expected_row = expected_topk[query_row]
+        if not torch.equal(actual_row, expected_row):
+            mismatch = torch.nonzero(
+                actual_row != expected_row,
+                as_tuple=False,
+            ).view(-1)
+            invalid = torch.nonzero(
+                (actual_row < 0)
+                | (actual_row >= final_len),
+                as_tuple=False,
+            ).view(-1)
+            pytest.fail(
+                "MTP LIM dense top-k mismatch: "
+                f"query_row={query_row}, "
+                f"mismatch_count={int(mismatch.numel())}, "
+                f"first_mismatch_indices={mismatch[:16].tolist()}, "
+                f"actual_at_mismatch={actual_row[mismatch[:16]].tolist()}, "
+                f"expected_at_mismatch={expected_row[mismatch[:16]].tolist()}, "
+                f"invalid_count={int(invalid.numel())}, "
+                f"invalid_indices={invalid[:16].tolist()}, "
+                "same_multiset="
+                f"{torch.equal(torch.sort(actual_row).values, torch.sort(expected_row).values)}"
+            )
+        assert torch.all(
+            attention[query_row, 0, _TOPK:] == -1
+        )
+    assert resident_lengths.tolist() == [final_len] * batch
+    assert counts.tolist() == [0] * batch
+    assert torch.equal(cache_slots, before)
+
+
+def test_packed_c8_mtp_lim_uses_per_query_candidates_and_dual_tails() -> None:
+    budget = 8192
+    source_len = 8192
+    final_len = 8321
+    queries_per_request = 4
+    inputs = _make_fused_lidu_inputs(
+        candidate_len=final_len - 1,
+        final_len=final_len,
+        row_mode=2,
+        batch=queries_per_request,
+        seed=47,
+    )
+    inputs["query_ends"] = torch.tensor(
+        [queries_per_request],
+        dtype=torch.int32,
+        device="npu",
+    )
+    inputs["block_table"] = inputs["block_table"][:1]
+    inputs["candidate_lens"] = torch.tensor(
+        [source_len],
+        dtype=torch.int32,
+        device="npu",
+    )
+    inputs["final_lens"] = torch.tensor(
+        [final_len],
+        dtype=torch.int32,
+        device="npu",
+    )
+    inputs["row_modes"] = torch.tensor(
+        [2],
+        dtype=torch.int32,
+        device="npu",
+    )
+    inputs["req_entries"] = torch.tensor(
+        [0],
+        dtype=torch.int32,
+        device="npu",
+    )
+
+    expected_topk_rows: list[torch.Tensor] = []
+    candidate_ends: list[int] = []
+    for query_row in range(queries_per_request):
+        visible_len = final_len - (queries_per_request - 1 - query_row)
+        candidate_end = (
+            (visible_len - 1) // _BLOCK_SIZE * _BLOCK_SIZE
+        )
+        candidate_ends.append(candidate_end)
+        row_inputs = {
+            "query": inputs["query"][query_row : query_row + 1],
+            "key": inputs["key"],
+            "weights": inputs["weights"][query_row : query_row + 1],
+            "query_scale": inputs["query_scale"][
+                query_row : query_row + 1
+            ],
+            "key_scale": inputs["key_scale"],
+            "query_ends": torch.tensor(
+                [1],
+                dtype=torch.int32,
+                device="npu",
+            ),
+            "candidate_lens": torch.tensor(
+                [candidate_end],
+                dtype=torch.int32,
+                device="npu",
+            ),
+            "block_table": inputs["block_table"],
+        }
+        expected_topk_rows.append(
+            _native_topk(row_inputs).cpu().view(-1)
+        )
+
+    cache_slots = torch.full(
+        (2, _cache_row_width(final_len)),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    cache_slots[:, -1].zero_()
+    cache_slots[0, -1] = -budget
+    outputs = _allocate_fused_lidu_outputs(
+        batch=1,
+        total_query_rows=queries_per_request,
+    )
+
+    _launch_mtp_lim(inputs, cache_slots, outputs)
+    torch.npu.synchronize()
+
+    attention, resident_lengths, _, _, counts = (
+        tensor.cpu() for tensor in outputs
+    )
+    cache_row = cache_slots[0].cpu()
+    for query_row, expected_tokens in enumerate(expected_topk_rows):
+        expected_slots = torch.where(
+            expected_tokens < source_len,
+            cache_row[expected_tokens.to(torch.long)],
+            budget + expected_tokens.remainder(2 * _BLOCK_SIZE),
+        ).to(torch.int32)
+        _assert_exact_int_tensor(
+            attention[query_row, 0, :_TOPK],
+            expected_slots,
+        )
+
+        visible_len = final_len - (queries_per_request - 1 - query_row)
+        tail_start = candidate_ends[query_row]
+        tail_tokens = torch.arange(
+            tail_start,
+            visible_len,
+            dtype=torch.int32,
+        )
+        expected_tail_slots = (
+            budget + tail_tokens.remainder(2 * _BLOCK_SIZE)
+        )
+        tail_len = int(tail_tokens.numel())
+        _assert_exact_int_tensor(
+            attention[
+                query_row,
+                0,
+                _TOPK : _TOPK + tail_len,
+            ],
+            expected_tail_slots,
+        )
+        assert torch.all(
+            attention[query_row, 0, _TOPK + tail_len :] == -1
+        )
+
+    assert resident_lengths.tolist() == [budget + 2 * _BLOCK_SIZE]
+    assert counts.tolist() == [budget]
 
 
 @pytest.mark.parametrize("budget", [6144, 10240, 12288])
