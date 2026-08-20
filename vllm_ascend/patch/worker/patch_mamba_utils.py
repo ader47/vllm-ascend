@@ -63,7 +63,15 @@ def _get_tensor_copy_pairs(copy_bufs: mamba_utils.MambaCopyBuffers) -> list[tupl
     return copy_bufs._tensor_copy_pairs
 
 
-def _collect_mamba_copy_meta_torch(
+def _reset_layerwise_copy_meta(copy_bufs: mamba_utils.MambaCopyBuffers) -> None:
+    copy_bufs._layer_copy_metadata = {}
+    copy_bufs._layer_copy_slices = {}
+    copy_bufs._layer_copy_staged = False
+    copy_bufs._layer_tensor_copy_pairs = {}
+    copy_bufs._tensor_copy_pairs = []
+
+
+def _collect_mamba_copy_meta_with_layers(
     copy_bufs: mamba_utils.MambaCopyBuffers,
     kv_cache_config,
     mamba_state_copy_funcs,
@@ -78,6 +86,10 @@ def _collect_mamba_copy_meta_torch(
         return
 
     tensor_copy_pairs = _get_tensor_copy_pairs(copy_bufs)
+    layer_copy_metadata = copy_bufs._layer_copy_metadata
+    layer_tensor_copy_pairs = copy_bufs._layer_tensor_copy_pairs
+    src_ptrs_np = copy_bufs.src_ptrs.np
+    dst_ptrs_np = copy_bufs.dst_ptrs.np
     sizes_np = copy_bufs.sizes.np
     offset = copy_bufs.offset
 
@@ -88,15 +100,108 @@ def _collect_mamba_copy_meta_torch(
         for layer_name in layer_names:
             attention = forward_context[layer_name]
             kv_caches: list[torch.Tensor] = attention.kv_cache
+            layer_meta = layer_copy_metadata.setdefault(layer_name, ([], [], []))
+            layer_pairs = layer_tensor_copy_pairs.setdefault(layer_name, [])
             for state, state_copy_func in zip(kv_caches, mamba_state_copy_funcs):
                 copy_spec = state_copy_func(state, block_ids, src_block_idx, accept_token_bias + 1)
+                src_ptr = copy_spec.start_addr
+                dst_ptr = state[dest_block_id].data_ptr()
+                size = copy_spec.num_elements * state.element_size()
+                src_ptrs_np[offset] = src_ptr
+                dst_ptrs_np[offset] = dst_ptr
+                sizes_np[offset] = size
+                layer_meta[0].append(src_ptr)
+                layer_meta[1].append(dst_ptr)
+                layer_meta[2].append(size)
+                if _can_launch_triton_batch_memcpy():
+                    offset += 1
+                    continue
                 src_state = _tensor_view_from_data_ptr(state, copy_spec.start_addr, copy_spec.num_elements)
                 dst_state = _tensor_view_from_data_ptr(state, state[dest_block_id].data_ptr(), copy_spec.num_elements)
                 tensor_copy_pairs.append((src_state, dst_state))
-                sizes_np[offset] = copy_spec.num_elements * state.element_size()
+                layer_pairs.append((src_state, dst_state))
                 offset += 1
 
     copy_bufs.offset = offset
+
+
+def prepare_mamba_copy_by_layer(copy_bufs: MambaCopyBuffers) -> None:
+    """Stage all layer copy metadata before layerwise model execution.
+
+    ``CpuGpuBuffer.copy_to_gpu`` is non-blocking. Repacking the same pinned CPU
+    buffers for every layer can therefore overwrite metadata that an earlier
+    H2D copy has not consumed yet. Pack all layers once and keep their GPU
+    slices immutable for the duration of the forward pass.
+    """
+    layer_copy_metadata = getattr(copy_bufs, "_layer_copy_metadata", None)
+    if not layer_copy_metadata or getattr(copy_bufs, "_layer_copy_staged", False):
+        return
+
+    if not _can_launch_triton_batch_memcpy():
+        copy_bufs._layer_copy_staged = True
+        return
+
+    offset = 0
+    layer_copy_slices = {}
+    for layer_name, (src_ptrs, dst_ptrs, sizes) in layer_copy_metadata.items():
+        num_copies = len(src_ptrs)
+        end = offset + num_copies
+        copy_bufs.src_ptrs.np[offset:end] = src_ptrs
+        copy_bufs.dst_ptrs.np[offset:end] = dst_ptrs
+        copy_bufs.sizes.np[offset:end] = sizes
+        layer_copy_slices[layer_name] = (offset, end)
+        offset = end
+
+    copy_bufs.offset = offset
+    copy_bufs._layer_copy_slices = layer_copy_slices
+    if offset:
+        copy_bufs.src_ptrs.copy_to_gpu(offset)
+        copy_bufs.dst_ptrs.copy_to_gpu(offset)
+        copy_bufs.sizes.copy_to_gpu(offset)
+    copy_bufs._layer_copy_staged = True
+
+
+def do_mamba_copy_block_for_layer(copy_bufs: MambaCopyBuffers, layer_name: str) -> None:
+    """Copy one layer's running state after its layerwise load completes."""
+    layer_copy_metadata = getattr(copy_bufs, "_layer_copy_metadata", None)
+    if not layer_copy_metadata:
+        return
+    if _can_launch_triton_batch_memcpy() and not getattr(copy_bufs, "_layer_copy_staged", False):
+        # Keep direct callers safe while connectors normally stage before the
+        # first layer load begins.
+        prepare_mamba_copy_by_layer(copy_bufs)
+    metadata = layer_copy_metadata.pop(layer_name, None)
+    if metadata is None:
+        return
+
+    if not _can_launch_triton_batch_memcpy():
+        layer_pairs = copy_bufs._layer_tensor_copy_pairs.pop(layer_name, [])
+        for src_state, dst_state in layer_pairs:
+            dst_state.copy_(src_state.clone())
+        return
+
+    layer_slice = copy_bufs._layer_copy_slices.pop(layer_name, None)
+    if layer_slice is None:
+        return
+    start, end = layer_slice
+    if start == end:
+        return
+    mamba_utils.batch_memcpy(
+        copy_bufs.src_ptrs.gpu[start:end],
+        copy_bufs.dst_ptrs.gpu[start:end],
+        copy_bufs.sizes.gpu[start:end],
+    )
+
+
+def finish_mamba_copy_by_layer(copy_bufs: MambaCopyBuffers) -> None:
+    remaining = getattr(copy_bufs, "_layer_copy_metadata", {})
+    if remaining:
+        raise RuntimeError(f"Mamba state copy was not executed for loaded layers: {sorted(remaining)}")
+    copy_bufs._layer_copy_slices = {}
+    copy_bufs._layer_copy_staged = False
+    copy_bufs._layer_tensor_copy_pairs = {}
+    copy_bufs._tensor_copy_pairs = []
+    copy_bufs.offset = 0
 
 
 def _do_mamba_copy_block_torch(copy_bufs: mamba_utils.MambaCopyBuffers):
@@ -200,9 +305,12 @@ if _can_launch_triton_batch_memcpy():
     mamba_utils.postprocess_mamba_fused_kernel = postprocess_mamba_fused_kernel
 else:
     mamba_utils.batch_memcpy = _batch_memcpy_unavailable
-    mamba_utils.collect_mamba_copy_meta = _collect_mamba_copy_meta_torch
     mamba_utils.do_mamba_copy_block = _do_mamba_copy_block_torch
     mamba_utils.postprocess_mamba_align_gpu = _postprocess_mamba_align_gpu_cpu_fallback
+
+mamba_utils.do_mamba_copy_block_for_layer = do_mamba_copy_block_for_layer
+mamba_utils.prepare_mamba_copy_by_layer = prepare_mamba_copy_by_layer
+mamba_utils.finish_mamba_copy_by_layer = finish_mamba_copy_by_layer
 
 # Ascend NPU does not support DT_UINT64 in aclnnInplaceZero.
 # MambaCopyBuffers.create() uses torch.uint64 for src_ptrs/dst_ptrs,
@@ -251,6 +359,7 @@ def preprocess_mamba(
         mamba_state_idx.pop(req_id, None)
 
     copy_bufs.offset = 0
+    _reset_layerwise_copy_meta(copy_bufs)
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
         prev_state_idx = mamba_state_idx.get(req_id)
@@ -277,7 +386,7 @@ def preprocess_mamba(
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
         mamba_state_idx[req_id] = curr_state_idx
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
-            mamba_utils.collect_mamba_copy_meta(
+            _collect_mamba_copy_meta_with_layers(
                 copy_bufs,
                 kv_cache_config,
                 mamba_state_copy_funcs,
