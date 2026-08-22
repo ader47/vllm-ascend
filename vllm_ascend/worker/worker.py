@@ -936,11 +936,13 @@ class NPUWorker(WorkerBase):
         physical_page_bytes = 0
         for slot in reuse_layout.buffer_slots:
             physical_page_bytes += reuse_layout.layer_cache_specs[slot[0]].main.spec.page_size_bytes
-            for layer in slot:
-                indexer = reuse_layout.layer_cache_specs[layer].indexer
-                if indexer is not None:
-                    physical_page_bytes += indexer.spec.page_size_bytes
-                    break
+            indexer_page_sizes = [
+                indexer.spec.page_size_bytes
+                for layer in slot
+                if (indexer := reuse_layout.layer_cache_specs[layer].indexer) is not None
+            ]
+            if indexer_page_sizes:
+                physical_page_bytes += max(indexer_page_sizes)
         return num_layers, num_buffer_assignments, logical_page_bytes / physical_page_bytes
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
