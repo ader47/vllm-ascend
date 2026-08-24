@@ -328,7 +328,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(indexer_spec.page_size_bytes, 2 * 16 * (128 + 2))
         self.assertFalse(hasattr(main_spec, "sfa_dcp_replicated_indexer_size"))
 
-    def test_layerwise_mixed_li_c8_indexers_share_raw_buffer(self):
+    def test_mixed_li_c8_indexers_share_raw_buffer_only_with_layer_reuse(self):
         runner = self._build_runner()
         runner.vllm_config.kv_transfer_config = SimpleNamespace(
             kv_connector="AscendStoreConnector",
@@ -397,6 +397,13 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             ]
         )
 
+        raw_caches_without_reuse = runner._allocate_kv_cache_tensors(kv_cache_config)
+        self.assertNotEqual(
+            raw_caches_without_reuse[bf16_name][0].untyped_storage().data_ptr(),
+            raw_caches_without_reuse[c8_name][0].untyped_storage().data_ptr(),
+        )
+
+        runner.layerwise_kv_cache_reuse_applied = True
         raw_caches = runner._allocate_kv_cache_tensors(kv_cache_config)
         bf16_raw = raw_caches[bf16_name]
         c8_raw = raw_caches[c8_name]

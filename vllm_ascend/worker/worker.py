@@ -66,6 +66,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
     build_layerwise_reuse_layout,
     get_gva_layerwise_config,
     get_layerwise_physical_layer_index,
+    is_layerwise_reuse_requested,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     get_host_device_memory_usage_ratio,
@@ -922,6 +923,8 @@ class NPUWorker(WorkerBase):
         physical_layers = {get_layerwise_physical_layer_index(layer_name, base_layers) for layer_name in kv_cache_spec}
         num_layers = len(physical_layers)
         if num_layers < base_layers:
+            return num_layers, num_layers, 1.0
+        if not is_layerwise_reuse_requested(kv_cache_spec, base_layers, extra_config):
             return num_layers, num_layers, 1.0
         reuse_layout = build_layerwise_reuse_layout(
             kv_cache_spec,

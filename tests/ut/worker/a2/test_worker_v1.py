@@ -252,6 +252,29 @@ class TestNPUWorker(TestBase):
 
         self.assertEqual(memory_info, (3, 3, 1.0))
 
+    def test_no_reuse_does_not_validate_multi_component_layers(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.model_config = MagicMock()
+        worker.parallel_config = MagicMock()
+        worker.model_config.get_num_layers.return_value = 2
+        suffixes = (
+            "compressor.state_cache",
+            "indexer.k_cache",
+            "indexer.compressor.state_cache",
+            "swa_cache",
+            "attn",
+        )
+        specs = {f"model.layers.{layer}.self_attn.{suffix}": MagicMock() for layer in range(2) for suffix in suffixes}
+
+        memory_info = worker._get_layerwise_kv_cache_memory_info(
+            specs,
+            {"layerwise_num_shared_buffers": 2},
+        )
+
+        self.assertEqual(memory_info, (2, 2, 1.0))
+
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.ops")
     @patch("vllm_ascend.worker.worker._register_atb_extensions")

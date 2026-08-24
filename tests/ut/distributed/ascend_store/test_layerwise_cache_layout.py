@@ -76,8 +76,40 @@ def test_no_reuse_skips_topology_validation():
         ],
     )
 
-    apply_layerwise_kv_cache_plan(kv_cache_config, _make_vllm_config(2, 2))
+    assert apply_layerwise_kv_cache_plan(kv_cache_config, _make_vllm_config(2, 2)) is False
 
+    assert kv_cache_config.kv_cache_tensors == original_tensors
+
+
+def test_no_reuse_skips_multi_component_layer_validation():
+    spec = MambaSpec(
+        block_size=2,
+        shapes=((1,),),
+        dtypes=(torch.int8,),
+    )
+    suffixes = (
+        "compressor.state_cache",
+        "indexer.k_cache",
+        "indexer.compressor.state_cache",
+        "swa_cache",
+        "attn",
+    )
+    layer_names = [f"model.layers.{layer}.self_attn.{suffix}" for layer in range(2) for suffix in suffixes]
+    original_tensors = [KVCacheTensor(size=16, shared_by=[layer_name]) for layer_name in layer_names]
+    kv_cache_config = SimpleNamespace(
+        kv_cache_tensors=original_tensors.copy(),
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=layer_names,
+                kv_cache_spec=UniformTypeKVCacheSpecs(
+                    block_size=2,
+                    kv_cache_specs=dict.fromkeys(layer_names, spec),
+                ),
+            )
+        ],
+    )
+
+    assert apply_layerwise_kv_cache_plan(kv_cache_config, _make_vllm_config(2, 2)) is False
     assert kv_cache_config.kv_cache_tensors == original_tensors
 
 

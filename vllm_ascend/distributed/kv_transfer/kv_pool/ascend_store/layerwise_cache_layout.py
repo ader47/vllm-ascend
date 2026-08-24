@@ -221,6 +221,18 @@ def get_layerwise_kv_cache_specs(
     return layer_specs
 
 
+def is_layerwise_reuse_requested(
+    layer_specs: dict[str, KVCacheSpec],
+    base_layers: int,
+    extra_config: dict[str, Any],
+) -> bool:
+    """Return whether the configuration maps any logical layers onto shared buffers."""
+    physical_layers = {get_layerwise_physical_layer_index(layer_name, base_layers) for layer_name in layer_specs}
+    if not physical_layers:
+        return False
+    return build_layerwise_cache_layout(len(physical_layers), extra_config).has_layer_reuse
+
+
 def build_layerwise_reuse_layout(
     layer_specs: dict[str, KVCacheSpec],
     base_layers: int,
@@ -307,18 +319,20 @@ def build_layerwise_reuse_layout(
 def apply_layerwise_kv_cache_plan(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
-) -> None:
-    """Rewrite logical layer tensors to use shared physical KV buffers."""
+) -> bool:
+    """Rewrite logical tensors and report whether buffer reuse was applied."""
     extra_config = get_gva_layerwise_config(vllm_config.kv_transfer_config)
     if extra_config is None:
-        return
+        return False
 
     old_tensors = kv_cache_config.kv_cache_tensors
     if len(old_tensors) <= 1:
-        return
+        return False
 
     base_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
     layer_specs = get_layerwise_kv_cache_specs(kv_cache_config)
+    if not is_layerwise_reuse_requested(layer_specs, base_layers, extra_config):
+        return False
     reuse_layout = build_layerwise_reuse_layout(
         layer_specs,
         base_layers,
@@ -326,7 +340,7 @@ def apply_layerwise_kv_cache_plan(
     )
     actual_layers = len(reuse_layout.layer_cache_specs)
     if not reuse_layout.has_layer_reuse:
-        return
+        return False
     if any(len(tensor.shared_by) != 1 or tensor.offset != 0 or tensor.block_stride != 0 for tensor in old_tensors):
         raise NotImplementedError(
             "Layerwise KV cache reuse does not support pre-shared or packed KV cache tensor descriptors."
@@ -338,7 +352,7 @@ def apply_layerwise_kv_cache_plan(
             base_layers,
             actual_layers,
         )
-        return
+        return False
     if actual_layers > base_layers:
         logger.info(
             "Layer reuse includes %d base and %d MTP/spec-decode layer(s).",
@@ -412,3 +426,4 @@ def apply_layerwise_kv_cache_plan(
         len(new_tensors),
         len(reuse_layout.buffer_slots),
     )
+    return True

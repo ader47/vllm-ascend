@@ -54,6 +54,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
     build_layerwise_reuse_layout,
     get_layerwise_kv_cache_specs,
     get_layerwise_physical_layer_index,
+    is_layerwise_reuse_requested,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
@@ -374,11 +375,13 @@ class KVPoolWorker:
                     )
                     self.num_layers = effective_num_layers
             if self.use_gva_layerwise:
-                self._layerwise_reuse_layout = build_layerwise_reuse_layout(
-                    get_layerwise_kv_cache_specs(self.kv_cache_config),
-                    base_layers,
-                    self._extra_config,
-                )
+                layer_specs = get_layerwise_kv_cache_specs(self.kv_cache_config)
+                if is_layerwise_reuse_requested(layer_specs, base_layers, self._extra_config):
+                    self._layerwise_reuse_layout = build_layerwise_reuse_layout(
+                        layer_specs,
+                        base_layers,
+                        self._extra_config,
+                    )
 
         if self.kv_cache_config is not None and self.num_kv_cache_groups > 1:
             for group_id, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
