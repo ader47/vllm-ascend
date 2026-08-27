@@ -17,6 +17,9 @@ struct VllmA5LiManageC8TilingData {
     uint32_t keyStride;
     uint32_t scaleStride;
     uint32_t scoreWorkspaceStride;
+    uint32_t fastScoreWorkspaceStride;
+    uint32_t fastQueryTileSize;
+    uint32_t fastPathEnabled;
 };
 
 #endif

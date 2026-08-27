@@ -2,11 +2,10 @@
  * A5 fixed-MTP3 C8 LightningIndexer + request-pool management.
  *
  * Natural first/short steps may still carry 1..4 query rows per request.
- * One MIX_AIC_1_2 kernel computes their top-k rows and
- * then performs the cross-row union/cache update in place.  Query rows are
- * intentionally processed one at a time in this correctness-first version:
- * the native QLI vector service writes 2048 contiguous indices, while the
- * public caller-owned attention rows have a 2176-element stride.
+ * They use the original correctness path, including first-fill.  An all
+ * SPARSE, steady, four-query batch uses the payload-TopK fast path and a
+ * request-local ordered union/cache update; both paths preserve the same
+ * caller-owned ABI.
  */
 
 #include "kernel_operator.h"
@@ -16,6 +15,9 @@
 #include "arch35/quant_lightning_indexer_service_cube.h"
 #include "arch35/quant_lightning_indexer_service_vector.h"
 #include "vllm_a5_li_manage_c8_manager.h"
+#include "vllm_a5_li_manage_c8_fast_qli.h"
+#include "vllm_a5_li_manage_c8_fast_union.h"
+#include "vllm_a5_li_manage_c8_fast_workspace.h"
 
 namespace {
 using namespace AscendC;
@@ -336,6 +338,64 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
     GET_TILING_DATA(tilingData, tiling);
     TPipe pipe;
     GM_ADDR userWorkspace = GetUserWorkspace(workspace);
+
+    if (vllm_a5_li_manage_c8_fast::IsAllStableMtp3(
+            actualSeqLengthsQuery, candidateLens, finalSeqLengthsKv,
+            rowModes, reqPoolEntries, cacheSlotsPool, &tilingData)) {
+        const uint64_t scoreStride = tilingData.fastScoreWorkspaceStride;
+        const uint64_t batchSize = tilingData.batchSize;
+        // Keep the workspace helper arithmetic expanded in device code: the
+        // constexpr helpers are also consumed by host tiling and are not
+        // declared as __aicore__ functions.
+        const uint64_t routePairOffset = scoreStride * batchSize;
+        const uint64_t routeThresholdOffset =
+            routePairOffset +
+            batchSize *
+                vllm_a5_li_manage_c8_fast_workspace::UNION_CAPACITY *
+                2U * sizeof(int32_t);
+        const uint64_t routeCountOffset =
+            routeThresholdOffset +
+            batchSize * vllm_a5_li_manage_c8_fast_workspace::ROUTES *
+                vllm_a5_li_manage_c8_fast_workspace::THRESHOLD_STRIDE *
+                sizeof(uint16_t);
+        GM_ADDR routePairRows = userWorkspace + routePairOffset;
+        GM_ADDR routeThresholds = userWorkspace + routeThresholdOffset;
+        GM_ADDR routeMissCounts = userWorkspace + routeCountOffset;
+        // Stable Stage 1 writes the sparse slot prefixes directly into the
+        // caller-owned ABI output. No private full-TopK slot workspace is
+        // needed; Stage 2 repairs miss prefixes in place and appends tails.
+        GM_ADDR topkSlots = sparseAndTailSlots;
+
+        vllm_a5_li_manage_c8_fast::QuantLiMtpPhase qli(
+            &pipe, &tilingData);
+        qli.Init(
+            indexWeights, query, queryDequantScale,
+            indexKeyCache, indexKeyDequantScale,
+            reqPoolEntries, cacheSlotsPool, candidateLens,
+            indexBlockTable, routePairRows, topkSlots,
+            routeThresholds, routeMissCounts,
+            userWorkspace);
+        qli.Process();
+
+        if ASCEND_IS_AIV {
+            AscendC::SyncAll();
+            if ((GetBlockIdx() & 1U) == 0U) {
+                pipe.Reset();
+                vllm_a5_li_manage_c8_fast::OrderedMissUnion unionOp;
+                unionOp.Init(
+                    routePairRows, routeThresholds, routeMissCounts,
+                    userWorkspace, candidateLens, finalSeqLengthsKv,
+                    reqPoolEntries, cacheSlotsPool, copySrcIds,
+                    copyDstSlots, copyCounts, topkSlots,
+                    sparseAndTailSlots, residentSeqLengths,
+                    tilingData.tokenCapacity, tilingData.outputCapacity,
+                    tilingData.batchSize, &pipe);
+                unionOp.Process(
+                    GetBlockIdx() / 2U, tilingData.usedCoreNum);
+            }
+        }
+        return;
+    }
 
     VllmA5MtpC8QliPhase qli(&pipe, &tilingData);
     qli.Init(

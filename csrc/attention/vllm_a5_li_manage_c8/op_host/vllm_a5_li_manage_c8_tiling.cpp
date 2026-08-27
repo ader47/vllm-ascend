@@ -7,6 +7,7 @@
 #include <limits>
 
 #include "../op_kernel/vllm_a5_li_manage_c8_tiling.h"
+#include "../op_kernel/vllm_a5_li_manage_c8_fast_workspace.h"
 #include "register/op_impl_registry.h"
 #include "tiling/platform/platform_ascendc.h"
 
@@ -173,8 +174,24 @@ static ge::graphStatus TilingVllmA5LiManageC8(
     if (aicCount == 0 || aivCount < 2) {
         return ge::GRAPH_FAILED;
     }
-    const uint32_t usedCoreNum = std::min<uint32_t>(
-        static_cast<uint32_t>(batch), aicCount);
+    const uint32_t mixGroupCount = std::min<uint32_t>(
+        aicCount, aivCount / 2U);
+    // The hot path owns one two-query tile per MIX group. N=32 with more
+    // than 64 packed queries uses the verified four-query tile and one MIX
+    // group per request. Any non-MTP3/static-stride case keeps the original
+    // one-request-per-group cold path.
+    const bool fastStaticEligible =
+        totalQueryRows == batch * MAX_QUERIES_PER_REQUEST &&
+        ((*weightStride - heads) *
+             static_cast<int64_t>(sizeof(uint16_t))) % 32 == 0;
+    const uint32_t fastQueryTileSize =
+        heads == 32 && totalQueryRows > 64 ? 4U : 2U;
+    const uint32_t fastTaskCount = static_cast<uint32_t>(batch) *
+        (static_cast<uint32_t>(MAX_QUERIES_PER_REQUEST) /
+         fastQueryTileSize);
+    const uint32_t usedCoreNum = fastStaticEligible
+        ? std::min<uint32_t>(fastTaskCount, mixGroupCount)
+        : std::min<uint32_t>(static_cast<uint32_t>(batch), mixGroupCount);
     const uint32_t maxCandidateLen = static_cast<uint32_t>(
         blockTable.GetDim(1) * BLOCK_SIZE);
     const uint32_t s1BaseSize =
@@ -183,7 +200,11 @@ static ge::graphStatus TilingVllmA5LiManageC8(
     const uint64_t scoreStride64 =
         static_cast<uint64_t>(s1BaseSize) * maxCandidateLen *
         sizeof(uint16_t);
-    if (scoreStride64 > std::numeric_limits<uint32_t>::max()) {
+    const uint64_t fastScoreStride64 =
+        static_cast<uint64_t>(MAX_QUERIES_PER_REQUEST) *
+        static_cast<uint64_t>(pool.GetDim(1) - 1) * sizeof(uint16_t);
+    if (scoreStride64 > std::numeric_limits<uint32_t>::max() ||
+        fastScoreStride64 > std::numeric_limits<uint32_t>::max()) {
         return ge::GRAPH_FAILED;
     }
 
@@ -205,10 +226,20 @@ static ge::graphStatus TilingVllmA5LiManageC8(
     tiling->keyStride = static_cast<uint32_t>(*keyStride);
     tiling->scaleStride = static_cast<uint32_t>(*scaleStride);
     tiling->scoreWorkspaceStride = static_cast<uint32_t>(scoreStride64);
+    tiling->fastScoreWorkspaceStride =
+        static_cast<uint32_t>(fastScoreStride64);
+    tiling->fastQueryTileSize = fastQueryTileSize;
+    tiling->fastPathEnabled = fastStaticEligible ? 1U : 0U;
 
+    const uint64_t coldWorkspaceBytes =
+        scoreStride64 * static_cast<uint64_t>(usedCoreNum);
+    const uint64_t fastWorkspaceBytes = fastStaticEligible
+        ? vllm_a5_li_manage_c8_fast_workspace::TotalBytes(
+              fastScoreStride64, static_cast<uint64_t>(batch))
+        : 0U;
     context->GetWorkspaceSizes(1)[0] =
         platform.GetLibApiWorkSpaceSize() +
-        scoreStride64 * static_cast<uint64_t>(usedCoreNum);
+        std::max(coldWorkspaceBytes, fastWorkspaceBytes);
     context->SetBlockDim(platform.CalcTschBlockDim(
         usedCoreNum * 2U, usedCoreNum, usedCoreNum * 2U));
     context->SetScheduleMode(1);
