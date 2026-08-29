@@ -1,3 +1,5 @@
+runlog/
+
 ## vLLM Ascend Ignore
 # VSCode
 .vscode/

@@ -26,6 +26,8 @@ def _vllm_config(
     decode_context_parallel_size: int = 1,
     prefill_context_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
+    data_parallel_size: int = 1,
+    enable_expert_parallel: bool = False,
     kv_cache_metrics: bool = False,
     enable_kv_cache_events: bool = False,
     compilation_mode: CompilationMode = CompilationMode.NONE,
@@ -62,6 +64,8 @@ def _vllm_config(
             decode_context_parallel_size=decode_context_parallel_size,
             prefill_context_parallel_size=prefill_context_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
+            data_parallel_size=data_parallel_size,
+            enable_expert_parallel=enable_expert_parallel,
         ),
         observability_config=SimpleNamespace(
             kv_cache_metrics=kv_cache_metrics,
@@ -266,6 +270,33 @@ def test_compromise_mtp3_contract_is_accepted() -> None:
     assert config.sparse_tail_block_count == 2
 
 
+def test_dp_mtp3_full_decode_graph_contract_is_accepted() -> None:
+    vllm_config = _vllm_config(
+        enforce_eager=False,
+        speculative_config=_mtp_config(),
+        data_parallel_size=2,
+        enable_expert_parallel=True,
+        compilation_mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        cudagraph_capture_sizes=[4, 8],
+    )
+    config = DSAOffloadConfig.from_dict(
+        {
+            "enabled": True,
+            "enable_row_mode_decode_graph": True,
+            "sparse_activation_tokens": 8192,
+            "resident_budget_tokens": [8192, 10240, 12288],
+        },
+        vllm_config=vllm_config,
+    )
+
+    config.validate_finalized_graph_contract(
+        vllm_config,
+        phase="test",
+        require_resolved_mode=True,
+    )
+
+
 def test_mtp_cache_layer_index_range_is_explicit() -> None:
     config = DSAOffloadConfig(
         enabled=True,
@@ -466,7 +497,7 @@ def test_final_graph_contract_rejects_empty_capture_sizes() -> None:
         (
             CompilationMode.VLLM_COMPILE,
             CUDAGraphMode.FULL,
-            "separate FULL decode routine",
+            "cudagraph_mode=FULL_DECODE_ONLY",
         ),
     ],
 )

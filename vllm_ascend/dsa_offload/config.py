@@ -214,11 +214,7 @@ class DSAOffloadConfig:
 
         layer_index = int(layer_index)
         target_layer_count = int(target_layer_count)
-        return (
-            self.mtp_enabled
-            and target_layer_count <= layer_index
-            < target_layer_count + self.mtp_cache_layer_count
-        )
+        return self.mtp_enabled and target_layer_count <= layer_index < target_layer_count + self.mtp_cache_layer_count
 
     @classmethod
     def from_dict(
@@ -300,9 +296,7 @@ class DSAOffloadConfig:
                 capabilities,
                 mtp_num_speculative_tokens,
                 mtp_cache_layer_count,
-            ) = (
-                config._validate_runtime_contract(vllm_config)
-            )
+            ) = config._validate_runtime_contract(vllm_config)
             config = replace(
                 config,
                 model_capabilities=capabilities,
@@ -416,18 +410,35 @@ class DSAOffloadConfig:
         if bool(cache_config.enable_prefix_caching):
             raise ValueError("DSA sparse offload does not yet support prefix caching")
         speculative_config = vllm_config.speculative_config
+        data_parallel_size = int(getattr(parallel_config, "data_parallel_size", 1) or 1)
+        if data_parallel_size > 1:
+            if not self.enable_row_mode_decode_graph and not bool(vllm_config.model_config.enforce_eager):
+                raise ValueError(
+                    "DSA sparse offload DP requires true eager execution or enable_row_mode_decode_graph=True"
+                )
+            if not bool(getattr(parallel_config, "enable_expert_parallel", False)):
+                raise ValueError("DSA sparse offload DP requires enable_expert_parallel=True")
+            if (
+                getattr(parallel_config, "data_parallel_backend", "mp") != "mp"
+                or getattr(
+                    parallel_config,
+                    "distributed_executor_backend",
+                    None,
+                )
+                == "external_launcher"
+            ):
+                raise ValueError("DSA sparse offload DP requires internal multiprocessing data parallelism")
+            if bool(getattr(parallel_config, "data_parallel_external_lb", False)) or bool(
+                getattr(parallel_config, "data_parallel_hybrid_lb", False)
+            ):
+                raise ValueError("DSA sparse offload DP does not support external or hybrid load balancing")
         mtp_num_speculative_tokens = 0
         mtp_cache_layer_count = 0
         if speculative_config is not None:
             method = getattr(speculative_config, "method", None)
-            mtp_num_speculative_tokens = int(
-                getattr(speculative_config, "num_speculative_tokens", 0) or 0
-            )
+            mtp_num_speculative_tokens = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
             if method != "mtp":
-                raise ValueError(
-                    "DSA sparse offload initially supports only speculative "
-                    f"method='mtp', got {method!r}"
-                )
+                raise ValueError(f"DSA sparse offload initially supports only speculative method='mtp', got {method!r}")
             if mtp_num_speculative_tokens != DSA_MTP_MAX_SPECULATIVE_TOKENS:
                 raise ValueError(
                     "DSA compromise MTP requires exactly "
@@ -435,9 +446,7 @@ class DSAOffloadConfig:
                     f"got {mtp_num_speculative_tokens}"
                 )
             if bool(getattr(speculative_config, "parallel_drafting", False)):
-                raise ValueError(
-                    "DSA compromise MTP does not support parallel_drafting"
-                )
+                raise ValueError("DSA compromise MTP does not support parallel_drafting")
             if bool(
                 getattr(
                     speculative_config,
@@ -445,15 +454,10 @@ class DSAOffloadConfig:
                     False,
                 )
             ):
-                raise ValueError(
-                    "DSA compromise MTP requires padded drafter batches"
-                )
+                raise ValueError("DSA compromise MTP requires padded drafter batches")
             draft_model_config = speculative_config.draft_model_config
             draft_hf_config = draft_model_config.hf_config
-            mtp_cache_layer_count = int(
-                getattr(draft_hf_config, "num_nextn_predict_layers", 0)
-                or 0
-            )
+            mtp_cache_layer_count = int(getattr(draft_hf_config, "num_nextn_predict_layers", 0) or 0)
             if mtp_cache_layer_count <= 0:
                 raise ValueError(
                     "DSA compromise MTP requires at least one physical "
@@ -461,9 +465,7 @@ class DSAOffloadConfig:
                     f"num_nextn_predict_layers={mtp_cache_layer_count}"
                 )
             unsupported_mtp_budgets = tuple(
-                budget
-                for budget in self.resident_budget_tokens
-                if budget not in DSA_MTP_SUPPORTED_RESIDENT_BUDGETS
+                budget for budget in self.resident_budget_tokens if budget not in DSA_MTP_SUPPORTED_RESIDENT_BUDGETS
             )
             if unsupported_mtp_budgets:
                 raise ValueError(
@@ -482,9 +484,7 @@ class DSAOffloadConfig:
                 )
         else:
             unsupported_nomtp_budgets = tuple(
-                budget
-                for budget in self.resident_budget_tokens
-                if budget not in DSA_NOMTP_SUPPORTED_RESIDENT_BUDGETS
+                budget for budget in self.resident_budget_tokens if budget not in DSA_NOMTP_SUPPORTED_RESIDENT_BUDGETS
             )
             if unsupported_nomtp_budgets:
                 raise ValueError(
@@ -581,11 +581,11 @@ class DSAOffloadConfig:
                     "with FULL decode graphs after Ascend normalization: "
                     f"phase={phase}, cudagraph_mode={cudagraph_mode}"
                 )
-            if require_resolved_mode and not cudagraph_mode.separate_routine():
+            if require_resolved_mode and cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
                 raise ValueError(
-                    "DSA row-mode decode graph requires a separate FULL "
-                    "decode routine (for example FULL_DECODE_ONLY), rather "
-                    "than an exact FULL graph shared with mixed batches: "
+                    "DSA row-mode decode graph requires "
+                    "cudagraph_mode=FULL_DECODE_ONLY after attention-backend "
+                    "resolution: "
                     f"phase={phase}, cudagraph_mode={cudagraph_mode}"
                 )
             capture_sizes = compilation_config.cudagraph_capture_sizes

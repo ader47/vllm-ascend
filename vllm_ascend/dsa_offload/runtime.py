@@ -541,6 +541,24 @@ class DSAOffloadRuntime:
         self._reset_selection_source()
         return execution_num_reqs
 
+    def prepare_idle_dummy(self, *, row_count: int) -> None:
+        """Run only PAD rows and no-op dumps, keeping request caches intact."""
+        if self._graph_capture_row_count:
+            raise RuntimeError("DSA idle dummy cannot overwrite capture state")
+        if self.dram_store is None:
+            raise RuntimeError("DSA idle dummy requires an initialized DRAM store")
+        if not 0 < row_count <= self.max_num_reqs:
+            raise ValueError("DSA idle dummy row count is outside runtime capacity")
+        self.active_num_reqs = 0
+        self.dump_job_count = 0
+        self.dump_before_cache_write = self.max_decode_query_len > 1
+        self._forward_epoch += 1
+        # A subsequent real forward must rebuild the overwritten device table.
+        self._dram_table_row_count = 0
+        self._dram_table_signature = None
+        self.active_dram_block_table.gpu[:row_count].zero_()
+        self.prepare_execution_view(active_num_reqs=0, graph_row_count=row_count)
+
     def prepare_graph_capture(self, *, row_count: int) -> None:
         """为原生 dummy-run 安装固定地址 DRAM/dump 输入。"""
 
@@ -587,12 +605,16 @@ class DSAOffloadRuntime:
 
         if not self._graph_capture_row_count:
             return
+        self.restore_after_idle_dummy()
+        self._graph_capture_row_count = 0
+
+    def restore_after_idle_dummy(self) -> None:
+        """Discard the temporary execution view, not persistent request data."""
         self.active_num_reqs = 0
         self.execution_num_reqs = 0
         self.dump_job_count = 0
         self.dump_launch_count = 0
         self.dump_before_cache_write = False
-        self._graph_capture_row_count = 0
         self._dram_table_row_count = 0
         self._dram_table_signature = None
 

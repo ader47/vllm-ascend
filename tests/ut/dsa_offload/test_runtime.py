@@ -1061,6 +1061,51 @@ def test_layer_claims_one_prewrite_dump_per_outer_forward() -> None:
     )
 
 
+def test_idle_dummy_uses_noop_dumps_and_rebuilds_real_dram_view() -> None:
+    pool, runtime, store = _make_runtime(max_num_reqs=4, max_decode_query_len=4)
+    state = DSAInputBatchCacheLayout(
+        max_num_reqs=4,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        resident_token_pool=pool,
+    )
+    pool_index = pool.acquire("live-request")
+    state.resident_pool_indices_cpu[0] = pool_index
+    store.reserve_blocks(
+        pool_indices=np.array([pool_index]),
+        logical_block_indices=np.array([0]),
+    )
+    table_before = store.logical_block_table.copy()
+    table_ptr = runtime.active_dram_block_table.gpu.data_ptr()
+
+    for row_count in (1, 2, 4, 1):
+        runtime.active_num_reqs = 1
+        assert runtime._refresh_active_dram_table(state)
+        assert runtime.active_dram_block_table.gpu[0, 0] > 0
+        runtime.dump_job_count = 1
+        runtime.dump_dst_block_ids.gpu.fill_(7)
+        runtime._selection_source_layer = 0
+
+        runtime.prepare_idle_dummy(row_count=row_count)
+        assert runtime.graph_capture_row_count == 0
+        assert runtime.active_num_reqs == 0
+        assert runtime.execution_num_reqs == row_count
+        assert runtime.dump_launch_count == row_count
+        assert runtime.dump_job_count == 0
+        assert runtime.dump_before_cache_write
+        assert runtime.active_dram_block_table.gpu[:row_count].eq(0).all()
+        assert runtime.dump_dst_block_ids.gpu[:row_count].eq(-1).all()
+        assert runtime._selection_source_layer is None
+        assert runtime._dram_table_signature is None
+        np.testing.assert_array_equal(store.logical_block_table, table_before)
+        assert pool.get_index("live-request") == pool_index
+
+        runtime.restore_after_idle_dummy()
+        assert runtime.active_dram_block_table.gpu.data_ptr() == table_ptr
+        assert runtime.execution_num_reqs == runtime.dump_launch_count == 0
+        assert not runtime.dump_before_cache_write
+
+
 def test_graph_capture_runtime_can_be_reused_for_multiple_sizes() -> None:
     _, runtime, _ = _make_runtime(max_num_reqs=4)
 

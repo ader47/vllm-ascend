@@ -100,6 +100,37 @@ def test_pad_rows_keep_a_legal_quant_li_candidate_length() -> None:
     assert state.candidate_lens.tolist() == [2048] * 4
 
 
+def test_idle_dummy_restores_request_state_without_touching_resident_pool() -> None:
+    state = _make_state()
+    pool = state.resident_token_pool
+    pool_index = pool.acquire("live-request")
+    state.row_count = 1
+    state.valid = True
+    state.row_modes_cpu[0] = 2
+    state.resident_pool_indices_cpu[0] = pool_index
+    state.candidate_lens_cpu[0] = 4096
+    state.copy_to_device()
+    pool.get_cache_slots(0)[pool_index].fill_(7)
+    cpu_before = state.columns.cpu.clone()
+    slots_before = pool.get_cache_slots(0).clone()
+    device_ptr = state.columns.gpu.data_ptr()
+
+    for row_count in (1, 2, 4, 1):
+        state.prepare_idle_dummy(row_count=row_count)
+        assert state.row_modes[:row_count].eq(0).all()
+        assert state.candidate_lens[:row_count].eq(2048).all()
+        assert state.resident_pool_indices[:row_count].eq(pool.padding_pool_index).all()
+        assert state.graph_capture_row_count == 0
+        assert state.row_count == 1 and state.valid
+        assert torch.equal(state.columns.cpu, cpu_before)
+        assert torch.equal(pool.get_cache_slots(0), slots_before)
+        assert pool.get_index("live-request") == pool_index
+
+        state.restore_after_idle_dummy()
+        assert state.columns.gpu.data_ptr() == device_ptr
+        assert torch.equal(state.columns.gpu, cpu_before)
+
+
 def _make_enter_projection() -> DSARequestCacheLayoutProjection:
     return DSARequestCacheLayoutProjection(
         request_ids=("enter",),

@@ -27,6 +27,7 @@ PORT="8000"
 API_KEY="EMPTY"
 
 TENSOR_PARALLEL_SIZE="16"
+DATA_PARALLEL_SIZE="1"
 MAX_NUM_SEQS="4"
 MAX_MODEL_LEN="131072"
 MAX_NUM_BATCHED_TOKENS="16384"
@@ -73,6 +74,11 @@ case "${RUN_MODE}" in
         ;;
 esac
 
+if [[ ! "${DATA_PARALLEL_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "DATA_PARALLEL_SIZE must be a positive integer, got: ${DATA_PARALLEL_SIZE}" >&2
+    exit 2
+fi
+
 case "${ENABLE_MTP}" in
     true)
         if [[ "${ENABLE_A5_PACKED_C8_DSA}" != "true" ]]; then
@@ -95,6 +101,13 @@ case "${ENABLE_MTP}" in
         exit 2
         ;;
 esac
+
+if (( DATA_PARALLEL_SIZE > 1 )); then
+    if [[ "${ENABLE_MTP}" == "true" && "${RUN_MODE}" != "eager" ]]; then
+        echo "DSA DP MTP3 currently requires RUN_MODE=eager" >&2
+        exit 2
+    fi
+fi
 
 case "${ENABLE_A5_PACKED_C8_DSA}" in
     true)
@@ -126,7 +139,7 @@ ADDITIONAL_CONFIG="$(
 JSON
 )"
 
-echo "[dsa-online] mode=${RUN_MODE} model=${MODEL_PATH}"
+echo "[dsa-online] mode=${RUN_MODE} model=${MODEL_PATH} dp=${DATA_PARALLEL_SIZE}"
 echo "[dsa-online] a5_packed_c8=${ENABLE_A5_PACKED_C8_DSA} mtp3=${ENABLE_MTP} safetensors=${SAFETENSORS_LOAD_STRATEGY}"
 echo "[dsa-online] endpoint=http://${HOST}:${PORT}/v1"
 
@@ -137,7 +150,7 @@ exec vllm serve "${MODEL_PATH}" \
     --api-key "${API_KEY}" \
     --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
     --pipeline-parallel-size 1 \
-    --data-parallel-size 1 \
+    --data-parallel-size "${DATA_PARALLEL_SIZE}" \
     --quantization ascend \
     --safetensors-load-strategy "${SAFETENSORS_LOAD_STRATEGY}" \
     --seed 1024 \

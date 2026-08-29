@@ -344,6 +344,25 @@ class DSAInputBatchCacheLayout:
     def graph_capture_row_count(self) -> int:
         return self._graph_capture_row_count
 
+    def prepare_idle_dummy(self, *, row_count: int) -> None:
+        """Temporarily pad an idle DP forward without acquiring request rows."""
+        if self._graph_capture_row_count:
+            raise RuntimeError("DSA idle dummy cannot overwrite capture state")
+        if not 0 < row_count <= self.max_num_reqs:
+            raise ValueError("DSA idle dummy row count is outside InputBatch capacity")
+        rows = slice(0, row_count)
+        self.stages[rows].fill_(_INVALID_STAGE)
+        self.target_resident_budget_tokens[rows].zero_()
+        self.sparse_budget_tokens[rows].zero_()
+        self.resident_valid_tokens[rows].fill_(_INVALID_RESIDENT_LENGTH)
+        self.row_modes[rows].fill_(DSA_ROW_MODE_PAD)
+        self.resident_pool_indices[rows].fill_(self.resident_token_pool.padding_pool_index)
+        self.candidate_lens[rows].fill_(DSA_SFA_COMPUTE_TOPK)
+
+    def restore_after_idle_dummy(self) -> None:
+        # CPU request state and resident-pool ownership were never changed.
+        self.columns.gpu.copy_(self.columns.cpu)
+
     def prepare_graph_capture(
         self,
         *,
