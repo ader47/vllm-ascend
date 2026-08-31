@@ -194,6 +194,16 @@ static ge::graphStatus TilingVllmA5LiManageC8(
         : std::min<uint32_t>(static_cast<uint32_t>(batch), mixGroupCount);
     const uint32_t maxCandidateLen = static_cast<uint32_t>(
         blockTable.GetDim(1) * BLOCK_SIZE);
+    const uint32_t tokenCapacity = static_cast<uint32_t>(
+        pool.GetDim(1) - 1);
+    // cache_slots reserves its final int32 for +/-budget metadata, so its
+    // logical token capacity is commonly one element short of the 256-entry
+    // row alignment. QuantLI stores score rows at a 128-token stride; keep
+    // that physical score stride explicit instead of reusing tokenCapacity.
+    const uint32_t fastScoreRowStride =
+        (tokenCapacity + static_cast<uint32_t>(BLOCK_SIZE) - 1U) /
+        static_cast<uint32_t>(BLOCK_SIZE) *
+        static_cast<uint32_t>(BLOCK_SIZE);
     const uint32_t s1BaseSize =
         (256U + static_cast<uint32_t>(heads) - 1U) /
         static_cast<uint32_t>(heads);
@@ -202,7 +212,7 @@ static ge::graphStatus TilingVllmA5LiManageC8(
         sizeof(uint16_t);
     const uint64_t fastScoreStride64 =
         static_cast<uint64_t>(MAX_QUERIES_PER_REQUEST) *
-        static_cast<uint64_t>(pool.GetDim(1) - 1) * sizeof(uint16_t);
+        fastScoreRowStride * sizeof(uint16_t);
     if (scoreStride64 > std::numeric_limits<uint32_t>::max() ||
         fastScoreStride64 > std::numeric_limits<uint32_t>::max()) {
         return ge::GRAPH_FAILED;
@@ -216,7 +226,7 @@ static ge::graphStatus TilingVllmA5LiManageC8(
     tiling->batchSize = static_cast<uint32_t>(batch);
     tiling->totalQueryRows = static_cast<uint32_t>(totalQueryRows);
     tiling->poolSize = static_cast<uint32_t>(pool.GetDim(0));
-    tiling->tokenCapacity = static_cast<uint32_t>(pool.GetDim(1) - 1);
+    tiling->tokenCapacity = tokenCapacity;
     tiling->outputCapacity = OUTPUT_CAPACITY;
     tiling->indexHeads = static_cast<uint32_t>(heads);
     tiling->maxBlockNumPerBatch =
@@ -230,6 +240,7 @@ static ge::graphStatus TilingVllmA5LiManageC8(
         static_cast<uint32_t>(fastScoreStride64);
     tiling->fastQueryTileSize = fastQueryTileSize;
     tiling->fastPathEnabled = fastStaticEligible ? 1U : 0U;
+    tiling->fastScoreRowStride = fastScoreRowStride;
 
     const uint64_t coldWorkspaceBytes =
         scoreStride64 * static_cast<uint64_t>(usedCoreNum);

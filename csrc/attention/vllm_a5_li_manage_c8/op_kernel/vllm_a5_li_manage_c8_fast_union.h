@@ -59,7 +59,7 @@ public:
         GM_ADDR unionCounts, GM_ADDR topkSlots,
         GM_ADDR sparseAndTailSlots, GM_ADDR residentSeqLengths,
         uint32_t tokenCapacity, uint32_t outputCapacity,
-        uint32_t batchSize, TPipe *pipe)
+        uint32_t scoreRowStride, uint32_t batchSize, TPipe *pipe)
     {
         routePairsGm_.SetGlobalBuffer((__gm__ int32_t *)routePairs);
         routeThresholdsGm_.SetGlobalBuffer(
@@ -83,6 +83,7 @@ public:
         sourceCapacity_ = tokenCapacity;
         poolStride_ = tokenCapacity + 1U;
         outputCapacity_ = outputCapacity;
+        scoreRowStride_ = scoreRowStride;
         batchSize_ = batchSize;
         pipe->InitBuffer(pairInputBuf_,
                          UNION_CAPACITY * 2U * sizeof(float));
@@ -216,7 +217,7 @@ private:
         const uint32_t firstChunk =
             HashVictimScanSeed(candidate, poolRow) % chunks;
         const uint64_t requestScoreBase =
-            static_cast<uint64_t>(batch) * UNION_ROUTES * sourceCapacity_;
+            static_cast<uint64_t>(batch) * UNION_ROUTES * scoreRowStride_;
         const uint64_t cacheBase =
             static_cast<uint64_t>(poolRow) * poolStride_;
         uint32_t written = 0U;
@@ -243,18 +244,18 @@ private:
                 scoreCopy, scorePad);
             DataCopyPad(
                 score1,
-                scoreWorkspaceGm_[requestScoreBase + sourceCapacity_ +
+                scoreWorkspaceGm_[requestScoreBase + scoreRowStride_ +
                                   chunkBase],
                 scoreCopy, scorePad);
             DataCopyPad(
                 score2,
                 scoreWorkspaceGm_[requestScoreBase +
-                                  sourceCapacity_ * 2U + chunkBase],
+                                  scoreRowStride_ * 2U + chunkBase],
                 scoreCopy, scorePad);
             DataCopyPad(
                 score3,
                 scoreWorkspaceGm_[requestScoreBase +
-                                  sourceCapacity_ * 3U + chunkBase],
+                                  scoreRowStride_ * 3U + chunkBase],
                 scoreCopy, scorePad);
             DataCopyPad(
                 slots32, cacheSlotsGm_[cacheBase + chunkBase],
@@ -679,6 +680,7 @@ private:
     uint32_t sourceCapacity_ = 0U;
     uint32_t poolStride_ = 0U;
     uint32_t outputCapacity_ = 0U;
+    uint32_t scoreRowStride_ = 0U;
     uint32_t batchSize_ = 0U;
 };
 } // namespace vllm_a5_li_manage_c8_fast

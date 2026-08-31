@@ -144,7 +144,7 @@ public:
         constInfo_.kHeadNum = 1;
         constInfo_.headDim = HEAD_DIM;
         constInfo_.sparseCount = TOPK;
-        constInfo_.kSeqSize = tiling_->tokenCapacity;
+        constInfo_.kSeqSize = tiling_->fastScoreRowStride;
         constInfo_.qSeqSize = ROUTES;
         constInfo_.kCacheBlockSize = BLOCK_SIZE;
         constInfo_.maxBlockNumPerBatch = tiling_->maxBlockNumPerBatch;
@@ -249,7 +249,7 @@ public:
                     (tiling_->fastScoreWorkspaceStride / sizeof(uint16_t));
                 const uint64_t routeScoreBase =
                     static_cast<uint64_t>(gS1) * tile *
-                    tiling_->tokenCapacity;
+                    tiling_->fastScoreRowStride;
                 vectorService_.InitVecWorkspaceTensor(
                     scoreWorkspaceBaseGm_[
                         requestScoreBase + routeScoreBase]);

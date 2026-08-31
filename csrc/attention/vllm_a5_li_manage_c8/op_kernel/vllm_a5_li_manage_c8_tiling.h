@@ -20,6 +20,7 @@ struct VllmA5LiManageC8TilingData {
     uint32_t fastScoreWorkspaceStride;
     uint32_t fastQueryTileSize;
     uint32_t fastPathEnabled;
+    uint32_t fastScoreRowStride;
 };
 
 #endif

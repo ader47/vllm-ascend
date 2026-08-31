@@ -137,9 +137,9 @@ def _make_fused_lidu_inputs(
     row_mode: int,
     batch: int = 1,
     seed: int = 7,
+    heads: int = 32,
 ) -> dict[str, torch.Tensor]:
     torch.manual_seed(seed)
-    heads = 32
     blocks = (candidate_len + _BLOCK_SIZE - 1) // _BLOCK_SIZE
     weights_storage = torch.randn(
         (batch, 128 + heads),
@@ -661,6 +661,276 @@ def test_packed_c8_mtp_lim_uses_per_query_candidates_and_dual_tails() -> None:
 
     assert resident_lengths.tolist() == [budget + 2 * _BLOCK_SIZE]
     assert counts.tolist() == [budget]
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+def test_packed_c8_mtp_lim_steady_fast_path_updates_union_and_dual_tails(
+    heads: int,
+) -> None:
+    budget = 8192
+    candidate_len = 8320
+    final_len = candidate_len + 4
+    queries_per_request = 4
+
+    def make_request(seed: int) -> dict[str, torch.Tensor]:
+        inputs = _make_fused_lidu_inputs(
+            candidate_len=candidate_len,
+            final_len=final_len,
+            row_mode=2,
+            batch=queries_per_request,
+            seed=seed,
+            heads=heads,
+        )
+        inputs["query_ends"] = torch.tensor(
+            [queries_per_request],
+            dtype=torch.int32,
+            device="npu",
+        )
+        for name in (
+            "block_table",
+            "candidate_lens",
+            "final_lens",
+            "row_modes",
+            "req_entries",
+        ):
+            inputs[name] = inputs[name][:1]
+        return inputs
+
+    cache_slots = torch.full(
+        (2, _cache_row_width(final_len)),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    cache_slots[:, -1].zero_()
+    cache_slots[0, -1] = -budget
+    # The final pool element is metadata, deliberately leaving a logical
+    # token capacity that is not a 128-token QuantLI score-row stride.
+    assert (int(cache_slots.shape[1]) - 1) % _BLOCK_SIZE != 0
+
+    # Establish the persistent request row through the correctness path. The
+    # positive metadata left by this call is part of the fast-path contract.
+    cold_outputs = _allocate_fused_lidu_outputs(
+        batch=1,
+        total_query_rows=queries_per_request,
+    )
+    _launch_mtp_lim(make_request(seed=53), cache_slots, cold_outputs)
+    torch.npu.synchronize()
+    assert int(cache_slots[0, -1].cpu()) == budget
+
+    steady_inputs = make_request(seed=59)
+    expected_topk_rows = []
+    for route in range(queries_per_request):
+        row_inputs = {
+            **steady_inputs,
+            "query": steady_inputs["query"][route : route + 1],
+            "weights": steady_inputs["weights"][route : route + 1],
+            "query_scale": steady_inputs["query_scale"][route : route + 1],
+            # candidate_lens is a durable prefix before every speculative
+            # query. A batched sparse_mode=3 reference would instead treat
+            # the queries as part of the key sequence and causally hide the
+            # final 3/2/1 prefix tokens from its early rows.
+            "query_ends": torch.tensor(
+                [1],
+                dtype=torch.int32,
+                device="npu",
+            ),
+        }
+        expected_topk_rows.append(_native_topk(row_inputs).cpu().view(-1))
+    expected_topk = torch.stack(expected_topk_rows)
+    pool_before = cache_slots[0].cpu().clone()
+    expected_misses = torch.unique(
+        expected_topk[pool_before[expected_topk.to(torch.long)] < 0]
+    )
+    assert expected_misses.numel() > 0
+
+    outputs = _allocate_fused_lidu_outputs(
+        batch=1,
+        total_query_rows=queries_per_request,
+    )
+    _launch_mtp_lim(steady_inputs, cache_slots, outputs)
+    torch.npu.synchronize()
+
+    attention, resident_lengths, source_ids, destination_slots, counts = (
+        tensor.cpu() for tensor in outputs
+    )
+    pool_after = cache_slots[0].cpu()
+    copy_count = int(counts[0])
+    assert copy_count == int(expected_misses.numel())
+    actual_sources = source_ids[0, 0, :copy_count]
+    actual_destinations = destination_slots[0, 0, :copy_count]
+    _assert_exact_int_tensor(
+        torch.sort(actual_sources).values,
+        torch.sort(expected_misses).values,
+    )
+    assert torch.unique(actual_destinations).numel() == copy_count
+    assert torch.all((actual_destinations >= 0) & (actual_destinations < budget))
+    _assert_exact_int_tensor(
+        pool_after[actual_sources.to(torch.long)],
+        actual_destinations,
+    )
+
+    inverse_before = torch.full((budget,), -1, dtype=torch.int32)
+    mapped_sources = torch.nonzero(
+        pool_before[:candidate_len] >= 0,
+        as_tuple=False,
+    ).view(-1)
+    inverse_before[pool_before[mapped_sources].to(torch.long)] = (
+        mapped_sources.to(torch.int32)
+    )
+    victim_sources = inverse_before[actual_destinations.to(torch.long)]
+    assert torch.all(victim_sources >= 0)
+    assert torch.all(pool_after[victim_sources.to(torch.long)] == -1)
+
+    for route in range(queries_per_request):
+        expected_slots = pool_after[expected_topk[route].to(torch.long)]
+        actual_slots = attention[route, 0, :_TOPK]
+        # The optimized path deliberately publishes the miss destinations
+        # before the compacted hit slots. Sparse attention consumes an
+        # unordered resident-slot set, so preserving native TopK score order
+        # would only add another 2048-entry reorder/round trip. Keep the test
+        # strict about membership, multiplicity and cardinality instead.
+        _assert_exact_int_tensor(
+            torch.sort(actual_slots).values,
+            torch.sort(expected_slots).values,
+        )
+        assert torch.unique(actual_slots).numel() == _TOPK
+        visible_len = final_len - (queries_per_request - 1 - route)
+        tail_tokens = torch.arange(
+            candidate_len,
+            visible_len,
+            dtype=torch.int32,
+        )
+        expected_tail = budget + tail_tokens.remainder(2 * _BLOCK_SIZE)
+        tail_len = int(tail_tokens.numel())
+        _assert_exact_int_tensor(
+            attention[route, 0, _TOPK : _TOPK + tail_len],
+            expected_tail,
+        )
+        assert torch.all(attention[route, 0, _TOPK + tail_len :] == -1)
+
+    assert resident_lengths.tolist() == [budget + 2 * _BLOCK_SIZE]
+    assert int(pool_after[-1]) == budget
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+def test_packed_c8_mtp_lim_steady_fast_path_has_exact_monotonic_topk(
+    heads: int,
+) -> None:
+    budget = 8192
+    candidate_len = budget
+    final_len = candidate_len + 4
+    queries_per_request = 4
+    inputs = _make_fused_lidu_inputs(
+        candidate_len=candidate_len,
+        final_len=final_len,
+        row_mode=2,
+        batch=queries_per_request,
+        seed=67,
+        heads=heads,
+    )
+    inputs["query_ends"] = torch.tensor(
+        [queries_per_request],
+        dtype=torch.int32,
+        device="npu",
+    )
+    for name in (
+        "block_table",
+        "candidate_lens",
+        "final_lens",
+        "row_modes",
+        "req_entries",
+    ):
+        inputs[name] = inputs[name][:1]
+
+    # QK=128 and the head reduction is heads*128, both powers of two.
+    # Scaling consecutive positive BF16 values by that factor therefore
+    # produces 8192 unique, exactly ordered final BF16 scores without ties.
+    inputs["query"] = torch.ones(
+        tuple(inputs["query"].shape),
+        dtype=torch.bfloat16,
+        device="npu",
+    ).to(torch.float8_e4m3fn)
+    inputs["key"] = torch.ones(
+        tuple(inputs["key"].shape),
+        dtype=torch.bfloat16,
+        device="npu",
+    ).to(torch.float8_e4m3fn)
+    inputs["weights"].fill_(1)
+    inputs["query_scale"].fill_(1)
+    score_bits = torch.arange(
+        0x2000,
+        0x2000 + candidate_len,
+        dtype=torch.int32,
+    ).to(torch.int16)
+    desired_scores = score_bits.view(torch.bfloat16).to(torch.float32)
+    key_scales = desired_scores / float(heads * 128)
+    inputs["key_scale"].view(-1).copy_(key_scales.to(device="npu"))
+
+    cache_slots = torch.full(
+        (2, _cache_row_width(final_len)),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    cache_slots[:, -1].zero_()
+    cache_slots[0, :candidate_len] = torch.arange(
+        candidate_len,
+        dtype=torch.int32,
+        device="npu",
+    )
+    cache_slots[0, -1] = budget
+    before = cache_slots.clone()
+    outputs = _allocate_fused_lidu_outputs(
+        batch=1,
+        total_query_rows=queries_per_request,
+    )
+
+    _launch_mtp_lim(inputs, cache_slots, outputs)
+    torch.npu.synchronize()
+
+    attention, resident_lengths, _, _, counts = (
+        tensor.cpu() for tensor in outputs
+    )
+    expected_topk = torch.arange(
+        candidate_len - _TOPK,
+        candidate_len,
+        dtype=torch.int32,
+    )
+    for route in range(queries_per_request):
+        actual_topk = attention[route, 0, :_TOPK]
+        sorted_actual = torch.sort(actual_topk).values
+        if not torch.equal(sorted_actual, expected_topk):
+            missing = expected_topk[~torch.isin(expected_topk, actual_topk)]
+            extra = actual_topk[~torch.isin(actual_topk, expected_topk)]
+            pytest.fail(
+                "MTP LIM monotonic TopK mismatch: "
+                f"heads={heads}, route={route}, "
+                f"unique={int(torch.unique(actual_topk).numel())}, "
+                f"actual_min={int(sorted_actual[0])}, "
+                f"actual_max={int(sorted_actual[-1])}, "
+                f"missing_count={int(missing.numel())}, "
+                f"extra_count={int(extra.numel())}, "
+                f"missing_prefix={missing[:16].tolist()}, "
+                f"extra_prefix={extra[:16].tolist()}"
+            )
+        visible_len = final_len - (queries_per_request - 1 - route)
+        tail_tokens = torch.arange(
+            candidate_len,
+            visible_len,
+            dtype=torch.int32,
+        )
+        expected_tail = budget + tail_tokens.remainder(2 * _BLOCK_SIZE)
+        tail_len = int(tail_tokens.numel())
+        _assert_exact_int_tensor(
+            attention[route, 0, _TOPK : _TOPK + tail_len],
+            expected_tail,
+        )
+        assert torch.all(attention[route, 0, _TOPK + tail_len :] == -1)
+
+    assert counts.tolist() == [0]
+    assert resident_lengths.tolist() == [budget + 2 * _BLOCK_SIZE]
+    assert torch.equal(cache_slots, before)
 
 
 @pytest.mark.parametrize("budget", [6144, 10240, 12288])

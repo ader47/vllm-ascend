@@ -389,6 +389,7 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
                     copyDstSlots, copyCounts, topkSlots,
                     sparseAndTailSlots, residentSeqLengths,
                     tilingData.tokenCapacity, tilingData.outputCapacity,
+                    tilingData.fastScoreRowStride,
                     tilingData.batchSize, &pipe);
                 unionOp.Process(
                     GetBlockIdx() / 2U, tilingData.usedCoreNum);
