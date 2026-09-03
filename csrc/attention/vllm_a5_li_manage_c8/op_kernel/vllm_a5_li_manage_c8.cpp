@@ -329,7 +329,8 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
     GM_ADDR indexKeyDequantScale, GM_ADDR indexBlockTable,
     GM_ADDR candidateLens, GM_ADDR finalSeqLengthsKv, GM_ADDR rowModes,
     GM_ADDR reqPoolEntries, GM_ADDR cacheSlotsPool,
-    GM_ADDR sparseAndTailSlots, GM_ADDR residentSeqLengths,
+    GM_ADDR sparseAndTailSlots, GM_ADDR sparseAndTailSrcIds,
+    GM_ADDR perQueryMissCounts, GM_ADDR residentSeqLengths,
     GM_ADDR copySrcIds, GM_ADDR copyDstSlots, GM_ADDR copyCounts,
     GM_ADDR workspace, GM_ADDR tiling)
 {
@@ -373,6 +374,7 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
             indexKeyCache, indexKeyDequantScale,
             reqPoolEntries, cacheSlotsPool, candidateLens,
             indexBlockTable, routePairRows, topkSlots,
+            sparseAndTailSrcIds,
             routeThresholds, routeMissCounts,
             userWorkspace);
         qli.Process();
@@ -387,7 +389,8 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
                     userWorkspace, candidateLens, finalSeqLengthsKv,
                     reqPoolEntries, cacheSlotsPool, copySrcIds,
                     copyDstSlots, copyCounts, topkSlots,
-                    sparseAndTailSlots, residentSeqLengths,
+                    sparseAndTailSlots, sparseAndTailSrcIds,
+                    perQueryMissCounts, residentSeqLengths,
                     tilingData.tokenCapacity, tilingData.outputCapacity,
                     tilingData.fastScoreRowStride,
                     tilingData.batchSize, &pipe);
@@ -416,6 +419,7 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
                 sparseAndTailSlots, actualSeqLengthsQuery,
                 candidateLens, finalSeqLengthsKv, rowModes,
                 reqPoolEntries, cacheSlotsPool, sparseAndTailSlots,
+                sparseAndTailSrcIds, perQueryMissCounts,
                 residentSeqLengths, copySrcIds, copyDstSlots,
                 copyCounts, GetBlockIdx() / 2U, ATTENTION_CAPACITY);
             manager.Process();

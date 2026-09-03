@@ -122,6 +122,7 @@ public:
         GM_ADDR reqPoolEntries, GM_ADDR cacheSlotsPool,
         GM_ADDR candidateLens, GM_ADDR indexBlockTable,
         GM_ADDR routePairRows, GM_ADDR topkSlots,
+        GM_ADDR topkSourceIds,
         GM_ADDR routeThresholds, GM_ADDR routeMissCounts,
         GM_ADDR userWorkspace)
     {
@@ -178,6 +179,8 @@ public:
             routePairRowsGm_.SetGlobalBuffer(
                 (__gm__ int32_t *)routePairRows);
             topkSlotsGm_.SetGlobalBuffer((__gm__ int32_t *)topkSlots);
+            topkSourceIdsGm_.SetGlobalBuffer(
+                (__gm__ int32_t *)topkSourceIds);
             routeMissCountsGm_.SetGlobalBuffer(
                 (__gm__ int32_t *)routeMissCounts);
             routeThresholdsGm_.SetGlobalBuffer(
@@ -187,12 +190,10 @@ public:
                 weightsGm_, queryScaleGm_, keyScaleGm_,
                 routePairRowsGm_, blockTableGm_, cacheSlotsGm_,
                 topkSlotsGm_, routeMissCountsGm_);
-            // The payload service keeps a source-output handle for its
-            // unreachable C=0 branch. Stable fast-path requests always have
-            // +C, so alias it to the caller-owned slot output. Stage 1 writes
-            // each 2048-slot prefix directly with the public 2176-row stride;
-            // Stage 2 repairs miss slots in place and appends only the tail.
-            vectorService_.InitMtpTopkSourceTensor(topkSlotsGm_);
+            // Stage 1 publishes the complete miss-prefix/hit-suffix source
+            // row and the hit-slot suffix. Stage 2 repairs only miss slots and
+            // appends the paired causal tail.
+            vectorService_.InitMtpTopkSourceTensor(topkSourceIdsGm_);
             vectorService_.InitMtpThresholdTensor(routeThresholdsGm_);
             vectorService_.InitBuffers(pipe_);
         } else {
@@ -341,6 +342,7 @@ private:
     GlobalTensor<int32_t> cacheSlotsGm_;
     GlobalTensor<int32_t> routePairRowsGm_;
     GlobalTensor<int32_t> topkSlotsGm_;
+    GlobalTensor<int32_t> topkSourceIdsGm_;
     GlobalTensor<int32_t> routeMissCountsGm_;
     GlobalTensor<uint16_t> routeThresholdsGm_;
     GlobalTensor<uint16_t> scoreWorkspaceBaseGm_;

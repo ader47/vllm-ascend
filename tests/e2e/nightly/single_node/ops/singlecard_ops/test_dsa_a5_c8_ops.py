@@ -249,6 +249,58 @@ def _allocate_fused_lidu_outputs(
     )
 
 
+def _allocate_mtp_lidu_outputs(
+    batch: int = 1,
+    total_query_rows: int | None = None,
+) -> tuple[torch.Tensor, ...]:
+    if total_query_rows is None:
+        total_query_rows = batch
+    sparse_and_tail_slots = torch.full(
+        (total_query_rows, 1, _ATTENTION_CAPACITY),
+        -77,
+        dtype=torch.int32,
+        device="npu",
+    )
+    sparse_and_tail_src_ids = torch.full_like(
+        sparse_and_tail_slots,
+        -77,
+    )
+    per_query_miss_counts = torch.full(
+        (total_query_rows,),
+        -77,
+        dtype=torch.int32,
+        device="npu",
+    )
+    resident_seq_lengths = torch.full(
+        (batch,),
+        -77,
+        dtype=torch.int32,
+        device="npu",
+    )
+    copy_src_ids = torch.full(
+        (batch, 1, _COPY_CAPACITY),
+        -77,
+        dtype=torch.int32,
+        device="npu",
+    )
+    copy_dst_slots = torch.full_like(copy_src_ids, -77)
+    copy_counts = torch.full(
+        (batch,),
+        -77,
+        dtype=torch.int32,
+        device="npu",
+    )
+    return (
+        sparse_and_tail_slots,
+        sparse_and_tail_src_ids,
+        per_query_miss_counts,
+        resident_seq_lengths,
+        copy_src_ids,
+        copy_dst_slots,
+        copy_counts,
+    )
+
+
 def _launch_fused_lidu(
     inputs: dict[str, torch.Tensor],
     cache_slots: torch.Tensor,
@@ -396,7 +448,7 @@ def test_packed_c8_mtp_lim_dense_short_rows_are_causal() -> None:
     )
     cache_slots[:, -1].zero_()
     before = cache_slots.clone()
-    outputs = _allocate_fused_lidu_outputs(
+    outputs = _allocate_mtp_lidu_outputs(
         batch,
         total_query_rows,
     )
@@ -404,7 +456,7 @@ def test_packed_c8_mtp_lim_dense_short_rows_are_causal() -> None:
     _launch_mtp_lim(inputs, cache_slots, outputs)
     torch.npu.synchronize()
 
-    attention, resident_lengths, _, _, counts = (
+    attention, _, _, resident_lengths, _, _, counts = (
         tensor.cpu() for tensor in outputs
     )
     for query_row in range(total_query_rows):
@@ -461,7 +513,7 @@ def test_packed_c8_mtp_lim_dense_long_rows_are_causal() -> None:
     )
     cache_slots[:, -1].zero_()
     before = cache_slots.clone()
-    outputs = _allocate_fused_lidu_outputs(
+    outputs = _allocate_mtp_lidu_outputs(
         batch,
         total_query_rows,
     )
@@ -469,7 +521,15 @@ def test_packed_c8_mtp_lim_dense_long_rows_are_causal() -> None:
     _launch_mtp_lim(inputs, cache_slots, outputs)
     torch.npu.synchronize()
 
-    attention, resident_lengths, raw_topk, error_metadata, counts = (
+    (
+        attention,
+        _,
+        _,
+        resident_lengths,
+        raw_topk,
+        error_metadata,
+        counts,
+    ) = (
         tensor.cpu() for tensor in outputs
     )
     if any(count < 0 for count in counts.tolist()):
@@ -613,7 +673,7 @@ def test_packed_c8_mtp_lim_uses_per_query_candidates_and_dual_tails() -> None:
     )
     cache_slots[:, -1].zero_()
     cache_slots[0, -1] = -budget
-    outputs = _allocate_fused_lidu_outputs(
+    outputs = _allocate_mtp_lidu_outputs(
         batch=1,
         total_query_rows=queries_per_request,
     )
@@ -621,7 +681,7 @@ def test_packed_c8_mtp_lim_uses_per_query_candidates_and_dual_tails() -> None:
     _launch_mtp_lim(inputs, cache_slots, outputs)
     torch.npu.synchronize()
 
-    attention, resident_lengths, _, _, counts = (
+    attention, _, _, resident_lengths, _, _, counts = (
         tensor.cpu() for tensor in outputs
     )
     cache_row = cache_slots[0].cpu()
@@ -710,7 +770,7 @@ def test_packed_c8_mtp_lim_steady_fast_path_updates_union_and_dual_tails(
 
     # Establish the persistent request row through the correctness path. The
     # positive metadata left by this call is part of the fast-path contract.
-    cold_outputs = _allocate_fused_lidu_outputs(
+    cold_outputs = _allocate_mtp_lidu_outputs(
         batch=1,
         total_query_rows=queries_per_request,
     )
@@ -744,16 +804,22 @@ def test_packed_c8_mtp_lim_steady_fast_path_updates_union_and_dual_tails(
     )
     assert expected_misses.numel() > 0
 
-    outputs = _allocate_fused_lidu_outputs(
+    outputs = _allocate_mtp_lidu_outputs(
         batch=1,
         total_query_rows=queries_per_request,
     )
     _launch_mtp_lim(steady_inputs, cache_slots, outputs)
     torch.npu.synchronize()
 
-    attention, resident_lengths, source_ids, destination_slots, counts = (
-        tensor.cpu() for tensor in outputs
-    )
+    (
+        attention,
+        attention_src_ids,
+        per_query_miss_counts,
+        resident_lengths,
+        source_ids,
+        destination_slots,
+        counts,
+    ) = (tensor.cpu() for tensor in outputs)
     pool_after = cache_slots[0].cpu()
     copy_count = int(counts[0])
     assert copy_count == int(expected_misses.numel())
@@ -785,6 +851,30 @@ def test_packed_c8_mtp_lim_steady_fast_path_updates_union_and_dual_tails(
     for route in range(queries_per_request):
         expected_slots = pool_after[expected_topk[route].to(torch.long)]
         actual_slots = attention[route, 0, :_TOPK]
+        actual_src_ids = attention_src_ids[route, 0, :_TOPK]
+        route_miss_count = int(per_query_miss_counts[route])
+        expected_route_misses = expected_topk[route][
+            pool_before[expected_topk[route].to(torch.long)] < 0
+        ]
+        assert route_miss_count == int(expected_route_misses.numel())
+        _assert_exact_int_tensor(
+            torch.sort(actual_src_ids[:route_miss_count]).values,
+            torch.sort(expected_route_misses).values,
+        )
+        assert torch.all(
+            pool_before[
+                actual_src_ids[route_miss_count:].to(torch.long)
+            ]
+            >= 0
+        )
+        _assert_exact_int_tensor(
+            torch.sort(actual_src_ids).values,
+            torch.sort(expected_topk[route]).values,
+        )
+        _assert_exact_int_tensor(
+            actual_slots,
+            pool_after[actual_src_ids.to(torch.long)],
+        )
         # The optimized path deliberately publishes the miss destinations
         # before the compacted hit slots. Sparse attention consumes an
         # unordered resident-slot set, so preserving native TopK score order
@@ -881,7 +971,7 @@ def test_packed_c8_mtp_lim_steady_fast_path_has_exact_monotonic_topk(
     )
     cache_slots[0, -1] = budget
     before = cache_slots.clone()
-    outputs = _allocate_fused_lidu_outputs(
+    outputs = _allocate_mtp_lidu_outputs(
         batch=1,
         total_query_rows=queries_per_request,
     )
@@ -889,7 +979,7 @@ def test_packed_c8_mtp_lim_steady_fast_path_has_exact_monotonic_topk(
     _launch_mtp_lim(inputs, cache_slots, outputs)
     torch.npu.synchronize()
 
-    attention, resident_lengths, _, _, counts = (
+    attention, _, _, resident_lengths, _, _, counts = (
         tensor.cpu() for tensor in outputs
     )
     expected_topk = torch.arange(

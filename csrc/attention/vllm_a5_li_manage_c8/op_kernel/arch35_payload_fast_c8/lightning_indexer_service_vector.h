@@ -843,13 +843,15 @@ __aicore__ inline void QLIVector<QLIT>::FinalizePayloadUpdate(
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         AscendC::DataCopyParams outputCopy{
             1, static_cast<uint16_t>(topkCount_ * sizeof(int32_t)), 0, 0};
-        const uint64_t sourceOutOffset =
-            static_cast<uint64_t>(outputRow) * topkCount_;
 #ifdef A5_MTP_SLOT_OUTPUT_STRIDE
+        const uint64_t sourceOutOffset =
+            static_cast<uint64_t>(outputRow) * A5_MTP_SLOT_OUTPUT_STRIDE;
         const uint64_t slotOutOffset =
             static_cast<uint64_t>(outputRow) *
             A5_MTP_SLOT_OUTPUT_STRIDE;
 #else
+        const uint64_t sourceOutOffset =
+            static_cast<uint64_t>(outputRow) * topkCount_;
         const uint64_t slotOutOffset = sourceOutOffset;
 #endif
 #ifndef A5_MTP_CLASSIFY_ONLY
@@ -874,15 +876,34 @@ __aicore__ inline void QLIVector<QLIT>::FinalizePayloadUpdate(
     uint32_t currentMissCount = static_cast<uint32_t>(
         AscendC::GetSpr<AscendC::SpecialPurposeReg::AR>() / sizeof(uint32_t));
     PipeBarrier<PIPE_V>();
-#ifndef A5_MTP_CLASSIFY_ONLY
     VllmFastTopkIndexerClassifyVF::SqueezeIndexerHitTokenIds(
         (__ubuf__ uint32_t *)classifiedIndex[currentMissCount].GetPhyAddr(),
         (__ubuf__ uint32_t *)indicesOutLocal_.GetPhyAddr(),
         topkCount_ / CLASSIFY_CHUNK);
     PipeBarrier<PIPE_V>();
-#endif
 
 #ifdef A5_MTP_CLASSIFY_ONLY
+    // Preserve the complete source row before BuildSortedMissPairs reuses the
+    // same UB storage. Stage 2 reads this prefix when repairing destinations,
+    // so source and destination remain elementwise paired even though the
+    // private union input is independently sorted by source ID.
+#ifdef A5_MTP_SLOT_OUTPUT_STRIDE
+    const uint64_t publicSourceOffset =
+        static_cast<uint64_t>(outputRow) * A5_MTP_SLOT_OUTPUT_STRIDE;
+#else
+    const uint64_t publicSourceOffset =
+        static_cast<uint64_t>(outputRow) * topkCount_;
+#endif
+    AscendC::DataCopyParams publicSourceCopy{
+        1, static_cast<uint16_t>(topkCount_ * sizeof(int32_t)), 0, 0};
+    SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
+    WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
+    DataCopyPad(
+        topkSourceIdsGm[publicSourceOffset], classifiedIndex,
+        publicSourceCopy);
+    SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
+    WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
+
     // Stage 1 of MTP3 management publishes only each route's actual sorted
     // miss-pair prefix plus its complete slot row. It must not choose victims
     // or mutate the shared request row. The survivor payload already carries
@@ -897,9 +918,9 @@ __aicore__ inline void QLIVector<QLIT>::FinalizePayloadUpdate(
     SetFlag<HardEvent::V_S>(V_MTE2_EVENT3);
     WaitFlag<HardEvent::V_S>(V_MTE2_EVENT3);
     BuildSortedMissPairs(classifiedIndex, currentMissCount);
-    // routePairRows already carries the complete sorted miss-source prefix.
-    // li_manage_c8 exposes slots rather than TopK source IDs, so rebuilding a
-    // redundant 2048-source row here would add vector work to every route.
+    // routePairRows carries the sorted miss prefix for union. The caller-owned
+    // source row additionally preserves the complete miss-prefix/hit-suffix
+    // ordering consumed by fused copy+SFA.
     LocalTensor<int32_t> routeMissCountLocal =
         candidatePayloadLocal_.template ReinterpretCast<int32_t>();
     routeMissCountLocal.SetValue(0, static_cast<int32_t>(currentMissCount));
@@ -943,9 +964,6 @@ __aicore__ inline void QLIVector<QLIT>::FinalizePayloadUpdate(
         thresholdGm[static_cast<uint64_t>(outputRow) *
                     MTP_THRESHOLD_STRIDE],
         scoreOutLocal_, MTP_THRESHOLD_STRIDE);
-    // li_manage_c8 publishes resident slots, not TopK source IDs. Miss
-    // sources already live in routePairRows for union; avoid a redundant
-    // 2048-int GM write on every route.
     DataCopyPad(topkSlotsGm[slotOutOffset], slotStageLocal_, slotOutputCopy);
     SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
     SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);

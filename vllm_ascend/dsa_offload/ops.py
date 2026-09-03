@@ -234,6 +234,8 @@ def a5_lightning_indexer_decode_update_mtp_c8(
     req_pool_entries: torch.Tensor,
     cache_slots: torch.Tensor,
     attention_slots: torch.Tensor,
+    attention_src_ids: torch.Tensor,
+    per_query_miss_counts: torch.Tensor,
     resident_seq_lengths: torch.Tensor,
     outputs: DSALightningIndexerOutputs,
 ) -> None:
@@ -262,6 +264,8 @@ def a5_lightning_indexer_decode_update_mtp_c8(
         req_pool_entries,
         cache_slots,
         attention_slots,
+        attention_src_ids,
+        per_query_miss_counts,
         resident_seq_lengths,
         outputs.topk_index,
         outputs.topk_slots,

@@ -43,6 +43,10 @@ public:
         this->Attr("weight_stride").Int();
         this->Output("sparse_and_tail_slots").ParamType(REQUIRED)
             .DataType(ints).Format(formats);
+        this->Output("sparse_and_tail_src_ids").ParamType(REQUIRED)
+            .DataType(ints).Format(formats);
+        this->Output("per_query_miss_counts").ParamType(REQUIRED)
+            .DataType(ints).Format(formats);
         this->Output("resident_seq_lengths").ParamType(REQUIRED)
             .DataType(ints).Format(formats);
         this->Output("copy_src_ids").ParamType(REQUIRED)

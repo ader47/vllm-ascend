@@ -2459,8 +2459,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor row_modes, Tensor req_pool_entries, "
         "Tensor(a!) cache_slots_pool, "
         "Tensor(b!) sparse_and_tail_slots, "
-        "Tensor(c!) resident_seq_lengths, Tensor(d!) copy_src_ids, "
-        "Tensor(e!) copy_dst_slots, Tensor(f!) copy_counts) -> ()");
+        "Tensor(c!) sparse_and_tail_src_ids, "
+        "Tensor(d!) per_query_miss_counts, "
+        "Tensor(e!) resident_seq_lengths, Tensor(f!) copy_src_ids, "
+        "Tensor(g!) copy_dst_slots, Tensor(h!) copy_counts) -> ()");
     ops.impl("npu_dsa_a5_li_manage_c8_out",
              torch::kPrivateUse1,
              &vllm_ascend::npu_dsa_a5_li_manage_c8_out);

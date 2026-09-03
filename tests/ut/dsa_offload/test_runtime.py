@@ -136,13 +136,21 @@ def test_a5_selection_scratch_is_allocated_only_for_packed_c8() -> None:
     )
 
     assert bf16_runtime._a5_attention_slots is None
+    assert bf16_runtime._a5_attention_src_ids is None
+    assert bf16_runtime._a5_per_query_miss_counts is None
     assert bf16_runtime._a5_resident_seq_lengths is None
     assert c8_runtime._a5_attention_slots is not None
     assert c8_runtime._a5_attention_slots.shape == (1, 1, 2176)
+    assert c8_runtime._a5_attention_src_ids is None
+    assert c8_runtime._a5_per_query_miss_counts is None
     assert c8_runtime._a5_resident_seq_lengths is not None
     assert c8_runtime._a5_resident_seq_lengths.shape == (1,)
     assert mtp_runtime._a5_attention_slots is not None
     assert mtp_runtime._a5_attention_slots.shape == (4, 1, 2176)
+    assert mtp_runtime._a5_attention_src_ids is not None
+    assert mtp_runtime._a5_attention_src_ids.shape == (4, 1, 2176)
+    assert mtp_runtime._a5_per_query_miss_counts is not None
+    assert mtp_runtime._a5_per_query_miss_counts.shape == (4,)
 
 
 def test_mtp_sparse_candidate_length_is_the_durable_dram_prefix() -> None:
@@ -278,6 +286,98 @@ def test_a5_selection_chain_reuses_preallocated_outputs(monkeypatch) -> None:
     assert selection.resident_seq_lengths is not None
     assert selection.resident_seq_lengths.data_ptr() == (runtime._a5_resident_seq_lengths.data_ptr())
     assert selection.resident_seq_lengths.tolist() == [4096, 4224]
+
+
+def test_a5_mtp_selection_chain_reuses_per_query_outputs(monkeypatch) -> None:
+    resident_pool, runtime, store = _make_runtime(
+        max_num_reqs=2,
+        packed_c8=True,
+        max_decode_query_len=4,
+    )
+    resident_cache = torch.empty(4, 128, 1, 656, dtype=torch.int8)
+    store.add_packed_layer(
+        layer_id=1,
+        resident_packed_cache=resident_cache,
+    )
+    indexer_cache = (
+        torch.empty(8, 128, 1, 128, dtype=torch.float8_e4m3fn),
+        torch.empty(8, 128, 1, 1, dtype=torch.float32),
+    )
+    captured: dict[str, torch.Tensor] = {}
+
+    def _fake_mtp_lidu(
+        *,
+        outputs,
+        attention_slots,
+        attention_src_ids,
+        per_query_miss_counts,
+        resident_seq_lengths,
+        **kwargs,
+    ) -> None:
+        outputs.topk_index.fill_(7)
+        outputs.topk_slots.fill_(9)
+        outputs.miss_count.zero_()
+        attention_slots.fill_(11)
+        attention_src_ids.fill_(13)
+        per_query_miss_counts.copy_(
+            torch.arange(8, dtype=torch.int32)
+        )
+        resident_seq_lengths.fill_(4096)
+        captured["attention_slots"] = attention_slots
+        captured["attention_src_ids"] = attention_src_ids
+        captured["per_query_miss_counts"] = per_query_miss_counts
+        captured["cache_slots"] = kwargs["cache_slots"]
+
+    monkeypatch.setattr(
+        runtime_module,
+        "a5_lightning_indexer_decode_update_mtp_c8",
+        _fake_mtp_lidu,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "a5_kvcache_scatter_copy_c8",
+        lambda **kwargs: None,
+    )
+
+    context = DSALayerOffloadContext(
+        layer_id=1,
+        indexer_cache=indexer_cache,
+        runtime=runtime,
+        selection_state_id=0,
+        packed_c8=True,
+    )
+    selection = context.execute_decode_selection(
+        query=torch.empty(8, 32, 128),
+        weights=torch.empty(8, 32),
+        row_modes=torch.tensor([2, 2], dtype=torch.int32),
+        resident_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+        actual_seq_lengths_key=torch.tensor([4096, 4096], dtype=torch.int32),
+        actual_seq_lengths_query=torch.tensor([4, 8], dtype=torch.int32),
+        indexer_block_table=torch.zeros(2, 64, dtype=torch.int32),
+        resident_cache=(resident_cache,),
+        resident_block_table=torch.zeros(2, 64, dtype=torch.int32),
+        dram_block_table=torch.zeros(2, 64, dtype=torch.int32),
+        candidate_lens=torch.tensor([4096, 4096], dtype=torch.int32),
+        query_dequant_scale=torch.ones(8, 32),
+        query_shape=(8, 32, 128),
+    )
+
+    assert runtime._a5_attention_slots is not None
+    assert runtime._a5_attention_src_ids is not None
+    assert runtime._a5_per_query_miss_counts is not None
+    assert captured["attention_slots"].data_ptr() == (
+        runtime._a5_attention_slots.data_ptr()
+    )
+    assert captured["attention_src_ids"].data_ptr() == (
+        runtime._a5_attention_src_ids.data_ptr()
+    )
+    assert captured["per_query_miss_counts"].data_ptr() == (
+        runtime._a5_per_query_miss_counts.data_ptr()
+    )
+    assert captured["cache_slots"].data_ptr() == (
+        resident_pool.get_cache_slots(0).data_ptr()
+    )
+    assert selection.sparse_indices.shape == (8, 1, 2176)
 
 
 def test_a5_shared_layer_reuses_full_lidu_and_own_packed_arena(

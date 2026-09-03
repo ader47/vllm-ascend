@@ -24,19 +24,22 @@ static ge::graphStatus InferVllmA5LiManageC8Shape(
         context->GetInputShape(QUERY)->GetDim(0);
     const int64_t batch =
         context->GetInputShape(ACTUAL_SEQ_LENGTHS_QUERY)->GetDim(0);
-    for (size_t index = 0; index < 5; ++index) {
+    for (size_t index = 0; index < 7; ++index) {
         if (context->GetOutputShape(index) == nullptr) {
             return ge::GRAPH_FAILED;
         }
     }
     *context->GetOutputShape(0) =
         gert::Shape({totalQueryRows, 1, ATTENTION_CAPACITY});
-    *context->GetOutputShape(1) = gert::Shape({batch});
-    *context->GetOutputShape(2) =
+    *context->GetOutputShape(1) =
+        gert::Shape({totalQueryRows, 1, ATTENTION_CAPACITY});
+    *context->GetOutputShape(2) = gert::Shape({totalQueryRows});
+    *context->GetOutputShape(3) = gert::Shape({batch});
+    *context->GetOutputShape(4) =
         gert::Shape({batch, 1, OUTPUT_CAPACITY});
-    *context->GetOutputShape(3) =
+    *context->GetOutputShape(5) =
         gert::Shape({batch, 1, OUTPUT_CAPACITY});
-    *context->GetOutputShape(4) = gert::Shape({batch});
+    *context->GetOutputShape(6) = gert::Shape({batch});
     return ge::GRAPH_SUCCESS;
 }
 
@@ -46,7 +49,7 @@ static ge::graphStatus InferVllmA5LiManageC8DataType(
     if (context == nullptr) {
         return ge::GRAPH_FAILED;
     }
-    for (size_t index = 0; index < 5; ++index) {
+    for (size_t index = 0; index < 7; ++index) {
         context->SetOutputDataType(index, ge::DT_INT32);
     }
     return ge::GRAPH_SUCCESS;

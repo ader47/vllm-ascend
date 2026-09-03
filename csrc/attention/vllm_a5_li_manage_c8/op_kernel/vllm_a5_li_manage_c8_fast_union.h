@@ -57,7 +57,8 @@ public:
         GM_ADDR finalSeqLengthsKv, GM_ADDR reqPoolEntries, GM_ADDR cacheSlots,
         GM_ADDR unionSources, GM_ADDR unionDestinations,
         GM_ADDR unionCounts, GM_ADDR topkSlots,
-        GM_ADDR sparseAndTailSlots, GM_ADDR residentSeqLengths,
+        GM_ADDR sparseAndTailSlots, GM_ADDR sparseAndTailSrcIds,
+        GM_ADDR perQueryMissCounts, GM_ADDR residentSeqLengths,
         uint32_t tokenCapacity, uint32_t outputCapacity,
         uint32_t scoreRowStride, uint32_t batchSize, TPipe *pipe)
     {
@@ -78,6 +79,10 @@ public:
         topkSlotsGm_.SetGlobalBuffer((__gm__ int32_t *)topkSlots);
         sparseAndTailSlotsGm_.SetGlobalBuffer(
             (__gm__ int32_t *)sparseAndTailSlots);
+        sparseAndTailSrcIdsGm_.SetGlobalBuffer(
+            (__gm__ int32_t *)sparseAndTailSrcIds);
+        perQueryMissCountsGm_.SetGlobalBuffer(
+            (__gm__ int32_t *)perQueryMissCounts);
         residentSeqLengthsGm_.SetGlobalBuffer(
             (__gm__ int32_t *)residentSeqLengths);
         sourceCapacity_ = tokenCapacity;
@@ -448,8 +453,10 @@ private:
     {
         LocalTensor<int32_t> routePairs = pairInputBuf_.Get<int32_t>();
         // pairInputBuf_ has 16384 int32 words. One 4096-word interleaved
-        // route-pair row plus four 2048-word destination prefixes use only
-        // 12288 words and remain disjoint.
+        // route-pair row, four 2048-word destination prefixes and one
+        // 2048-word reordered public source prefix remain disjoint.
+        LocalTensor<int32_t> publicSources =
+            routePairs[UNION_PAIR_WORDS + UNION_ROUTES * UNION_TOPK];
         const uint64_t requestPairBase =
             static_cast<uint64_t>(batch) * UNION_CAPACITY * 2U;
         for (uint32_t route = 0U; route < UNION_ROUTES; ++route) {
@@ -466,11 +473,19 @@ private:
                 {false, 0, 0, 0});
             UnionSync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
 
+            const uint64_t publicRow =
+                (static_cast<uint64_t>(batch) * UNION_ROUTES + route) *
+                vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY;
             LocalTensor<int32_t> rowDestinations =
                 allDestinations[route * UNION_TOPK];
             uint32_t unionCursor = 0U;
             for (uint32_t miss = 0U; miss < length; ++miss) {
+                // BuildSortedMissPairs emits source IDs in ascending order,
+                // matching the deduplicated union order.  Re-publish that
+                // same order into the caller-owned source prefix so source
+                // and repaired destination stay elementwise paired.
                 const int32_t source = routePairs.GetValue(miss * 2U + 1U);
+                publicSources.SetValue(miss, source);
                 while (unionCursor < unionCount &&
                        unionSources.GetValue(unionCursor) < source) {
                     ++unionCursor;
@@ -482,6 +497,13 @@ private:
                         : -1;
                 rowDestinations.SetValue(miss, destination);
             }
+            UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+            DataCopyPad(
+                sparseAndTailSrcIdsGm_[publicRow], publicSources,
+                {1, static_cast<uint16_t>(
+                        length * static_cast<uint32_t>(sizeof(int32_t))),
+                 0, 0});
+            UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
         }
     }
 
@@ -492,6 +514,17 @@ private:
         LocalTensor<int32_t> unionDestinations,
         LocalTensor<int32_t> topkMissDestinations)
     {
+        for (uint32_t route = 0U; route < UNION_ROUTES; ++route) {
+            countLocal.SetValue(route, static_cast<int32_t>(lengths[route]));
+        }
+        PipeBarrier<PIPE_V>();
+        UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+        DataCopyPad(
+            perQueryMissCountsGm_[batch * UNION_ROUTES], countLocal,
+            {1, static_cast<uint16_t>(
+                    UNION_ROUTES * sizeof(int32_t)), 0, 0});
+        UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+
         countLocal.SetValue(0U, static_cast<int32_t>(count));
         UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
         if (count != 0U) {
@@ -530,7 +563,10 @@ private:
         // the caller-owned [T,2176] output, and the loop above repaired only
         // its miss prefix. Publish the 128-entry causal-tail suffix in place;
         // this removes the old full-row GM -> UB -> GM round trip.
-        LocalTensor<int32_t> tail = pairInputBuf_.Get<int32_t>();
+        LocalTensor<int32_t> tailSlots = pairInputBuf_.Get<int32_t>();
+        LocalTensor<int32_t> tailSources =
+            tailSlots[vllm_a5_li_manage_c8_fast_workspace::
+                ATTENTION_CAPACITY - UNION_TOPK];
         const uint32_t poolRow = static_cast<uint32_t>(
             reqPoolEntriesGm_.GetValue(batch));
         const uint32_t budget = ReadBudget(batch, poolRow);
@@ -539,7 +575,10 @@ private:
         const uint32_t candidate = static_cast<uint32_t>(
             candidateLensGm_.GetValue(batch));
         for (uint32_t route = 0U; route < UNION_ROUTES; ++route) {
-            Duplicate(tail, static_cast<int32_t>(-1),
+            Duplicate(tailSlots, static_cast<int32_t>(-1),
+                      vllm_a5_li_manage_c8_fast_workspace::
+                          ATTENTION_CAPACITY - UNION_TOPK);
+            Duplicate(tailSources, static_cast<int32_t>(-1),
                       vllm_a5_li_manage_c8_fast_workspace::
                           ATTENTION_CAPACITY - UNION_TOPK);
             UnionSync<HardEvent::V_S>(HardEvent::V_S);
@@ -548,16 +587,21 @@ private:
             const uint32_t tailCount = visible - candidate;
             for (uint32_t index = 0U; index < tailCount; ++index) {
                 const uint32_t token = candidate + index;
-                tail.SetValue(
+                tailSlots.SetValue(
                     index,
                     static_cast<int32_t>(budget + token % 256U));
+                tailSources.SetValue(index, static_cast<int32_t>(token));
             }
             UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             const uint64_t publicRow =
                 (static_cast<uint64_t>(batch) * UNION_ROUTES + route) *
                 vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY;
             DataCopy(
-                sparseAndTailSlotsGm_[publicRow + UNION_TOPK], tail,
+                sparseAndTailSlotsGm_[publicRow + UNION_TOPK], tailSlots,
+                vllm_a5_li_manage_c8_fast_workspace::
+                    ATTENTION_CAPACITY - UNION_TOPK);
+            DataCopy(
+                sparseAndTailSrcIdsGm_[publicRow + UNION_TOPK], tailSources,
                 vllm_a5_li_manage_c8_fast_workspace::
                     ATTENTION_CAPACITY - UNION_TOPK);
             UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
@@ -671,6 +715,8 @@ private:
     GlobalTensor<int32_t> unionCountsGm_;
     GlobalTensor<int32_t> topkSlotsGm_;
     GlobalTensor<int32_t> sparseAndTailSlotsGm_;
+    GlobalTensor<int32_t> sparseAndTailSrcIdsGm_;
+    GlobalTensor<int32_t> perQueryMissCountsGm_;
     GlobalTensor<int32_t> residentSeqLengthsGm_;
     TBuf<TPosition::VECCALC> pairInputBuf_;
     TBuf<TPosition::VECCALC> pairOutputBuf_;

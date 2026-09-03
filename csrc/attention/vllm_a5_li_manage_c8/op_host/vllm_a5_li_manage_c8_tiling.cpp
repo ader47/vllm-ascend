@@ -196,10 +196,10 @@ static ge::graphStatus TilingVllmA5LiManageC8(
         blockTable.GetDim(1) * BLOCK_SIZE);
     const uint32_t tokenCapacity = static_cast<uint32_t>(
         pool.GetDim(1) - 1);
-    // cache_slots reserves its final int32 for +/-budget metadata, so its
-    // logical token capacity is commonly one element short of the 256-entry
-    // row alignment. QuantLI stores score rows at a 128-token stride; keep
-    // that physical score stride explicit instead of reusing tokenCapacity.
+    // cache_slots_pool reserves its final int32 for +/-budget metadata.
+    // Production rows are aligned independently of QuantLI score rows, so
+    // the logical token capacity must not be used as the physical score
+    // stride.
     const uint32_t fastScoreRowStride =
         (tokenCapacity + static_cast<uint32_t>(BLOCK_SIZE) - 1U) /
         static_cast<uint32_t>(BLOCK_SIZE) *

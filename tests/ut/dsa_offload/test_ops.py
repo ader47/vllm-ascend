@@ -215,6 +215,11 @@ def test_a5_mtp_lim_keeps_request_and_query_axes_separate(
         (total_query_rows, 1, 2176),
         dtype=torch.int32,
     )
+    attention_src_ids = torch.empty_like(attention_slots)
+    per_query_miss_counts = torch.empty(
+        (total_query_rows,),
+        dtype=torch.int32,
+    )
     resident_seq_lengths = torch.empty((batch,), dtype=torch.int32)
 
     a5_lightning_indexer_decode_update_mtp_c8(
@@ -243,6 +248,8 @@ def test_a5_mtp_lim_keeps_request_and_query_axes_separate(
         req_pool_entries=torch.tensor([0, 1], dtype=torch.int32),
         cache_slots=torch.empty((2, 65537), dtype=torch.int32),
         attention_slots=attention_slots,
+        attention_src_ids=attention_src_ids,
+        per_query_miss_counts=per_query_miss_counts,
         resident_seq_lengths=resident_seq_lengths,
         outputs=outputs,
     )
@@ -252,6 +259,10 @@ def test_a5_mtp_lim_keeps_request_and_query_axes_separate(
     assert args[0].stride() == (160, 1)
     assert args[12] is attention_slots
     assert args[12].shape[0] == total_query_rows
-    assert args[13] is resident_seq_lengths
-    assert args[14].shape[0] == batch
+    assert args[13] is attention_src_ids
+    assert args[13].shape == attention_slots.shape
+    assert args[14] is per_query_miss_counts
+    assert args[14].shape[0] == total_query_rows
+    assert args[15] is resident_seq_lengths
     assert args[16].shape[0] == batch
+    assert args[18].shape[0] == batch
