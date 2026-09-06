@@ -9,6 +9,7 @@ from vllm_ascend.dsa_offload.contracts import DSA_LIDU_CACHE_ROW_ALIGNMENT
 from vllm_ascend.dsa_offload.ops import (
     quant_lightning_indexer_topk,
     require_dsa_offload_ops,
+    sparse_flash_attention_for_offload_c8,
 )
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -25,6 +26,7 @@ _PACKED_ROW_BYTES = 656
 _TOPK = 2048
 _COPY_CAPACITY = 16384
 _ATTENTION_CAPACITY = _TOPK + _BLOCK_SIZE
+_MTP_ATTENTION_CAPACITY = _TOPK + 2 * _BLOCK_SIZE
 
 
 def _cache_row_width(max_model_len: int) -> int:
@@ -256,7 +258,7 @@ def _allocate_mtp_lidu_outputs(
     if total_query_rows is None:
         total_query_rows = batch
     sparse_and_tail_slots = torch.full(
-        (total_query_rows, 1, _ATTENTION_CAPACITY),
+        (total_query_rows, 1, _MTP_ATTENTION_CAPACITY),
         -77,
         dtype=torch.int32,
         device="npu",
@@ -375,6 +377,181 @@ def _native_topk(inputs: dict[str, torch.Tensor]) -> torch.Tensor:
     )
 
 
+def _native_mtp_topk_rows(inputs: dict[str, torch.Tensor]) -> list[torch.Tensor]:
+    """Independent R=1 LI calls: shared sparse prefix, per-query dense visibility."""
+    rows = []
+    start = 0
+    for request, end in enumerate(inputs["query_ends"].cpu().tolist()):
+        mode = int(inputs["row_modes"][request].cpu())
+        final_len = int(inputs["final_lens"][request].cpu())
+        candidate = int(inputs["candidate_lens"][request].cpu())
+        for query_row in range(start, end):
+            length = candidate if mode == 2 else final_len - (end - 1 - query_row)
+            if mode == 0:
+                rows.append(torch.empty(0, dtype=torch.int32))
+            elif length <= _TOPK:
+                rows.append(torch.arange(length, dtype=torch.int32))
+            else:
+                row_inputs = {
+                    **inputs,
+                    "query": inputs["query"][query_row : query_row + 1],
+                    "weights": inputs["weights"][query_row : query_row + 1],
+                    "query_scale": inputs["query_scale"][query_row : query_row + 1],
+                    "query_ends": torch.ones(1, dtype=torch.int32, device="npu"),
+                    "candidate_lens": torch.tensor([length], dtype=torch.int32, device="npu"),
+                    "block_table": inputs["block_table"][request : request + 1],
+                }
+                rows.append(_native_topk(row_inputs).cpu().view(-1))
+        start = end
+    return rows
+
+
+def _assert_mtp_selection(inputs, pool_before, pool_after, outputs, topk_rows):
+    """Verify copy/cache semantics, then build QSFA indices from the independent LI oracle."""
+    slots, sources, query_misses, resident, copy_src, copy_dst, counts = [x.cpu() for x in outputs]
+    before, after = pool_before.cpu(), pool_after.cpu()
+    expected_pool = before.clone()
+    oracle_slots = torch.full_like(slots, -1)
+    start = 0
+    for request, end in enumerate(inputs["query_ends"].cpu().tolist()):
+        mode = int(inputs["row_modes"][request].cpu())
+        final_len = int(inputs["final_lens"][request].cpu())
+        candidate = int(inputs["candidate_lens"][request].cpu())
+        if mode == 2:
+            entry = int(inputs["req_entries"][request].cpu())
+            budget = abs(int(before[entry, -1]))
+            first_fill = int(before[entry, -1]) < 0
+            union = torch.unique(torch.cat(topk_rows[start:end])).long()
+            misses = union[before[entry, union] < 0]
+            count = int(counts[request])
+            assert count == (budget if first_fill else misses.numel())
+            copied = copy_src[request, 0, :count].long()
+            destinations = copy_dst[request, 0, :count]
+            assert torch.unique(copied).numel() == count
+            assert torch.unique(destinations).numel() == count
+            assert torch.all((copied >= 0) & (copied < candidate))
+            assert torch.all((destinations >= 0) & (destinations < budget))
+            if not first_fill:
+                _assert_exact_int_tensor(torch.sort(copied).values, torch.sort(misses).values)
+            old = before[entry, :-1]
+            evicted = (old >= 0) & torch.isin(old, destinations)
+            expected_pool[entry, :-1][evicted] = -1
+            expected_pool[entry, copied] = destinations
+            expected_pool[entry, -1] = budget
+            assert torch.all(after[entry, union] >= 0)
+            held = after[entry, :-1][after[entry, :-1] >= 0]
+            _assert_exact_int_tensor(torch.sort(held).values, torch.arange(budget, dtype=torch.int32))
+            assert resident[request] == budget + 2 * _BLOCK_SIZE
+        else:
+            assert counts[request] == 0
+            assert resident[request] == (0 if mode == 0 else final_len)
+        for row in range(start, end):
+            expected_tokens = topk_rows[row]
+            selected = expected_tokens.numel()
+            actual_tokens = sources[row, 0, :selected].long()
+            _assert_exact_int_tensor(torch.sort(actual_tokens).values, torch.sort(expected_tokens.long()).values)
+            if mode == 2:
+                m = int(query_misses[row])
+                expected_misses = expected_tokens[before[entry, expected_tokens.long()] < 0]
+                assert m == expected_misses.numel()
+                _assert_exact_int_tensor(
+                    torch.sort(actual_tokens[:m]).values, torch.sort(expected_misses.long()).values
+                )
+                assert torch.all(before[entry, actual_tokens[m:]] >= 0)
+                _assert_exact_int_tensor(slots[row, 0, :selected], after[entry, actual_tokens])
+                oracle_slots[row, 0, :selected] = after[entry, expected_tokens.long()]
+                visible = final_len - (end - 1 - row)
+                tail = torch.arange(candidate, visible, dtype=torch.int32)
+                tail_slots = budget + tail.remainder(2 * _BLOCK_SIZE)
+                _assert_exact_int_tensor(sources[row, 0, _TOPK : _TOPK + tail.numel()], tail)
+                _assert_exact_int_tensor(slots[row, 0, _TOPK : _TOPK + tail.numel()], tail_slots)
+                oracle_slots[row, 0, _TOPK : _TOPK + tail.numel()] = tail_slots
+                selected = _TOPK + tail.numel()
+            else:
+                assert query_misses[row] == 0
+                _assert_exact_int_tensor(slots[row, 0, :selected], actual_tokens.to(torch.int32))
+                oracle_slots[row, 0, :selected] = expected_tokens
+            assert torch.all(slots[row, 0, selected:] == -1)
+            assert torch.all(sources[row, 0, selected:] == -1)
+        start = end
+    _assert_exact_int_tensor(after, expected_pool)
+    return oracle_slots
+
+
+@pytest.mark.parametrize("output_index", [0, 1])
+def test_packed_c8_mtp_lim_rejects_old_2176_outputs(output_index) -> None:
+    inputs = _make_fused_lidu_inputs(candidate_len=2048, final_len=0, row_mode=0)
+    pool = torch.zeros((1, _cache_row_width(8192)), dtype=torch.int32, device="npu")
+    outputs = list(_allocate_mtp_lidu_outputs())
+    outputs[output_index] = torch.empty((1, 1, _ATTENTION_CAPACITY), dtype=torch.int32, device="npu")
+    with pytest.raises(RuntimeError, match="2304"):
+        _launch_mtp_lim(inputs, pool, tuple(outputs))
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+def test_packed_c8_mtp_lim_mixed_2304_graph_replay(heads) -> None:
+    batch, total_rows, candidate, budget = 4, 10, 8320, 8192
+    inputs = _make_fused_lidu_inputs(
+        candidate_len=candidate, final_len=candidate + 256, row_mode=2, batch=total_rows, heads=heads
+    )
+    for name in ("block_table", "candidate_lens", "final_lens", "row_modes", "req_entries", "query_ends"):
+        inputs[name] = inputs[name][:batch].clone()
+    # Exercise the framework suffix-view ABI, including an unaligned row stride.
+    weight_storage = torch.empty((total_rows, heads + 1), dtype=torch.bfloat16, device="npu")
+    weight_storage[:, :heads].copy_(inputs["weights"])
+    inputs["weights"] = weight_storage[:, :heads]
+    pool = torch.full((4, _cache_row_width(candidate + 256)), -1, dtype=torch.int32, device="npu")
+    outputs = _allocate_mtp_lidu_outputs(batch, total_rows)
+    inputs["query_ends"].copy_(torch.tensor([1, 3, 6, 10], dtype=torch.int32, device="npu"))
+    inputs["row_modes"].zero_()
+    inputs["final_lens"].zero_()
+    inputs["req_entries"].fill_(-1)
+    pool[:, -1].zero_()
+    _launch_mtp_lim(inputs, pool, outputs)
+    torch.npu.synchronize()
+    pointers = tuple(t.data_ptr() for t in (*inputs.values(), pool, *outputs))
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, pool=torch.npu.graph_pool_handle()):
+        _launch_mtp_lim(inputs, pool, outputs)
+    graph.replay()
+    torch.npu.synchronize()
+    assert outputs[-1].cpu().eq(0).all()
+
+    for ends, modes, finals, entries, first_fill in (
+        ([1, 3, 6, 10], [0, 1, 2, 2], [0, 16, candidate + 129, candidate + 256], [-1, -1, 2, 0], False),
+        ([4, 7, 9, 10], [2, 1, 0, 2], [candidate + 129, 4096, 0, candidate + 256], [1, -1, -1, 0], True),
+        ([4, 7, 9, 10], [2, 1, 0, 2], [candidate + 129, 4096, 0, candidate + 256], [1, -1, -1, 0], False),
+    ):
+        metadata = (("query_ends", ends), ("row_modes", modes), ("final_lens", finals), ("req_entries", entries))
+        for name, values in metadata:
+            inputs[name].copy_(torch.tensor(values, dtype=torch.int32, device="npu"))
+        initial = torch.full_like(pool, -1)
+        initial[:, -1].zero_()
+        for request, entry in enumerate(entries):
+            if modes[request] == 2:
+                initial[entry, :budget] = torch.arange(budget, dtype=torch.int32, device="npu")
+                initial[entry, -1] = budget
+        if first_fill:
+            initial[entries[0]].fill_(-1)
+            initial[entries[0], -1] = -budget
+        topk = _native_mtp_topk_rows(inputs)
+        pool.copy_(initial)
+        _launch_mtp_lim(inputs, pool, outputs)
+        torch.npu.synchronize()
+        _assert_mtp_selection(inputs, initial, pool, outputs, topk)
+        for _ in range(3):
+            pool.copy_(initial)
+            graph.replay()
+            torch.npu.synchronize()
+            _assert_mtp_selection(inputs, initial, pool, outputs, topk)
+        resident_before = pool.clone()
+        graph.replay()
+        torch.npu.synchronize()
+        _assert_mtp_selection(inputs, resident_before, pool, outputs, topk)
+        assert outputs[-1].cpu().eq(0).all()
+        assert pointers == tuple(t.data_ptr() for t in (*inputs.values(), pool, *outputs))
+
+
 @pytest.mark.parametrize("dense_len", [1, 2048, 2049, 2176, 2177, 6144])
 def test_packed_c8_fused_lidu_dense_matches_framework_semantics(
     dense_len: int,
@@ -413,6 +590,109 @@ def test_packed_c8_fused_lidu_dense_matches_framework_semantics(
     assert resident_lengths.tolist() == [dense_len] * batch
     assert counts.tolist() == [0] * batch
     assert torch.equal(cache_slots, before)
+
+
+def test_packed_c8_mtp_2304_copy_qsfa_chain_eager_and_graph() -> None:
+    """Framework wiring check, not a closure of native QSFA's padding precision issue."""
+    candidate, budget, routes, tail_capacity = 8320, 8192, 4, 256
+    final_len = candidate + tail_capacity
+    inputs = _make_fused_lidu_inputs(
+        candidate_len=candidate, final_len=final_len, row_mode=2, batch=routes, seed=83
+    )
+    for name in ("block_table", "candidate_lens", "final_lens", "row_modes", "req_entries"):
+        inputs[name] = inputs[name][:1]
+    inputs["query_ends"] = torch.tensor([routes], dtype=torch.int32, device="npu")
+    topk = _native_mtp_topk_rows(inputs)
+    initial_pool = torch.full((2, _cache_row_width(final_len)), -1, dtype=torch.int32, device="npu")
+    initial_pool[:, -1].zero_()
+    initial_pool[0, :budget] = torch.arange(budget, dtype=torch.int32, device="npu")
+    initial_pool[0, -1] = budget
+    pool = initial_pool.clone()
+    outputs = _allocate_mtp_lidu_outputs(1, routes)
+    _launch_mtp_lim(inputs, pool, outputs)
+    torch.npu.synchronize()
+    oracle_slots = _assert_mtp_selection(inputs, initial_pool, pool, outputs, topk)
+    count = int(outputs[-1].cpu()[0])
+    assert count > 0
+    sources = outputs[4][0, 0, :count].cpu().long()
+    destinations = outputs[5][0, 0, :count].cpu().long()
+
+    # Valid packed rows: 512 FP8 latent bytes, 128 BF16 RoPE bytes, four FP32 scales.
+    generator = torch.Generator().manual_seed(89)
+    source_bytes = torch.zeros((final_len, _PACKED_ROW_BYTES), dtype=torch.int8)
+    source_bytes[:, :512] = torch.randint(-3, 4, (final_len, 512), generator=generator).float().to(
+        torch.float8_e4m3fn
+    ).view(torch.int8)
+    source_bytes[:, 512:640] = (torch.randn((final_len, 64), generator=generator) * 0.1).to(
+        torch.bfloat16
+    ).view(torch.int8)
+    source_bytes[:, 640:] = torch.full((final_len, 4), 0.05, dtype=torch.float32).view(torch.int8)
+    dram_shape = (final_len // _BLOCK_SIZE, _BLOCK_SIZE, 1, _PACKED_ROW_BYTES)
+    dram = _swapped_arena(dram_shape)
+    _write_swapped_arena(dram, source_bytes.view(dram_shape))
+    hbm_blocks = (budget + tail_capacity) // _BLOCK_SIZE
+    hbm_shape = (hbm_blocks, _BLOCK_SIZE, 1, _PACKED_ROW_BYTES)
+    initial_hbm = torch.full((budget + tail_capacity, _PACKED_ROW_BYTES), -91, dtype=torch.int8)
+    initial_hbm[:budget] = source_bytes[:budget]
+    tail_ids = torch.arange(candidate, final_len)
+    initial_hbm[budget + tail_ids.remainder(tail_capacity)] = source_bytes[tail_ids]
+    # Reset every copy target before BOTH eager and replay, not just before the first run.
+    initial_hbm[destinations] = -91
+    expected_hbm = initial_hbm.clone()
+    expected_hbm[destinations] = source_bytes[sources]
+    hbm = initial_hbm.view(hbm_shape).to("npu")
+    hbm_table = torch.arange(hbm_blocks, dtype=torch.int32, device="npu").view(1, -1)
+    dram_table = torch.arange(dram_shape[0], dtype=torch.int32, device="npu").view(1, -1)
+    query = (torch.randn((routes, 8, 576), generator=generator) * 0.1).to(torch.bfloat16).to("npu")
+    scale = 576 ** -0.5
+
+    def chain():
+        _launch_mtp_lim(inputs, pool, outputs)
+        torch.ops._C_ascend.npu_dsa_a5_kvcache_scatter_copy_c8_out(
+            hbm, dram, hbm_table, dram_table, outputs[4], outputs[5], outputs[6]
+        )
+        return sparse_flash_attention_for_offload_c8(
+            query=query, packed_kv=hbm.view(torch.float8_e4m3fn), sparse_indices=outputs[0],
+            scale_value=scale, block_table=hbm_table, actual_seq_lengths_query=inputs["query_ends"],
+            resident_seq_lengths=outputs[3],
+        )
+
+    # Separate golden data and independent LI-derived indices, not the tested slots.
+    reference_kv = expected_hbm.view(hbm_shape).to("npu").view(torch.float8_e4m3fn)
+    golden = torch_npu.npu_kv_quant_sparse_flash_attention(
+        query=query, key=reference_kv, value=reference_kv, sparse_indices=oracle_slots.to("npu"),
+        scale_value=scale, key_quant_mode=2, value_quant_mode=2, block_table=hbm_table,
+        actual_seq_lengths_query=inputs["query_ends"],
+        actual_seq_lengths_kv=torch.tensor([budget + tail_capacity], dtype=torch.int32, device="npu"),
+        sparse_block_size=1, layout_query="TND", layout_kv="PA_BSND", sparse_mode=3,
+        attention_mode=2, quant_scale_repo_mode=1, tile_size=128, rope_head_dim=64,
+    )
+    if isinstance(golden, tuple):
+        golden = golden[0]
+    pool.copy_(initial_pool)
+    actual = chain()
+    torch.npu.synchronize()
+    _assert_mtp_selection(inputs, initial_pool, pool, outputs, topk)
+    _assert_exact_int_tensor(hbm.cpu().view_as(expected_hbm), expected_hbm)
+    torch.testing.assert_close(actual, golden, atol=0.002, rtol=0.02)
+    pointers = tuple(t.data_ptr() for t in (pool, hbm, dram, hbm_table, *inputs.values(), *outputs))
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, pool=torch.npu.graph_pool_handle()):
+        graph_attention = chain()
+    graph.replay()
+    torch.npu.synchronize()
+    assert outputs[-1].cpu().tolist() == [0]
+    graph_output_pointer = graph_attention.data_ptr()
+    for _ in range(3):
+        pool.copy_(initial_pool)
+        hbm.copy_(initial_hbm.view(hbm_shape).to("npu"))
+        graph.replay()
+        torch.npu.synchronize()
+        _assert_mtp_selection(inputs, initial_pool, pool, outputs, topk)
+        _assert_exact_int_tensor(hbm.cpu().view_as(expected_hbm), expected_hbm)
+        torch.testing.assert_close(graph_attention, golden, atol=0.002, rtol=0.02)
+        assert graph_attention.data_ptr() == graph_output_pointer
+        assert pointers == tuple(t.data_ptr() for t in (pool, hbm, dram, hbm_table, *inputs.values(), *outputs))
 
 
 def test_packed_c8_mtp_lim_dense_short_rows_are_causal() -> None:
@@ -499,12 +779,7 @@ def test_packed_c8_mtp_lim_dense_long_rows_are_causal() -> None:
     inputs["final_lens"] = inputs["final_lens"][:batch]
     inputs["row_modes"] = inputs["row_modes"][:batch]
     inputs["req_entries"] = inputs["req_entries"][:batch]
-    # This is the exact native target-model call shape: compact TND Q rows,
-    # per-request final KV lengths, and sparse_mode=3 for causal visibility.
-    expected_topk = _native_topk(inputs).cpu().reshape(
-        total_query_rows,
-        _TOPK,
-    )
+    expected_topk = torch.stack(_native_mtp_topk_rows(inputs))
     cache_slots = torch.full(
         (batch + 1, _cache_row_width(8192)),
         -1,
@@ -562,8 +837,9 @@ def test_packed_c8_mtp_lim_dense_long_rows_are_causal() -> None:
             )
         pytest.fail(f"MTP LIM dense selection error: {diagnostics}")
     for query_row in range(total_query_rows):
-        actual_row = attention[query_row, 0, :_TOPK]
-        expected_row = expected_topk[query_row]
+        # Score ordering is not an ABI guarantee; membership and multiplicity are.
+        actual_row = torch.sort(attention[query_row, 0, :_TOPK]).values
+        expected_row = torch.sort(expected_topk[query_row]).values
         if not torch.equal(actual_row, expected_row):
             mismatch = torch.nonzero(
                 actual_row != expected_row,
@@ -594,13 +870,14 @@ def test_packed_c8_mtp_lim_dense_long_rows_are_causal() -> None:
     assert torch.equal(cache_slots, before)
 
 
-def test_packed_c8_mtp_lim_uses_per_query_candidates_and_dual_tails() -> None:
+@pytest.mark.parametrize("source_len", [8192, 8320])
+@pytest.mark.parametrize("visible_tail", [0, 1, 127, 128, 129, 255, 256])
+def test_packed_c8_mtp_lim_uses_shared_prefix_and_dual_tails(source_len, visible_tail) -> None:
     budget = 8192
-    source_len = 8192
-    final_len = 8321
-    queries_per_request = 4
+    queries_per_request = min(4, visible_tail + 1)
+    final_len = source_len + visible_tail
     inputs = _make_fused_lidu_inputs(
-        candidate_len=final_len - 1,
+        candidate_len=source_len,
         final_len=final_len,
         row_mode=2,
         batch=queries_per_request,
@@ -634,13 +911,7 @@ def test_packed_c8_mtp_lim_uses_per_query_candidates_and_dual_tails() -> None:
     )
 
     expected_topk_rows: list[torch.Tensor] = []
-    candidate_ends: list[int] = []
     for query_row in range(queries_per_request):
-        visible_len = final_len - (queries_per_request - 1 - query_row)
-        candidate_end = (
-            (visible_len - 1) // _BLOCK_SIZE * _BLOCK_SIZE
-        )
-        candidate_ends.append(candidate_end)
         row_inputs = {
             "query": inputs["query"][query_row : query_row + 1],
             "key": inputs["key"],
@@ -655,7 +926,7 @@ def test_packed_c8_mtp_lim_uses_per_query_candidates_and_dual_tails() -> None:
                 device="npu",
             ),
             "candidate_lens": torch.tensor(
-                [candidate_end],
+                [source_len],
                 dtype=torch.int32,
                 device="npu",
             ),
@@ -681,25 +952,22 @@ def test_packed_c8_mtp_lim_uses_per_query_candidates_and_dual_tails() -> None:
     _launch_mtp_lim(inputs, cache_slots, outputs)
     torch.npu.synchronize()
 
-    attention, _, _, resident_lengths, _, _, counts = (
+    attention, source_ids, query_misses, resident_lengths, _, _, counts = (
         tensor.cpu() for tensor in outputs
     )
     cache_row = cache_slots[0].cpu()
     for query_row, expected_tokens in enumerate(expected_topk_rows):
-        expected_slots = torch.where(
-            expected_tokens < source_len,
-            cache_row[expected_tokens.to(torch.long)],
-            budget + expected_tokens.remainder(2 * _BLOCK_SIZE),
-        ).to(torch.int32)
+        actual_tokens = source_ids[query_row, 0, :_TOPK]
         _assert_exact_int_tensor(
-            attention[query_row, 0, :_TOPK],
-            expected_slots,
+            torch.sort(actual_tokens).values,
+            torch.sort(expected_tokens).values,
         )
+        _assert_exact_int_tensor(attention[query_row, 0, :_TOPK], cache_row[actual_tokens.long()])
+        assert query_misses[query_row] == _TOPK
 
         visible_len = final_len - (queries_per_request - 1 - query_row)
-        tail_start = candidate_ends[query_row]
         tail_tokens = torch.arange(
-            tail_start,
+            source_len,
             visible_len,
             dtype=torch.int32,
         )
@@ -715,9 +983,11 @@ def test_packed_c8_mtp_lim_uses_per_query_candidates_and_dual_tails() -> None:
             ],
             expected_tail_slots,
         )
+        _assert_exact_int_tensor(source_ids[query_row, 0, _TOPK : _TOPK + tail_len], tail_tokens)
         assert torch.all(
             attention[query_row, 0, _TOPK + tail_len :] == -1
         )
+        assert torch.all(source_ids[query_row, 0, _TOPK + tail_len :] == -1)
 
     assert resident_lengths.tolist() == [budget + 2 * _BLOCK_SIZE]
     assert counts.tolist() == [budget]

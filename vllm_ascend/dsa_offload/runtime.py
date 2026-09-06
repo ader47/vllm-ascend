@@ -31,7 +31,8 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.dsa_offload.contracts import (
-    DSA_A5_ATTENTION_CAPACITY,
+    DSA_A5_MTP_ATTENTION_CAPACITY,
+    DSA_A5_NOMTP_ATTENTION_CAPACITY,
     DSA_DRAM_NULL_BLOCK_ID,
     DSA_DUMP_NOOP_DST_BLOCK_ID,
     DSA_LIDU_OUTPUT_CAPACITY,
@@ -136,10 +137,15 @@ class DSAOffloadRuntime:
         self._a5_per_query_miss_counts: torch.Tensor | None = None
         self._a5_resident_seq_lengths: torch.Tensor | None = None
         if self.packed_c8:
+            attention_capacity = (
+                DSA_A5_MTP_ATTENTION_CAPACITY
+                if self.max_decode_query_len > 1
+                else DSA_A5_NOMTP_ATTENTION_CAPACITY
+            )
             attention_shape = (
                 self.max_num_reqs * self.max_decode_query_len,
                 1,
-                DSA_A5_ATTENTION_CAPACITY,
+                attention_capacity,
             )
             self._a5_attention_slots = torch.empty(
                 attention_shape,
@@ -411,8 +417,8 @@ class DSAOffloadRuntime:
         普通 Q=1 的 DENSE 行候选区是当前完整序列，SPARSE 行只覆盖最后
         一个物理 tail 之前的完整逻辑块。MTP target Q=4 验算时，DENSE 写
         完整可见长度；SPARSE 的该列专门表示已经持久化到 DRAM 的 durable
-        prefix。每个 query 真正的 LI candidate 由 LIM 根据 final length 在
-        设备侧独立推导，避免 graph prepare 构造 T=4B 的 host 元数据。
+        prefix D。同一请求的所有 query 共享 [0,D) 的 LI 候选域；LIM 根据
+        final length 逐 query 追加因果可见的双尾 [D,V)，不让 tail 参与 LI。
         """
 
         num_reqs = self.active_num_reqs

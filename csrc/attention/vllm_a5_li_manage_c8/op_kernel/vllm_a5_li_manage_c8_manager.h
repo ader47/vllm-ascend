@@ -18,7 +18,7 @@ using namespace AscendC;
 
 constexpr uint32_t BLOCK_SIZE = 128;
 constexpr uint32_t TOPK = 2048;
-constexpr uint32_t TAIL_CAPACITY = BLOCK_SIZE;
+constexpr uint32_t TAIL_CAPACITY = 2 * BLOCK_SIZE;
 constexpr uint32_t TAIL_BLOCK_COUNT = 2;
 constexpr uint32_t TAIL_STORAGE_CAPACITY =
     TAIL_BLOCK_COUNT * BLOCK_SIZE;
@@ -268,7 +268,7 @@ private:
 
     __aicore__ inline bool AppendCausalTail(
         uint32_t queryRow, uint32_t queryEnd,
-        uint32_t finalLen, uint32_t budget,
+        uint32_t sourceLen, uint32_t finalLen, uint32_t budget,
         LocalTensor<int32_t> slots, LocalTensor<int32_t> sources)
     {
         const uint32_t laterQueries = queryEnd - 1U - queryRow;
@@ -276,8 +276,10 @@ private:
             return false;
         }
         const uint32_t visibleLen = finalLen - laterQueries;
-        const uint32_t tailTokenStart =
-            ((visibleLen - 1U) / BLOCK_SIZE) * BLOCK_SIZE;
+        const uint32_t tailTokenStart = sourceLen;
+        if (visibleLen < tailTokenStart) {
+            return false;
+        }
         const uint32_t tailCount = visibleLen - tailTokenStart;
         if (tailCount > TAIL_CAPACITY) {
             return false;
@@ -312,13 +314,11 @@ private:
                 return false;
             }
             const uint32_t slot = hash.GetValue(hashPosition) >> SLOT_SHIFT;
-            if (slot >= budget + TAIL_STORAGE_CAPACITY) {
+            if (token < 0 || static_cast<uint32_t>(token) >= sourceLen ||
+                slot >= budget) {
                 return false;
             }
-            const bool durable = token >= 0 &&
-                static_cast<uint32_t>(token) < sourceLen;
-            const bool isMiss = durable &&
-                (firstFill || protectedSlots.GetValue(slot) == 2U);
+            const bool isMiss = firstFill || protectedSlots.GetValue(slot) == 2U;
             missCount += isMiss ? 1U : 0U;
         }
 
@@ -333,10 +333,7 @@ private:
                 return false;
             }
             const uint32_t slot = hash.GetValue(hashPosition) >> SLOT_SHIFT;
-            const bool durable = token >= 0 &&
-                static_cast<uint32_t>(token) < sourceLen;
-            const bool isMiss = durable &&
-                (firstFill || protectedSlots.GetValue(slot) == 2U);
+            const bool isMiss = firstFill || protectedSlots.GetValue(slot) == 2U;
             const uint32_t output = isMiss ? missCursor++ : hitCursor++;
             sources.SetValue(output, token);
             slots.SetValue(output, static_cast<int32_t>(slot));
@@ -346,41 +343,7 @@ private:
             perQueryMissCountsGm_[queryRow],
             static_cast<int32_t>(missCount));
         return AppendCausalTail(
-            queryRow, queryEnd, finalLen, budget, slots, sources);
-    }
-
-    __aicore__ inline uint32_t QueryCandidateLen(
-        uint32_t queryRow, uint32_t queryEnd,
-        uint32_t finalLen) const
-    {
-        const uint32_t laterQueries = queryEnd - 1U - queryRow;
-        if (finalLen <= laterQueries) {
-            return 0;
-        }
-        const uint32_t visibleLen = finalLen - laterQueries;
-        return ((visibleLen - 1U) / BLOCK_SIZE) * BLOCK_SIZE;
-    }
-
-    __aicore__ inline bool ResolveTailSlot(
-        int32_t token, uint32_t sourceLen, uint32_t finalLen,
-        uint32_t budget, uint32_t &slot) const
-    {
-        if (token < static_cast<int32_t>(sourceLen)) {
-            return false;
-        }
-        if (token < 0 || token >= static_cast<int32_t>(finalLen)) {
-            slot = MISS_SLOT;
-            return true;
-        }
-        const uint32_t tokenU32 = static_cast<uint32_t>(token);
-        const uint32_t finalBlock = (finalLen - 1U) / BLOCK_SIZE;
-        const uint32_t tokenBlock = tokenU32 / BLOCK_SIZE;
-        if (tokenBlock + 1U < finalBlock) {
-            slot = MISS_SLOT;
-            return true;
-        }
-        slot = budget + tokenU32 % TAIL_STORAGE_CAPACITY;
-        return true;
+            queryRow, queryEnd, sourceLen, finalLen, budget, slots, sources);
     }
 
     __aicore__ inline void ClearCopyRow(uint32_t batch)
@@ -538,15 +501,10 @@ private:
             budget > sourceLen) {
             return false;
         }
-        const uint32_t earliestCandidate = QueryCandidateLen(
-            0, queryCount, static_cast<uint32_t>(finalLen));
-        const uint32_t latestCandidate = QueryCandidateLen(
-            queryCount - 1U,
-            queryCount,
-            static_cast<uint32_t>(finalLen));
-        return earliestCandidate >= TOPK &&
-            sourceLen <= earliestCandidate &&
-            latestCandidate <= tiling_->maxCandidateLen &&
+        const uint32_t earliestVisible =
+            static_cast<uint32_t>(finalLen) - (queryCount - 1U);
+        return sourceLen <= earliestVisible &&
+            sourceLen <= tiling_->maxCandidateLen &&
             finalLen <= static_cast<int32_t>(tiling_->tokenCapacity);
     }
 
@@ -566,12 +524,10 @@ private:
         uint32_t unionCount = 0;
         for (uint32_t queryRow = queryStart; queryRow < queryEnd; ++queryRow) {
             LoadTopk(queryRow, topk);
-            const uint32_t queryCandidate = QueryCandidateLen(
-                queryRow, queryEnd, finalLen);
             for (uint32_t index = 0; index < TOPK; ++index) {
                 const int32_t token = topk.GetValue(index);
                 if (token < 0 ||
-                    token >= static_cast<int32_t>(queryCandidate)) {
+                    token >= static_cast<int32_t>(sourceLen)) {
                     return false;
                 }
                 uint32_t hashPosition = 0;
@@ -581,20 +537,6 @@ private:
                     return false;
                 }
                 if (!found) {
-                    uint32_t tailSlot = 0;
-                    if (ResolveTailSlot(
-                            token, sourceLen, finalLen,
-                            budget, tailSlot)) {
-                        if (tailSlot == MISS_SLOT) {
-                            return false;
-                        }
-                        hash.SetValue(
-                            hashPosition,
-                            PackHashEntry(
-                                static_cast<uint32_t>(token),
-                                tailSlot));
-                        continue;
-                    }
                     if (unionCount >= budget ||
                         unionCount >= tiling_->outputCapacity) {
                         return false;
@@ -701,12 +643,10 @@ private:
         // those writes are not guaranteed to invalidate the scalar DCache.
         for (uint32_t queryRow = queryStart; queryRow < queryEnd; ++queryRow) {
             LoadTopk(queryRow, topk);
-            const uint32_t queryCandidate = QueryCandidateLen(
-                queryRow, queryEnd, finalLen);
             for (uint32_t index = 0; index < TOPK; ++index) {
                 const int32_t token = topk.GetValue(index);
                 if (token < 0 ||
-                    token >= static_cast<int32_t>(queryCandidate)) {
+                    token >= static_cast<int32_t>(sourceLen)) {
                     return false;
                 }
                 uint32_t hashPosition = 0;
@@ -719,18 +659,6 @@ private:
                     continue;
                 }
                 const uint32_t tokenU32 = static_cast<uint32_t>(token);
-                uint32_t tailSlot = 0;
-                if (ResolveTailSlot(
-                        token, sourceLen, finalLen,
-                        budget, tailSlot)) {
-                    if (tailSlot == MISS_SLOT) {
-                        return false;
-                    }
-                    hash.SetValue(
-                        hashPosition,
-                        PackHashEntry(tokenU32, tailSlot));
-                    continue;
-                }
                 const int32_t slot = cacheSlotsPoolGm_.GetValue(
                     poolBase + tokenU32);
                 if (slot >= 0 && slot < static_cast<int32_t>(budget)) {

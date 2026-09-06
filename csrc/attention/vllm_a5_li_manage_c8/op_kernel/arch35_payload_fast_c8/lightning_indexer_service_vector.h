@@ -441,7 +441,6 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const VllmFastQLICommon::Run
 {
     auto pingpong = (info.loop % 2);
     auto kScalepingpong = (info.kScaleLoop % 2);
-    auto s1BaseSizePerAIV = CeilDiv(s1BaseSize_, 2);
     int64_t curS1Idx = info.gS1Idx * s1BaseSize_;
     int64_t curS2Idx = info.s2Idx * s2BaseSize_;
     int64_t curS1ProcNum = curS1Idx + s1BaseSize_ > info.actS1Size ? info.actS1Size % s1BaseSize_ : s1BaseSize_;
@@ -461,16 +460,36 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const VllmFastQLICommon::Run
             info.tensorWeightsOffset + curAivS1Idx * weightStride_;
         DataCopyPadExtParams<W_T> padWeightsParams{false, 0, 0, 0};
         DataCopyExtParams wDataCopyExtParams;
-        wDataCopyExtParams.blockCount = curAivS1ProcNum;
         wDataCopyExtParams.blockLen = gSize_ * sizeof(W_T);
-        // DataCopyPad GM->UB uses byte units for the GM-side srcStride,
-        // whereas the UB-side dstStride below is measured in 32-byte blocks.
-        // The distinction is observable only for the four-query tile: each
-        // AIV then copies two strided projection rows in one transfer.
-        wDataCopyExtParams.srcStride =
+        constexpr uint32_t weightRowStride =
+            UB_BANK_DEPTH_STRIDE / sizeof(W_T);
+        const uint32_t weightGapBytes =
             (weightStride_ - gSize_) * sizeof(W_T);
-        wDataCopyExtParams.dstStride = (UB_BANK_DEPTH_STRIDE - wDataCopyExtParams.blockLen) / 32;
-        DataCopyPad(weightUB_, weightsGm[weightGmOffset], wDataCopyExtParams, padWeightsParams);
+        if (weightGapBytes % 32U == 0U) {
+            // Fast multi-row transfer. GM srcStride is in bytes while the UB
+            // destination stride is in 32-byte blocks.
+            wDataCopyExtParams.blockCount = curAivS1ProcNum;
+            wDataCopyExtParams.srcStride = weightGapBytes;
+            wDataCopyExtParams.dstStride =
+                (UB_BANK_DEPTH_STRIDE - wDataCopyExtParams.blockLen) / 32;
+            DataCopyPad(weightUB_, weightsGm[weightGmOffset],
+                        wDataCopyExtParams, padWeightsParams);
+        } else {
+            // A legal caller-owned projection view may have a row gap that is
+            // not representable by the multi-block MTE stride. At most two
+            // rows are owned by one AIV, so issue aligned single-row copies
+            // instead of forcing the whole batch onto the cold path.
+            wDataCopyExtParams.blockCount = 1;
+            wDataCopyExtParams.srcStride = 0;
+            wDataCopyExtParams.dstStride = 0;
+            for (uint32_t row = 0U;
+                 row < static_cast<uint32_t>(curAivS1ProcNum); ++row) {
+                DataCopyPad(
+                    weightUB_[row * weightRowStride],
+                    weightsGm[weightGmOffset + row * weightStride_],
+                    wDataCopyExtParams, padWeightsParams);
+            }
+        }
 
         //qScaleGm  -->  qScaleUB_
         DataCopyPadExtParams<SCALE_T> padQScaleParams{false, 0, 0, 0};
@@ -489,8 +508,6 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const VllmFastQLICommon::Run
         // Rows are separated by UB_BANK_DEPTH_STRIDE. The old decode path
         // only handled one row per AIV; s1Base=4 assigns two rows and must
         // convert/scale both without treating the bank padding as data.
-        constexpr uint32_t weightRowStride =
-            UB_BANK_DEPTH_STRIDE / sizeof(W_T);
         constexpr uint32_t floatRowStride =
             UB_BANK_DEPTH_STRIDE / sizeof(float);
         Cast(weightFloatUB_, weightUB_, RoundMode::CAST_NONE, gSize_);
@@ -565,8 +582,14 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const VllmFastQLICommon::Run
     SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
     WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
     //outUB_ --->  scoreGm
+    // Keep active route score rows contiguous in the fixed [B,4]
+    // workspace.  For a partial tile (for example R=2 with tile=4), the odd
+    // AIV starts at row 1 rather than the full-tile row 2.
     int64_t vec1OutGmOffset = blockId_ % 2 == 0 ? curS2Idx :
-                            s1BaseSizePerAIV * VllmFastQLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) + curS2Idx;
+                            CeilDiv(curS1ProcNum, 2) *
+                                VllmFastQLICommon::Align(
+                                    (uint64_t)constInfo_.kSeqSize,
+                                    (uint64_t)s2BaseSize_) + curS2Idx;
     DataCopyExtParams copyOutParams;
     copyOutParams.blockCount = curAivS1ProcNum;
     copyOutParams.blockLen = s2BaseSize_ * sizeof(SCORE_T);
@@ -819,8 +842,80 @@ __aicore__ inline void QLIVector<QLIT>::FinalizePayloadUpdate(
     LocalTensor<int32_t> classifiedIndex = topkSharedTmpLocal_.template ReinterpretCast<int32_t>();
     LocalTensor<uint32_t> compactPayloadLocal =
         topkSharedTmpLocal_[topkCountAlign256_];
+    const uint32_t publicOutputBaseRow =
+        static_cast<uint32_t>(info.indiceOutOffset / topkCount_);
+    const uint32_t fixedWorkspaceRow =
+        info.workspaceRow + outputRow - publicOutputBaseRow;
 
     WaitFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
+    if (info.denseDirectPublish) {
+        // DENSE owns the complete HBM sequence.  The streaming TopK payload
+        // is therefore already the final logical/physical token ID; never
+        // dereference req_pool_entries or cache_slots for this mode.
+        LocalTensor<int32_t> denseTokenIds =
+            indicesOutLocal_.template ReinterpretCast<int32_t>();
+        if (validS2Len >= topkCount_) {
+            // RunTokenPayloadOnly retains the packed {slot14, token18}
+            // representation used by the shared streaming TopK. DENSE has no
+            // cache slot, so strip the miss-slot prefix before publishing the
+            // plain logical token IDs expected by the ABI.
+            SetFlag<HardEvent::V_S>(V_MTE2_EVENT3);
+            WaitFlag<HardEvent::V_S>(V_MTE2_EVENT3);
+            VllmFastTopkIndexerClassifyVF::SqueezeIndexerMissTokenIds(
+                (__ubuf__ uint32_t *)classifiedIndex.GetPhyAddr(),
+                (__ubuf__ uint32_t *)indicesOutLocal_.GetPhyAddr(),
+                topkCount_ / CLASSIFY_CHUNK);
+            PipeBarrier<PIPE_V>();
+            denseTokenIds = classifiedIndex;
+        }
+        LocalTensor<int32_t> scalar =
+            candidatePayloadLocal_.template ReinterpretCast<int32_t>();
+        scalar.SetValue(0U, 0);
+        Duplicate(scoreOutLocal_, static_cast<uint16_t>(0xffffU), 16U);
+        PipeBarrier<PIPE_V>();
+        SetFlag<HardEvent::S_MTE3>(EVENT_ID1);
+        WaitFlag<HardEvent::S_MTE3>(EVENT_ID1);
+        AscendC::DataCopyParams scalarCopy{
+            1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0};
+        DataCopyPad(missCountGm[fixedWorkspaceRow], scalar, scalarCopy);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID1);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID1);
+
+        SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
+        WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
+        AscendC::DataCopyParams outputCopy{
+            1, static_cast<uint16_t>(topkCount_ * sizeof(int32_t)), 0, 0};
+#ifdef A5_MTP_SLOT_OUTPUT_STRIDE
+        const uint64_t outputOffset =
+            static_cast<uint64_t>(outputRow) * A5_MTP_SLOT_OUTPUT_STRIDE;
+#else
+        const uint64_t outputOffset =
+            static_cast<uint64_t>(outputRow) * topkCount_;
+#endif
+#ifdef A5_MTP_CLASSIFY_ONLY
+        DataCopyPad(
+            topkSourceIdsGm[outputOffset],
+            denseTokenIds,
+            outputCopy);
+#else
+        DataCopyPad(
+            indiceOutGm[outputOffset],
+            denseTokenIds,
+            outputCopy);
+#endif
+        DataCopyPad(
+            topkSlotsGm[outputOffset],
+            denseTokenIds,
+            outputCopy);
+#ifdef A5_MTP_CLASSIFY_ONLY
+        DataCopy(
+            thresholdGm[static_cast<uint64_t>(fixedWorkspaceRow) * 16U],
+            scoreOutLocal_, 16U);
+#endif
+        SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
+        SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
+        return;
+    }
     if (info.cacheTokenCount == 0) {
         Duplicate(classifiedIndex, static_cast<int32_t>(-1), topkCount_);
         Duplicate(slotStageLocal_, static_cast<int32_t>(-1), topkCount_);
@@ -833,7 +928,7 @@ __aicore__ inline void QLIVector<QLIT>::FinalizePayloadUpdate(
         AscendC::DataCopyParams scalarCopy{
             1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0};
 #ifdef A5_MTP_CLASSIFY_ONLY
-        DataCopyPad(missCountGm[outputRow], missCountLocal, scalarCopy);
+        DataCopyPad(missCountGm[fixedWorkspaceRow], missCountLocal, scalarCopy);
 #else
         DataCopyPad(missCountGm[info.bIdx], missCountLocal, scalarCopy);
 #endif
@@ -934,7 +1029,7 @@ __aicore__ inline void QLIVector<QLIT>::FinalizePayloadUpdate(
     WaitFlag<HardEvent::S_MTE3>(EVENT_ID1);
     AscendC::DataCopyParams routeScalarCopy{
         1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0};
-    DataCopyPad(missCountGm[outputRow], routeMissCountLocal, routeScalarCopy);
+    DataCopyPad(missCountGm[fixedWorkspaceRow], routeMissCountLocal, routeScalarCopy);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID1);
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID1);
     SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
@@ -954,14 +1049,14 @@ __aicore__ inline void QLIVector<QLIT>::FinalizePayloadUpdate(
             static_cast<uint16_t>(currentMissCount * 2U * sizeof(int32_t)),
             0, 0};
         const uint64_t pairOutOffset =
-            static_cast<uint64_t>(outputRow) * topkCount_ * 2U;
+            static_cast<uint64_t>(fixedWorkspaceRow) * topkCount_ * 2U;
         DataCopyPad(
             indiceOutGm[pairOutOffset],
             mrgValueLocal_.template ReinterpretCast<int32_t>(),
             pairOutputCopy);
     }
     DataCopy(
-        thresholdGm[static_cast<uint64_t>(outputRow) *
+        thresholdGm[static_cast<uint64_t>(fixedWorkspaceRow) *
                     MTP_THRESHOLD_STRIDE],
         scoreOutLocal_, MTP_THRESHOLD_STRIDE);
     DataCopyPad(topkSlotsGm[slotOutOffset], slotStageLocal_, slotOutputCopy);
@@ -1074,18 +1169,19 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(
         slotPrefetchCap = 2 * CeilDiv(constInfo_.mBaseSize, 2) * s2BaseSize_;
     }
     int32_t cuRealAcSeq = info.actS2Size;
-    if (constInfo_.attenMaskFlag) {
+    if (info.causalClip) {
         cuRealAcSeq = info.actS2SizeOrig - info.actS1Size + curAivS1Idx + 1;
     }
 
     int32_t validS2Len = cuRealAcSeq;
     for (uint32_t i = 0; i < curAivS1ProcNum; i++) {
         uint32_t rowIdx = blockId_ % 2 * CeilDiv(curS1ProcNum, 2) + i;
-        uint32_t vecOffset = blockId_ % 2 * CeilDiv(s1BaseSize_, 2) + i;
+        uint32_t vecOffset =
+            blockId_ % 2 * CeilDiv(curS1ProcNum, 2) + i;
 
         uint16_t zero = 0;
         int32_t neg = -1;
-        if (constInfo_.attenMaskFlag) {
+        if (info.causalClip) {
             validS2Len = (int32_t)i + cuRealAcSeq;
         }
         if (validS2Len <= 0) {
@@ -1119,13 +1215,19 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(
                     copyInParams, padParams);
                 SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
                 WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
-                topkOp_.RunAblationStage(
-                    mrgValueLocal_, indicesOutLocal_, scoreOutLocal_,
-                    slotPrefetchLocal, slotStageLocal_, cacheSlotsGm,
-                    static_cast<uint64_t>(info.cacheRowIdx) * constInfo_.cacheSlotsSize,
-                    0, topkCount_, validS2LenAlign,
-                    static_cast<uint32_t>(validS2Len), 0, 1,
-                    true, slotPrefetchCap);
+                if (info.denseDirectPublish) {
+                    topkOp_.RunTokenPayloadOnly(
+                        mrgValueLocal_, indicesOutLocal_, scoreOutLocal_,
+                        0U, validS2LenAlign, 0U, 1U);
+                } else {
+                    topkOp_.RunAblationStage(
+                        mrgValueLocal_, indicesOutLocal_, scoreOutLocal_,
+                        slotPrefetchLocal, slotStageLocal_, cacheSlotsGm,
+                        static_cast<uint64_t>(info.cacheRowIdx) * constInfo_.cacheSlotsSize,
+                        0, topkCount_, validS2LenAlign,
+                        static_cast<uint32_t>(validS2Len), 0, 1,
+                        true, slotPrefetchCap);
+                }
             } else {
                 for (uint32_t loopIdx = 0; loopIdx < s2LoopNum; loopIdx++) {
                     if (loopIdx == 0) {
@@ -1136,12 +1238,18 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(
                             copyInParams, padParams);
                         SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
                         WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
-                        topkOp_.RunAblationStage(
-                            mrgValueLocal_, indicesOutLocal_, scoreOutLocal_,
-                            slotPrefetchLocal, slotStageLocal_, cacheSlotsGm,
-                            static_cast<uint64_t>(info.cacheRowIdx) * constInfo_.cacheSlotsSize,
-                            0, topkCount_, trunkLen_, trunkLen_,
-                            loopIdx, s2LoopNum, true, slotPrefetchCap);
+                        if (info.denseDirectPublish) {
+                            topkOp_.RunTokenPayloadOnly(
+                                mrgValueLocal_, indicesOutLocal_, scoreOutLocal_,
+                                0U, trunkLen_, loopIdx, s2LoopNum);
+                        } else {
+                            topkOp_.RunAblationStage(
+                                mrgValueLocal_, indicesOutLocal_, scoreOutLocal_,
+                                slotPrefetchLocal, slotStageLocal_, cacheSlotsGm,
+                                static_cast<uint64_t>(info.cacheRowIdx) * constInfo_.cacheSlotsSize,
+                                0, topkCount_, trunkLen_, trunkLen_,
+                                loopIdx, s2LoopNum, true, slotPrefetchCap);
+                        }
                         continue;
                     }
                     SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT2);
@@ -1181,15 +1289,24 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(
                     AscendC::DataCopyPad(mrgValueLocal_[topkCountAlign256_], scoreGm[offset], copyInParams, padParams);
                     SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
                     WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
-                    topkOp_.RunAblationStage(
-                        mrgValueLocal_, indicesOutLocal_, scoreOutLocal_,
-                        slotPrefetchLocal, slotStageLocal_, cacheSlotsGm,
-                        static_cast<uint64_t>(info.cacheRowIdx) * constInfo_.cacheSlotsSize,
-                        loopIdx * trunkLen_, topkCount_,
-                        VllmFastQLICommon::Align(topkCountAlign256_ + validTrunkLen,
-                                        static_cast<uint32_t>(256)),
-                        validTrunkLen, loopIdx, s2LoopNum,
-                        true, slotPrefetchCap);
+                    const uint32_t mergedValidLen =
+                        VllmFastQLICommon::Align(
+                            topkCountAlign256_ + validTrunkLen,
+                            static_cast<uint32_t>(256));
+                    if (info.denseDirectPublish) {
+                        topkOp_.RunTokenPayloadOnly(
+                            mrgValueLocal_, indicesOutLocal_, scoreOutLocal_,
+                            loopIdx * trunkLen_, mergedValidLen,
+                            loopIdx, s2LoopNum);
+                    } else {
+                        topkOp_.RunAblationStage(
+                            mrgValueLocal_, indicesOutLocal_, scoreOutLocal_,
+                            slotPrefetchLocal, slotStageLocal_, cacheSlotsGm,
+                            static_cast<uint64_t>(info.cacheRowIdx) * constInfo_.cacheSlotsSize,
+                            loopIdx * trunkLen_, topkCount_, mergedValidLen,
+                            validTrunkLen, loopIdx, s2LoopNum,
+                            true, slotPrefetchCap);
+                    }
                     SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT1);
                 }
             }

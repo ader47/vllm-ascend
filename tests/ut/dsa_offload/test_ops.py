@@ -212,7 +212,7 @@ def test_a5_mtp_lim_keeps_request_and_query_axes_separate(
         tail_info=torch.empty((batch, 2), dtype=torch.int32),
     )
     attention_slots = torch.empty(
-        (total_query_rows, 1, 2176),
+        (total_query_rows, 1, 2304),
         dtype=torch.int32,
     )
     attention_src_ids = torch.empty_like(attention_slots)
@@ -258,7 +258,7 @@ def test_a5_mtp_lim_keeps_request_and_query_axes_separate(
     assert args[0] is weights
     assert args[0].stride() == (160, 1)
     assert args[12] is attention_slots
-    assert args[12].shape[0] == total_query_rows
+    assert args[12].shape == (total_query_rows, 1, 2304)
     assert args[13] is attention_src_ids
     assert args[13].shape == attention_slots.shape
     assert args[14] is per_query_miss_counts
@@ -266,3 +266,54 @@ def test_a5_mtp_lim_keeps_request_and_query_axes_separate(
     assert args[15] is resident_seq_lengths
     assert args[16].shape[0] == batch
     assert args[18].shape[0] == batch
+
+
+@pytest.mark.parametrize("capacity", [2176, 2304])
+def test_a5_qsfa_preserves_lim_slots_and_resident_span(monkeypatch, capacity) -> None:
+    captured = {}
+    expected_output = torch.empty((4, 8, 512), dtype=torch.bfloat16)
+
+    def native_sfa(**kwargs):
+        captured.update(kwargs)
+        return expected_output
+
+    monkeypatch.setitem(
+        sys.modules, "torch_npu", SimpleNamespace(npu_kv_quant_sparse_flash_attention=native_sfa)
+    )
+    indices = torch.full((4, 1, capacity), -1, dtype=torch.int32)
+    indices[:, -1, -1] = 8447  # Include the last column: no truncation to 2176.
+    packed_kv = torch.empty((66, 128, 1, 656), dtype=torch.int8)
+    lengths = torch.tensor([8448], dtype=torch.int32)
+    query_ends = torch.tensor([4], dtype=torch.int32)
+    result = dsa_ops.sparse_flash_attention_for_offload_c8(
+        query=torch.empty((4, 8, 576), dtype=torch.bfloat16),
+        packed_kv=packed_kv,
+        sparse_indices=indices,
+        scale_value=0.125,
+        block_table=torch.zeros((1, 66), dtype=torch.int32),
+        actual_seq_lengths_query=query_ends,
+        resident_seq_lengths=lengths,
+    )
+
+    assert result is expected_output
+    assert captured["sparse_indices"] is indices
+    assert captured["sparse_indices"].shape[-1] == capacity
+    assert captured["actual_seq_lengths_kv"] is lengths
+    assert captured["actual_seq_lengths_query"] is query_ends
+    assert captured["key"] is packed_kv and captured["value"] is packed_kv
+    assert captured["layout_query"] == "TND"
+    assert captured["sparse_block_size"] == 1
+
+
+@pytest.mark.parametrize("capacity", [2048, 2175, 2303, 2305])
+def test_a5_qsfa_rejects_invalid_attention_width(capacity) -> None:
+    with pytest.raises(ValueError, match="2176.*2304"):
+        dsa_ops.sparse_flash_attention_for_offload_c8(
+            query=torch.empty((1, 8, 576), dtype=torch.bfloat16),
+            packed_kv=torch.empty((1, 128, 1, 656), dtype=torch.int8),
+            sparse_indices=torch.empty((1, 1, capacity), dtype=torch.int32),
+            scale_value=0.125,
+            block_table=torch.zeros((1, 1), dtype=torch.int32),
+            actual_seq_lengths_query=torch.tensor([1], dtype=torch.int32),
+            resident_seq_lengths=torch.tensor([1], dtype=torch.int32),
+        )

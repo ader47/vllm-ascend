@@ -9,7 +9,7 @@ namespace ops {
 namespace {
 constexpr size_t QUERY = 1;
 constexpr size_t ACTUAL_SEQ_LENGTHS_QUERY = 3;
-constexpr int64_t ATTENTION_CAPACITY = 2176;
+constexpr int64_t ATTENTION_CAPACITY = 2304;
 constexpr int64_t OUTPUT_CAPACITY = 16384;
 } // namespace
 

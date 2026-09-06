@@ -9,7 +9,8 @@ constexpr uint64_t ROUTES = 4U;
 constexpr uint64_t TOPK = 2048U;
 constexpr uint64_t UNION_CAPACITY = ROUTES * TOPK;
 constexpr uint64_t THRESHOLD_STRIDE = 16U;
-constexpr uint64_t ATTENTION_CAPACITY = TOPK + 128U;
+constexpr uint64_t TAIL_CAPACITY = 2U * 128U;
+constexpr uint64_t ATTENTION_CAPACITY = TOPK + TAIL_CAPACITY;
 constexpr uint64_t ALIGN_BYTES = 32U;
 
 constexpr uint64_t AlignBytes(uint64_t value)

@@ -44,6 +44,17 @@ A5 packed C8 物理布局另外复用 vLLM-Ascend 原生的
 
 ## 2. 快速冒烟
 
+### A5 C8 LIM-MTP 2304 升级回归
+
+LIM-MTP 源码同步自单算子仓 `ops_lidu_scattercopy_sfa_a5` 的 `d946b55`（内核与已验证的 `1d6cffa` 一致）。MTP 的两份 attention 索引为 `[T,1,2304]`，各 query 在共享 durable prefix 上选 topK，再追加最多 256 个 causal-tail token；非 MTP 仍为 2176。块分配、COPY ABI、`torch.ops._C_ascend` 注册位置不变。必须重新编译安装当前框架算子并重启推理、重新组图，不能复用旧 2176 buffer/graph。
+
+```bash
+python -m pytest -q tests/ut/dsa_offload/test_ops.py tests/ut/dsa_offload/test_runtime.py tests/ut/dsa_offload/test_input_batch.py tests/ut/dsa_offload/test_request_cache_layout.py tests/ut/dsa_offload/test_resident_pool.py tests/ut/dsa_offload/test_dram_store.py
+python -m pytest -q tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_a5_c8_ops.py
+```
+
+第二条需在 Ascend 950 运行，覆盖框架注册入口的非 MTP 回归、MTP 独立官方 LI TopK 对照、双尾边界、混合状态与 graph replay。LIM→COPY→官方 SFA 对照使用独立构造的索引和 KV，验证框架接线；官方 SFA 已知的 `-1` padding 精度风险仍单独保留，不能把该对照通过解释为精度问题已解决。
+
 `simple_prompt_test.py` 延续 v0.19 的直接用法，不提供一长串 CLI 参数。
 先修改文件顶部“用户配置”区：
 

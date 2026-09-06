@@ -8,8 +8,8 @@
 
 ``disabled`` 用于验证基线隔离，``cache-init`` 只验证双平面 KV cache
 初始化，``eager`` 和 ``graph`` 分别验证 DSA eager 与 FULL decode graph。
-默认短 prompt 主要覆盖 DENSE；验证真正的 sparse/ENTER 路径时，应换成
-token 长度超过 ``DSA_SPARSE_ACTIVATION_TOKENS`` 的文本。
+默认使用 novel_dataset.chinese_20k，在单机 8 卡上验证 TP8 DSA offload
+与 MTP3；实际 prompt token 长度以模型 tokenizer 为准。
 """
 
 from __future__ import annotations
@@ -19,34 +19,33 @@ import os
 from pathlib import Path
 from typing import Any
 
+from novel_dataset import chinese_20k
+
 # =========================
 # 用户配置
 # =========================
 
-MODEL_PATH = "/mnt/kv_dpc/weight/GLM-5.1-w4a8"
+MODEL_PATH = "/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4"
 RUN_MODE = "eager"  # disabled / cache-init / eager / graph
-PROMPTS = [
-    "你好，请用一句话介绍你自己。",
-    "请只回答数字：一加一等于多少？",
-]
+PROMPTS = chinese_20k
 
-TENSOR_PARALLEL_SIZE = 16
+TENSOR_PARALLEL_SIZE = 8
 DATA_PARALLEL_SIZE = 1
-MAX_NUM_SEQS = 2
-MAX_MODEL_LEN = 8192
-MAX_NUM_BATCHED_TOKENS = 8192
+MAX_NUM_SEQS = 1
+MAX_MODEL_LEN = 25600
+MAX_NUM_BATCHED_TOKENS = 25600
 ENABLE_CHUNKED_PREFILL = False
-MAX_TOKENS = 32
-GPU_MEMORY_UTILIZATION = 0.90
+MAX_TOKENS = 64
+GPU_MEMORY_UTILIZATION = 0.85
 QUANTIZATION = "ascend"
 ENABLE_EXPERT_PARALLEL = True
-ENABLE_MTP = False
+ENABLE_MTP = True
 MTP_NUM_SPECULATIVE_TOKENS = 3
 
 # A5/950 上的 DSA 首版只支持 LI C8 与 SFA C8 同时开启；A3/910C 保持 False。
 # disabled 模式也会保留这个 vLLM-Ascend 原生物理布局开关，便于用同一 C8
 # cache 编码公平对照“原生 C8”与“DSA C8”。
-ENABLE_A5_PACKED_C8_DSA = False
+ENABLE_A5_PACKED_C8_DSA = True
 
 ENABLE_PROFILE = False
 PROFILE_DIR = "/home/data/vllm_profile/dsa_smoke"
@@ -158,6 +157,7 @@ def build_llm_kwargs() -> dict[str, Any]:
         kwargs["speculative_config"] = {
             "method": "mtp",
             "num_speculative_tokens": MTP_NUM_SPECULATIVE_TOKENS,
+            "enforce_eager": True,
         }
     if graph_enabled:
         decode_query_len = (

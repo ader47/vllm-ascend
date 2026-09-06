@@ -1,4 +1,4 @@
-/** Host registration for the one-kernel A5 fixed-MTP3 C8 LI + manage op. */
+/** Host tiling for the one-kernel A5 MTP0..3 C8 LI + manage op. */
 
 #include <algorithm>
 #include <cstddef>
@@ -30,7 +30,7 @@ enum InputIndex : size_t {
 constexpr int64_t BLOCK_SIZE = 128;
 constexpr int64_t HEAD_DIM = 128;
 constexpr int64_t TOPK = 2048;
-constexpr int64_t ATTENTION_CAPACITY = TOPK + BLOCK_SIZE;
+constexpr int64_t ATTENTION_CAPACITY = TOPK + 2 * BLOCK_SIZE;
 constexpr int64_t OUTPUT_CAPACITY = 16384;
 constexpr int64_t MAX_QUERIES_PER_REQUEST = 4;
 constexpr int64_t MAX_TOKEN_CAPACITY = 1 << 18;
@@ -176,22 +176,15 @@ static ge::graphStatus TilingVllmA5LiManageC8(
     }
     const uint32_t mixGroupCount = std::min<uint32_t>(
         aicCount, aivCount / 2U);
-    // The hot path owns one two-query tile per MIX group. N=32 with more
-    // than 64 packed queries uses the verified four-query tile and one MIX
-    // group per request. Any non-MTP3/static-stride case keeps the original
-    // one-request-per-group cold path.
-    const bool fastStaticEligible =
-        totalQueryRows == batch * MAX_QUERIES_PER_REQUEST &&
-        ((*weightStride - heads) *
-             static_cast<int64_t>(sizeof(uint16_t))) % 32 == 0;
+    // Reserve four route lanes per request. Runtime query ends determine
+    // which lanes are active; graph replay may change them without retiling.
     const uint32_t fastQueryTileSize =
         heads == 32 && totalQueryRows > 64 ? 4U : 2U;
     const uint32_t fastTaskCount = static_cast<uint32_t>(batch) *
         (static_cast<uint32_t>(MAX_QUERIES_PER_REQUEST) /
          fastQueryTileSize);
-    const uint32_t usedCoreNum = fastStaticEligible
-        ? std::min<uint32_t>(fastTaskCount, mixGroupCount)
-        : std::min<uint32_t>(static_cast<uint32_t>(batch), mixGroupCount);
+    const uint32_t usedCoreNum =
+        std::min<uint32_t>(fastTaskCount, mixGroupCount);
     const uint32_t maxCandidateLen = static_cast<uint32_t>(
         blockTable.GetDim(1) * BLOCK_SIZE);
     const uint32_t tokenCapacity = static_cast<uint32_t>(
@@ -239,15 +232,14 @@ static ge::graphStatus TilingVllmA5LiManageC8(
     tiling->fastScoreWorkspaceStride =
         static_cast<uint32_t>(fastScoreStride64);
     tiling->fastQueryTileSize = fastQueryTileSize;
-    tiling->fastPathEnabled = fastStaticEligible ? 1U : 0U;
+    tiling->fastPathEnabled = 1U;
     tiling->fastScoreRowStride = fastScoreRowStride;
 
     const uint64_t coldWorkspaceBytes =
         scoreStride64 * static_cast<uint64_t>(usedCoreNum);
-    const uint64_t fastWorkspaceBytes = fastStaticEligible
-        ? vllm_a5_li_manage_c8_fast_workspace::TotalBytes(
-              fastScoreStride64, static_cast<uint64_t>(batch))
-        : 0U;
+    const uint64_t fastWorkspaceBytes =
+        vllm_a5_li_manage_c8_fast_workspace::TotalBytes(
+            fastScoreStride64, static_cast<uint64_t>(batch));
     context->GetWorkspaceSizes(1)[0] =
         platform.GetLibApiWorkSpaceSize() +
         std::max(coldWorkspaceBytes, fastWorkspaceBytes);

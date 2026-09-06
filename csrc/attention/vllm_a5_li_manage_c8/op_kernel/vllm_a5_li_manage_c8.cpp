@@ -1,11 +1,9 @@
 /**
- * A5 fixed-MTP3 C8 LightningIndexer + request-pool management.
+ * A5 MTP0..3 C8 LightningIndexer + request-pool management.
  *
- * Natural first/short steps may still carry 1..4 query rows per request.
- * They use the original correctness path, including first-fill.  An all
- * SPARSE, steady, four-query batch uses the payload-TopK fast path and a
- * request-local ordered union/cache update; both paths preserve the same
- * caller-owned ABI.
+ * All legal batches without first-fill use the unified QLI/union path.
+ * First-fill retains the correctness-first manager. Both paths score only
+ * the durable SPARSE prefix and append up to 256 causal parity-tail tokens.
  */
 
 #include "kernel_operator.h"
@@ -27,11 +25,33 @@ using namespace QLIKernel;
 constexpr uint32_t BLOCK_SIZE = 128;
 constexpr uint32_t HEAD_DIM = 128;
 constexpr uint32_t TOPK = 2048;
-constexpr uint32_t ATTENTION_CAPACITY = TOPK + BLOCK_SIZE;
+constexpr uint32_t ATTENTION_CAPACITY = TOPK + 2U * BLOCK_SIZE;
 constexpr uint32_t MAX_QUERIES_PER_REQUEST = 4;
 constexpr int32_t ROW_MODE_DENSE = 1;
 constexpr int32_t ROW_MODE_SPARSE = 2;
 constexpr uint32_t REQUEST_DONE_EVENT = 6;
+constexpr uint32_t GATE_READY_EVENT = 4;
+constexpr uint32_t GATE_ACK_EVENT = 5;
+
+// Every AIC/AIV must read the same pre-launch +/-C metadata. In particular,
+// an early first-fill manager must not change it before a late core decides
+// which branch to execute. Drain both local handshakes around the AIV-wide
+// barrier before either service allocates its own cross-core events.
+__aicore__ inline void SynchronizePathDecision()
+{
+    if ASCEND_IS_AIC {
+        CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(GATE_READY_EVENT);
+        CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
+            GATE_READY_EVENT + ConstInfo::AIV0_AIV1_OFFSET);
+        CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(GATE_ACK_EVENT);
+        CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
+            GATE_ACK_EVENT + ConstInfo::AIV0_AIV1_OFFSET);
+    } else {
+        CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_V>(GATE_READY_EVENT);
+        AscendC::SyncAll();
+        CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_V>(GATE_ACK_EVENT);
+    }
+}
 
 using MtpQliType = QLIType<
     fp8_e4m3fn_t, fp8_e4m3fn_t, float, uint16_t, int32_t, true,
@@ -164,7 +184,7 @@ public:
                 const uint32_t candidate =
                     mode == ROW_MODE_DENSE
                     ? QueryVisibleLen(queryRow, queryEnd, finalLen)
-                    : QueryCandidateLen(queryRow, queryEnd, finalLen);
+                    : static_cast<uint32_t>(candidateLensGm_.GetValue(batch));
                 if (candidate <= TOPK) {
                     continue;
                 }
@@ -270,13 +290,20 @@ private:
         const int32_t mode = rowModesGm_.GetValue(batch);
         const int32_t finalLen = finalSeqLengthsKvGm_.GetValue(batch);
         if ((mode != ROW_MODE_SPARSE && mode != ROW_MODE_DENSE) ||
-            finalLen <= 0) {
+            finalLen < static_cast<int32_t>(queryEnd - queryStart) ||
+            finalLen > static_cast<int32_t>(tiling_->tokenCapacity)) {
             return false;
         }
         const uint32_t finalLenU32 = static_cast<uint32_t>(finalLen);
         const uint32_t candidate = mode == ROW_MODE_DENSE
             ? QueryVisibleLen(queryEnd - 1U, queryEnd, finalLenU32)
-            : QueryCandidateLen(queryEnd - 1U, queryEnd, finalLenU32);
+            : static_cast<uint32_t>(candidateLensGm_.GetValue(batch));
+        if (mode == ROW_MODE_SPARSE &&
+            (candidate % BLOCK_SIZE != 0U ||
+             candidate > finalLenU32 - (queryEnd - queryStart - 1U) ||
+             finalLenU32 - candidate > 2U * BLOCK_SIZE)) {
+            return false;
+        }
         return candidate > TOPK &&
             candidate <= tiling_->maxCandidateLen;
     }
@@ -287,18 +314,6 @@ private:
     {
         const uint32_t laterQueries = queryEnd - 1U - queryRow;
         return finalLen > laterQueries ? finalLen - laterQueries : 0;
-    }
-
-    __aicore__ inline uint32_t QueryCandidateLen(
-        uint32_t queryRow, uint32_t queryEnd,
-        uint32_t finalLen) const
-    {
-        const uint32_t visibleLen = QueryVisibleLen(
-            queryRow, queryEnd, finalLen);
-        if (visibleLen == 0) {
-            return 0;
-        }
-        return ((visibleLen - 1U) / BLOCK_SIZE) * BLOCK_SIZE;
     }
 
 private:
@@ -340,9 +355,12 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
     TPipe pipe;
     GM_ADDR userWorkspace = GetUserWorkspace(workspace);
 
-    if (vllm_a5_li_manage_c8_fast::IsAllStableMtp3(
+    const bool requiresColdPath =
+        vllm_a5_li_manage_c8_fast::RequiresColdPath(
             actualSeqLengthsQuery, candidateLens, finalSeqLengthsKv,
-            rowModes, reqPoolEntries, cacheSlotsPool, &tilingData)) {
+            rowModes, reqPoolEntries, cacheSlotsPool, &tilingData);
+    SynchronizePathDecision();
+    if (!requiresColdPath) {
         const uint64_t scoreStride = tilingData.fastScoreWorkspaceStride;
         const uint64_t batchSize = tilingData.batchSize;
         // Keep the workspace helper arithmetic expanded in device code: the
@@ -371,8 +389,9 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
             &pipe, &tilingData);
         qli.Init(
             indexWeights, query, queryDequantScale,
-            indexKeyCache, indexKeyDequantScale,
-            reqPoolEntries, cacheSlotsPool, candidateLens,
+            actualSeqLengthsQuery, indexKeyCache, indexKeyDequantScale,
+            finalSeqLengthsKv,
+            reqPoolEntries, cacheSlotsPool, candidateLens, rowModes,
             indexBlockTable, routePairRows, topkSlots,
             sparseAndTailSrcIds,
             routeThresholds, routeMissCounts,
@@ -386,14 +405,17 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
                 vllm_a5_li_manage_c8_fast::OrderedMissUnion unionOp;
                 unionOp.Init(
                     routePairRows, routeThresholds, routeMissCounts,
-                    userWorkspace, candidateLens, finalSeqLengthsKv,
-                    reqPoolEntries, cacheSlotsPool, copySrcIds,
+                    userWorkspace, actualSeqLengthsQuery,
+                    candidateLens, finalSeqLengthsKv,
+                    rowModes, reqPoolEntries, cacheSlotsPool, copySrcIds,
                     copyDstSlots, copyCounts, topkSlots,
                     sparseAndTailSlots, sparseAndTailSrcIds,
                     perQueryMissCounts, residentSeqLengths,
                     tilingData.tokenCapacity, tilingData.outputCapacity,
                     tilingData.fastScoreRowStride,
-                    tilingData.batchSize, &pipe);
+                    tilingData.batchSize, tilingData.poolSize,
+                    tilingData.totalQueryRows, tilingData.maxCandidateLen,
+                    &pipe);
                 unionOp.Process(
                     GetBlockIdx() / 2U, tilingData.usedCoreNum);
             }

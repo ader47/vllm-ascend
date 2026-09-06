@@ -14,7 +14,8 @@ from typing import NamedTuple
 import torch
 
 from vllm_ascend.dsa_offload.contracts import (
-    DSA_A5_ATTENTION_CAPACITY,
+    DSA_A5_MTP_ATTENTION_CAPACITY,
+    DSA_A5_NOMTP_ATTENTION_CAPACITY,
     DSA_A5_PACKED_KV_ROW_BYTES,
     DSA_SFA_COMPUTE_TOPK,
 )
@@ -241,10 +242,9 @@ def a5_lightning_indexer_decode_update_mtp_c8(
 ) -> None:
     """调用 A5 多 query LIM；copy plan 保持请求轴，attention 保持 TND 轴。
 
-    ``candidate_lens`` 对 SPARSE 行表示 durable DRAM prefix。算子根据
-    ``actual_seq_lengths_query``/``final_seq_lengths_kv`` 为每条 query
-    独立推导 LI candidate，并把两块 parity tail 内的命中直接映射为
-    resident slot。
+    SPARSE 的每条 query 独立在共享 durable prefix 上选 topK，再追加
+    因果可见的双尾；配对 attention 输出为 [T,1,2304]，resident span=C+256。
+    tail 不参与 LI 或 union copy。参数顺序及 caller-owned 所有权不变。
     """
 
     index_key_dequant_scale = _normalize_a5_indexer_key_scale(
@@ -304,11 +304,16 @@ def sparse_flash_attention_for_offload_c8(
     actual_seq_lengths_query: torch.Tensor,
     resident_seq_lengths: torch.Tensor,
 ) -> torch.Tensor:
-    """以 KSC 生成的 resident slot plan 调用 A5 原生 QSFA。"""
+    """直接消费 LIM 输出：非 MTP 2176 列、MTP 2304 列，不裁剪或重排。"""
 
-    if sparse_indices.shape[-1] != DSA_A5_ATTENTION_CAPACITY:
+    if sparse_indices.shape[-1] not in (
+        DSA_A5_NOMTP_ATTENTION_CAPACITY,
+        DSA_A5_MTP_ATTENTION_CAPACITY,
+    ):
         raise ValueError(
-            f"A5 DSA attention slots must have width {DSA_A5_ATTENTION_CAPACITY}, got {tuple(sparse_indices.shape)}"
+            "A5 DSA attention slots must have width "
+            f"{DSA_A5_NOMTP_ATTENTION_CAPACITY} (non-MTP) or "
+            f"{DSA_A5_MTP_ATTENTION_CAPACITY} (MTP), got {tuple(sparse_indices.shape)}"
         )
     query = query.contiguous()
     kwargs = dict(

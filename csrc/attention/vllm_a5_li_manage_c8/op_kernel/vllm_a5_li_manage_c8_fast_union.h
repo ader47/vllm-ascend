@@ -12,6 +12,9 @@ using namespace AscendC;
 
 constexpr uint32_t UNION_ROUTES = 4U;
 constexpr uint32_t UNION_TOPK = 2048U;
+constexpr int32_t UNION_ROW_MODE_PAD = 0;
+constexpr int32_t UNION_ROW_MODE_DENSE = 1;
+constexpr int32_t UNION_ROW_MODE_SPARSE = 2;
 constexpr uint32_t UNION_CAPACITY = UNION_ROUTES * UNION_TOPK;
 constexpr uint32_t UNION_PAIR_WORDS = UNION_TOPK * 2U;
 constexpr uint32_t UNION_SOURCE_MASK = (1U << 18U) - 1U;
@@ -53,23 +56,30 @@ class OrderedMissUnion {
 public:
     __aicore__ inline void Init(
         GM_ADDR routePairs, GM_ADDR routeThresholds, GM_ADDR routeCounts,
-        GM_ADDR scoreWorkspace, GM_ADDR candidateLens,
-        GM_ADDR finalSeqLengthsKv, GM_ADDR reqPoolEntries, GM_ADDR cacheSlots,
+        GM_ADDR scoreWorkspace, GM_ADDR actualSeqLengthsQuery,
+        GM_ADDR candidateLens,
+        GM_ADDR finalSeqLengthsKv, GM_ADDR rowModes,
+        GM_ADDR reqPoolEntries, GM_ADDR cacheSlots,
         GM_ADDR unionSources, GM_ADDR unionDestinations,
         GM_ADDR unionCounts, GM_ADDR topkSlots,
         GM_ADDR sparseAndTailSlots, GM_ADDR sparseAndTailSrcIds,
         GM_ADDR perQueryMissCounts, GM_ADDR residentSeqLengths,
         uint32_t tokenCapacity, uint32_t outputCapacity,
-        uint32_t scoreRowStride, uint32_t batchSize, TPipe *pipe)
+        uint32_t scoreRowStride, uint32_t batchSize,
+        uint32_t poolSize, uint32_t totalQueryRows,
+        uint32_t maxCandidateLen, TPipe *pipe)
     {
         routePairsGm_.SetGlobalBuffer((__gm__ int32_t *)routePairs);
         routeThresholdsGm_.SetGlobalBuffer(
             (__gm__ uint16_t *)routeThresholds);
         routeCountsGm_.SetGlobalBuffer((__gm__ int32_t *)routeCounts);
         scoreWorkspaceGm_.SetGlobalBuffer((__gm__ uint16_t *)scoreWorkspace);
+        actualSeqLengthsQueryGm_.SetGlobalBuffer(
+            (__gm__ int32_t *)actualSeqLengthsQuery);
         candidateLensGm_.SetGlobalBuffer((__gm__ int32_t *)candidateLens);
         finalSeqLengthsKvGm_.SetGlobalBuffer(
             (__gm__ int32_t *)finalSeqLengthsKv);
+        rowModesGm_.SetGlobalBuffer((__gm__ int32_t *)rowModes);
         reqPoolEntriesGm_.SetGlobalBuffer((__gm__ int32_t *)reqPoolEntries);
         cacheSlotsGm_.SetGlobalBuffer((__gm__ int32_t *)cacheSlots);
         unionSourcesGm_.SetGlobalBuffer((__gm__ int32_t *)unionSources);
@@ -90,6 +100,9 @@ public:
         outputCapacity_ = outputCapacity;
         scoreRowStride_ = scoreRowStride;
         batchSize_ = batchSize;
+        poolSize_ = poolSize;
+        totalQueryRows_ = totalQueryRows;
+        maxCandidateLen_ = maxCandidateLen;
         pipe->InitBuffer(pairInputBuf_,
                          UNION_CAPACITY * 2U * sizeof(float));
         pipe->InitBuffer(pairOutputBuf_,
@@ -168,15 +181,33 @@ private:
             sourceCapacity_));
     }
 
+    __aicore__ inline bool QueryRange(
+        uint32_t batch, uint32_t &queryStart,
+        uint32_t &queryEnd, uint32_t &routeCount)
+    {
+        const int32_t end = actualSeqLengthsQueryGm_.GetValue(batch);
+        const int32_t start = batch == 0U
+            ? 0 : actualSeqLengthsQueryGm_.GetValue(batch - 1U);
+        if (start < 0 || end <= start ||
+            end > static_cast<int32_t>(totalQueryRows_) ||
+            end - start > static_cast<int32_t>(UNION_ROUTES)) {
+            return false;
+        }
+        queryStart = static_cast<uint32_t>(start);
+        queryEnd = static_cast<uint32_t>(end);
+        routeCount = queryEnd - queryStart;
+        return true;
+    }
+
     __aicore__ inline void LoadThresholds(
         uint32_t batch, LocalTensor<uint16_t> local,
-        uint16_t values[UNION_ROUTES])
+        uint32_t routeCount, uint16_t values[UNION_ROUTES])
     {
         constexpr uint32_t STRIDE =
             vllm_a5_li_manage_c8_fast_workspace::THRESHOLD_STRIDE;
         const uint64_t routeBase =
             static_cast<uint64_t>(batch) * UNION_ROUTES;
-        for (uint32_t route = 0U; route < UNION_ROUTES; ++route) {
+        for (uint32_t route = 0U; route < routeCount; ++route) {
             DataCopyPad(
                 local[route * STRIDE],
                 routeThresholdsGm_[(routeBase + route) * STRIDE],
@@ -185,14 +216,24 @@ private:
                 {false, 0, 0, 0});
         }
         UnionSync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
-        for (uint32_t route = 0U; route < UNION_ROUTES; ++route) {
+        for (uint32_t route = 0U; route < routeCount; ++route) {
             values[route] = local.GetValue(route * STRIDE);
+        }
+        // The victim VF tests score < threshold for all four lanes.  An
+        // absent speculative route must therefore be neutral, not a reason
+        // to reject an otherwise safe victim.  Stage A does not publish an
+        // unused score row; CompactSafeVictims supplies a zero row and this
+        // maximal threshold makes that lane conservatively pass.  A real
+        // score equal to 0xffff can only make the fast scan miss a victim;
+        // AppendExactVictims still completes the request exactly.
+        for (uint32_t route = routeCount; route < UNION_ROUTES; ++route) {
+            values[route] = 0xffffU;
         }
     }
 
     __aicore__ inline uint32_t CompactSafeVictims(
         uint32_t batch, uint32_t candidate, uint32_t poolRow,
-        uint32_t budget, uint32_t required,
+        uint32_t budget, uint32_t required, uint32_t routeCount,
         const uint16_t thresholds[UNION_ROUTES],
         LocalTensor<int32_t> destinations,
         LocalTensor<int32_t> victimSources)
@@ -243,25 +284,41 @@ private:
             const DataCopyPadExtParams<uint16_t> scorePad{
                 true, 0,
                 static_cast<uint8_t>(alignedLen - chunkLen), 0U};
-            DataCopyPad(
-                score0,
-                scoreWorkspaceGm_[requestScoreBase + chunkBase],
-                scoreCopy, scorePad);
-            DataCopyPad(
-                score1,
-                scoreWorkspaceGm_[requestScoreBase + scoreRowStride_ +
-                                  chunkBase],
-                scoreCopy, scorePad);
-            DataCopyPad(
-                score2,
-                scoreWorkspaceGm_[requestScoreBase +
-                                  scoreRowStride_ * 2U + chunkBase],
-                scoreCopy, scorePad);
-            DataCopyPad(
-                score3,
-                scoreWorkspaceGm_[requestScoreBase +
-                                  scoreRowStride_ * 3U + chunkBase],
-                scoreCopy, scorePad);
+            if (routeCount > 0U) {
+                DataCopyPad(
+                    score0,
+                    scoreWorkspaceGm_[requestScoreBase + chunkBase],
+                    scoreCopy, scorePad);
+            } else {
+                Duplicate(score0, static_cast<uint16_t>(0), alignedLen);
+            }
+            if (routeCount > 1U) {
+                DataCopyPad(
+                    score1,
+                    scoreWorkspaceGm_[requestScoreBase + scoreRowStride_ +
+                                      chunkBase],
+                    scoreCopy, scorePad);
+            } else {
+                Duplicate(score1, static_cast<uint16_t>(0), alignedLen);
+            }
+            if (routeCount > 2U) {
+                DataCopyPad(
+                    score2,
+                    scoreWorkspaceGm_[requestScoreBase +
+                                      scoreRowStride_ * 2U + chunkBase],
+                    scoreCopy, scorePad);
+            } else {
+                Duplicate(score2, static_cast<uint16_t>(0), alignedLen);
+            }
+            if (routeCount > 3U) {
+                DataCopyPad(
+                    score3,
+                    scoreWorkspaceGm_[requestScoreBase +
+                                      scoreRowStride_ * 3U + chunkBase],
+                    scoreCopy, scorePad);
+            } else {
+                Duplicate(score3, static_cast<uint16_t>(0), alignedLen);
+            }
             DataCopyPad(
                 slots32, cacheSlotsGm_[cacheBase + chunkBase],
                 {1, chunkLen * static_cast<uint32_t>(sizeof(int32_t)),
@@ -311,6 +368,7 @@ private:
     __aicore__ inline uint32_t AppendExactVictims(
         uint32_t batch, uint32_t candidate, uint32_t poolRow,
         uint32_t budget, uint32_t written, uint32_t required,
+        uint32_t routeCount, uint32_t queryStart,
         LocalTensor<int32_t> destinations,
         LocalTensor<int32_t> victimSources)
     {
@@ -330,12 +388,12 @@ private:
                 protectedSlots.SetValue(static_cast<uint32_t>(slot), 1);
             }
         }
-        // Stage 1 writes directly to the public [T, 2176] rows. Only the
+        // Stage 1 writes directly to the public [T, 2304] rows. Only the
         // first 2048 entries participate in sparse TopK protection; the tail
         // suffix is filled after cache management completes.
-        for (uint32_t route = 0U; route < UNION_ROUTES; ++route) {
+        for (uint32_t route = 0U; route < routeCount; ++route) {
             const uint64_t topkBase =
-                (static_cast<uint64_t>(batch) * UNION_ROUTES + route) *
+                (static_cast<uint64_t>(queryStart) + route) *
                 vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY;
             for (uint32_t index = 0U; index < UNION_TOPK; ++index) {
                 const int32_t slot =
@@ -381,7 +439,8 @@ private:
     }
 
     __aicore__ inline uint32_t FindVictims(
-        uint32_t batch, uint32_t count,
+        uint32_t batch, uint32_t count, uint32_t routeCount,
+        uint32_t queryStart,
         LocalTensor<int32_t> destinations,
         LocalTensor<int32_t> victimSources)
     {
@@ -394,17 +453,18 @@ private:
 
         LocalTensor<uint16_t> thresholdLocal = thresholdBuf_.Get<uint16_t>();
         uint16_t thresholds[UNION_ROUTES];
-        LoadThresholds(batch, thresholdLocal, thresholds);
+        LoadThresholds(batch, thresholdLocal, routeCount, thresholds);
         const uint32_t candidate = static_cast<uint32_t>(
             candidateLensGm_.GetValue(batch));
         const uint32_t poolRow = static_cast<uint32_t>(
             reqPoolEntriesGm_.GetValue(batch));
         const uint32_t budget = ReadBudget(batch, poolRow);
         uint32_t written = CompactSafeVictims(
-            batch, candidate, poolRow, budget, count, thresholds,
+            batch, candidate, poolRow, budget, count, routeCount, thresholds,
             destinations, victimSources);
         written = AppendExactVictims(
             batch, candidate, poolRow, budget, written, count,
+            routeCount, queryStart,
             destinations, victimSources);
         return written;
     }
@@ -446,7 +506,8 @@ private:
     }
 
     __aicore__ inline void PrepareTopkMissPrefixes(
-        uint32_t batch, const uint32_t lengths[UNION_ROUTES],
+        uint32_t batch, uint32_t queryStart, uint32_t routeCount,
+        const uint32_t lengths[UNION_ROUTES],
         uint32_t unionCount, LocalTensor<int32_t> unionSources,
         LocalTensor<int32_t> unionDestinations,
         LocalTensor<int32_t> allDestinations)
@@ -459,7 +520,7 @@ private:
             routePairs[UNION_PAIR_WORDS + UNION_ROUTES * UNION_TOPK];
         const uint64_t requestPairBase =
             static_cast<uint64_t>(batch) * UNION_CAPACITY * 2U;
-        for (uint32_t route = 0U; route < UNION_ROUTES; ++route) {
+        for (uint32_t route = 0U; route < routeCount; ++route) {
             const uint32_t length = lengths[route];
             if (length == 0U) {
                 continue;
@@ -474,7 +535,7 @@ private:
             UnionSync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
 
             const uint64_t publicRow =
-                (static_cast<uint64_t>(batch) * UNION_ROUTES + route) *
+                (static_cast<uint64_t>(queryStart) + route) *
                 vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY;
             LocalTensor<int32_t> rowDestinations =
                 allDestinations[route * UNION_TOPK];
@@ -508,21 +569,23 @@ private:
     }
 
     __aicore__ inline void PublishFinalOutputs(
-        uint32_t batch, const uint32_t lengths[UNION_ROUTES],
+        uint32_t batch, uint32_t queryStart, uint32_t queryEnd,
+        uint32_t routeCount,
+        const uint32_t lengths[UNION_ROUTES],
         uint32_t count, LocalTensor<int32_t> countLocal,
         LocalTensor<int32_t> unionSources,
         LocalTensor<int32_t> unionDestinations,
         LocalTensor<int32_t> topkMissDestinations)
     {
-        for (uint32_t route = 0U; route < UNION_ROUTES; ++route) {
+        for (uint32_t route = 0U; route < routeCount; ++route) {
             countLocal.SetValue(route, static_cast<int32_t>(lengths[route]));
         }
         PipeBarrier<PIPE_V>();
         UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
         DataCopyPad(
-            perQueryMissCountsGm_[batch * UNION_ROUTES], countLocal,
+            perQueryMissCountsGm_[queryStart], countLocal,
             {1, static_cast<uint16_t>(
-                    UNION_ROUTES * sizeof(int32_t)), 0, 0});
+                    routeCount * sizeof(int32_t)), 0, 0});
         UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
 
         countLocal.SetValue(0U, static_cast<int32_t>(count));
@@ -538,12 +601,12 @@ private:
             DataCopyPad(
                 unionDestinationsGm_[unionOffset], unionDestinations,
                 {1, unionBytes, 0, 0});
-            for (uint32_t route = 0U; route < UNION_ROUTES; ++route) {
+            for (uint32_t route = 0U; route < routeCount; ++route) {
                 if (lengths[route] == 0U) {
                     continue;
                 }
                 const uint64_t rowOffset =
-                    (static_cast<uint64_t>(batch) * UNION_ROUTES + route) *
+                    (static_cast<uint64_t>(queryStart) + route) *
                     vllm_a5_li_manage_c8_fast_workspace::
                         ATTENTION_CAPACITY;
                 DataCopyPad(
@@ -560,8 +623,8 @@ private:
         UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
 
         // Stage 1 already published each 2048-slot sparse prefix directly to
-        // the caller-owned [T,2176] output, and the loop above repaired only
-        // its miss prefix. Publish the 128-entry causal-tail suffix in place;
+        // the caller-owned [T,2304] output, and the loop above repaired only
+        // its miss prefix. Publish the two-block causal-tail suffix in place;
         // this removes the old full-row GM -> UB -> GM round trip.
         LocalTensor<int32_t> tailSlots = pairInputBuf_.Get<int32_t>();
         LocalTensor<int32_t> tailSources =
@@ -574,7 +637,7 @@ private:
             finalSeqLengthsKvGm_.GetValue(batch));
         const uint32_t candidate = static_cast<uint32_t>(
             candidateLensGm_.GetValue(batch));
-        for (uint32_t route = 0U; route < UNION_ROUTES; ++route) {
+        for (uint32_t route = 0U; route < routeCount; ++route) {
             Duplicate(tailSlots, static_cast<int32_t>(-1),
                       vllm_a5_li_manage_c8_fast_workspace::
                           ATTENTION_CAPACITY - UNION_TOPK);
@@ -582,7 +645,8 @@ private:
                       vllm_a5_li_manage_c8_fast_workspace::
                           ATTENTION_CAPACITY - UNION_TOPK);
             UnionSync<HardEvent::V_S>(HardEvent::V_S);
-            const uint32_t later = UNION_ROUTES - 1U - route;
+            const uint32_t queryRow = queryStart + route;
+            const uint32_t later = queryEnd - 1U - queryRow;
             const uint32_t visible = finalLen - later;
             const uint32_t tailCount = visible - candidate;
             for (uint32_t index = 0U; index < tailCount; ++index) {
@@ -594,7 +658,7 @@ private:
             }
             UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             const uint64_t publicRow =
-                (static_cast<uint64_t>(batch) * UNION_ROUTES + route) *
+                static_cast<uint64_t>(queryRow) *
                 vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY;
             DataCopy(
                 sparseAndTailSlotsGm_[publicRow + UNION_TOPK], tailSlots,
@@ -615,33 +679,214 @@ private:
         UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
     }
 
-    __aicore__ inline void ProcessRequest(uint32_t batch)
+    __aicore__ inline void FillAttentionRows(
+        uint32_t queryStart, uint32_t routeCount, int32_t value)
     {
+        LocalTensor<int32_t> row = sourceBuf_.Get<int32_t>();
+        Duplicate(
+            row, value,
+            vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY);
+        UnionSync<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+        for (uint32_t route = 0U; route < routeCount; ++route) {
+            const uint64_t publicRow =
+                (static_cast<uint64_t>(queryStart) + route) *
+                vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY;
+            DataCopy(
+                sparseAndTailSlotsGm_[publicRow], row,
+                vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY);
+            DataCopy(
+                sparseAndTailSrcIdsGm_[publicRow], row,
+                vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY);
+        }
+        UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+    }
+
+    __aicore__ inline void PublishRequestMetadata(
+        uint32_t batch, uint32_t queryStart, uint32_t routeCount,
+        int32_t perQueryCount, int32_t copyCount, int32_t residentLength)
+    {
+        LocalTensor<int32_t> values = countBuf_.Get<int32_t>();
+        for (uint32_t route = 0U; route < routeCount; ++route) {
+            values.SetValue(route, perQueryCount);
+        }
+        UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+        DataCopyPad(
+            perQueryMissCountsGm_[queryStart], values,
+            {1, static_cast<uint16_t>(routeCount * sizeof(int32_t)), 0, 0});
+        UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+
+        // Every UB source passed to MTE3 must be 32-byte aligned. Reuse the
+        // first aligned scalar lane sequentially instead of addressing
+        // values[4]/values[5], whose byte offsets are only 16/20.
+        values.SetValue(0U, copyCount);
+        UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+        DataCopyPad(
+            unionCountsGm_[batch], values,
+            {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});
+        UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+
+        values.SetValue(0U, residentLength);
+        UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+        DataCopyPad(
+            residentSeqLengthsGm_[batch], values,
+            {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});
+        UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+    }
+
+    __aicore__ inline void PublishPad(
+        uint32_t batch, uint32_t queryStart, uint32_t routeCount)
+    {
+        // PAD owns real packed query rows but has no request-pool state.
+        // Clear only those compact public rows and never dereference its
+        // undefined pool entry.
+        FillAttentionRows(queryStart, routeCount, -1);
+        PublishRequestMetadata(batch, queryStart, routeCount, 0, 0, 0);
+    }
+
+    __aicore__ inline void PublishError(
+        uint32_t batch, uint32_t queryStart, uint32_t routeCount)
+    {
+        FillAttentionRows(queryStart, routeCount, -1);
+        PublishRequestMetadata(batch, queryStart, routeCount, -1, -1, 0);
+    }
+
+    __aicore__ inline void PublishDense(
+        uint32_t batch, uint32_t queryStart, uint32_t queryEnd)
+    {
+        const int32_t finalRaw = finalSeqLengthsKvGm_.GetValue(batch);
+        const uint32_t routeCount = queryEnd - queryStart;
+        if (finalRaw < static_cast<int32_t>(routeCount) ||
+            finalRaw > static_cast<int32_t>(sourceCapacity_) ||
+            finalRaw > static_cast<int32_t>(maxCandidateLen_)) {
+            PublishError(batch, queryStart, routeCount);
+            return;
+        }
+
+        LocalTensor<int32_t> row = sourceBuf_.Get<int32_t>();
+        const uint32_t capacity = static_cast<uint32_t>(
+            vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY);
+        for (uint32_t route = 0U; route < routeCount; ++route) {
+            const uint32_t queryRow = queryStart + route;
+            const uint32_t later = queryEnd - 1U - queryRow;
+            const uint32_t visible = static_cast<uint32_t>(finalRaw) - later;
+            const uint64_t publicRow =
+                static_cast<uint64_t>(queryRow) * capacity;
+            if (visible <= UNION_TOPK) {
+                Duplicate(row, static_cast<int32_t>(-1), capacity);
+                PipeBarrier<PIPE_V>();
+                if (visible != 0U) {
+                    CreateVecIndex(row, static_cast<int32_t>(0), visible);
+                    PipeBarrier<PIPE_V>();
+                }
+                UnionSync<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+                DataCopy(sparseAndTailSlotsGm_[publicRow], row, capacity);
+                DataCopy(sparseAndTailSrcIdsGm_[publicRow], row, capacity);
+                UnionSync<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+            } else {
+                // Stage A has published the official C8 LI top-2048 prefix.
+                // DENSE has no tail/cache-management suffix, so only clear
+                // the expanded two-block public suffix here.
+                const uint32_t suffix = capacity - UNION_TOPK;
+                Duplicate(row, static_cast<int32_t>(-1), suffix);
+                UnionSync<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+                DataCopy(
+                    sparseAndTailSlotsGm_[publicRow + UNION_TOPK],
+                    row, suffix);
+                DataCopy(
+                    sparseAndTailSrcIdsGm_[publicRow + UNION_TOPK],
+                    row, suffix);
+                UnionSync<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+            }
+        }
+        UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+        PublishRequestMetadata(
+            batch, queryStart, routeCount, 0, 0, finalRaw);
+    }
+
+    __aicore__ inline bool ValidateSparse(
+        uint32_t batch, uint32_t routeCount,
+        uint32_t &candidate, uint32_t &finalLen,
+        uint32_t &poolRow, uint32_t &budget)
+    {
+        const int32_t candidateRaw = candidateLensGm_.GetValue(batch);
+        const int32_t finalRaw = finalSeqLengthsKvGm_.GetValue(batch);
+        const int32_t poolRowRaw = reqPoolEntriesGm_.GetValue(batch);
+        if (poolRowRaw < 0 ||
+            poolRowRaw >= static_cast<int32_t>(poolSize_) ||
+            candidateRaw < static_cast<int32_t>(UNION_TOPK) ||
+            candidateRaw > static_cast<int32_t>(sourceCapacity_) ||
+            candidateRaw > static_cast<int32_t>(maxCandidateLen_) ||
+            candidateRaw % 128 != 0 ||
+            finalRaw < static_cast<int32_t>(routeCount) ||
+            finalRaw > static_cast<int32_t>(sourceCapacity_)) {
+            return false;
+        }
+        candidate = static_cast<uint32_t>(candidateRaw);
+        finalLen = static_cast<uint32_t>(finalRaw);
+        poolRow = static_cast<uint32_t>(poolRowRaw);
+        const uint32_t earliestVisible = finalLen - (routeCount - 1U);
+        const uint32_t tailCapacity = static_cast<uint32_t>(
+            vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY -
+            UNION_TOPK);
+        if (candidate > earliestVisible ||
+            finalLen - candidate > tailCapacity) {
+            return false;
+        }
+        const int32_t metadata = cacheSlotsGm_.GetValue(
+            static_cast<uint64_t>(poolRow) * poolStride_ + sourceCapacity_);
+        // A negative value denotes first-fill and must have selected the
+        // correctness-first batch path before Stage A.  The unified fast
+        // path accepts only a populated cache.
+        if (metadata <= 0) {
+            return false;
+        }
+        budget = static_cast<uint32_t>(metadata);
+        return (budget == 8192U || budget == 10240U || budget == 12288U) &&
+            budget <= candidate;
+    }
+
+    __aicore__ inline void ProcessSparse(
+        uint32_t batch, uint32_t queryStart, uint32_t queryEnd,
+        uint32_t routeCount)
+    {
+        uint32_t candidate = 0U;
+        uint32_t finalLen = 0U;
+        uint32_t poolRow = 0U;
+        uint32_t budget = 0U;
+        if (!ValidateSparse(
+                batch, routeCount, candidate, finalLen, poolRow, budget)) {
+            PublishError(batch, queryStart, routeCount);
+            return;
+        }
+
         LocalTensor<float> pairs = pairInputBuf_.Get<float>();
         LocalTensor<float> merged = pairOutputBuf_.Get<float>();
         LocalTensor<int32_t> sources = sourceBuf_.Get<int32_t>();
         LocalTensor<int32_t> countLocal = countBuf_.Get<int32_t>();
         const uint64_t routeBase =
             static_cast<uint64_t>(batch) * UNION_CAPACITY * 2U;
-        DataCopyPad(countLocal, routeCountsGm_[batch * UNION_ROUTES],
-                    {1, static_cast<uint32_t>(UNION_ROUTES * sizeof(int32_t)),
-                     0, 0, 0},
-                    {false, 0, 0, 0});
+        // Internal workspaces retain four fixed lanes per request, while the
+        // public ABI is compact TND.  Read only the actually present lanes.
+        DataCopyPad(
+            countLocal, routeCountsGm_[batch * UNION_ROUTES],
+            {1, static_cast<uint32_t>(routeCount * sizeof(int32_t)),
+             0, 0, 0},
+            {false, 0, 0, 0});
         UnionSync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
 
         uint32_t lengths[UNION_ROUTES] = {0U, 0U, 0U, 0U};
         uint32_t total = 0U;
         LocalTensor<int32_t> pairWords = pairs.ReinterpretCast<int32_t>();
-        for (uint32_t route = 0U; route < UNION_ROUTES; ++route) {
-            int32_t rawLength = countLocal.GetValue(route);
-            uint32_t length = rawLength < 0
-                ? 0U : static_cast<uint32_t>(rawLength);
-            if (length > UNION_TOPK) {
-                length = UNION_TOPK;
+        for (uint32_t route = 0U; route < routeCount; ++route) {
+            const int32_t rawLength = countLocal.GetValue(route);
+            if (rawLength < 0 || rawLength > static_cast<int32_t>(UNION_TOPK)) {
+                PublishError(batch, queryStart, routeCount);
+                return;
             }
+            const uint32_t length = static_cast<uint32_t>(rawLength);
             lengths[route] = length;
             total += length;
-            if (length > 0U) {
+            if (length != 0U) {
                 const uint32_t pairOffset = route * UNION_PAIR_WORDS;
                 DataCopyPad(
                     pairWords[pairOffset],
@@ -654,7 +899,8 @@ private:
         }
         if (total == 0U) {
             PublishFinalOutputs(
-                batch, lengths, 0U, countLocal, sources, sources, sources);
+                batch, queryStart, queryEnd, routeCount, lengths,
+                0U, countLocal, sources, sources, sources);
             return;
         }
 
@@ -680,34 +926,83 @@ private:
         PipeBarrier<PIPE_V>();
 
         const uint32_t count = Deduplicate(merged, pairs, total, sources);
+        if (count > budget || count > outputCapacity_) {
+            PublishError(batch, queryStart, routeCount);
+            return;
+        }
         LocalTensor<int32_t> victimStorage =
             pairOutputBuf_.Get<int32_t>();
         LocalTensor<int32_t> destinations = victimStorage;
         LocalTensor<int32_t> victimSources =
             victimStorage[UNION_CAPACITY];
         const uint32_t found = FindVictims(
-            batch, count, destinations, victimSources);
-        const uint32_t updated = found == count
-            ? ApplyCacheUpdates(
-                  batch, count, sources, destinations, victimSources)
-            : 0U;
+            batch, count, routeCount, queryStart,
+            destinations, victimSources);
+        if (found != count) {
+            PublishError(batch, queryStart, routeCount);
+            return;
+        }
+        const uint32_t updated = ApplyCacheUpdates(
+            batch, count, sources, destinations, victimSources);
+        if (updated != count) {
+            PublishError(batch, queryStart, routeCount);
+            return;
+        }
         LocalTensor<int32_t> topkScratch = pairInputBuf_.Get<int32_t>();
         LocalTensor<int32_t> topkMissDestinations =
             topkScratch[UNION_PAIR_WORDS];
         PrepareTopkMissPrefixes(
-            batch, lengths, updated, sources, destinations,
-            topkMissDestinations);
+            batch, queryStart, routeCount, lengths, updated,
+            sources, destinations, topkMissDestinations);
         PublishFinalOutputs(
-            batch, lengths, updated, countLocal, sources, destinations,
-            topkMissDestinations);
+            batch, queryStart, queryEnd, routeCount, lengths, updated,
+            countLocal, sources, destinations, topkMissDestinations);
+    }
+
+    __aicore__ inline void ProcessRequest(uint32_t batch)
+    {
+        uint32_t queryStart = 0U;
+        uint32_t queryEnd = 0U;
+        uint32_t routeCount = 0U;
+        if (!QueryRange(batch, queryStart, queryEnd, routeCount)) {
+            // No safe compact TND range exists to clear. Publish request
+            // scalars only; the fast gate should normally reject this case.
+            LocalTensor<int32_t> values = countBuf_.Get<int32_t>();
+            values.SetValue(0U, -1);
+            UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+            DataCopyPad(
+                unionCountsGm_[batch], values,
+                {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});
+            UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+            values.SetValue(0U, 0);
+            UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+            DataCopyPad(
+                residentSeqLengthsGm_[batch], values,
+                {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});
+            UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+            return;
+        }
+
+        const int32_t mode = rowModesGm_.GetValue(batch);
+        if (mode == UNION_ROW_MODE_PAD) {
+            PublishPad(batch, queryStart, routeCount);
+        } else if (mode == UNION_ROW_MODE_DENSE) {
+            PublishDense(batch, queryStart, queryEnd);
+        } else if (mode == UNION_ROW_MODE_SPARSE) {
+            ProcessSparse(batch, queryStart, queryEnd, routeCount);
+        } else {
+            PublishError(batch, queryStart, routeCount);
+        }
     }
 
     GlobalTensor<int32_t> routePairsGm_;
     GlobalTensor<uint16_t> routeThresholdsGm_;
     GlobalTensor<int32_t> routeCountsGm_;
     GlobalTensor<uint16_t> scoreWorkspaceGm_;
+    GlobalTensor<int32_t> actualSeqLengthsQueryGm_;
     GlobalTensor<int32_t> candidateLensGm_;
     GlobalTensor<int32_t> finalSeqLengthsKvGm_;
+    GlobalTensor<int32_t> rowModesGm_;
     GlobalTensor<int32_t> reqPoolEntriesGm_;
     GlobalTensor<int32_t> cacheSlotsGm_;
     GlobalTensor<int32_t> unionSourcesGm_;
@@ -728,6 +1023,9 @@ private:
     uint32_t outputCapacity_ = 0U;
     uint32_t scoreRowStride_ = 0U;
     uint32_t batchSize_ = 0U;
+    uint32_t poolSize_ = 0U;
+    uint32_t totalQueryRows_ = 0U;
+    uint32_t maxCandidateLen_ = 0U;
 };
 } // namespace vllm_a5_li_manage_c8_fast
 

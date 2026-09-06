@@ -1,4 +1,4 @@
-/** Stable MTP3 C8 LI stage with {source18, slot14} TopK payloads. */
+/** Unified steady C8 LI stage with {source18, slot14} TopK payloads. */
 
 #ifndef VLLM_A5_LI_MANAGE_C8_FAST_QLI_H
 #define VLLM_A5_LI_MANAGE_C8_FAST_QLI_H
@@ -12,7 +12,7 @@
 // guards, so it can coexist with the stock QuantLI cold path.
 using VllmFastLIC8TilingData = VllmA5LiManageC8TilingData;
 #define A5_MTP_CLASSIFY_ONLY 1
-#define A5_MTP_SLOT_OUTPUT_STRIDE 2176U
+#define A5_MTP_SLOT_OUTPUT_STRIDE 2304U
 #include "arch35_payload_fast_c8/lightning_indexer_common.h"
 #include "arch35_payload_fast_c8/lightning_indexer_service_cube.h"
 #include "arch35_payload_fast_c8/lightning_indexer_service_vector.h"
@@ -26,7 +26,11 @@ constexpr uint32_t BLOCK_SIZE = 128U;
 constexpr uint32_t HEAD_DIM = 128U;
 constexpr uint32_t TOPK = 2048U;
 constexpr uint32_t ROUTES = 4U;
+constexpr uint32_t ROW_MODE_PAD = 0U;
+constexpr uint32_t ROW_MODE_DENSE = 1U;
 constexpr uint32_t ROW_MODE_SPARSE = 2U;
+constexpr uint32_t THRESHOLD_STRIDE = 16U;
+constexpr uint16_t INACTIVE_THRESHOLD = 0xffffU;
 
 using C8MtpQliType = VllmFastQLICommon::QLIType<
     fp8_e4m3fn_t, fp8_e4m3fn_t, int32_t, true,
@@ -34,18 +38,22 @@ using C8MtpQliType = VllmFastQLICommon::QLIType<
     VllmFastQLICommon::LI_LAYOUT::PA_BSND,
     bfloat16_t, float32_t, float32_t, uint16_t>;
 
-/**
- * Runtime gate for the only optimized regime. Any cold/mixed/variable-tail
- * batch returns false and executes the original correctness-first path.
+/** Return true only when the correctness-first batch path is required.
+ *
+ * All legal PAD/DENSE/SPARSE-steady requests, including compact R=1..4
+ * batches, are accepted by the unified fast path.  SPARSE first-fill is the
+ * sole legal slow-path condition.  Malformed rows are also routed to the old
+ * path so its established error publication runs without unsafe GM reads in
+ * Stage A.
  */
-__aicore__ inline bool IsAllStableMtp3(
+__aicore__ inline bool RequiresColdPath(
     GM_ADDR actualSeqLengthsQuery, GM_ADDR candidateLens,
     GM_ADDR finalSeqLengthsKv, GM_ADDR rowModes, GM_ADDR reqPoolEntries,
     GM_ADDR cacheSlotsPool, const VllmA5LiManageC8TilingData *tiling)
 {
-    if (tiling->fastPathEnabled == 0U ||
-        tiling->totalQueryRows != tiling->batchSize * ROUTES) {
-        return false;
+    if (tiling->fastPathEnabled == 0U || tiling->batchSize == 0U ||
+        tiling->totalQueryRows == 0U) {
+        return true;
     }
     GlobalTensor<int32_t> queryEnds;
     GlobalTensor<int32_t> candidates;
@@ -62,51 +70,60 @@ __aicore__ inline bool IsAllStableMtp3(
 
     const uint64_t poolStride =
         static_cast<uint64_t>(tiling->tokenCapacity) + 1U;
+    int32_t queryStart = 0;
     for (uint32_t batch = 0U; batch < tiling->batchSize; ++batch) {
-        if (queryEnds.GetValue(batch) !=
-                static_cast<int32_t>((batch + 1U) * ROUTES) ||
-            modes.GetValue(batch) != static_cast<int32_t>(ROW_MODE_SPARSE)) {
-            return false;
+        const int32_t queryEnd = queryEnds.GetValue(batch);
+        const int32_t routeCount = queryEnd - queryStart;
+        if (routeCount < 1 || routeCount > static_cast<int32_t>(ROUTES) ||
+            queryEnd > static_cast<int32_t>(tiling->totalQueryRows)) {
+            return true;
+        }
+        const int32_t mode = modes.GetValue(batch);
+        if (mode == static_cast<int32_t>(ROW_MODE_PAD)) {
+            queryStart = queryEnd;
+            continue;
+        }
+        const int32_t finalLen = finalLengths.GetValue(batch);
+        if (finalLen < routeCount ||
+            finalLen > static_cast<int32_t>(tiling->tokenCapacity)) {
+            return true;
+        }
+        if (mode == static_cast<int32_t>(ROW_MODE_DENSE)) {
+            if (finalLen > static_cast<int32_t>(tiling->maxCandidateLen)) {
+                return true;
+            }
+            queryStart = queryEnd;
+            continue;
+        }
+        if (mode != static_cast<int32_t>(ROW_MODE_SPARSE)) {
+            return true;
         }
         const int32_t poolRow = entries.GetValue(batch);
         const int32_t candidate = candidates.GetValue(batch);
-        const int32_t finalLen = finalLengths.GetValue(batch);
         if (poolRow < 0 ||
             poolRow >= static_cast<int32_t>(tiling->poolSize) ||
-            candidate <= static_cast<int32_t>(TOPK) ||
+            candidate < static_cast<int32_t>(TOPK) ||
             candidate > static_cast<int32_t>(tiling->tokenCapacity) ||
             candidate > static_cast<int32_t>(tiling->maxCandidateLen) ||
             candidate % static_cast<int32_t>(BLOCK_SIZE) != 0 ||
-            finalLen < candidate ||
-            finalLen > static_cast<int32_t>(tiling->tokenCapacity) ||
+            candidate > finalLen - (routeCount - 1) ||
             finalLen - candidate > 256) {
-            return false;
+            return true;
         }
-        const int32_t budget = pool.GetValue(
+        const int32_t metadata = pool.GetValue(
             static_cast<uint64_t>(poolRow) * poolStride +
             tiling->tokenCapacity);
+        if (metadata < 0) {
+            return true;
+        }
+        const int32_t budget = metadata;
         if ((budget != 8192 && budget != 10240 && budget != 12288) ||
             budget > candidate) {
-            return false;
+            return true;
         }
-        // The payload implementation scores one shared source range for all
-        // four speculative rows. Boundary steps whose causal full-block
-        // lengths differ remain on the old path.
-        for (uint32_t route = 0U; route < ROUTES; ++route) {
-            const uint32_t later = ROUTES - 1U - route;
-            if (finalLen <= static_cast<int32_t>(later)) {
-                return false;
-            }
-            const uint32_t visible =
-                static_cast<uint32_t>(finalLen) - later;
-            const uint32_t selection =
-                ((visible - 1U) / BLOCK_SIZE) * BLOCK_SIZE;
-            if (selection != static_cast<uint32_t>(candidate)) {
-                return false;
-            }
-        }
+        queryStart = queryEnd;
     }
-    return true;
+    return queryStart != static_cast<int32_t>(tiling->totalQueryRows);
 }
 
 class QuantLiMtpPhase {
@@ -118,9 +135,11 @@ public:
 
     __aicore__ inline void Init(
         GM_ADDR indexWeights, GM_ADDR query, GM_ADDR queryDequantScale,
+        GM_ADDR actualSeqLengthsQuery,
         GM_ADDR indexKeyCache, GM_ADDR indexKeyDequantScale,
+        GM_ADDR finalSeqLengthsKv,
         GM_ADDR reqPoolEntries, GM_ADDR cacheSlotsPool,
-        GM_ADDR candidateLens, GM_ADDR indexBlockTable,
+        GM_ADDR candidateLens, GM_ADDR rowModes, GM_ADDR indexBlockTable,
         GM_ADDR routePairRows, GM_ADDR topkSlots,
         GM_ADDR topkSourceIds,
         GM_ADDR routeThresholds, GM_ADDR routeMissCounts,
@@ -133,7 +152,12 @@ public:
             aiCoreIdx_ = subBlockIdx_;
         }
 
+        queryEndsGm_.SetGlobalBuffer(
+            (__gm__ int32_t *)actualSeqLengthsQuery);
+        finalLengthsGm_.SetGlobalBuffer(
+            (__gm__ int32_t *)finalSeqLengthsKv);
         candidateLensGm_.SetGlobalBuffer((__gm__ int32_t *)candidateLens);
+        rowModesGm_.SetGlobalBuffer((__gm__ int32_t *)rowModes);
         reqPoolEntriesGm_.SetGlobalBuffer((__gm__ int32_t *)reqPoolEntries);
         cacheSlotsGm_.SetGlobalBuffer((__gm__ int32_t *)cacheSlotsPool);
         blockTableGm_.SetGlobalBuffer((__gm__ int32_t *)indexBlockTable);
@@ -150,10 +174,8 @@ public:
         constInfo_.kCacheBlockSize = BLOCK_SIZE;
         constInfo_.maxBlockNumPerBatch = tiling_->maxBlockNumPerBatch;
         constInfo_.outputLayout = VllmFastQLICommon::LI_LAYOUT::TND;
-        // candidate_lens is already the durable, fully offloaded prefix.
-        // It excludes the causal tail/current queries, so every MTP route
-        // ranks the complete prefix; causal handling is applied only while
-        // publishing each route's dense tail slots.
+        // SPARSE uses a shared durable prefix and DENSE selects per-route
+        // causal lengths explicitly in RunInfo.
         constInfo_.attenMaskFlag = false;
         constInfo_.isAccumSeqS1 = true;
         constInfo_.s1BaseSize = tiling_->fastQueryTileSize;
@@ -213,7 +235,7 @@ public:
         if (tile != 2U && tile != ROUTES) {
             return;
         }
-        const uint32_t queryTileCount = ROUTES / tile;
+        const uint32_t queryTileCount = (ROUTES + tile - 1U) / tile;
         const uint32_t taskCount = tiling_->batchSize * queryTileCount;
         if ASCEND_IS_AIV {
             vectorService_.AllocEventID();
@@ -231,19 +253,39 @@ public:
         for (uint32_t task = aiCoreIdx_; task < taskCount;
              task += tiling_->usedCoreNum) {
             const uint32_t batch = task / queryTileCount;
+            uint32_t queryStart = 0U;
+            uint32_t queryEnd = 0U;
+            uint32_t routeCount = 0U;
+            GetQueryRange(
+                batch, queryStart, queryEnd, routeCount);
             const uint32_t gS1 = task % queryTileCount;
-            const uint32_t queryBegin = batch * ROUTES;
-            const uint32_t candidate = static_cast<uint32_t>(
-                candidateLensGm_.GetValue(batch));
-            const uint32_t poolRow = static_cast<uint32_t>(
-                reqPoolEntriesGm_.GetValue(batch));
-            const uint64_t poolStride =
-                static_cast<uint64_t>(tiling_->tokenCapacity) + 1U;
-            const uint32_t budget = static_cast<uint32_t>(
-                cacheSlotsGm_.GetValue(
+            const uint32_t routeBase = gS1 * tile;
+            if (routeBase >= routeCount ||
+                !TaskNeedsQli(batch, routeBase, tile, routeCount)) {
+                continue;
+            }
+            const int32_t mode = rowModesGm_.GetValue(batch);
+            const bool dense =
+                mode == static_cast<int32_t>(ROW_MODE_DENSE);
+            const uint32_t scanLen = dense
+                ? static_cast<uint32_t>(finalLengthsGm_.GetValue(batch))
+                : static_cast<uint32_t>(candidateLensGm_.GetValue(batch));
+            uint32_t poolRow = 0U;
+            uint32_t budget = 0U;
+            if (!dense) {
+                poolRow = static_cast<uint32_t>(
+                    reqPoolEntriesGm_.GetValue(batch));
+                const uint64_t poolStride =
+                    static_cast<uint64_t>(tiling_->tokenCapacity) + 1U;
+                budget = static_cast<uint32_t>(cacheSlotsGm_.GetValue(
                     static_cast<uint64_t>(poolRow) * poolStride +
                     tiling_->tokenCapacity));
-            const uint32_t loopCount = candidate / BLOCK_SIZE;
+            }
+            const uint32_t activeRoutes =
+                routeBase + tile > routeCount
+                    ? routeCount - routeBase : tile;
+            const uint32_t loopCount =
+                (scanLen + BLOCK_SIZE - 1U) / BLOCK_SIZE;
             if ASCEND_IS_AIV {
                 const uint64_t requestScoreBase =
                     static_cast<uint64_t>(batch) *
@@ -265,18 +307,22 @@ public:
                 run.gS1Idx = gS1;
                 run.s2Idx = s2;
                 run.s2Start = 0U;
-                run.validS2Len = candidate;
+                run.validS2Len = scanLen;
                 run.kScaleLoop = s2 / 16U + 1U;
                 run.cacheRowIdx = poolRow;
                 run.cacheTokenCount = budget;
-                run.actS1Size = ROUTES;
-                run.actS2Size = candidate;
-                run.actS2SizeOrig = candidate;
-                run.actMBaseSize = constInfo_.mBaseSize;
-                run.actualSingleProcessSInnerSize = BLOCK_SIZE;
-                run.actualSingleProcessSInnerSizeAlign = BLOCK_SIZE;
+                run.actS1Size = routeCount;
+                run.actS2Size = scanLen;
+                run.actS2SizeOrig = scanLen;
+                run.actMBaseSize = activeRoutes * tiling_->indexHeads;
+                run.actualSingleProcessSInnerSize =
+                    scanLen - s2 * BLOCK_SIZE < BLOCK_SIZE
+                        ? scanLen - s2 * BLOCK_SIZE : BLOCK_SIZE;
+                run.actualSingleProcessSInnerSizeAlign =
+                    VllmFastQLICommon::Align(
+                        run.actualSingleProcessSInnerSize, 32U);
                 run.tensorQueryOffset =
-                    static_cast<uint64_t>(queryBegin) *
+                    static_cast<uint64_t>(queryStart) *
                         tiling_->indexHeads * HEAD_DIM +
                     static_cast<uint64_t>(gS1) *
                         constInfo_.mBaseSize * HEAD_DIM;
@@ -285,13 +331,16 @@ public:
                 run.tensorKeyScaleOffset =
                     static_cast<uint64_t>(s2) * BLOCK_SIZE;
                 run.tensorWeightsOffset =
-                    static_cast<uint64_t>(queryBegin) *
+                    static_cast<uint64_t>(queryStart) *
                     tiling_->weightStride;
                 run.tensorQueryScaleOffset =
-                    static_cast<uint64_t>(queryBegin) *
+                    static_cast<uint64_t>(queryStart) *
                     tiling_->indexHeads;
                 run.indiceOutOffset =
-                    static_cast<uint64_t>(queryBegin) * TOPK;
+                    static_cast<uint64_t>(queryStart) * TOPK;
+                run.workspaceRow = batch * ROUTES;
+                run.causalClip = dense;
+                run.denseDirectPublish = dense;
                 run.isFirstS2InnerLoop = s2 == 0U;
                 run.isLastS2InnerLoop = s2 + 1U == loopCount;
                 run.isAllLoopEnd = false;
@@ -302,9 +351,10 @@ public:
                 } else {
                     vectorService_.ProcessVec1(run);
                     if (run.isLastS2InnerLoop) {
-                        const bool finalTask =
-                            task + tiling_->usedCoreNum >= taskCount;
-                        vectorService_.ProcessTopK(run, finalTask);
+                        const bool finalTask = !HasLaterActiveTask(
+                            task, taskCount, queryTileCount, tile);
+                        vectorService_.ProcessTopK(
+                            run, !dense && finalTask);
                     }
                 }
             }
@@ -324,6 +374,67 @@ public:
     }
 
 private:
+    __aicore__ inline void GetQueryRange(
+        uint32_t batch, uint32_t &queryStart, uint32_t &queryEnd,
+        uint32_t &routeCount) const
+    {
+        const int32_t end = queryEndsGm_.GetValue(batch);
+        const int32_t start = batch == 0U
+            ? 0 : queryEndsGm_.GetValue(batch - 1U);
+        queryStart = static_cast<uint32_t>(start);
+        queryEnd = static_cast<uint32_t>(end);
+        routeCount = queryEnd - queryStart;
+    }
+
+    __aicore__ inline bool TaskNeedsQli(
+        uint32_t batch, uint32_t routeBase, uint32_t tile,
+        uint32_t routeCount) const
+    {
+        if (routeBase >= routeCount) {
+            return false;
+        }
+        const int32_t mode = rowModesGm_.GetValue(batch);
+        if (mode == static_cast<int32_t>(ROW_MODE_PAD)) {
+            return false;
+        }
+        if (mode == static_cast<int32_t>(ROW_MODE_SPARSE)) {
+            return true;
+        }
+        if (mode != static_cast<int32_t>(ROW_MODE_DENSE)) {
+            return false;
+        }
+        const uint32_t activeRoutes = routeBase + tile > routeCount
+            ? routeCount - routeBase : tile;
+        const uint32_t lastRoute = routeBase + activeRoutes - 1U;
+        const uint32_t finalLen = static_cast<uint32_t>(
+            finalLengthsGm_.GetValue(batch));
+        const uint32_t visible =
+            finalLen - (routeCount - 1U - lastRoute);
+        return visible > TOPK;
+    }
+
+    __aicore__ inline bool HasLaterActiveTask(
+        uint32_t task, uint32_t taskCount, uint32_t queryTileCount,
+        uint32_t tile) const
+    {
+        for (uint32_t next = task + tiling_->usedCoreNum;
+             next < taskCount; next += tiling_->usedCoreNum) {
+            const uint32_t nextBatch = next / queryTileCount;
+            uint32_t queryStart = 0U;
+            uint32_t queryEnd = 0U;
+            uint32_t routeCount = 0U;
+            GetQueryRange(
+                nextBatch, queryStart, queryEnd, routeCount);
+            const uint32_t routeBase =
+                (next % queryTileCount) * tile;
+            if (TaskNeedsQli(
+                    nextBatch, routeBase, tile, routeCount)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     TPipe *pipe_;
     const VllmA5LiManageC8TilingData *tiling_;
     uint32_t subBlockIdx_ = 0U;
@@ -337,7 +448,10 @@ private:
     GlobalTensor<float> queryScaleGm_;
     GlobalTensor<float> keyScaleGm_;
     GlobalTensor<int32_t> blockTableGm_;
+    GlobalTensor<int32_t> queryEndsGm_;
+    GlobalTensor<int32_t> finalLengthsGm_;
     GlobalTensor<int32_t> candidateLensGm_;
+    GlobalTensor<int32_t> rowModesGm_;
     GlobalTensor<int32_t> reqPoolEntriesGm_;
     GlobalTensor<int32_t> cacheSlotsGm_;
     GlobalTensor<int32_t> routePairRowsGm_;

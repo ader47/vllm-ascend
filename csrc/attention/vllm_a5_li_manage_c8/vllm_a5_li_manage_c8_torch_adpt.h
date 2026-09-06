@@ -31,7 +31,7 @@ inline void npu_dsa_a5_li_manage_c8_out(
 {
     constexpr int64_t block_size = 128;
     constexpr int64_t head_dim = 128;
-    constexpr int64_t attention_capacity = 2176;
+    constexpr int64_t attention_capacity = 2304;
     constexpr int64_t copy_capacity = 16384;
     constexpr int64_t max_source_capacity = 1 << 18;
     constexpr int64_t max_queries_per_request = 4;
@@ -131,7 +131,8 @@ inline void npu_dsa_a5_li_manage_c8_out(
                     copy_src_ids.size(2) == copy_capacity &&
                     copy_dst_slots.sizes() == copy_src_ids.sizes() &&
                     copy_counts.dim() == 1 && copy_counts.size(0) == batch,
-                "DSA A5 MTP LIM caller-owned output shapes are invalid.");
+                "DSA A5 MTP LIM caller-owned output shapes are invalid; "
+                "paired attention outputs must be [T,1,2304].");
 
     const auto device = query.device();
     const at::Tensor* tensors[] = {

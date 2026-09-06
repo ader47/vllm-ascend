@@ -146,9 +146,9 @@ def test_a5_selection_scratch_is_allocated_only_for_packed_c8() -> None:
     assert c8_runtime._a5_resident_seq_lengths is not None
     assert c8_runtime._a5_resident_seq_lengths.shape == (1,)
     assert mtp_runtime._a5_attention_slots is not None
-    assert mtp_runtime._a5_attention_slots.shape == (4, 1, 2176)
+    assert mtp_runtime._a5_attention_slots.shape == (4, 1, 2304)
     assert mtp_runtime._a5_attention_src_ids is not None
-    assert mtp_runtime._a5_attention_src_ids.shape == (4, 1, 2176)
+    assert mtp_runtime._a5_attention_src_ids.shape == (4, 1, 2304)
     assert mtp_runtime._a5_per_query_miss_counts is not None
     assert mtp_runtime._a5_per_query_miss_counts.shape == (4,)
 
@@ -288,7 +288,9 @@ def test_a5_selection_chain_reuses_preallocated_outputs(monkeypatch) -> None:
     assert selection.resident_seq_lengths.tolist() == [4096, 4224]
 
 
-def test_a5_mtp_selection_chain_reuses_per_query_outputs(monkeypatch) -> None:
+@pytest.mark.parametrize("query_counts", [(1, 1), (1, 2), (3, 1), (4, 4)])
+def test_a5_mtp_selection_chain_reuses_per_query_outputs(monkeypatch, query_counts) -> None:
+    total_query_rows = sum(query_counts)
     resident_pool, runtime, store = _make_runtime(
         max_num_reqs=2,
         packed_c8=True,
@@ -320,7 +322,7 @@ def test_a5_mtp_selection_chain_reuses_per_query_outputs(monkeypatch) -> None:
         attention_slots.fill_(11)
         attention_src_ids.fill_(13)
         per_query_miss_counts.copy_(
-            torch.arange(8, dtype=torch.int32)
+            torch.arange(total_query_rows, dtype=torch.int32)
         )
         resident_seq_lengths.fill_(4096)
         captured["attention_slots"] = attention_slots
@@ -347,19 +349,19 @@ def test_a5_mtp_selection_chain_reuses_per_query_outputs(monkeypatch) -> None:
         packed_c8=True,
     )
     selection = context.execute_decode_selection(
-        query=torch.empty(8, 32, 128),
-        weights=torch.empty(8, 32),
+        query=torch.empty(total_query_rows, 32, 128),
+        weights=torch.empty(total_query_rows, 32),
         row_modes=torch.tensor([2, 2], dtype=torch.int32),
         resident_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
         actual_seq_lengths_key=torch.tensor([4096, 4096], dtype=torch.int32),
-        actual_seq_lengths_query=torch.tensor([4, 8], dtype=torch.int32),
+        actual_seq_lengths_query=torch.tensor(query_counts, dtype=torch.int32).cumsum(0).to(torch.int32),
         indexer_block_table=torch.zeros(2, 64, dtype=torch.int32),
         resident_cache=(resident_cache,),
         resident_block_table=torch.zeros(2, 64, dtype=torch.int32),
         dram_block_table=torch.zeros(2, 64, dtype=torch.int32),
         candidate_lens=torch.tensor([4096, 4096], dtype=torch.int32),
-        query_dequant_scale=torch.ones(8, 32),
-        query_shape=(8, 32, 128),
+        query_dequant_scale=torch.ones(total_query_rows, 32),
+        query_shape=(total_query_rows, 32, 128),
     )
 
     assert runtime._a5_attention_slots is not None
@@ -377,16 +379,18 @@ def test_a5_mtp_selection_chain_reuses_per_query_outputs(monkeypatch) -> None:
     assert captured["cache_slots"].data_ptr() == (
         resident_pool.get_cache_slots(0).data_ptr()
     )
-    assert selection.sparse_indices.shape == (8, 1, 2176)
+    assert selection.sparse_indices.shape == (total_query_rows, 1, 2304)
 
 
+@pytest.mark.parametrize("routes", [1, 4])
 def test_a5_shared_layer_reuses_full_lidu_and_own_packed_arena(
-    monkeypatch,
+    monkeypatch, routes,
 ) -> None:
     resident_pool, runtime, store = _make_runtime(
         packed_c8=True,
         resident_layer_count=2,
         selection_state_count=1,
+        max_decode_query_len=routes,
     )
     resident_caches = (
         torch.empty(4, 128, 1, 656, dtype=torch.int8),
@@ -413,7 +417,8 @@ def test_a5_shared_layer_reuses_full_lidu_and_own_packed_arena(
     def _fake_scatter(**kwargs) -> None:
         scatter_calls.append(kwargs)
 
-    monkeypatch.setattr(runtime_module, "a5_lightning_indexer_decode_update_c8", _fake_fused_lidu)
+    operator = "a5_lightning_indexer_decode_update_mtp_c8" if routes > 1 else "a5_lightning_indexer_decode_update_c8"
+    monkeypatch.setattr(runtime_module, operator, _fake_fused_lidu)
     monkeypatch.setattr(
         runtime_module,
         "a5_kvcache_scatter_copy_c8",
@@ -435,17 +440,17 @@ def test_a5_shared_layer_reuses_full_lidu_and_own_packed_arena(
         "dram_block_table": torch.zeros(1, 64, dtype=torch.int32),
     }
     full.execute_decode_selection(
-        query=torch.empty(1, 32, 128),
-        weights=torch.empty(1, 32),
+        query=torch.empty(routes, 32, 128),
+        weights=torch.empty(routes, 32),
         row_modes=torch.tensor([1], dtype=torch.int32),
         resident_pool_indices=torch.tensor([0], dtype=torch.int32),
         actual_seq_lengths_key=torch.tensor([4096], dtype=torch.int32),
-        actual_seq_lengths_query=torch.tensor([1], dtype=torch.int32),
+        actual_seq_lengths_query=torch.tensor([routes], dtype=torch.int32),
         indexer_block_table=torch.zeros(1, 64, dtype=torch.int32),
         resident_cache=(resident_caches[0],),
         candidate_lens=torch.tensor([4096], dtype=torch.int32),
-        query_dequant_scale=torch.ones(1, 32),
-        query_shape=(1, 32, 128),
+        query_dequant_scale=torch.ones(routes, 32),
+        query_shape=(routes, 32, 128),
         **common_tables,
     )
 
@@ -459,6 +464,7 @@ def test_a5_shared_layer_reuses_full_lidu_and_own_packed_arena(
     selection = shared.execute_shared_decode_selection(
         resident_cache=(resident_caches[1],),
         num_reqs=1,
+        num_query_rows=routes,
         **common_tables,
     )
 
@@ -471,7 +477,8 @@ def test_a5_shared_layer_reuses_full_lidu_and_own_packed_arena(
     assert scatter_calls[1]["source_token_ids"] is outputs.topk_index
     assert runtime._a5_attention_slots is not None
     assert selection.sparse_indices.data_ptr() == (runtime._a5_attention_slots.data_ptr())
-    assert selection.sparse_indices.tolist() == [[[11] * 2176]]
+    capacity = 2304 if routes > 1 else 2176
+    assert selection.sparse_indices.tolist() == [[[11] * capacity]] * routes
     assert selection.resident_seq_lengths is not None
     assert selection.resident_seq_lengths.tolist() == [4096]
 
