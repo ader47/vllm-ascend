@@ -114,6 +114,12 @@ additional_config={
 首次部署或更新 DSA 自定义算子后，必须完整重编译并重新安装
 vLLM-Ascend。
 
+本次同步单算子仓 `c1428fc` 的 LIM-MTP union 向量去重、批量输出及 COPY 地址缓存、无效 pair 跳过实现；公开 ABI 和 2304 语义不变。COPY 的 host tiling、tiling header 与 kernel 须配套重编译；无效 pair 跳过，不再使用原设备侧断言。以下 A5 回归覆盖 LIM、真实 DRAM→HBM COPY、无效 pair、eager/graph 与官方 SFA 整链，不设时延门槛。
+
+```bash
+pytest -q tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_a5_c8_ops.py
+```
+
 ### A5 C8 增量配置
 
 A5 当前只接通 SFA C8 与 LI C8 同时开启的完整数据面。在上述

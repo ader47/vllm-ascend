@@ -119,6 +119,8 @@ static ge::graphStatus TilingVllmA5KvcacheScatterCopyC8(
     tiling->dramPhysicalBlockCount =
         static_cast<uint32_t>(dramKv.GetDim(0));
     tiling->packedRowBytes = PACKED_ROW_BYTES;
+    tiling->blockSize = BLOCK_SIZE;
+    tiling->blockRowBytes = static_cast<uint32_t>(BLOCK_SIZE * PACKED_ROW_BYTES);
     tiling->totalPairSlots = totalPairSlots;
     context->SetBlockDim(usedCoreNum);
     return ge::GRAPH_SUCCESS;

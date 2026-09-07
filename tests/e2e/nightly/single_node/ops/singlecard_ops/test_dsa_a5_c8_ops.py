@@ -1658,6 +1658,55 @@ def test_packed_c8_fused_lidu_copy_plan_is_consumed_by_ksc() -> None:
     assert torch.equal(actual_rows, expected_rows)
 
 
+@pytest.mark.parametrize("mixed", [False, True])
+def test_packed_c8_ksc_skips_invalid_pairs_without_losing_valid_copies(mixed: bool) -> None:
+    batch, blocks_per_request, pair_count = 3, 8, 1024
+    physical_blocks = batch * blocks_per_request
+    poison = -91
+    dram_cpu = _make_unique_packed_rows(physical_blocks * _BLOCK_SIZE).view(
+        physical_blocks, _BLOCK_SIZE, 1, _PACKED_ROW_BYTES
+    )
+    dram = _swapped_arena(tuple(dram_cpu.shape))
+    _write_swapped_arena(dram, dram_cpu)
+    hbm = torch.full(
+        (physical_blocks + 1, _BLOCK_SIZE, 1, _PACKED_ROW_BYTES),
+        poison, dtype=torch.int8, device="npu",
+    )
+    # Each request owns disjoint physical blocks; the final HBM block is a guard.
+    dram_table = torch.arange(physical_blocks, dtype=torch.int32).view(batch, -1)
+    hbm_table = dram_table.flip(1).contiguous()
+    dram_table[:, 0], dram_table[:, 1] = -1, physical_blocks
+    hbm_table[:, 0], hbm_table[:, 1] = -1, physical_blocks + 1
+    valid_token = 2 * _BLOCK_SIZE
+    patterns = torch.tensor([
+        [-1, valid_token], [valid_token, -1],
+        [pair_count, valid_token], [valid_token, pair_count],
+        [0, valid_token], [_BLOCK_SIZE, valid_token],
+        [valid_token, 0], [valid_token, _BLOCK_SIZE],
+    ], dtype=torch.int32).repeat(pair_count // 8, 1)
+    sources = torch.full((batch, 1, _COPY_CAPACITY), -1, dtype=torch.int32)
+    destinations = torch.full_like(sources, -1)
+    sources[:, 0, :pair_count] = patterns[:, 0]
+    destinations[:, 0, :pair_count] = patterns[:, 1]
+    expected = torch.full(tuple(hbm.shape), poison, dtype=torch.int8)
+    if mixed:
+        for i, index in enumerate((0, 63, 64, 127, 128, 511, 512, 1023)):
+            sources[:, 0, index] = valid_token + i
+            destinations[:, 0, index] = valid_token + i
+            for row in range(batch):
+                expected[int(hbm_table[row, 2]), i] = dram_cpu[int(dram_table[row, 2]), i]
+    pointer = hbm.data_ptr()
+    result = torch.ops._C_ascend.npu_dsa_a5_kvcache_scatter_copy_c8_out(
+        hbm, dram, hbm_table.to("npu"), dram_table.to("npu"),
+        sources.to("npu"), destinations.to("npu"),
+        torch.full((batch,), pair_count, dtype=torch.int32, device="npu"),
+    )
+    torch.npu.synchronize()
+    assert result is None
+    assert hbm.data_ptr() == pointer
+    assert torch.equal(hbm.cpu(), expected)
+
+
 def test_packed_c8_ksc_copies_one_opaque_row() -> None:
     hbm = torch.zeros(
         (17, _BLOCK_SIZE, 1, _PACKED_ROW_BYTES),

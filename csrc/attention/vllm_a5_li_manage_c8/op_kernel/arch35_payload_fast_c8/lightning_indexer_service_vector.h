@@ -971,34 +971,7 @@ __aicore__ inline void QLIVector<QLIT>::FinalizePayloadUpdate(
     uint32_t currentMissCount = static_cast<uint32_t>(
         AscendC::GetSpr<AscendC::SpecialPurposeReg::AR>() / sizeof(uint32_t));
     PipeBarrier<PIPE_V>();
-    VllmFastTopkIndexerClassifyVF::SqueezeIndexerHitTokenIds(
-        (__ubuf__ uint32_t *)classifiedIndex[currentMissCount].GetPhyAddr(),
-        (__ubuf__ uint32_t *)indicesOutLocal_.GetPhyAddr(),
-        topkCount_ / CLASSIFY_CHUNK);
-    PipeBarrier<PIPE_V>();
-
 #ifdef A5_MTP_CLASSIFY_ONLY
-    // Preserve the complete source row before BuildSortedMissPairs reuses the
-    // same UB storage. Stage 2 reads this prefix when repairing destinations,
-    // so source and destination remain elementwise paired even though the
-    // private union input is independently sorted by source ID.
-#ifdef A5_MTP_SLOT_OUTPUT_STRIDE
-    const uint64_t publicSourceOffset =
-        static_cast<uint64_t>(outputRow) * A5_MTP_SLOT_OUTPUT_STRIDE;
-#else
-    const uint64_t publicSourceOffset =
-        static_cast<uint64_t>(outputRow) * topkCount_;
-#endif
-    AscendC::DataCopyParams publicSourceCopy{
-        1, static_cast<uint16_t>(topkCount_ * sizeof(int32_t)), 0, 0};
-    SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
-    WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
-    DataCopyPad(
-        topkSourceIdsGm[publicSourceOffset], classifiedIndex,
-        publicSourceCopy);
-    SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
-    WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
-
     // Stage 1 of MTP3 management publishes only each route's actual sorted
     // miss-pair prefix plus its complete slot row. It must not choose victims
     // or mutate the shared request row. The survivor payload already carries
@@ -1013,9 +986,17 @@ __aicore__ inline void QLIVector<QLIT>::FinalizePayloadUpdate(
     SetFlag<HardEvent::V_S>(V_MTE2_EVENT3);
     WaitFlag<HardEvent::V_S>(V_MTE2_EVENT3);
     BuildSortedMissPairs(classifiedIndex, currentMissCount);
-    // routePairRows carries the sorted miss prefix for union. The caller-owned
-    // source row additionally preserves the complete miss-prefix/hit-suffix
-    // ordering consumed by fused copy+SFA.
+    // Sorting reuses topkSharedTmp but not indicesOutLocal (survivor payload)
+    // or mrgValueLocal (sorted pairs). Build the final source row only now:
+    // sorted misses followed by hits in the same squeeze order as hit slots.
+    // Extraction may write padded lanes; the following hit squeeze replaces
+    // them before publication. Stage 2 need only repair destination slots.
+    ExtractSortedMissSourceIds(classifiedIndex, currentMissCount);
+    VllmFastTopkIndexerClassifyVF::SqueezeIndexerHitTokenIds(
+        (__ubuf__ uint32_t *)classifiedIndex[currentMissCount].GetPhyAddr(),
+        (__ubuf__ uint32_t *)indicesOutLocal_.GetPhyAddr(),
+        topkCount_ / CLASSIFY_CHUNK);
+    PipeBarrier<PIPE_V>();
     LocalTensor<int32_t> routeMissCountLocal =
         candidatePayloadLocal_.template ReinterpretCast<int32_t>();
     routeMissCountLocal.SetValue(0, static_cast<int32_t>(currentMissCount));
@@ -1029,9 +1010,6 @@ __aicore__ inline void QLIVector<QLIT>::FinalizePayloadUpdate(
     WaitFlag<HardEvent::S_MTE3>(EVENT_ID1);
     AscendC::DataCopyParams routeScalarCopy{
         1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0};
-    DataCopyPad(missCountGm[fixedWorkspaceRow], routeMissCountLocal, routeScalarCopy);
-    SetFlag<HardEvent::MTE3_S>(EVENT_ID1);
-    WaitFlag<HardEvent::MTE3_S>(EVENT_ID1);
     SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
     WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
     AscendC::DataCopyParams slotOutputCopy{
@@ -1043,6 +1021,9 @@ __aicore__ inline void QLIVector<QLIT>::FinalizePayloadUpdate(
     const uint64_t slotOutOffset =
         static_cast<uint64_t>(outputRow) * topkCount_;
 #endif
+    // All sources are disjoint and stay live until TOPK_MTE3_V_EVENT is
+    // consumed before the next route (or by FreeEventID at phase end).
+    DataCopyPad(missCountGm[fixedWorkspaceRow], routeMissCountLocal, routeScalarCopy);
     if (currentMissCount > 0U) {
         AscendC::DataCopyParams pairOutputCopy{
             1,
@@ -1059,12 +1040,18 @@ __aicore__ inline void QLIVector<QLIT>::FinalizePayloadUpdate(
         thresholdGm[static_cast<uint64_t>(fixedWorkspaceRow) *
                     MTP_THRESHOLD_STRIDE],
         scoreOutLocal_, MTP_THRESHOLD_STRIDE);
+    DataCopyPad(topkSourceIdsGm[slotOutOffset], classifiedIndex, slotOutputCopy);
     DataCopyPad(topkSlotsGm[slotOutOffset], slotStageLocal_, slotOutputCopy);
     SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
     SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
     return;
 #endif
 
+    VllmFastTopkIndexerClassifyVF::SqueezeIndexerHitTokenIds(
+        (__ubuf__ uint32_t *)classifiedIndex[currentMissCount].GetPhyAddr(),
+        (__ubuf__ uint32_t *)indicesOutLocal_.GetPhyAddr(),
+        topkCount_ / CLASSIFY_CHUNK);
+    PipeBarrier<PIPE_V>();
     uint32_t candidateCount = 0;
 #if LI_UPDATE_ABLATION_MODE >= 4
     if (currentMissCount > 0) {

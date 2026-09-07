@@ -4,6 +4,7 @@
 #define VLLM_A5_LI_MANAGE_C8_FAST_UNION_H
 
 #include "kernel_operator.h"
+#include "vllm_a5_li_manage_c8_fast_union_vf.h"
 #include "vllm_a5_li_manage_c8_fast_victim_vf.h"
 #include "vllm_a5_li_manage_c8_fast_workspace.h"
 
@@ -18,11 +19,7 @@ constexpr int32_t UNION_ROW_MODE_SPARSE = 2;
 constexpr uint32_t UNION_CAPACITY = UNION_ROUTES * UNION_TOPK;
 constexpr uint32_t UNION_PAIR_WORDS = UNION_TOPK * 2U;
 constexpr uint32_t UNION_SOURCE_MASK = (1U << 18U) - 1U;
-constexpr uint32_t UNION_KEY_BASE_BITS = 0x40000000U;
-constexpr int32_t UNION_KEY_DECODE_BASE =
-    static_cast<int32_t>(UNION_KEY_BASE_BITS + UNION_SOURCE_MASK);
 constexpr uint32_t B32_VECTOR_ELEMENTS = 64U;
-constexpr uint32_t B32_VECTOR_REPEAT_STRIDE = 8U;
 constexpr uint32_t VICTIM_SCAN_CHUNK = 2048U;
 constexpr uint32_t VICTIM_SLOT_SHIFT = 18U;
 constexpr uint32_t VICTIM_SLOT_MASK = (1U << 14U) - 1U;
@@ -33,23 +30,6 @@ __aicore__ inline void UnionSync(HardEvent value)
     event_t id = static_cast<event_t>(GetTPipePtr()->FetchEventID(value));
     SetFlag<event>(id);
     WaitFlag<event>(id);
-}
-
-__aicore__ inline void ExtractPairKeys(
-    const LocalTensor<uint32_t> &keys,
-    const LocalTensor<uint32_t> &pairs,
-    uint32_t count)
-{
-    GatherMaskParams params;
-    params.repeatTimes =
-        (count * 2U * sizeof(uint32_t) + 255U) / 256U;
-    params.src0BlockStride = 1;
-    params.src0RepeatStride = B32_VECTOR_REPEAT_STRIDE;
-    params.src1RepeatStride = 0;
-    uint64_t reserved = 0U;
-    GatherMask(keys, pairs, static_cast<uint8_t>(1), false,
-               static_cast<uint32_t>(0), params, reserved);
-    PipeBarrier<PIPE_V>();
 }
 
 class OrderedMissUnion {
@@ -109,7 +89,9 @@ public:
                          UNION_CAPACITY * 2U * sizeof(float));
         pipe->InitBuffer(sourceBuf_,
                          UNION_CAPACITY * sizeof(int32_t));
-        pipe->InitBuffer(countBuf_, 32U);
+        // Three independent aligned rows let MTE3 publish per-query counts,
+        // union count and resident length together without reusing scalar UB.
+        pipe->InitBuffer(countBuf_, 3U * 32U);
         pipe->InitBuffer(
             thresholdBuf_,
             UNION_ROUTES *
@@ -125,39 +107,19 @@ public:
     }
 
 private:
-    __aicore__ inline uint32_t ScalarDeduplicate(
-        LocalTensor<uint32_t> keys, uint32_t total,
+    __aicore__ inline uint32_t Deduplicate(
+        LocalTensor<float> merged, uint32_t total,
         LocalTensor<int32_t> output)
     {
-        uint32_t count = 0U;
-        int32_t last = -1;
-        for (uint32_t index = 0U; index < total; ++index) {
-            const uint32_t key = keys.GetValue(index);
-            const int32_t source = static_cast<int32_t>(
-                UNION_SOURCE_MASK - (key - UNION_KEY_BASE_BITS));
-            if (source != last) {
-                output.SetValue(count++, source);
-                last = source;
-            }
-        }
-        return count;
-    }
-
-    __aicore__ inline uint32_t Deduplicate(
-        LocalTensor<float> merged, LocalTensor<float> scratch,
-        uint32_t total, LocalTensor<int32_t> output)
-    {
-        LocalTensor<uint32_t> keys = scratch.ReinterpretCast<uint32_t>();
-        ExtractPairKeys(keys, merged.ReinterpretCast<uint32_t>(), total);
-        // MrgSort has already put equal source keys next to one another.
-        // Keep this boundary correctness-first: GatherMask's predicate
-        // repeat geometry is easy to get wrong when the sum of four route
-        // miss counts is not a 64-element multiple, and that used to leak a
-        // duplicate source into copy_count. Stable decode normally has only
-        // a few hundred route misses, so this bounded UB walk is cheap; the
-        // scoring/TopK stages remain fully vectorized.
+        VllmA5LiManageC8FastUnionVF::DeduplicateSortedPairs(
+            (__ubuf__ uint32_t *)output.GetPhyAddr(),
+            (__ubuf__ uint32_t *)merged.GetPhyAddr(), total);
+        const uint32_t count = static_cast<uint32_t>(
+            GetSpr<SpecialPurposeReg::AR>() / sizeof(uint32_t));
+        PipeBarrier<PIPE_V>();
+        // The following victim phase reuses the merged-pair UB allocation.
         UnionSync<HardEvent::V_S>(HardEvent::V_S);
-        return ScalarDeduplicate(keys, total, output);
+        return count;
     }
 
     __aicore__ inline uint32_t HashVictimScanSeed(
@@ -506,7 +468,7 @@ private:
     }
 
     __aicore__ inline void PrepareTopkMissPrefixes(
-        uint32_t batch, uint32_t queryStart, uint32_t routeCount,
+        uint32_t batch, uint32_t routeCount,
         const uint32_t lengths[UNION_ROUTES],
         uint32_t unionCount, LocalTensor<int32_t> unionSources,
         LocalTensor<int32_t> unionDestinations,
@@ -514,10 +476,7 @@ private:
     {
         LocalTensor<int32_t> routePairs = pairInputBuf_.Get<int32_t>();
         // pairInputBuf_ has 16384 int32 words. One 4096-word interleaved
-        // route-pair row, four 2048-word destination prefixes and one
-        // 2048-word reordered public source prefix remain disjoint.
-        LocalTensor<int32_t> publicSources =
-            routePairs[UNION_PAIR_WORDS + UNION_ROUTES * UNION_TOPK];
+        // route-pair row and four 2048-word destination prefixes are disjoint.
         const uint64_t requestPairBase =
             static_cast<uint64_t>(batch) * UNION_CAPACITY * 2U;
         for (uint32_t route = 0U; route < routeCount; ++route) {
@@ -534,19 +493,14 @@ private:
                 {false, 0, 0, 0});
             UnionSync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
 
-            const uint64_t publicRow =
-                (static_cast<uint64_t>(queryStart) + route) *
-                vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY;
             LocalTensor<int32_t> rowDestinations =
                 allDestinations[route * UNION_TOPK];
             uint32_t unionCursor = 0U;
             for (uint32_t miss = 0U; miss < length; ++miss) {
                 // BuildSortedMissPairs emits source IDs in ascending order,
-                // matching the deduplicated union order.  Re-publish that
-                // same order into the caller-owned source prefix so source
-                // and repaired destination stay elementwise paired.
+                // matching the deduplicated union and the public source
+                // prefix already published once by Stage 1.
                 const int32_t source = routePairs.GetValue(miss * 2U + 1U);
-                publicSources.SetValue(miss, source);
                 while (unionCursor < unionCount &&
                        unionSources.GetValue(unionCursor) < source) {
                     ++unionCursor;
@@ -558,18 +512,11 @@ private:
                         : -1;
                 rowDestinations.SetValue(miss, destination);
             }
-            UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-            DataCopyPad(
-                sparseAndTailSrcIdsGm_[publicRow], publicSources,
-                {1, static_cast<uint16_t>(
-                        length * static_cast<uint32_t>(sizeof(int32_t))),
-                 0, 0});
-            UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
         }
     }
 
     __aicore__ inline void PublishFinalOutputs(
-        uint32_t batch, uint32_t queryStart, uint32_t queryEnd,
+        uint32_t batch, uint32_t queryStart,
         uint32_t routeCount,
         const uint32_t lengths[UNION_ROUTES],
         uint32_t count, LocalTensor<int32_t> countLocal,
@@ -577,19 +524,49 @@ private:
         LocalTensor<int32_t> unionDestinations,
         LocalTensor<int32_t> topkMissDestinations)
     {
+        constexpr uint32_t TAIL = VllmA5LiManageC8FastUnionVF::TAIL_CAPACITY;
+        static_assert(TAIL + UNION_TOPK ==
+            vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY,
+            "tail rows must match the public attention capacity");
+        static_assert(2U * UNION_ROUTES * TAIL <= UNION_PAIR_WORDS,
+            "tail scratch must not overlap live miss destinations");
+        // PrepareTopkMissPrefixes has finished reading route pairs. Reuse
+        // only [0,4096); miss destinations in [4096,12288) stay live for DMA.
+        LocalTensor<int32_t> tailSlots = pairInputBuf_.Get<int32_t>();
+        LocalTensor<int32_t> tailSources = tailSlots[UNION_ROUTES * TAIL];
+        const uint32_t poolRow = static_cast<uint32_t>(
+            reqPoolEntriesGm_.GetValue(batch));
+        const uint32_t budget = ReadBudget(batch, poolRow);
+        const uint32_t finalLen = static_cast<uint32_t>(
+            finalSeqLengthsKvGm_.GetValue(batch));
+        const uint32_t candidate = static_cast<uint32_t>(
+            candidateLensGm_.GetValue(batch));
+        VllmA5LiManageC8FastUnionVF::BuildCausalTailRows(
+            (__ubuf__ uint32_t *)tailSlots.GetPhyAddr(),
+            (__ubuf__ uint32_t *)tailSources.GetPhyAddr(),
+            candidate, budget, finalLen, routeCount);
+
+        // Independent 32-byte scalar rows: no DMA source is overwritten
+        // until the single completion wait at the end of this request.
+        LocalTensor<int32_t> unionCountLocal = countLocal[8U];
+        LocalTensor<int32_t> residentLocal = countLocal[16U];
         for (uint32_t route = 0U; route < routeCount; ++route) {
             countLocal.SetValue(route, static_cast<int32_t>(lengths[route]));
         }
-        PipeBarrier<PIPE_V>();
+        unionCountLocal.SetValue(0U, static_cast<int32_t>(count));
+        residentLocal.SetValue(0U, static_cast<int32_t>(budget + TAIL));
         UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+        UnionSync<HardEvent::V_MTE3>(HardEvent::V_MTE3);
         DataCopyPad(
             perQueryMissCountsGm_[queryStart], countLocal,
             {1, static_cast<uint16_t>(
                     routeCount * sizeof(int32_t)), 0, 0});
-        UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
-
-        countLocal.SetValue(0U, static_cast<int32_t>(count));
-        UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+        DataCopyPad(
+            unionCountsGm_[batch], unionCountLocal,
+            {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});
+        DataCopyPad(
+            residentSeqLengthsGm_[batch], residentLocal,
+            {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});
         if (count != 0U) {
             const uint64_t unionOffset =
                 static_cast<uint64_t>(batch) * outputCapacity_;
@@ -601,81 +578,25 @@ private:
             DataCopyPad(
                 unionDestinationsGm_[unionOffset], unionDestinations,
                 {1, unionBytes, 0, 0});
-            for (uint32_t route = 0U; route < routeCount; ++route) {
-                if (lengths[route] == 0U) {
-                    continue;
-                }
-                const uint64_t rowOffset =
-                    (static_cast<uint64_t>(queryStart) + route) *
-                    vllm_a5_li_manage_c8_fast_workspace::
-                        ATTENTION_CAPACITY;
+        }
+        for (uint32_t route = 0U; route < routeCount; ++route) {
+            const uint64_t publicRow =
+                (static_cast<uint64_t>(queryStart) + route) *
+                vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY;
+            if (count != 0U && lengths[route] != 0U) {
                 DataCopyPad(
-                    topkSlotsGm_[rowOffset],
+                    topkSlotsGm_[publicRow],
                     topkMissDestinations[route * UNION_TOPK],
-                    {1, static_cast<uint16_t>(
-                            lengths[route] * sizeof(int32_t)),
+                    {1, static_cast<uint16_t>(lengths[route] * sizeof(int32_t)),
                      0, 0});
             }
-        }
-        DataCopyPad(
-            unionCountsGm_[batch], countLocal,
-            {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});
-        UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
-
-        // Stage 1 already published each 2048-slot sparse prefix directly to
-        // the caller-owned [T,2304] output, and the loop above repaired only
-        // its miss prefix. Publish the two-block causal-tail suffix in place;
-        // this removes the old full-row GM -> UB -> GM round trip.
-        LocalTensor<int32_t> tailSlots = pairInputBuf_.Get<int32_t>();
-        LocalTensor<int32_t> tailSources =
-            tailSlots[vllm_a5_li_manage_c8_fast_workspace::
-                ATTENTION_CAPACITY - UNION_TOPK];
-        const uint32_t poolRow = static_cast<uint32_t>(
-            reqPoolEntriesGm_.GetValue(batch));
-        const uint32_t budget = ReadBudget(batch, poolRow);
-        const uint32_t finalLen = static_cast<uint32_t>(
-            finalSeqLengthsKvGm_.GetValue(batch));
-        const uint32_t candidate = static_cast<uint32_t>(
-            candidateLensGm_.GetValue(batch));
-        for (uint32_t route = 0U; route < routeCount; ++route) {
-            Duplicate(tailSlots, static_cast<int32_t>(-1),
-                      vllm_a5_li_manage_c8_fast_workspace::
-                          ATTENTION_CAPACITY - UNION_TOPK);
-            Duplicate(tailSources, static_cast<int32_t>(-1),
-                      vllm_a5_li_manage_c8_fast_workspace::
-                          ATTENTION_CAPACITY - UNION_TOPK);
-            UnionSync<HardEvent::V_S>(HardEvent::V_S);
-            const uint32_t queryRow = queryStart + route;
-            const uint32_t later = queryEnd - 1U - queryRow;
-            const uint32_t visible = finalLen - later;
-            const uint32_t tailCount = visible - candidate;
-            for (uint32_t index = 0U; index < tailCount; ++index) {
-                const uint32_t token = candidate + index;
-                tailSlots.SetValue(
-                    index,
-                    static_cast<int32_t>(budget + token % 256U));
-                tailSources.SetValue(index, static_cast<int32_t>(token));
-            }
-            UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-            const uint64_t publicRow =
-                static_cast<uint64_t>(queryRow) *
-                vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY;
             DataCopy(
-                sparseAndTailSlotsGm_[publicRow + UNION_TOPK], tailSlots,
-                vllm_a5_li_manage_c8_fast_workspace::
-                    ATTENTION_CAPACITY - UNION_TOPK);
+                sparseAndTailSlotsGm_[publicRow + UNION_TOPK],
+                tailSlots[route * TAIL], TAIL);
             DataCopy(
-                sparseAndTailSrcIdsGm_[publicRow + UNION_TOPK], tailSources,
-                vllm_a5_li_manage_c8_fast_workspace::
-                    ATTENTION_CAPACITY - UNION_TOPK);
-            UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+                sparseAndTailSrcIdsGm_[publicRow + UNION_TOPK],
+                tailSources[route * TAIL], TAIL);
         }
-        countLocal.SetValue(
-            0U, static_cast<int32_t>(budget + 2U * 128U));
-        UnionSync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-        DataCopyPad(
-            residentSeqLengthsGm_[batch], countLocal,
-            {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});
         UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
     }
 
@@ -846,8 +767,7 @@ private:
     }
 
     __aicore__ inline void ProcessSparse(
-        uint32_t batch, uint32_t queryStart, uint32_t queryEnd,
-        uint32_t routeCount)
+        uint32_t batch, uint32_t queryStart, uint32_t routeCount)
     {
         uint32_t candidate = 0U;
         uint32_t finalLen = 0U;
@@ -899,7 +819,7 @@ private:
         }
         if (total == 0U) {
             PublishFinalOutputs(
-                batch, queryStart, queryEnd, routeCount, lengths,
+                batch, queryStart, routeCount, lengths,
                 0U, countLocal, sources, sources, sources);
             return;
         }
@@ -925,8 +845,9 @@ private:
         MrgSort<float>(merged, inputs, params);
         PipeBarrier<PIPE_V>();
 
-        const uint32_t count = Deduplicate(merged, pairs, total, sources);
-        if (count > budget || count > outputCapacity_) {
+        const uint32_t count = Deduplicate(merged, total, sources);
+        if (count == 0U || count > total ||
+            count > budget || count > outputCapacity_) {
             PublishError(batch, queryStart, routeCount);
             return;
         }
@@ -952,10 +873,10 @@ private:
         LocalTensor<int32_t> topkMissDestinations =
             topkScratch[UNION_PAIR_WORDS];
         PrepareTopkMissPrefixes(
-            batch, queryStart, routeCount, lengths, updated,
+            batch, routeCount, lengths, updated,
             sources, destinations, topkMissDestinations);
         PublishFinalOutputs(
-            batch, queryStart, queryEnd, routeCount, lengths, updated,
+            batch, queryStart, routeCount, lengths, updated,
             countLocal, sources, destinations, topkMissDestinations);
     }
 
@@ -989,7 +910,7 @@ private:
         } else if (mode == UNION_ROW_MODE_DENSE) {
             PublishDense(batch, queryStart, queryEnd);
         } else if (mode == UNION_ROW_MODE_SPARSE) {
-            ProcessSparse(batch, queryStart, queryEnd, routeCount);
+            ProcessSparse(batch, queryStart, routeCount);
         } else {
             PublishError(batch, queryStart, routeCount);
         }

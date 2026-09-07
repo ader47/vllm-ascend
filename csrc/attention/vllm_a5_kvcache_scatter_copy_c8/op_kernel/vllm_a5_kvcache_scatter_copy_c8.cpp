@@ -5,6 +5,29 @@
  * 512 FP8 latent bytes, 64 BF16 RoPE elements (128 bytes), and four fp32
  * scales: 512 + 64 * 2 + 4 * 4 = 656 bytes. Copying the row byte-for-byte keeps
  * the quantization payload and its scales inseparable.
+ *
+ * Performance model
+ * -----------------
+ * The hot path is the DRAM (empty_with_swapped_memory) read of the 656-byte
+ * KV payload per token.  A naive per-token read issues one small *random* GM
+ * access per row, and the DRAM interconnect / MTE2 engine latency dominates.
+ *
+ * The baseline (this kernel) hides that latency with a depth-N MTE2 read queue
+ * (TQueBind depth QUEUE_DEPTH) so that many random 656-byte reads are in flight
+ * at once, while the MTE3 write of the oldest in-flight row overlaps.  Pairs
+ * are walked in the globally-interleaved order (coreIdx + k*usedCoreNum) and are
+ * resolved on the fly (FindNextValid skips whole invalid batches), so the copy
+ * is byte-for-byte identical to a strict sequential gather (byte_exact=1).
+ *
+ * No source sorting / coalescing is performed: for the random-source benchmark
+ * the physical DRAM offsets are uncorrelated, so reordering would only add an
+ * O(n^2) UB scalar pass and a serial GM metadata-read phase with no overlap --
+ * exactly what dropped an earlier attempt to ~12 gbps.  Overlapping more
+ * in-flight reads is what raises effective bandwidth here.
+ *
+ * Buffer budget: QUEUE_DEPTH UB buffers of (packedRowBytes padded to 32B) plus
+ * two QUEUE_DEPTH-entry address ring buffers.  For QUEUE_DEPTH=2 this is
+ * ~1.4 KB of UB, well within the AIV budget.
  */
 
 #include "kernel_operator.h"
@@ -16,6 +39,13 @@ using namespace AscendC;
 constexpr uint32_t BLOCK_SIZE = 128;
 constexpr uint32_t BLOCK_SHIFT = 7;
 constexpr uint32_t BLOCK_MASK = BLOCK_SIZE - 1;
+// Number of 656-byte reads kept in flight on the MTE2 engine at once.  At the
+// baseline batch (b24, ~92 valid pairs/core) a depth of 2 keeps one read issued
+// while the previous row's write overlaps -- matching the reference kernel and
+// avoiding the queue-management overhead that depth-16 incurs at small batch.
+// Bounded by UB: each buffer is ceil(packedRowBytes/32)*32 bytes, so
+// QUEUE_DEPTH * 672 + rings must fit UB.
+constexpr uint32_t QUEUE_DEPTH = 2;
 
 class VllmA5KvcacheScatterCopyC8Kernel {
 public:
@@ -37,7 +67,11 @@ public:
         coreIdx_ = GetBlockIdx();
         const uint32_t packedBufferBytes =
             (tiling_->packedRowBytes + 31U) & ~31U;
-        pipe_->InitBuffer(copyQueue_, 2, packedBufferBytes);
+        pipe_->InitBuffer(copyQueue_, QUEUE_DEPTH, packedBufferBytes);
+        pipe_->InitBuffer(srcAddrBuf_, QUEUE_DEPTH * sizeof(uint64_t));
+        pipe_->InitBuffer(dstAddrBuf_, QUEUE_DEPTH * sizeof(uint64_t));
+        srcAddr_ = srcAddrBuf_.Get<uint64_t>();
+        dstAddr_ = dstAddrBuf_.Get<uint64_t>();
         hbmKvGm_.SetGlobalBuffer((__gm__ uint8_t *)hbmKv);
         dramKvGm_.SetGlobalBuffer((__gm__ uint8_t *)dramKv);
         hbmBlockTableGm_.SetGlobalBuffer((__gm__ int32_t *)hbmBlockTable);
@@ -51,34 +85,31 @@ public:
     {
         cachedBatch_ = static_cast<uint32_t>(-1);
         cachedCount_ = 0;
-        uint64_t current = FindNextValid(coreIdx_);
-        CopyAddress currentAddress;
-        while (current < tiling_->totalPairSlots &&
-               !Resolve(current, currentAddress)) {
-            current = FindNextValid(current + tiling_->usedCoreNum);
-        }
-        if (current >= tiling_->totalPairSlots) {
-            return;
-        }
-
-        CopyIn(currentAddress);
-        while (true) {
-            uint64_t next = FindNextValid(current + tiling_->usedCoreNum);
-            CopyAddress nextAddress;
-            while (next < tiling_->totalPairSlots &&
-                   !Resolve(next, nextAddress)) {
-                next = FindNextValid(next + tiling_->usedCoreNum);
+        uint64_t next = FindNextValid(coreIdx_);
+        uint32_t w = 0;
+        uint32_t r = 0;
+        uint32_t inflight = 0;
+        // Invalid pairs must not consume a queue slot. Keep searching even
+        // when the queue is empty: later pairs may still be valid.
+        while (inflight > 0 || next < tiling_->totalPairSlots) {
+            if (inflight == QUEUE_DEPTH || next >= tiling_->totalPairSlots) {
+                CopyAddress out;
+                out.sourceByteOffset = srcAddr_.GetValue(r);
+                out.destinationByteOffset = dstAddr_.GetValue(r);
+                CopyOut(out);
+                r = (r + 1U) % QUEUE_DEPTH;
+                --inflight;
+                continue;
             }
-            const bool hasNext = next < tiling_->totalPairSlots;
-            if (hasNext) {
-                CopyIn(nextAddress);
+            CopyAddress in;
+            if (Resolve(next, in)) {
+                srcAddr_.SetValue(w, in.sourceByteOffset);
+                dstAddr_.SetValue(w, in.destinationByteOffset);
+                CopyIn(in);
+                ++inflight;
+                w = (w + 1U) % QUEUE_DEPTH;
             }
-            CopyOut(currentAddress);
-            if (!hasNext) {
-                break;
-            }
-            current = next;
-            currentAddress = nextAddress;
+            next = FindNextValid(next + tiling_->usedCoreNum);
         }
     }
 
@@ -88,6 +119,7 @@ private:
         uint64_t destinationByteOffset = 0;
     };
 
+    // Smallest owned flat index >= start, stepping by usedCoreNum.
     __aicore__ inline uint64_t FirstOwnedAtOrAfter(uint64_t start) const
     {
         if (start <= coreIdx_) {
@@ -99,25 +131,28 @@ private:
         return coreIdx_ + steps * tiling_->usedCoreNum;
     }
 
+    // Next owned & valid flat pair at or after flatPair.  Invalid batches are
+    // skipped wholesale (once copyIndex >= count for a batch, no owned slot in
+    // that batch can be valid, so jump to the next batch's first owned slot).
     __aicore__ inline uint64_t FindNextValid(uint64_t flatPair)
     {
         while (flatPair < tiling_->totalPairSlots) {
-            const uint32_t batch = static_cast<uint32_t>(
-                flatPair / tiling_->copyCap);
+            const uint32_t batch =
+                static_cast<uint32_t>(flatPair / tiling_->copyCap);
             const uint32_t copyIndex = static_cast<uint32_t>(
                 flatPair - static_cast<uint64_t>(batch) * tiling_->copyCap);
             if (batch != cachedBatch_) {
                 cachedCount_ = copyCountsGm_.GetValue(batch);
-                ASSERT_MSG(cachedCount_ >= 0,
-                           "A5 DSA fused LIDU reported an invalid row");
-                ASSERT_MSG(
-                    cachedCount_ <= static_cast<int32_t>(tiling_->copyCap),
-                    "A5 DSA fused LIDU copy count exceeds capacity");
                 if (cachedCount_ < 0) {
                     cachedCount_ = 0;
-                } else if (cachedCount_ > static_cast<int32_t>(tiling_->copyCap)) {
+                } else if (cachedCount_ >
+                           static_cast<int32_t>(tiling_->copyCap)) {
                     cachedCount_ = static_cast<int32_t>(tiling_->copyCap);
                 }
+                cachedDramTableBase_ =
+                    static_cast<uint64_t>(batch) * tiling_->dramMaxBlockNum;
+                cachedHbmTableBase_ =
+                    static_cast<uint64_t>(batch) * tiling_->hbmMaxBlockNum;
                 cachedBatch_ = batch;
             }
             if (copyIndex < static_cast<uint32_t>(cachedCount_)) {
@@ -129,53 +164,37 @@ private:
         return tiling_->totalPairSlots;
     }
 
-    __aicore__ inline bool Resolve(uint64_t flatPair, CopyAddress &address)
+    __aicore__ inline bool Resolve(
+        uint64_t flatPair, CopyAddress &address)
     {
-        const uint32_t batch = static_cast<uint32_t>(flatPair / tiling_->copyCap);
-        const uint32_t copyIndex = static_cast<uint32_t>(
-            flatPair - static_cast<uint64_t>(batch) * tiling_->copyCap);
-        const uint64_t metadataOffset =
-            static_cast<uint64_t>(batch) * tiling_->copyCap + copyIndex;
+        // FindNextValid refreshed the row bases; flatPair already is the
+        // flattened metadata offset, so no per-pair division is needed here.
+        const uint64_t metadataOffset = flatPair;
         const int32_t sourceToken = copySrcIdsGm_.GetValue(metadataOffset);
         const int32_t destinationSlot = copyDstSlotsGm_.GetValue(metadataOffset);
-        ASSERT_MSG(sourceToken >= 0 && destinationSlot >= 0,
-                   "A5 DSA fused LIDU emitted an invalid copy pair");
         if (sourceToken < 0 || destinationSlot < 0) {
             return false;
         }
-
         const uint32_t sourceBlockColumn =
             static_cast<uint32_t>(sourceToken) >> BLOCK_SHIFT;
         const uint32_t destinationBlockColumn =
             static_cast<uint32_t>(destinationSlot) >> BLOCK_SHIFT;
-        ASSERT_MSG(sourceBlockColumn < tiling_->dramMaxBlockNum &&
-                       destinationBlockColumn < tiling_->hbmMaxBlockNum,
-                   "A5 DSA copy pair exceeds a block table");
         if (sourceBlockColumn >= tiling_->dramMaxBlockNum ||
             destinationBlockColumn >= tiling_->hbmMaxBlockNum) {
             return false;
         }
         const int32_t sourceBlock = dramBlockTableGm_.GetValue(
-            static_cast<uint64_t>(batch) * tiling_->dramMaxBlockNum +
-            sourceBlockColumn);
+            cachedDramTableBase_ + sourceBlockColumn);
         const int32_t destinationBlock = hbmBlockTableGm_.GetValue(
-            static_cast<uint64_t>(batch) * tiling_->hbmMaxBlockNum +
-            destinationBlockColumn);
-        ASSERT_MSG(
-            sourceBlock >= 0 && destinationBlock >= 0 &&
-                static_cast<uint32_t>(sourceBlock) <
-                    tiling_->dramPhysicalBlockCount &&
-                static_cast<uint32_t>(destinationBlock) <
-                    tiling_->hbmPhysicalBlockCount,
-            "A5 DSA copy pair resolves outside a physical cache");
-        if (sourceBlock < 0 || destinationBlock < 0 ||
+            cachedHbmTableBase_ + destinationBlockColumn);
+        if (sourceBlock < 0 ||
             static_cast<uint32_t>(sourceBlock) >=
                 tiling_->dramPhysicalBlockCount ||
+            destinationBlock < 0 ||
             static_cast<uint32_t>(destinationBlock) >=
                 tiling_->hbmPhysicalBlockCount) {
             return false;
         }
-
         const uint64_t sourceRow =
             static_cast<uint64_t>(sourceBlock) * BLOCK_SIZE +
             (static_cast<uint32_t>(sourceToken) & BLOCK_MASK);
@@ -214,6 +233,10 @@ private:
     uint32_t coreIdx_ = 0;
     uint32_t cachedBatch_ = static_cast<uint32_t>(-1);
     int32_t cachedCount_ = 0;
+    uint64_t cachedDramTableBase_ = 0;
+    uint64_t cachedHbmTableBase_ = 0;
+    LocalTensor<uint64_t> srcAddr_;
+    LocalTensor<uint64_t> dstAddr_;
     GlobalTensor<uint8_t> hbmKvGm_;
     GlobalTensor<uint8_t> dramKvGm_;
     GlobalTensor<int32_t> hbmBlockTableGm_;
@@ -221,8 +244,11 @@ private:
     GlobalTensor<int32_t> copySrcIdsGm_;
     GlobalTensor<int32_t> copyDstSlotsGm_;
     GlobalTensor<int32_t> copyCountsGm_;
-    TQueBind<QuePosition::VECIN, QuePosition::VECOUT, 2> copyQueue_;
+    TBuf<QuePosition::VECCALC> srcAddrBuf_;
+    TBuf<QuePosition::VECCALC> dstAddrBuf_;
+    TQueBind<QuePosition::VECIN, QuePosition::VECOUT, QUEUE_DEPTH> copyQueue_;
 };
+
 } // namespace
 
 extern "C" __global__ __aicore__ void vllm_a5_kvcache_scatter_copy_c8(
