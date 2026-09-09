@@ -86,19 +86,28 @@ def set_cos_and_sin(vllm_config, max_num_reqs, decode_token_per_req, dtype, devi
         _sin = torch.zeros(1, max_num_batched_tokens, 1, rope_dim, dtype=dtype, device=device)
 
 
-def get_cos_and_sin_mla(positions, use_cache=False):
+def get_cos_and_sin_mla(positions, use_cache=False, *, out=None):
     global _cos_cache
     global _sin_cache
-    cos = _cos_cache[positions].unsqueeze(1).unsqueeze(2)
-    sin = _sin_cache[positions].unsqueeze(1).unsqueeze(2)
-    if not use_cache:
-        return cos, sin
     global _cos_mla
     global _sin_mla
     num_tokens = positions.size(0)
-    _cos_mla[:num_tokens, ...] = cos
-    _sin_mla[:num_tokens, ...] = sin
-    return _cos_mla[:num_tokens, ...], _sin_mla[:num_tokens, ...]
+    if out is None and use_cache:
+        out = (_cos_mla[:num_tokens], _sin_mla[:num_tokens])
+    if out is None:
+        cos = torch.index_select(_cos_cache, 0, positions).unsqueeze(1).unsqueeze(2)
+        sin = torch.index_select(_sin_cache, 0, positions).unsqueeze(1).unsqueeze(2)
+        return cos, sin
+    # Gather straight into graph-stable storage instead of advanced indexing
+    # followed by a copy. Shapes are fixed for each captured token count.
+    cos, sin = out
+    for cache, output in ((_cos_cache, cos), (_sin_cache, sin)):
+        if output.dtype == cache.dtype and output.is_contiguous():
+            torch.index_select(cache, 0, positions, out=output.view(num_tokens, cache.shape[-1]))
+        else:
+            # Preserve the old copy/cast semantics for other MLA consumers.
+            output.copy_(torch.index_select(cache, 0, positions).unsqueeze(1).unsqueeze(2))
+    return cos, sin
 
 
 def _record_cos_sin_cache(cos_sin_cache):

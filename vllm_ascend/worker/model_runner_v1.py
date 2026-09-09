@@ -2322,8 +2322,17 @@ class NPUModelRunner(GPUModelRunner):
                     if self.use_aux_hidden_state_outputs:
                         target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
                 else:
+                    if (
+                        getattr(self.drafter, "use_glm_mtp_graph", False)
+                        and not self.vllm_config.speculative_config.disable_padded_drafter_batch
+                    ):
+                        # prepare_inputs_padded returns arange(total_tokens):
+                        # no compaction/reordering, so these gathers are views.
+                        token_indices = slice(0, common_attn_metadata.num_actual_tokens)
+                        target_positions = self._get_positions(common_attn_metadata.num_actual_tokens)
+                    else:
+                        target_positions = self._get_positions(token_indices)
                     target_token_ids = self.input_ids.gpu[token_indices]
-                    target_positions = self._get_positions(token_indices)
                     if self.use_aux_hidden_state_outputs:
                         target_hidden_states = torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)
                     else:

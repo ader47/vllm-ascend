@@ -52,7 +52,16 @@ from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
-from vllm_ascend.utils import check_gdn_layer, enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
+from vllm_ascend.spec_decode.glm_mtp_graph import GLMMTPGraphBuffers
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    check_gdn_layer,
+    enable_sp,
+    flashcomm2_enable,
+    get_ascend_device_type,
+    lmhead_tp_enable,
+    shared_expert_dp_enabled,
+)
 from vllm_ascend.worker.utils import copy_snapshot_to_gpu
 
 
@@ -149,6 +158,7 @@ def _is_glm_model(model_config) -> bool:
 
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
+    use_glm_mtp_graph = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
@@ -215,23 +225,54 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.use_cuda_graph = self.runner._use_aclgraph() and not self.speculative_config.enforce_eager
         self._raise_if_padded_drafter_batch_disabled_and_full_graph_enabled()
 
-        # GLM series models: speculative decoding does not yet support running
-        # the draft model in graph mode. Force the draft model to always use
-        # eager mode. This is equivalent to the user adding
-        # `"enforce_eager": true` to the `--speculative-config`, and keeps
-        # the target model's graph-mode setting untouched.
-        # TODO(lilinsiman): Remove this code segment after future versions of the GLM
-        # series models support graph input for speculative inference.
-        if _is_glm_model(self.vllm_config.model_config):
+        # Opt in via speculative_config.enforce_eager=False. Keep other GLM
+        # configurations eager. TP/DP sizes are topology-independent here:
+        # replicated hidden states, fixed graph shapes and DP mode consensus
+        # are required, rather than a whitelist of parallel sizes.
+        self.use_glm_mtp_graph = (
+            self.use_cuda_graph
+            and getattr(vllm_config.model_config.hf_text_config, "model_type", None) == "glm_moe_dsa"
+            and self.method == "mtp"
+            and self.num_speculative_tokens == 3
+            and get_ascend_device_type() == AscendDeviceType.A5
+            and self.runner.dsa_offload_enabled
+            and vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+            and self.speculative_config.draft_tensor_parallel_size == vllm_config.parallel_config.tensor_parallel_size
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+            and self.pcp_size == self.dcp_size == 1
+            and not self.parallel_drafting
+            and not self.use_async_scheduling
+            # runner.dynamic_eplb is assigned after drafter construction.
+            and not self.runner.ascend_config.eplb_config.dynamic_eplb
+            and not self.runner.enable_enpu
+            and not enable_sp(vllm_config)
+            # Includes SP enabled by compiler passes. Keep both MTP hidden
+            # outputs replicated: logits use pre-norm, recycling uses post-norm.
+            and not self.enable_shared_expert_dp
+            and not flashcomm2_enable()
+            and not lmhead_tp_enable()
+        )
+        self._glm_mtp_graph = (
+            GLMMTPGraphBuffers(self, AscendCommonAttentionMetadata, AscendAttentionState.SpecDecoding)
+            if self.use_glm_mtp_graph
+            else None
+        )
+        if _is_glm_model(self.vllm_config.model_config) and not self.use_glm_mtp_graph:
             if self.use_cuda_graph:
                 logger.warning(
-                    "GLM series models with speculative decoding currently do "
-                    "not support graph mode. The draft model has been "
-                    "automatically switched to eager mode "
-                    "(enforce_eager=true). Graph mode support for GLM "
-                    "speculative decoding will be added in a future release. "
+                    "This GLM speculative configuration is outside the supported "
+                    "A5 DSA MTP3 FULL_DECODE_ONLY graph path (any valid TP/DP, "
+                    "matching draft TP, no SP/shared-expert-DP/FlashComm2/lm-head TP); "
+                    "keeping the drafter eager."
                 )
             self.use_cuda_graph = False
+        if self.use_glm_mtp_graph:
+            logger.info(
+                "[GLM MTP graph] Enabled separate 3-step draft graph: target_tp=%d draft_tp=%d dp=%d",
+                vllm_config.parallel_config.tensor_parallel_size,
+                self.speculative_config.draft_tensor_parallel_size,
+                vllm_config.parallel_config.data_parallel_size,
+            )
 
         # TODO: Remove it when the bug of fx-graph is solved
         self.maybe_eager_context: AbstractContextManager[Any] = nullcontext()
@@ -301,6 +342,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         from vllm.compilation.backends import set_model_tag
 
         draft_vllm_config = self._create_draft_vllm_config()
+        if self.use_glm_mtp_graph:
+            # Validate the target DSA graph contract before opting the draft
+            # model out of Dynamo. Never change the target config around
+            # _create_draft_vllm_config(): its validating replace() would see
+            # NONE and reject the target's row-mode graph settings.
+            draft_vllm_config = copy.copy(draft_vllm_config)
+            draft_vllm_config.compilation_config = copy.copy(draft_vllm_config.compilation_config)
+            draft_vllm_config.compilation_config.mode = CompilationMode.NONE
+            # Shallow copies retain the shared attention/MoE registries so
+            # the runner still discovers the raw, separately captured MTP.
         draft_load_config = self.speculative_config.draft_load_config
         logger.info(
             "[spec_decode/base] Loading draft model: method=%s, load_format=%s, model=%s",
@@ -542,6 +593,66 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 decode_metadata.sas_metadata = decode_metadata.sas_metadata.clone()
         return attn_metadata
 
+    def _sync_glm_mtp_graph(self, num_tokens, *, eligible):
+        mode = CUDAGraphMode.NONE
+        descriptor = None
+        if eligible and num_tokens % self.decode_threshold == 0:
+            mode, descriptor = self.runner.cudagraph_dispatcher.dispatch(
+                num_tokens=num_tokens, uniform_decode=True, has_lora=False
+            )
+            if mode == CUDAGraphMode.FULL:
+                num_tokens = descriptor.num_tokens
+        # Reuse the existing draft DP collective, including on idle ranks.
+        # Any rank requiring eager must force *all* ranks to eager.
+        num_tokens, across_dp, mode = self.runner._sync_metadata_across_dp(
+            num_tokens, is_draft_model=True, cudagraph_mode=mode
+        )
+        if mode == CUDAGraphMode.FULL:
+            mode, descriptor = self.runner.cudagraph_dispatcher.dispatch(
+                num_tokens=num_tokens, uniform_decode=True, has_lora=False
+            )
+            assert mode == CUDAGraphMode.FULL and descriptor.num_tokens == num_tokens
+        else:
+            mode, descriptor = CUDAGraphMode.NONE, None
+        return num_tokens, across_dp, mode, descriptor
+
+    def _run_glm_mtp_graph(self, common, num_tokens, batch_size, indices, across_dp, descriptor):
+        assert self._glm_mtp_graph is not None
+        assert len(self.draft_attn_groups) == 1
+        metadata = self._glm_mtp_graph.prepare(common, num_tokens, batch_size, indices)
+        graph_batch_size = num_tokens // self.decode_threshold
+        entry = self._runnable.concrete_aclgraph_entries.get(descriptor)
+        replay = entry is not None and entry.aclgraph is not None
+        with set_ascend_forward_context(
+            metadata[0],
+            self.vllm_config,
+            num_tokens=num_tokens,
+            num_actual_tokens=batch_size * self.decode_threshold,
+            num_tokens_across_dp=across_dp,
+            batch_descriptor=descriptor,
+            aclgraph_runtime_mode=CUDAGraphMode.FULL,
+            is_draft_model=True,
+            draft_attn_metadatas=metadata,
+        ):
+            get_forward_context().moe_layer_index = 0
+            output = self._runnable(
+                num_input_tokens=num_tokens,
+                batch_size=graph_batch_size,
+                token_indices_to_sample=self.token_indices_to_sample[:graph_batch_size],
+                target_positions=self.positions[:num_tokens],
+                inputs_embeds=None,
+                multi_steps_attn_metadata=metadata,
+                num_tokens=num_tokens,
+                is_prefill=False,
+            )
+        if replay:
+            logger.info_once("[GLM MTP graph] Replaying separate merged 3-step draft graph (with device preprocessing)")
+        else:
+            logger.info(
+                "[GLM MTP graph] Captured 3-step draft graph: tokens=%d, padded_reqs=%d", num_tokens, graph_batch_size
+            )
+        return output[:batch_size]
+
     @torch.inference_mode()
     def dummy_run(
         self,
@@ -555,11 +666,22 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         dummy_compute_logits=lambda hidden_states: None,
         is_profile=False,
     ):
-        (
-            num_tokens,
-            num_tokens_across_dp,
-            _,
-        ) = self.runner._sync_metadata_across_dp(num_tokens, is_draft_model=True)
+        if self.use_glm_mtp_graph:
+            num_tokens, num_tokens_across_dp, aclgraph_runtime_mode, batch_descriptor = self._sync_glm_mtp_graph(
+                num_tokens,
+                eligible=aclgraph_runtime_mode == CUDAGraphMode.FULL and not with_prefill and not is_profile,
+            )
+            if aclgraph_runtime_mode == CUDAGraphMode.FULL:
+                # Capture and runtime-idle use exactly the same metadata layout
+                # as a busy rank; all idle KV writes remain masked with -1.
+                self._run_glm_mtp_graph(None, num_tokens, 0, None, num_tokens_across_dp, batch_descriptor)
+                return
+        else:
+            (
+                num_tokens,
+                num_tokens_across_dp,
+                _,
+            ) = self.runner._sync_metadata_across_dp(num_tokens, is_draft_model=True)
         pcp_manager = getattr(self.runner, "pcp_manager", None)
 
         multi_steps_attn_metadata = []
@@ -790,7 +912,27 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         has_lora = len(self.runner.input_batch.lora_id_to_lora_request) > 0
         uniform_decode = target_model_batch_desc.uniform
 
-        if self.use_cuda_graph:
+        if self.use_glm_mtp_graph:
+            num_input_tokens, num_tokens_across_dp, aclgraph_runtime_mode, batch_descriptor = self._sync_glm_mtp_graph(
+                num_tokens,
+                eligible=(
+                    uniform_decode
+                    and not has_lora
+                    and num_prefill_reqs == 0
+                    and num_tokens == batch_size * self.decode_threshold
+                    and common_attn_metadata.max_query_len == self.decode_threshold
+                ),
+            )
+            if aclgraph_runtime_mode == CUDAGraphMode.FULL:
+                return self._run_glm_mtp_graph(
+                    common_attn_metadata,
+                    num_input_tokens,
+                    batch_size,
+                    token_indices_to_sample,
+                    num_tokens_across_dp,
+                    batch_descriptor,
+                )
+        elif self.use_cuda_graph:
             _, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens, uniform_decode=uniform_decode, has_lora=has_lora
             )
@@ -798,20 +940,21 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             num_input_tokens = num_tokens
 
-        (
-            num_input_tokens,
-            num_tokens_across_dp,
-            _,
-        ) = self.runner._sync_metadata_across_dp(num_input_tokens, is_draft_model=True)
+        if not self.use_glm_mtp_graph:
+            (
+                num_input_tokens,
+                num_tokens_across_dp,
+                _,
+            ) = self.runner._sync_metadata_across_dp(num_input_tokens, is_draft_model=True)
 
-        if self.use_cuda_graph:
-            aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
-                num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora
-            )
-            num_input_tokens = batch_descriptor.num_tokens
-        else:
-            aclgraph_runtime_mode = CUDAGraphMode.NONE
-            batch_descriptor = None
+            if self.use_cuda_graph:
+                aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
+                    num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora
+                )
+                num_input_tokens = batch_descriptor.num_tokens
+            else:
+                aclgraph_runtime_mode = CUDAGraphMode.NONE
+                batch_descriptor = None
 
         if aclgraph_runtime_mode == CUDAGraphMode.FULL:
             # TODO: Due to the inconsistency between the proposer `dispatcher` and model runner, this padding
@@ -1067,6 +1210,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
         # `model_hidden_states` represent the speculative model inputs.
+        if self.use_glm_mtp_graph and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            # Captured together with all three draft forwards. The real batch
+            # is encoded in staged seq_lens, never a capture-time Python count.
+            self._glm_mtp_graph.preprocess(num_input_tokens, multi_steps_attn_metadata)
         model_input_ids = self.input_ids[:num_input_tokens]
         model_positions = self._get_positions(num_input_tokens)
 
@@ -1217,6 +1364,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         forward_context = get_forward_context()
         _EXTRA_CTX.num_tokens = input_batch_size
         _EXTRA_CTX.num_accept_tokens = batch_size
+
+        if self.use_glm_mtp_graph and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            # Step 0 uses four verification tokens/request; later steps have
+            # one active token/request. Derive the mask on device so replay
+            # also handles shrinking/idle DP batches without frozen CPU counts.
+            mc2_mask = getattr(forward_context, "mc2_mask", None)
+            if mc2_mask is not None:
+                # Communication pads to a TP multiple (e.g. TP8, BS1:
+                # 4 graph tokens but 8 mask entries). The tail stays inactive.
+                next_step_mask = multi_steps_attn_metadata[1][self.attn_layer_names[0]].seq_lens > 0
+                mc2_mask[:num_input_tokens].copy_(next_step_mask)
+                if mc2_mask.numel() > num_input_tokens:
+                    mc2_mask[num_input_tokens:].fill_(False)
 
         for draft_index in range(self.num_speculative_tokens - 1):
             # Reset MOE layer index for each draft step iteration

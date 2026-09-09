@@ -23,7 +23,8 @@
 ``disabled`` 用于验证基线隔离，``cache-init`` 只验证双平面 KV cache
 初始化，``eager`` 和 ``graph`` 分别验证 DSA eager 与 FULL decode graph。
 DP>1 时每台机器的父进程只创建本机离线前端进程，并通过 ``VLLM_DP_*``
-建立全局 SPMD 协调；MTP drafter 保持 eager，target model 使用 FULL decode graph。
+建立全局 SPMD 协调；graph 模式下 target 一张图，三轮 MTP 合成独立一张图。
+``ENABLE_MTP_GRAPH=False`` 可回退到 target graph + drafter eager 做精度/性能对照。
 默认短 prompt 主要覆盖 DENSE；验证真正的 sparse/ENTER 路径时，应换成
 token 长度超过 ``DSA_SPARSE_ACTIVATION_TOKENS`` 的文本。
 """
@@ -74,6 +75,8 @@ QUANTIZATION = "ascend"
 ENABLE_EXPERT_PARALLEL = True
 ENABLE_MTP = False
 MTP_NUM_SPECULATIVE_TOKENS = 3
+# 仅在 RUN_MODE="graph" 且 ENABLE_MTP=True 时生效；支持 A5 DSA TP1 或 TP8DP1。
+ENABLE_MTP_GRAPH = True
 
 # A5/950 上的 DSA 首版只支持 LI C8 与 SFA C8 同时开启；A3/910C 保持 False。
 # disabled 模式也会保留这个 vLLM-Ascend 原生物理布局开关，便于用同一 C8
@@ -306,8 +309,9 @@ def build_llm_kwargs(dp_rank: int, multi_node: bool) -> dict[str, Any]:
         kwargs["speculative_config"] = {
             "method": "mtp",
             "num_speculative_tokens": MTP_NUM_SPECULATIVE_TOKENS,
+            "draft_tensor_parallel_size": TENSOR_PARALLEL_SIZE,
             # 只约束 drafter；target 仍由顶层配置进入 FULL decode graph。
-            "enforce_eager": True,
+            "enforce_eager": not (graph_enabled and ENABLE_MTP_GRAPH),
         }
     if graph_enabled:
         decode_query_len = (
@@ -325,6 +329,16 @@ def build_llm_kwargs(dp_rank: int, multi_node: bool) -> dict[str, Any]:
             "cudagraph_mode": "FULL_DECODE_ONLY",
             "cudagraph_capture_sizes": capture_sizes,
         }
+        if ENABLE_MTP:
+            # Keep identical collective/hidden layouts for MTP graph and its
+            # eager control, independently of the chosen TP/DP topology.
+            additional_config.update(
+                enable_flashcomm1=False,
+                enable_shared_expert_dp=False,
+                enable_flashcomm2_parallel_size=0,
+                enable_reduce_sample=False,
+            )
+            kwargs["compilation_config"]["pass_config"] = {"enable_sp": False}
     if ENABLE_PROFILE:
         from vllm.config import ProfilerConfig
 
@@ -445,7 +459,8 @@ def run_dp_rank(
             f"mode={RUN_MODE} model={MODEL_PATH!r} prompts={len(local_prompts)} "
             f"tp={TENSOR_PARALLEL_SIZE} ep={TENSOR_PARALLEL_SIZE * DATA_PARALLEL_SIZE} "
             f"max_model_len={MAX_MODEL_LEN} max_num_seqs={MAX_NUM_SEQS} "
-            f"a5_packed_c8={ENABLE_A5_PACKED_C8_DSA} mtp={ENABLE_MTP}"
+            f"a5_packed_c8={ENABLE_A5_PACKED_C8_DSA} mtp={ENABLE_MTP} "
+            f"mtp_graph_requested={RUN_MODE == 'graph' and ENABLE_MTP and ENABLE_MTP_GRAPH}"
         )
         llm = LLM(**kwargs)
 
