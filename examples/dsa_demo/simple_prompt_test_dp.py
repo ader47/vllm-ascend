@@ -26,26 +26,26 @@ from typing import Any
 
 from novel_dataset import chinese_20k
 
-PROMPTS = chinese_20k * 16
+PROMPTS = [(chinese_20k[0]*3)[:92800],] * (4 * 16)
 
 # =========================
 # 用户配置
 # =========================
 
-MODEL_PATH = "/home/models/GLM-5.2-w4a4c8-mxfp4"
+MODEL_PATH = "/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4"
 RUN_MODE = "graph"  # disabled / cache-init / eager / graph
 
 # 单机总 NPU 数 = TP * DP。8 卡上用 TP4DP2；TP8DP2 需要 16 卡。
-TENSOR_PARALLEL_SIZE = 8
-DATA_PARALLEL_SIZE = 1
+TENSOR_PARALLEL_SIZE = 2
+DATA_PARALLEL_SIZE = 4
 DP_PROCESS_TIMEOUT_SECONDS = 3600
 # max_num_seqs 按 DP rank 计算；16 条 prompt 在 DP2 下每个 rank 处理 8 条。
-MAX_NUM_SEQS = 8
-MAX_MODEL_LEN = 24576
+MAX_NUM_SEQS = 20
+MAX_MODEL_LEN = 131072
 MAX_NUM_BATCHED_TOKENS = 4096
 ENABLE_CHUNKED_PREFILL = True
-MAX_TOKENS = 512
-GPU_MEMORY_UTILIZATION = 0.82
+MAX_TOKENS = 256
+GPU_MEMORY_UTILIZATION = 0.94
 QUANTIZATION = "ascend"
 ENABLE_EXPERT_PARALLEL = True
 ENABLE_MTP = True
@@ -57,14 +57,14 @@ MTP_NUM_SPECULATIVE_TOKENS = 3
 ENABLE_A5_PACKED_C8_DSA = True
 
 ENABLE_PROFILE = True
-PROFILE_DIR = "/home/w00916487/vllm_profile/tp8_offload_seq20k_bs16/"
+PROFILE_DIR = "/home/w00916487/vllm_profile/dp4tp2_offload_seq64k_bs64/"
 RESULT_JSON: str | None = None
 
 DSA_PROMPT_BUDGET_THRESHOLDS = [32768, 65536]
-DSA_INDEXER_MLA_BLOCK_RATIO = 3
+DSA_INDEXER_MLA_BLOCK_RATIO = 4
 DSA_MAX_ACTIVE_REQS = 256
 DSA_HOT_CPU_BLOCK_MULTIPLE = 1.0
-DSA_GRAPH_CAPTURE_SIZES = [1, 2, 4, 8]
+DSA_GRAPH_CAPTURE_SIZES = [1, 2, 4, 8, 16]
 DSA_TRACE_POINTS = {
     # 当前仅解析预留合同，尚无稳定日志 consumer；验收默认关闭。
     "enabled": False,
@@ -74,7 +74,7 @@ DSA_TRACE_POINTS = {
 
 NATIVE_RUNTIME_ENV_OVERRIDES = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "HCCL_BUFFSIZE": "200",
+    "HCCL_BUFFSIZE": "512",
     "OMP_NUM_THREADS": "10",
     "OMP_PROC_BIND": "false",
     "PYTHONHASHSEED": "114514",
@@ -96,12 +96,12 @@ def get_open_port() -> int:
 
 def build_dsa_config(enable_graph: bool) -> dict[str, Any]:
     sparse_activation_tokens = (
-        10240 if ENABLE_MTP else 6144
+        12288 if ENABLE_MTP else 12288
     )
     resident_budget_tokens = (
-        [10240, 10240, 10240]
+        [12288, 12288, 12288]
         if ENABLE_MTP
-        else [10240, 10240, 10240]
+        else [12288, 12288, 12288]
     )
     return {
         "enabled": True,

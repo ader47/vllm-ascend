@@ -236,8 +236,8 @@ def build_dsa_config(enable_graph: bool) -> dict[str, Any]:
         else [10240, 10240, 10240]
     )
     return {
-        "enabled": True,
-        "split_indexer_cache": True,
+        "enabled": False,
+        "split_indexer_cache": False,
         "indexer_mla_block_ratio": DSA_INDEXER_MLA_BLOCK_RATIO,
         "sparse_activation_tokens": sparse_activation_tokens,
         "prompt_budget_thresholds": DSA_PROMPT_BUDGET_THRESHOLDS,
@@ -297,12 +297,12 @@ def build_llm_kwargs(dp_rank: int, multi_node: bool) -> dict[str, Any]:
                 "enable_sparse_li_c8": ENABLE_A5_PACKED_C8_DSA,
             }
         )
-    if RUN_MODE != "disabled":
-        additional_config.update(
-            {
-                "dsa_sparse_config": build_dsa_config(graph_enabled),
-            }
-        )
+    # if RUN_MODE != "disabled":
+    #     additional_config.update(
+    #         {
+    #             "dsa_sparse_config": build_dsa_config(graph_enabled),
+    #         }
+    #     )
     if additional_config:
         kwargs["additional_config"] = additional_config
     if ENABLE_MTP:
@@ -313,7 +313,7 @@ def build_llm_kwargs(dp_rank: int, multi_node: bool) -> dict[str, Any]:
             # 只约束 drafter；target 仍由顶层配置进入 FULL decode graph。
             "enforce_eager": not (graph_enabled and ENABLE_MTP_GRAPH),
         }
-    if graph_enabled:
+    if graph_enabled or RUN_MODE == "disabled":
         decode_query_len = (
             1 + MTP_NUM_SPECULATIVE_TOKENS if ENABLE_MTP else 1
         )
