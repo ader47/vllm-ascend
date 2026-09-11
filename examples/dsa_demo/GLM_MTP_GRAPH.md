@@ -32,6 +32,12 @@ ENABLE_PROFILE = False
 `ENABLE_MTP_GRAPH=False` 即得到 **target graph + drafter eager** 对照组。
 `RUN_MODE="eager"` 时两者仍为 eager；仅打开 `ENABLE_MTP_GRAPH` 不会打开 MTP。
 
+基线与 offload 对照统一保留 MTP 的 BF16 全量 MLA/Indexer cache：即使不传
+`dsa_sparse_config`，MTP 层也会关闭 SFA C8 和 LI C8，target 层仍遵循原来的
+C8 开关。这样避免 BF16 MTP 投影将 packed FP8 cache 传给非量化 MLA Prolog。
+此策略与 MTP graph 开关独立；同步 `vllm_ascend/attention/sfa_v1.py` 和
+`vllm_ascend/worker/model_runner_v1.py` 后重启进程即可生效，无需重新编译算子。
+
 限定 Ascend A5、`glm_moe_dsa`、DSA offload、MTP3，不再按 TP/DP 数值设置白名单。
 target/draft TP 必须相同；拓扑仍需满足模型、显存和通信后端本身的约束。
 允许配置不代表所有拓扑均已通过真机验证，特别是混合 TP+DP 的 MC2/EP 路径。

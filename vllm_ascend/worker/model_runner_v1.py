@@ -6208,15 +6208,12 @@ class NPUModelRunner(GPUModelRunner):
                     enable_sparse_li_c8_for_layer = bool(getattr(impl, "enable_sparse_li_c8", False))
 
                     layer_index = extract_layer_index(layer_name)
-                    is_mtp_full_cache_layer = (
-                        self.dsa_offload_enabled
-                        and self.ascend_config.dsa_offload_config.is_mtp_cache_layer_index(
+                    is_mtp_full_cache_layer = impl.is_mtp_full_cache_layer
+                    if self.dsa_offload_enabled and is_mtp_full_cache_layer != (
+                        self.ascend_config.dsa_offload_config.is_mtp_cache_layer_index(
                             layer_index,
                             target_resident_layer_count,
                         )
-                    )
-                    if is_mtp_full_cache_layer != bool(
-                        impl.is_dsa_mtp_full_cache_layer
                     ):
                         raise RuntimeError(
                             "DSA MTP cache-layer classification drifted "
@@ -6312,7 +6309,7 @@ class NPUModelRunner(GPUModelRunner):
                     elif is_mtp_full_cache_layer:
                         if not has_indexer:
                             raise RuntimeError(
-                                "DSA MTP full-cache layer must keep its local "
+                                "MTP full-cache layer must keep its local "
                                 f"baseline Indexer: layer={layer_name}"
                             )
                         sparse_head_dim = (

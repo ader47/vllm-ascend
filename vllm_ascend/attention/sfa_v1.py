@@ -11,6 +11,7 @@ from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backend import (
     AttentionBackend,  # type: ignore
@@ -686,20 +687,17 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.local_num_heads = self.num_heads
         self.layer_name = kwargs.get("layer_name")
         self.dsa_offload_context: DSALayerOffloadContext | None = None
-        dsa_config = ascend_config.dsa_offload_config
-        self.is_dsa_mtp_full_cache_layer = False
-        if dsa_config.mtp_enabled and self.layer_name is not None:
-            from vllm.model_executor.models.utils import extract_layer_index
-
-            target_layer_count = self.vllm_config.model_config.get_num_layers(
-                self.vllm_config.parallel_config
-            )
-            self.is_dsa_mtp_full_cache_layer = (
-                dsa_config.is_mtp_cache_layer_index(
-                    extract_layer_index(self.layer_name),
-                    target_layer_count,
-                )
-            )
+        # MTP's BF16 projections cannot write the packed C8 cache through
+        # MLA Prolog. Keep its native full cache in both baseline and offload
+        # runs; physical MTP layers are appended after the target layers.
+        speculative_config = self.vllm_config.speculative_config
+        self.is_mtp_full_cache_layer = False
+        if speculative_config is not None and speculative_config.method == "mtp" and self.layer_name is not None:
+            target_layer_count = self.vllm_config.model_config.get_total_num_hidden_layers()
+            draft_hf_config = speculative_config.draft_model_config.hf_config
+            mtp_layer_count = int(getattr(draft_hf_config, "num_nextn_predict_layers", 0) or 0)
+            layer_index = extract_layer_index(self.layer_name)
+            self.is_mtp_full_cache_layer = target_layer_count <= layer_index < target_layer_count + mtp_layer_count
         hf_config = self.vllm_config.model_config.hf_config
         hf_text_config = getattr(self.vllm_config.model_config, "hf_text_config", None)
         config_candidates = (hf_config, hf_text_config)
@@ -745,14 +743,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         # - C8 indexer cache for lightning indexer.
         # The user-facing switches control these layouts independently, and
         # layers without an indexer only apply the SFA setting.
-        self.enable_sparse_sfa_c8 = (
-            ascend_config.enable_sparse_sfa_c8
-            and not self.is_dsa_mtp_full_cache_layer
-        )
+        self.enable_sparse_sfa_c8 = ascend_config.enable_sparse_sfa_c8 and not self.is_mtp_full_cache_layer
         self.enable_sparse_li_c8 = (
             self.has_indexer
             and ascend_config.is_sparse_li_c8_layer(self.layer_name)
-            and not self.is_dsa_mtp_full_cache_layer
+            and not self.is_mtp_full_cache_layer
         )
         if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
             if get_ascend_device_type() == AscendDeviceType.A5:
@@ -1711,10 +1706,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             if indexer_block_table is None:
                 raise RuntimeError("DSA attention metadata is missing the Indexer block table")
 
-            if attn_metadata.attn_state in (
-                AscendAttentionState.DecodeOnly,
-                AscendAttentionState.SpecDecoding,
-            ) and attn_metadata.dsa_decode_forward:
+            if (
+                attn_metadata.attn_state
+                in (
+                    AscendAttentionState.DecodeOnly,
+                    AscendAttentionState.SpecDecoding,
+                )
+                and attn_metadata.dsa_decode_forward
+            ):
                 row_modes = attn_metadata.dsa_row_modes
                 resident_pool_indices = attn_metadata.dsa_resident_pool_indices
                 dram_block_table = attn_metadata.dsa_dram_block_table
@@ -1937,9 +1936,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         dsa_context = self.dsa_offload_context
         if dsa_context is not None:
             if kv_cache is None:
-                raise RuntimeError(
-                    "DSA full-block dump requires a resident cache"
-                )
+                raise RuntimeError("DSA full-block dump requires a resident cache")
             # MTP provisional rows may reuse the same parity tail that still
             # contains a newly confirmed block. The confirmed block must be
             # persisted before any KV write in this layer. Non-MTP/prefill
@@ -2287,10 +2284,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             # （仅对本层 arena 跑 KSC）；其余（prefill/mixed/非 DSA）仍走
             # 原生 buffer 路径，读 full 层刚 stash 的 token 级 top-K。
             dsa_context = self.dsa_offload_context
-            if dsa_context is not None and attn_metadata.attn_state in (
-                AscendAttentionState.DecodeOnly,
-                AscendAttentionState.SpecDecoding,
-            ) and attn_metadata.dsa_decode_forward:
+            if (
+                dsa_context is not None
+                and attn_metadata.attn_state
+                in (
+                    AscendAttentionState.DecodeOnly,
+                    AscendAttentionState.SpecDecoding,
+                )
+                and attn_metadata.dsa_decode_forward
+            ):
                 if kv_cache is None:
                     raise RuntimeError(f"DSA shared-indexer decode requires a resident cache: layer={self.layer_name}")
                 if dsa_context.packed_c8 and len(kv_cache) != 1:
