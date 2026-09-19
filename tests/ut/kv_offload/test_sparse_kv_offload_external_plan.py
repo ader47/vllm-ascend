@@ -19,6 +19,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT,
     FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT,
     SparseKVOffloadManager,
+    _nano_finalized_block_slots,
 )
 
 
@@ -354,6 +355,288 @@ def test_capture_without_fused_overlap_stays_on_current_stream():
     current_stream.wait_stream.assert_not_called()
     manager.current_kv_save_stream.wait_event.assert_not_called()
     manager.fused_plan_stream.wait_event.assert_not_called()
+
+
+def test_nano_d2h_flushes_only_completed_full_blocks():
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.token_size_bytes_k = 8
+    manager.token_size_bytes_v = 4
+    manager.topk_buffers_k = [torch.zeros((512, 2), dtype=torch.float32)]
+    manager.topk_buffers_v = [torch.zeros((512, 1), dtype=torch.float32)]
+    manager.k_caches_cpu = [torch.zeros((512, 2), dtype=torch.float32)]
+    manager.v_caches_cpu = [torch.zeros((512, 1), dtype=torch.float32)]
+    manager.nano_d2h_src_ptrs_npu = torch.empty(4, dtype=torch.int64)
+    manager.nano_d2h_dst_ptrs_npu = torch.empty(4, dtype=torch.int64)
+    manager.nano_d2h_lengths_npu = torch.empty(4, dtype=torch.int32)
+    manager.nano_d2h_size_npu = torch.empty(1, dtype=torch.int32)
+    sparse_copy = MagicMock(return_value=0)
+
+    with patch.object(
+        manager_module,
+        "offload",
+        SimpleNamespace(sparse_copy=sparse_copy),
+        create=True,
+    ):
+        manager._offload_nano_full_blocks_on_current_stream(
+            layer_id=0,
+            source_slots=torch.tensor([128, 256], dtype=torch.int64),
+            destination_slots=torch.tensor([256, 384], dtype=torch.int64),
+            active=torch.tensor([True, False]),
+        )
+
+    k_npu = manager.topk_buffers_k[0]
+    v_npu = manager.topk_buffers_v[0]
+    k_cpu = manager.k_caches_cpu[0]
+    v_cpu = manager.v_caches_cpu[0]
+    assert manager.nano_d2h_src_ptrs_npu[:2].tolist() == [
+        k_npu.data_ptr() + 128 * manager.token_size_bytes_k,
+        k_npu.data_ptr() + 256 * manager.token_size_bytes_k,
+    ]
+    assert manager.nano_d2h_src_ptrs_npu[2:4].tolist() == [
+        v_npu.data_ptr() + 128 * manager.token_size_bytes_v,
+        v_npu.data_ptr() + 256 * manager.token_size_bytes_v,
+    ]
+    assert manager.nano_d2h_dst_ptrs_npu[:2].tolist() == [
+        k_cpu.data_ptr() + 256 * manager.token_size_bytes_k,
+        k_cpu.data_ptr() + 384 * manager.token_size_bytes_k,
+    ]
+    assert manager.nano_d2h_dst_ptrs_npu[2:4].tolist() == [
+        v_cpu.data_ptr() + 256 * manager.token_size_bytes_v,
+        v_cpu.data_ptr() + 384 * manager.token_size_bytes_v,
+    ]
+    assert manager.nano_d2h_lengths_npu[:4].tolist() == [1024, 0, 512, 0]
+    assert manager.nano_d2h_size_npu.item() == 4
+    sparse_copy.assert_called_once()
+
+
+def test_nano_finalize_uses_accepted_mtp_rows_at_block_boundary():
+    source_slots, destination_slots, active, committed_lens = _nano_finalized_block_slots(
+        seq_lens=torch.full((5,), 136, dtype=torch.int32),
+        query_ends=torch.tensor([16, 32, 48, 64, 80], dtype=torch.int32),
+        rejected_rows=torch.tensor([16, 11, 8, 6, 0], dtype=torch.int32),
+        pools=torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32),
+        active=torch.ones(5, dtype=torch.bool),
+        block_table=torch.tensor([[10], [11], [12], [13], [14]], dtype=torch.int32),
+        stride_blocks=34,
+        hot_tokens=4096,
+    )
+
+    assert committed_lens.tolist() == [120, 125, 128, 130, 136]
+    assert active.tolist() == [False, False, True, True, True]
+    assert source_slots[2:].tolist() == [12800, 17152, 21504]
+    assert destination_slots[2:].tolist() == [1536, 1664, 1792]
+
+
+def test_nano_finalize_does_not_advance_on_invalid_rejection_count():
+    _, _, active, committed_lens = _nano_finalized_block_slots(
+        seq_lens=torch.tensor([136], dtype=torch.int32),
+        query_ends=torch.tensor([16], dtype=torch.int32),
+        rejected_rows=torch.tensor([17], dtype=torch.int32),
+        pools=torch.tensor([0], dtype=torch.int32),
+        active=torch.tensor([True]),
+        block_table=torch.tensor([[10]], dtype=torch.int32),
+        stride_blocks=34,
+        hot_tokens=4096,
+    )
+
+    assert committed_lens.tolist() == [120]
+    assert active.tolist() == [False]
+
+
+def test_nano_finalize_truncates_residency_but_does_not_invent_mtp_writes():
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.use_nano = True
+    manager.max_num_reqs = 2
+    manager.nano_plan_capacity = 2
+    manager.topk_buffer_size = 4096
+    manager.nano_rejected_rows_npu = torch.zeros(2, dtype=torch.int32)
+    manager.nano_confirmed_generations = torch.full((2,), -1, dtype=torch.int64)
+    manager.nano_confirmed_src_slots = torch.zeros(2, dtype=torch.int64)
+    manager.nano_confirmed_dst_slots = torch.zeros(2, dtype=torch.int64)
+    manager.nano_confirmed_active = torch.zeros(2, dtype=torch.bool)
+    generations = torch.full((4,), -1, dtype=torch.int64)
+    resident_lens = torch.zeros(4, dtype=torch.int32)
+    generations[:2] = torch.tensor([7, 9])
+    resident_lens[:2] = 136
+    draft_generations = torch.tensor([7, -1, -1, -1], dtype=torch.int64)
+    draft_lens = torch.tensor([120, 0, 0, 0], dtype=torch.int32)
+    manager.nano_tail_states = {
+        "layer.0": (generations, resident_lens),
+        "draft": (draft_generations, draft_lens),
+    }
+    metadata = SimpleNamespace(
+        nano_enabled=True,
+        nano_seq_lens=torch.tensor([136, 136], dtype=torch.int32),
+        nano_query_ends=torch.tensor([16, 32], dtype=torch.int32),
+        nano_pool_entries=torch.tensor([0, 1], dtype=torch.int32),
+        nano_generations=torch.tensor([7, 9], dtype=torch.int64),
+        nano_active=torch.tensor([True, True]),
+        nano_source_block_table=torch.tensor([[10], [11]], dtype=torch.int32),
+        nano_flush_src_slots=torch.empty(2, dtype=torch.int64),
+        nano_flush_dst_slots=torch.empty(2, dtype=torch.int64),
+        nano_flush_active=torch.empty(2, dtype=torch.bool),
+    )
+
+    manager.finalize_nano_full_blocks(
+        metadata,
+        torch.tensor([11, 8], dtype=torch.int32),
+    )
+
+    assert resident_lens[:2].tolist() == [125, 128]
+    assert generations[:2].tolist() == [7, 9]
+    assert draft_generations[:2].tolist() == [7, -1]
+    assert draft_lens[:2].tolist() == [120, 0]
+    assert manager.nano_confirmed_generations.tolist() == [7, 9]
+    assert manager.nano_confirmed_active.tolist() == [False, True]
+    assert manager.nano_confirmed_src_slots.tolist() == [4224, 8448]
+    assert manager.nano_confirmed_dst_slots.tolist() == [1280, 1408]
+
+
+def test_nano_mtp_gathers_confirmed_plan_by_pool_and_generation():
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.max_num_reqs = 3
+    manager.nano_plan_capacity = 3
+    manager.nano_confirmed_generations = torch.tensor([10, 20, 30], dtype=torch.int64)
+    manager.nano_confirmed_src_slots = torch.tensor([100, 200, 300], dtype=torch.int64)
+    manager.nano_confirmed_dst_slots = torch.tensor([1000, 2000, 3000], dtype=torch.int64)
+    manager.nano_confirmed_active = torch.tensor([True, False, True])
+
+    source, destination, active = manager.gather_nano_confirmed_plan(
+        pools=torch.tensor([2, 0, 1], dtype=torch.int32),
+        generations=torch.tensor([30, 10, 99], dtype=torch.int64),
+        active=torch.tensor([True, True, True]),
+    )
+
+    assert source.tolist() == [300, 100, 200]
+    assert destination.tolist() == [3000, 1000, 2000]
+    assert active.tolist() == [True, True, False]
+
+
+@pytest.mark.parametrize("max_real_reqs", [1, 2])
+def test_nano_confirmation_dummy_slot_cannot_alias_real_pool(max_real_reqs):
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.use_nano = True
+    manager.max_num_reqs = max_real_reqs
+    manager.nano_plan_capacity = 8
+    manager.topk_buffer_size = 4096
+    manager.nano_rejected_rows_npu = torch.zeros(2, dtype=torch.int32)
+    manager.nano_confirmed_generations = torch.full((8,), -1, dtype=torch.int64)
+    manager.nano_confirmed_src_slots = torch.zeros(8, dtype=torch.int64)
+    manager.nano_confirmed_dst_slots = torch.zeros(8, dtype=torch.int64)
+    manager.nano_confirmed_active = torch.zeros(8, dtype=torch.bool)
+    manager.nano_tail_states = {}
+    metadata = SimpleNamespace(
+        nano_enabled=True,
+        nano_seq_lens=torch.tensor([128, 1], dtype=torch.int32),
+        nano_query_ends=torch.tensor([1, 2], dtype=torch.int32),
+        nano_pool_entries=torch.tensor([max_real_reqs - 1, 4], dtype=torch.int32),
+        nano_generations=torch.tensor([7, -1], dtype=torch.int64),
+        nano_active=torch.tensor([True, False]),
+        nano_source_block_table=torch.tensor([[3], [-1]], dtype=torch.int32),
+        nano_flush_src_slots=torch.empty(2, dtype=torch.int64),
+        nano_flush_dst_slots=torch.empty(2, dtype=torch.int64),
+        nano_flush_active=torch.empty(2, dtype=torch.bool),
+    )
+
+    manager.finalize_nano_full_blocks(metadata, None)
+
+    assert manager.nano_confirmed_generations[max_real_reqs - 1].item() == 7
+    assert manager.nano_confirmed_active[max_real_reqs - 1].item()
+    assert manager.nano_confirmed_generations[4].item() == -1
+
+
+def test_nano_shared_plan_rejects_different_layer_tail_layouts():
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
+    manager.tp_rank = 0
+    manager.topk_buffers_k = [
+        torch.empty((2, 128, 1, 4), dtype=torch.bfloat16),
+        torch.empty((3, 128, 1, 4), dtype=torch.bfloat16),
+    ]
+    manager.topk_buffers_v = [
+        torch.empty((2, 128, 1, 2), dtype=torch.bfloat16),
+        torch.empty((3, 128, 1, 2), dtype=torch.bfloat16),
+    ]
+    manager.k_caches_cpu = [
+        torch.empty((4, 128, 1, 4), dtype=torch.bfloat16),
+        torch.empty((4, 128, 1, 4), dtype=torch.bfloat16),
+    ]
+    manager.v_caches_cpu = [
+        torch.empty((4, 128, 1, 2), dtype=torch.bfloat16),
+        torch.empty((4, 128, 1, 2), dtype=torch.bfloat16),
+    ]
+
+    with pytest.raises(ValueError, match="identical device tail layout"):
+        manager._validate_nano_shared_block_layout()
+
+
+def test_nano_d2h_runs_on_side_stream_without_a_per_layer_join():
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.use_nano = True
+    manager.tp_rank = 0
+    manager.max_num_reqs = 1
+    manager.num_layers = 2
+    manager._get_offload_layer_id = MagicMock(return_value=1)
+    manager.nano_d2h_stream = MagicMock()
+    manager.nano_d2h_inputs_ready = [MagicMock(), MagicMock()]
+    manager._offload_nano_full_blocks_on_current_stream = MagicMock()
+    compute_stream = MagicMock()
+    inputs_ready = manager.nano_d2h_inputs_ready[1]
+    source_slots = torch.tensor([128, 0, 0], dtype=torch.int64)
+    destination_slots = torch.tensor([256, 0, 0], dtype=torch.int64)
+    active = torch.tensor([True, False, False])
+
+    with (
+        patch.object(manager_module.torch_npu.npu, "current_stream", return_value=compute_stream),
+        patch.object(manager_module.torch_npu.npu, "stream", return_value=nullcontext()),
+    ):
+        manager.offload_nano_full_blocks("layer.1", source_slots, destination_slots, active)
+
+    manager.nano_d2h_stream.wait_event.assert_called_once_with(inputs_ready)
+    manager._offload_nano_full_blocks_on_current_stream.assert_called_once_with(
+        1,
+        source_slots,
+        destination_slots,
+        active,
+    )
+    inputs_ready.record.assert_called_once_with(compute_stream)
+    compute_stream.wait_event.assert_not_called()
+
+
+def test_nano_d2h_join_records_tail_before_wait_without_host_sync():
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.use_nano = True
+    manager.tp_rank = 0
+    manager.num_layers = 2
+    manager.nano_d2h_stream = MagicMock()
+    manager.nano_d2h_done = MagicMock()
+    compute_stream = MagicMock()
+    calls = []
+    manager.nano_d2h_stream.wait_stream.side_effect = lambda _: calls.append("fork")
+    manager.nano_d2h_done.record.side_effect = lambda _: calls.append("record")
+    compute_stream.wait_event.side_effect = lambda _: calls.append("wait")
+
+    with patch.object(manager_module.torch_npu.npu, "current_stream", return_value=compute_stream):
+        manager.join_nano_d2h()
+
+    assert calls == ["fork", "record", "wait"]
+    compute_stream.wait_event.assert_called_once_with(manager.nano_d2h_done)
+    manager.nano_d2h_done.synchronize.assert_not_called()
+
+
+def test_nano_iteration_orders_tp_consumers_after_d2h_join():
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.use_nano = True
+    manager.nano_completion_token = torch.zeros(1, dtype=torch.int32)
+    calls = []
+    manager.join_nano_d2h = lambda: calls.append("join")
+    group = SimpleNamespace(all_reduce=lambda _: calls.append("tp"))
+    with (
+        patch.object(manager_module, "get_tensor_model_parallel_world_size", return_value=2),
+        patch.object(manager_module, "get_tp_group", return_value=group),
+    ):
+        manager.wait_for_nano_host_copies()
+    assert calls == ["join", "tp"]
 
 
 def test_current_kv_injection_uses_planner_linear_slots_and_sentinel():

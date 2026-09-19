@@ -22,6 +22,9 @@ from vllm.platforms import current_platform
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+    get_sparse_kv_offload_manager,
+)
 
 from ..utils import weak_ref_tensors
 
@@ -210,6 +213,12 @@ class ACLGraphWrapper:
                         # forks copy_stream, but wait_prefetch only happens in
                         # the next forward pass.
                         get_offloader().join_after_forward()
+                        offload_config = get_ascend_config().sparse_kv_offload_config
+                        if offload_config.enabled and offload_config.use_nano:
+                            # Capture a closed fork/join in each Target/MTP
+                            # graph. Do not infer this boundary from layer ids;
+                            # merged MTP invokes the same layer multiple times.
+                            get_sparse_kv_offload_manager().join_nano_d2h()
                         if self.aclgraph_options.weak_ref_output:
                             # by converting it to weak ref,
                             # the original `output` will immediately be released

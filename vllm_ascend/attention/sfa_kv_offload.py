@@ -10,9 +10,11 @@ Data plane (see zsc-sfa-kv-offload-merge-plan.md):
   ``keep_device_kv_cache=True``): ``exec_kv`` writes the NPU paged main
   cache as usual, then the layer's cache rows are committed D2H
   (``cache_cpu[slot] = cache_npu[slot]``) through the manager;
-- decode: no NPU main K/V cache at all (indexer K cache only). The current
-  token's K/V is produced compute-only and committed D2H directly; top-k
-  misses are loaded H2D into the resident (topk) buffer and a single
+- decode: no NPU main K/V cache at all (indexer K cache only). Nano writes
+  current K/V directly into two request-local tail pages in the top-k buffer;
+  a scheduled full page is copied D2H on a side stream and becomes visible
+  only after rejection confirms it. The other page remains available to
+  compute. Top-k misses are loaded H2D into the resident buffer and a single
   resident SFA attention runs.
 - fused_overlap decode (optional via ``use_fused_overlap``): replace resident
   onload + SFA with ``npu_fused_sparse_attention_overlap``, reading full KV
@@ -56,6 +58,7 @@ from vllm_ascend.utils import enable_dsa_cp
 
 M = TypeVar("M", bound=AscendSFAMetadata)
 _FSA_SELECTION_STATUS_ALIGNMENT = 8
+_NANO_TAIL_BLOCK_SIZE = 128
 
 
 def prepare_copy_sfa_queries(query, query_rope):
@@ -105,6 +108,52 @@ def _check_device_kv_cache_exist() -> None:
             "keep_device_kv_cache=True; a PD-disaggregated decode node "
             "only accepts decode requests"
         )
+
+
+def _nano_candidate_block_slots(
+    seq_lens: torch.Tensor,
+    widths: torch.Tensor,
+    pools: torch.Tensor,
+    active: torch.Tensor,
+    block_table: torch.Tensor,
+    stride_blocks: int,
+    hot_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Describe a scheduled full tail page without publishing it."""
+    previous_lens = seq_lens - widths
+    completed_blocks = torch.div(
+        seq_lens,
+        _NANO_TAIL_BLOCK_SIZE,
+        rounding_mode="floor",
+    ) - torch.div(
+        previous_lens,
+        _NANO_TAIL_BLOCK_SIZE,
+        rounding_mode="floor",
+    )
+    logical_blocks = (
+        torch.div(
+            seq_lens,
+            _NANO_TAIL_BLOCK_SIZE,
+            rounding_mode="floor",
+        )
+        - 1
+    )
+    safe_logical_blocks = logical_blocks.clamp(0, block_table.shape[1] - 1).to(torch.int64)
+    physical_blocks = block_table.gather(1, safe_logical_blocks[:, None]).squeeze(1).to(torch.int64)
+    flush_active = (
+        active
+        & (completed_blocks == 1)
+        & (logical_blocks >= 0)
+        & (logical_blocks < block_table.shape[1])
+        & (physical_blocks >= 0)
+    )
+    source_slots = (
+        pools.to(torch.int64) * stride_blocks * _NANO_TAIL_BLOCK_SIZE
+        + hot_tokens
+        + logical_blocks.to(torch.int64).remainder(2) * _NANO_TAIL_BLOCK_SIZE
+    )
+    destination_slots = physical_blocks.clamp_min(0) * _NANO_TAIL_BLOCK_SIZE
+    return source_slots, destination_slots, flush_active
 
 
 class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
@@ -178,6 +227,9 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         self.nano_tail_src = torch.empty((steps, requests, 2), dtype=torch.int64, device=device)
         self.nano_tail_dst = torch.empty_like(self.nano_tail_src)
         self.nano_tail_lengths = torch.empty((steps, requests, 2), dtype=torch.int32, device=device)
+        self.nano_flush_src_slots = torch.empty((steps, requests), dtype=torch.int64, device=device)
+        self.nano_flush_dst_slots = torch.empty_like(self.nano_flush_src_slots)
+        self.nano_flush_active = torch.empty((steps, requests), dtype=torch.bool, device=device)
         hf_config = vllm_config.model_config.hf_text_config
         self.nano_token_bytes = torch.tensor(
             [hf_config.kv_lora_rank * 2, hf_config.qk_rope_head_dim * 2], dtype=torch.int64, device=device
@@ -214,6 +266,11 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             and (num_prefills == 0 or common_attn_metadata.offload_dummy)
             and 1 <= common_attn_metadata.max_query_len <= 7
         )
+        if self.use_nano and not metadata.nano_enabled and not common_attn_metadata.offload_dummy:
+            raise ValueError(
+                "nano requires decode metadata with 1–7 query rows per request; "
+                "falling back would discard unoffloaded partial tails"
+            )
         if metadata.nano_enabled:
             # Include graph padding in the operator batch. These addresses
             # remain fixed from capture through replay; only device contents
@@ -233,7 +290,18 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             # S=0 would skip LI and could leave selections from an earlier
             # active replay in these shared output rows.
             seq_lens = torch.where(active, common_attn_metadata.seq_lens[:count], widths)
+            if draft_index > 0:
+                # Padded step 0 retains rejected rows in its shape. Later
+                # steps start at the selected accepted row, not that shape's
+                # optimistic end. Use the same positions as RoPE/slot_mapping.
+                positions = common_attn_metadata.positions[:count]
+                active = active & (common_attn_metadata.slot_mapping[:count] >= 0)
+                seq_lens = torch.where(active, positions.to(torch.int32) + 1, widths)
             prefix = torch.div((seq_lens - widths).clamp_min(0), 128, rounding_mode="floor") * 128
+            if draft_index > 0:
+                # Newly full draft pages stay in HBM throughout this proposal.
+                # Advancing the boundary here would load uncommitted Host KV.
+                prefix = torch.where(active, self.nano_vectors["prefix_lens"][0, :count], 0)
             cache = torch.where(active, prefix.clamp_max(self.nano_hot_tokens), 2048)
             safe_pools = torch.where(active, pools[:count], self.nano_rows[:count] + self.nano_pool_capacity)
             logical = torch.where(active, cache + seq_lens - prefix, cache)
@@ -322,6 +390,44 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             self.nano_token_active[draft_index, :tokens].copy_(token_active)
             metadata.nano_device_slots = self.nano_device_slots[draft_index, :tokens]
             metadata.nano_token_active = self.nano_token_active[draft_index, :tokens]
+
+            # Start a candidate full-page transfer as soon as a scheduled span
+            # can cross the boundary. Target copies remain private until
+            # rejection sampling confirms the committed length. Draft/MTP
+            # metadata is built after rejection, so its mask is already final.
+            if getattr(common_attn_metadata, "nano_draft", False):
+                (
+                    flush_src_slots,
+                    flush_dst_slots,
+                    flush_active,
+                ) = get_sparse_kv_offload_manager().gather_nano_confirmed_plan(
+                    safe_pools,
+                    generations[:count],
+                    active,
+                )
+                if draft_index > 0:
+                    # Step 0 processes the accepted target rows. Later MTP
+                    # steps only append provisional draft rows beyond the
+                    # committed boundary and must not recopy the same block.
+                    flush_active = torch.zeros_like(flush_active)
+            else:
+                flush_src_slots, flush_dst_slots, flush_active = _nano_candidate_block_slots(
+                    seq_lens,
+                    widths,
+                    safe_pools,
+                    active,
+                    metadata.nano_source_block_table,
+                    self.nano_stride_blocks,
+                    self.nano_hot_tokens,
+                )
+            self.nano_flush_src_slots[draft_index, :count].copy_(flush_src_slots)
+            self.nano_flush_dst_slots[draft_index, :count].copy_(flush_dst_slots)
+            self.nano_flush_active[draft_index, :count].copy_(flush_active)
+            metadata.nano_flush_src_slots = self.nano_flush_src_slots[draft_index, :count]
+            metadata.nano_flush_dst_slots = self.nano_flush_dst_slots[draft_index, :count]
+            metadata.nano_flush_active = self.nano_flush_active[draft_index, :count]
+            # Target and MTP step 0 may copy; step 1+ only appends resident KV.
+            metadata.nano_draft_step = draft_index
             metadata.num_prefills = 0
             metadata.num_decodes = count
             # Query boundaries already have an exact CPU mirror. Only
@@ -402,6 +508,15 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         offload_cfg = get_ascend_config().sparse_kv_offload_config
         self.use_fused_overlap = offload_cfg.use_fused_overlap
         self.use_nano = offload_cfg.use_nano
+        # Without MTP's last-hit-block drop, the scheduler can register a
+        # newly full decode block during allocation and share it within this
+        # very batch. Such Host consumers must wait at the layer, not only at
+        # iteration end. Keep this conservative path without patching scheduler.
+        self.nano_requires_host_visibility = (
+            self.use_nano
+            and self.vllm_config.speculative_config is None
+            and self.vllm_config.cache_config.enable_prefix_caching
+        )
         self.nano_indexer_owner = self
         self._nano_metadata = None
         if self.use_nano:
@@ -431,7 +546,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 self.nano_miss_src = torch.empty((requests, 32768), dtype=torch.int32, device=device)
                 self.nano_miss_dst = torch.empty_like(self.nano_miss_src)
                 self.nano_misses = torch.zeros(requests, dtype=torch.int32, device=device)
-                self.nano_reuse_cache_tokens = torch.empty(requests, dtype=torch.int32, device=device)
+                self.nano_dense_slots = torch.arange(offload_cfg.topk, dtype=torch.int32, device=device)
                 self.nano_reuse_topk_misses = torch.zeros(output_tokens, dtype=torch.int32, device=device)
                 self.nano_reuse_misses = torch.zeros(requests, dtype=torch.int32, device=device)
                 self.nano_reuse_request_count = 0
@@ -441,6 +556,11 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             # per-step source/destination geometry is supplied by metadata.
             self.nano_copy_src = torch.empty(requests * 4, dtype=torch.int64, device=device)
             self.nano_copy_dst = torch.empty_like(self.nano_copy_src)
+            self.nano_copy_lengths = torch.empty(requests * 4, dtype=torch.int32, device=device)
+            self.nano_tail_generation = torch.full((requests * 2,), -1, dtype=torch.int64, device=device)
+            self.nano_tail_seq_len = torch.zeros(requests * 2, dtype=torch.int32, device=device)
+            self.nano_tail_start = torch.zeros_like(self.nano_tail_seq_len)
+            self.nano_restore_active = torch.empty(requests, dtype=torch.bool, device=device)
             self.nano_host_bases = None
             self.nano_device_bases = None
         self.lru_resident_capacity = offload_cfg.topk_buffer_size
@@ -565,6 +685,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             # whose source-to-slot maps otherwise still look valid.
             self.nano_reuse_request_count = 0
             self.nano_last_generation.fill_(-1)
+            self.nano_tail_generation.fill_(-1)
         try:
             return super().forward(layer_name, hidden_states, kv_cache, attn_metadata, output)
         finally:
@@ -643,12 +764,33 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             self.nano_miss_dst[:count],
             self.nano_misses[:count],
         )
-        # MTP draft step 0 owns the only LIM invocation. Preserve its cache
-        # budget so later draft steps can reuse the compacted LIM outputs
-        # without rebuilding source-to-slot metadata.
+        self._prepare_nano_dense_prefix(metadata)
+        # MTP draft step 0 owns the only LIM invocation. Later-step metadata
+        # preserves its prefix/cache geometry; only TopK rows need compaction.
         self.nano_reuse_request_count = count
-        self.nano_reuse_cache_tokens[:count].copy_(cache)
         return self.nano_topk_src[:tokens]
+
+    def _prepare_nano_dense_prefix(self, metadata) -> None:
+        """Short histories use identity slots, not the LI kernel's sparse ABI.
+
+        LI requires a prefix of at least TopK rows. Below that threshold,
+        fill the small dense history on a cold mapping and keep it resident.
+        The existing request-level scatter handles mixed dense/sparse batches.
+        """
+        count = metadata.nano_pool_entries.numel()
+        prefix = metadata.nano_prefix_lens
+        dense = metadata.nano_active & (prefix > 0) & (prefix < self.sfa_sparse_topk)
+        slots = self.nano_dense_slots[None, :]
+        for buffer in (self.nano_miss_src, self.nano_miss_dst):
+            rows = buffer[:count, : self.sfa_sparse_topk]
+            rows.copy_(torch.where(dense[:, None], slots, rows))
+        self.nano_misses[:count].copy_(
+            torch.where(
+                dense,
+                torch.where(self.nano_states[:count] == -2, prefix, 0),
+                self.nano_misses[:count],
+            )
+        )
 
     def bind_nano_kv_cache(self, manager, layer_name) -> None:
         """Bind immutable layer addresses after cache registration, before capture."""
@@ -664,11 +806,16 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             dtype=torch.int64,
             device=device,
         ).view(2, 1)
+        manager.register_nano_tail_state(
+            layer_name,
+            self.nano_tail_generation,
+            self.nano_tail_seq_len,
+        )
 
     def _nano_restore_tail(self, metadata, manager, layer_name):
-        # Byte offsets and lengths are common to every layer and are already
-        # prepared by the metadata builder. Only these two base-address adds
-        # remain per layer; there is no per-layer mask/cast/length preparation.
+        # Byte offsets and maximum lengths are common to every layer. The
+        # layer-local residency mask suppresses H2D for a partial tail that is
+        # still present in its request-owned top-k pages.
         if self.nano_host_bases is None:
             raise RuntimeError("nano KV base addresses must be bound before graph capture")
         count = metadata.nano_copy_src_offsets.numel()
@@ -680,9 +827,45 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             self.nano_device_bases,
             out=self.nano_copy_dst[:count].view(2, -1),
         )
+        request_count = metadata.nano_pool_entries.numel()
+        copy_lengths = self.nano_copy_lengths[:count].view(2, request_count, 2)
+        copy_lengths.copy_(metadata.nano_copy_lengths.view(2, request_count, 2))
+        copy_lengths.masked_fill_(~self.nano_restore_active[:request_count][None, :, None], 0)
         manager.copy_nano_kv(
-            self.nano_copy_src[:count], self.nano_copy_dst[:count], metadata.nano_copy_lengths, metadata.nano_copy_count
+            self.nano_copy_src[:count],
+            self.nano_copy_dst[:count],
+            self.nano_copy_lengths[:count],
+            metadata.nano_copy_count,
         )
+
+    def _prepare_nano_tail_state(self, metadata) -> None:
+        """Decide whether the committed partial tail must be restored."""
+        count = metadata.nano_pool_entries.numel()
+        pools = metadata.nano_pool_entries.to(torch.int64)
+        ends = metadata.nano_query_ends
+        starts = torch.roll(ends, 1)
+        starts[0] = 0
+        previous_lens = metadata.nano_seq_lens - (ends - starts)
+        resident_lens = self.nano_tail_seq_len[pools]
+        rollback = resident_lens - previous_lens
+        resident = (
+            metadata.nano_active
+            & (self.nano_tail_generation[pools] == metadata.nano_generations)
+            & (self.nano_tail_start[pools] <= metadata.nano_prefix_lens)
+            & (rollback >= 0)
+            & (rollback < 2 * _NANO_TAIL_BLOCK_SIZE)
+        )
+        self.nano_restore_active[:count].copy_(metadata.nano_active & ~resident)
+
+    def _update_nano_tail_state(self, metadata) -> None:
+        """Publish actual layer-local writes, never another layer's progress."""
+        pools = metadata.nano_pool_entries.to(torch.int64)
+        for state, value in (
+            (self.nano_tail_generation, metadata.nano_generations),
+            (self.nano_tail_start, metadata.nano_prefix_lens),
+            (self.nano_tail_seq_len, metadata.nano_seq_lens),
+        ):
+            state.scatter_(0, pools, torch.where(metadata.nano_active, value, state[pools]))
 
     def compact_nano_topk_metadata(self, slot_ids: torch.Tensor) -> None:
         """Compact draft-step-0 LIM rows for direct reuse by later steps."""
@@ -705,20 +888,21 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         hbm_v = manager.topk_buffers_v[layer_id].view(-1, 128, 1, self.qk_rope_head_dim)
         host_k = manager.k_caches_cpu[layer_id].view(-1, 128, self.kv_lora_rank)
         host_v = manager.v_caches_cpu[layer_id].view(-1, 128, self.qk_rope_head_dim)
+        cache_tokens = metadata.nano_cache_tokens
+        logical_lens = metadata.nano_logical_lens
         if reuse_indices:
             # The proposer compacts the complete step-0 LIM result alongside
             # the shared logical TopK rows. All selected sources are resident
             # after step 0, so later steps issue no cache copies.
-            cache_tokens = self.nano_reuse_cache_tokens[:count]
-            logical_lens = cache_tokens  # exact saved selection; no extra tail
             topk_misses = self.nano_reuse_topk_misses[:tokens]
             misses = self.nano_reuse_misses[:count]
         else:
-            self._nano_restore_tail(metadata, manager, layer_name)
-            cache_tokens = metadata.nano_cache_tokens
-            logical_lens = metadata.nano_logical_lens
             topk_misses = owner.nano_topk_misses[:tokens]
             misses = owner.nano_misses[:count]
+        # The kernel accepts C=0 (dense) or C>=TopK (sparse + tail).
+        # For a short prefix the HBM table already maps the dense hot rows
+        # followed by the ring tail; keep that table and logical length.
+        attention_cache_tokens = torch.where(cache_tokens < self.sfa_sparse_topk, 0, cache_tokens)
         heads = query.shape[1]
         q, qr = prepare_copy_sfa_queries(query[:tokens], query_rope[:tokens])
         out = torch.empty_like(q)
@@ -727,7 +911,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             q,
             metadata.nano_query_ends,
             logical_lens,
-            cache_tokens,
+            attention_cache_tokens,
             owner.nano_topk_dst[:tokens],
             owner.nano_topk_src[:tokens],
             topk_misses,
@@ -781,20 +965,61 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         attn_metadata: M,
     ):
         if self._is_decode_only(attn_metadata):
-            k_nope, k_pe = self._compute_kv_only(kv_no_split, cos, sin)
             manager = get_sparse_kv_offload_manager()
             layer_name = self._offload_layer_name()
-            k_cache_cpu, v_cache_cpu = self._cpu_cache_pair(manager, layer_name)
+            layer_id = manager._get_offload_layer_id(layer_name)
             if attn_metadata.nano_enabled:
-                layer_id = manager._get_offload_layer_id(layer_name)
-                device_slots = attn_metadata.nano_device_slots
-                for cache_tensor, value in (
-                    (manager.topk_buffers_k[layer_id], k_nope),
-                    (manager.topk_buffers_v[layer_id], k_pe),
-                ):
-                    rows = cache_tensor.view(-1, cache_tensor.shape[-1])
-                    rows.index_copy_(0, device_slots[: value.shape[0]], value.reshape(value.shape[0], -1))
-                slots = torch.where(attn_metadata.nano_token_active[: slots.numel()], slots, -1)
+                assert self.kv_a_layernorm is not None
+                if attn_metadata.nano_draft_step <= 0:
+                    self._prepare_nano_tail_state(attn_metadata)
+                    self._nano_restore_tail(attn_metadata, manager, layer_name)
+                # Step 1+ appends to this proposal's resident tail. It must
+                # neither restore speculative bytes from Host nor touch the
+                # confirmed full page that step 0 may still be copying.
+                token_count = kv_no_split.shape[0]
+                device_slots = attn_metadata.nano_device_slots[:token_count]
+                k_nope_cache = manager.topk_buffers_k[layer_id].view(
+                    -1,
+                    self.block_size,
+                    self.num_kv_heads,
+                    self.kv_lora_rank,
+                )
+                k_pe_cache = manager.topk_buffers_v[layer_id].view(
+                    -1,
+                    self.block_size,
+                    self.num_kv_heads,
+                    self.qk_rope_head_dim,
+                )
+                torch_npu.npu_kv_rmsnorm_rope_cache(
+                    kv_no_split.view(
+                        token_count,
+                        self.num_kv_heads,
+                        1,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                    ),
+                    self.kv_a_layernorm.weight,
+                    cos,
+                    sin,
+                    device_slots,
+                    k_pe_cache,
+                    k_nope_cache,
+                    epsilon=self.kv_a_layernorm.variance_epsilon,
+                    cache_mode="PA",
+                )
+                self._update_nano_tail_state(attn_metadata)
+                if attn_metadata.nano_draft_step <= 0:
+                    manager.offload_nano_full_blocks(
+                        layer_name=layer_name,
+                        source_slots=attn_metadata.nano_flush_src_slots,
+                        destination_slots=attn_metadata.nano_flush_dst_slots,
+                        active=attn_metadata.nano_flush_active,
+                    )
+                    if self.nano_requires_host_visibility:
+                        manager.wait_for_nano_host_copies()
+                return None, None
+
+            k_nope, k_pe = self._compute_kv_only(kv_no_split, cos, sin)
+            k_cache_cpu, v_cache_cpu = self._cpu_cache_pair(manager, layer_name)
             manager.offload_new_kv(
                 layer_name=layer_name,
                 slot_mapping=slots,

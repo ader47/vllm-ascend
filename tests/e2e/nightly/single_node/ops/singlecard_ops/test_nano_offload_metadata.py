@@ -41,11 +41,13 @@ def common(ends, lengths, pools=(1, 0), generations=(11, 12)):
     return SimpleNamespace(
         query_start_loc=torch.tensor([0, *ends], dtype=torch.int32, device="npu"),
         query_start_loc_cpu=torch.tensor([0, *ends], dtype=torch.int32),
-        # Intentionally no CPU sequence-length attribute: lengths must stay on device.
+        # Intentionally no CPU sequence-length attribute: lengths stay on device.
         seq_lens=torch.tensor(lengths, dtype=torch.int32, device="npu"),
+        positions=torch.tensor([length - 1 for length in lengths], dtype=torch.int64, device="npu"),
         req_topk_buffer_slots=torch.tensor(pools, dtype=torch.int32, device="npu"),
         req_topk_buffer_generations=torch.tensor(generations, dtype=torch.int64, device="npu"),
         block_table_tensor=torch.arange(count * 128, dtype=torch.int32, device="npu").reshape(count, 128),
+        slot_mapping=torch.arange(128, 128 + ends[-1], dtype=torch.int64, device="npu"),
         req_ids_tensor=None,
         token_to_req=None,
         nano_eligible=True,
@@ -73,6 +75,10 @@ def make_impl():
     impl.nano_last_generation = torch.full((8,), -1, dtype=torch.int64, device="npu")
     impl.nano_last_prefix = torch.zeros(8, dtype=torch.int32, device="npu")
     impl.nano_last_cache = torch.zeros(8, dtype=torch.int32, device="npu")
+    impl.nano_tail_generation = torch.full((8,), -1, dtype=torch.int64, device="npu")
+    impl.nano_tail_seq_len = torch.zeros(8, dtype=torch.int32, device="npu")
+    impl.nano_tail_start = torch.zeros(8, dtype=torch.int32, device="npu")
+    impl.nano_restore_active = torch.empty(4, dtype=torch.bool, device="npu")
     return impl
 
 
@@ -152,6 +158,31 @@ def test_inactive_capture_becomes_active_on_graph_replay():
     assert impl.nano_last_generation[1].item() == 11
 
 
+def test_partial_tail_restore_decision_during_graph_replay():
+    builder, impl = make_builder(), make_impl()
+    cm = common([1], [127], pools=(1,), generations=(11,))
+    metadata = populate(builder, cm)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        impl._prepare_nano_tail_state(metadata)
+
+    impl.nano_tail_generation.fill_(-1)
+    impl.nano_tail_seq_len.zero_()
+    graph.replay()
+    assert impl.nano_restore_active[0].item()
+
+    # Simulate this layer's completed write (not another layer's finalizer).
+    impl.nano_tail_generation[1] = 11
+    impl.nano_tail_seq_len[1] = 127
+    cm.seq_lens[0] = 128
+    populate(builder, cm)
+    graph.replay()
+    assert not impl.nano_restore_active[0].item()
+    # Scheduled boundary crossing starts a candidate D2H. Rejection sampling
+    # later decides whether the copied bytes become logically visible.
+    assert metadata.nano_flush_active[0].item()
+
+
 def test_eager_sp_padding_uses_private_tail_and_exact_query_count():
     builder = make_builder()
     cm = common([4, 5], [10371, 8321])
@@ -176,6 +207,7 @@ def test_runner_pool_ownership_survives_compaction_and_dummy_run():
     runner._offload_request_slots = {}
     runner._offload_slot_generation = 0
     runner._offload_slot_generations = {}
+    runner._nano_preempted_req_ids = set()
     runner.input_batch = SimpleNamespace(req_ids=["a", "b"], req_id_to_index={"a": 0, "b": 1})
     runner._prepare_nano_request_slots(2, 3, dummy=False)
     assert runner._offload_pool_slots.np[:3].tolist() == [0, 1, 6]
