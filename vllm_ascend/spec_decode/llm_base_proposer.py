@@ -862,6 +862,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 multi_steps_attn_metadata=multi_steps_attn_metadata,
                 num_tokens=num_tokens,
             )
+            if self.runner is not None and getattr(self.runner, "sparse_kv_offload_manager", None) is not None:
+                # Dummy forwards also reuse the fixed metadata buffers on
+                # their next call; close eager work before that reuse.
+                self.runner.sparse_kv_offload_manager.join_nano_d2h()
             forward_context = get_forward_context()
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
                 self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
@@ -909,6 +913,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # configured maximum, so pre-allocated buffers stay valid; K == 0 is
         # handled just below.
         self.num_speculative_tokens = num_speculative_tokens
+
+        if getattr(self.runner, "sparse_kv_offload_enabled", False) and self.runner.sparse_kv_offload_config.use_nano:
+            max_draft_tokens = self.vllm_config.speculative_config.num_speculative_tokens
+            if not 1 <= num_speculative_tokens <= max_draft_tokens:
+                raise ValueError("nano requires 1 <= scheduled draft steps <= configured maximum")
 
         # Dynamic SD may schedule K == 0 draft tokens for the current batch
         # size. Return an empty [batch_size, 0] draft so downstream copy/unpack
@@ -1854,25 +1863,34 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         if draft_index == 1:
             if aclgraph_runtime_mode == CUDAGraphMode.FULL:
-                common_attn_metadata.num_reqs = input_batch_size
-                common_attn_metadata.block_table_tensor = self._adjust_tensor(
-                    common_attn_metadata.block_table_tensor, input_batch_size
+                # Nano owns metadata/tail pages per padded request, not per
+                # step-0 token. Keep that graph-stable request layout when
+                # later steps switch to one query per request. Extra model
+                # input rows remain padding and get private dummy KV slots.
+                nano_enabled = (
+                    getattr(self.runner, "sparse_kv_offload_enabled", False)
+                    and self.runner.sparse_kv_offload_config.use_nano
                 )
-                common_attn_metadata.seq_lens = self._adjust_tensor(common_attn_metadata.seq_lens, input_batch_size)
+                request_batch_size = common_attn_metadata.num_reqs if nano_enabled else input_batch_size
+                common_attn_metadata.num_reqs = request_batch_size
+                common_attn_metadata.block_table_tensor = self._adjust_tensor(
+                    common_attn_metadata.block_table_tensor, request_batch_size
+                )
+                common_attn_metadata.seq_lens = self._adjust_tensor(common_attn_metadata.seq_lens, request_batch_size)
                 common_attn_metadata.seq_lens_cpu = self._adjust_tensor(
-                    common_attn_metadata.seq_lens_cpu, input_batch_size
+                    common_attn_metadata.seq_lens_cpu, request_batch_size
                 )
                 if common_attn_metadata._seq_lens_cpu is not None:
                     common_attn_metadata._seq_lens_cpu = self._adjust_tensor(
-                        common_attn_metadata._seq_lens_cpu, input_batch_size
+                        common_attn_metadata._seq_lens_cpu, request_batch_size
                     )
                 if common_attn_metadata.num_computed_tokens_cpu is not None:
                     common_attn_metadata.num_computed_tokens_cpu = self._adjust_tensor(
-                        common_attn_metadata.num_computed_tokens_cpu, input_batch_size
+                        common_attn_metadata.num_computed_tokens_cpu, request_batch_size
                     )
-                common_attn_metadata.query_start_loc = self.arange[: input_batch_size + 1]
+                common_attn_metadata.query_start_loc = self.arange[: request_batch_size + 1]
                 common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
-                    self.token_arange_np[: input_batch_size + 1]
+                    self.token_arange_np[: request_batch_size + 1]
                 ).clone()
             else:
                 common_attn_metadata.query_start_loc = self.arange[: batch_size + 1]
@@ -2247,6 +2265,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
             req_topk_buffer_generations=common_attn_metadata.req_topk_buffer_generations,
             nano_eligible=common_attn_metadata.nano_eligible,
+            nano_draft=True,
             offload_dummy=common_attn_metadata.offload_dummy,
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
             token_to_req=token_to_req,

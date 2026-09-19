@@ -714,6 +714,30 @@ class TestShortRequestFirstConfig(TestBase):
 
 
 class TestSparseKVOffloadConfig(TestBase):
+    @staticmethod
+    def _nano_vllm_config(
+        *,
+        disable_padded_drafter_batch: bool,
+        dynamic_schedule=None,
+    ):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=2048)),
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                pipeline_parallel_size=1,
+            ),
+            kv_transfer_config=SimpleNamespace(is_kv_consumer=True),
+            cache_config=SimpleNamespace(block_size=128),
+            use_v2_model_runner=False,
+            speculative_config=SimpleNamespace(
+                method="mtp",
+                num_speculative_tokens=2,
+                num_speculative_tokens_per_batch_size=dynamic_schedule,
+                disable_padded_drafter_batch=disable_padded_drafter_batch,
+            ),
+        )
+
     def test_disabled_string_false_does_not_enter_enabled_path(self):
         config = SparseKVOffloadConfig.from_additional_config(SimpleNamespace(), {"enabled": "false"})
 
@@ -755,6 +779,74 @@ class TestSparseKVOffloadConfig(TestBase):
     def test_non_dict_config_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "sparse_kv_offload_config must be a dict"):
             SparseKVOffloadConfig.from_additional_config(SimpleNamespace(), [])
+
+    def test_nano_rejects_speculation_without_device_rejection_metadata(self):
+        with self.assertRaisesRegex(ValueError, "requires padded drafter batches"):
+            SparseKVOffloadConfig.from_additional_config(
+                self._nano_vllm_config(disable_padded_drafter_batch=True),
+                {
+                    "enabled": True,
+                    "fused_op_type": "nano",
+                    "topk_buffer_size": 8192,
+                },
+            )
+
+    def test_nano_rejects_colocated_prefill_fallback(self):
+        with self.assertRaisesRegex(ValueError, "prefill/mixed fallback"):
+            SparseKVOffloadConfig.from_additional_config(
+                self._nano_vllm_config(disable_padded_drafter_batch=False),
+                {
+                    "enabled": True,
+                    "fused_op_type": "nano",
+                    "topk_buffer_size": 8192,
+                    "keep_device_kv_cache": True,
+                },
+            )
+
+    def test_nano_rejects_dynamic_mtp_k_zero(self):
+        with self.assertRaisesRegex(ValueError, "K=0 skips"):
+            SparseKVOffloadConfig.from_additional_config(
+                self._nano_vllm_config(
+                    disable_padded_drafter_batch=False,
+                    dynamic_schedule=[(1, 32, 2), (33, 64, 0)],
+                ),
+                {
+                    "enabled": True,
+                    "fused_op_type": "nano",
+                    "topk_buffer_size": 8192,
+                },
+            )
+
+    def test_nano_rejects_fixed_mtp_k_zero(self):
+        vllm_config = self._nano_vllm_config(
+            disable_padded_drafter_batch=False,
+        )
+        vllm_config.speculative_config.num_speculative_tokens = 0
+
+        with self.assertRaisesRegex(ValueError, "at least one draft token"):
+            SparseKVOffloadConfig.from_additional_config(
+                vllm_config,
+                {
+                    "enabled": True,
+                    "fused_op_type": "nano",
+                    "topk_buffer_size": 8192,
+                },
+            )
+
+    def test_nano_allows_dynamic_mtp_with_positive_k(self):
+        config = SparseKVOffloadConfig.from_additional_config(
+            self._nano_vllm_config(
+                disable_padded_drafter_batch=False,
+                dynamic_schedule=[(1, 32, 2), (33, 64, 1)],
+            ),
+            {
+                "enabled": True,
+                "fused_op_type": "nano",
+                "topk_buffer_size": 8192,
+            },
+        )
+
+        self.assertTrue(config.use_nano)
 
 
 class TestSchedulerConfig(TestBase):

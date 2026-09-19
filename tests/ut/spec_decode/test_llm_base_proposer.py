@@ -46,6 +46,91 @@ NON_FULL_CUDAGRAPH_MODES = [
 ]
 
 
+@pytest.mark.parametrize("scheduled_k", [0, 7])
+def test_nano_rejects_runtime_k_that_skips_updates_or_exceeds_tail_bound(scheduled_k):
+    proposer = SimpleNamespace(
+        runner=SimpleNamespace(
+            sparse_kv_offload_enabled=True,
+            sparse_kv_offload_config=SimpleNamespace(use_nano=True),
+        ),
+        vllm_config=SimpleNamespace(speculative_config=SimpleNamespace(num_speculative_tokens=6)),
+    )
+    with pytest.raises(ValueError, match="scheduled draft steps"):
+        AscendSpecDecodeBaseProposer._propose(
+            proposer,
+            num_speculative_tokens=scheduled_k,
+            target_token_ids=None,
+            target_positions=None,
+            target_hidden_states=None,
+            next_token_ids=None,
+            token_indices_to_sample=None,
+            common_attn_metadata=SimpleNamespace(batch_size=lambda: 1),
+            target_model_batch_desc=None,
+            sampling_metadata=None,
+        )
+
+
+@pytest.mark.parametrize("nano_enabled", [True, False])
+def test_nano_draft_graph_padding_keeps_request_capacity(nano_enabled):
+    # Two requests with three step-0 queries each, plus graph padding.
+    # Eight model input rows must not become eight Nano request slots.
+    proposer = AscendSpecDecodeBaseProposer.__new__(AscendSpecDecodeBaseProposer)
+    proposer.runner = SimpleNamespace(
+        sparse_kv_offload_enabled=True,
+        sparse_kv_offload_config=SimpleNamespace(use_nano=nano_enabled),
+    )
+    proposer.shallow_copy_metadata = lambda md: SimpleNamespace(**vars(md))
+    proposer.arange = torch.arange(17, dtype=torch.int32)
+    proposer.token_arange_np = proposer.arange.numpy()
+    proposer.method = "mtp"
+    proposer.uses_mrope = proposer.has_gdn = proposer.use_compress = False
+    proposer.max_model_len = 1024
+    proposer.block_size = 128
+    proposer.sliding_window = None
+    proposer.slot_mapping_group = torch.empty((3, 16), dtype=torch.int32)
+    proposer.seq_lens_group = torch.empty((3, 16), dtype=torch.int32)
+    proposer.query_start_loc_group = torch.empty((3, 17), dtype=torch.int32)
+    common = SimpleNamespace(
+        num_reqs=3,
+        block_table_tensor=torch.arange(24, dtype=torch.int32).view(3, 8),
+        seq_lens=torch.tensor([130, 258, 2], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([130, 258, 2], dtype=torch.int32),
+        _seq_lens_cpu=None,
+        num_computed_tokens_cpu=None,
+        positions=torch.arange(8, dtype=torch.int64),
+    )
+    builder = MagicMock()
+    group = SimpleNamespace(get_metadata_builder=lambda: builder)
+    result, _ = proposer.attn_update_stack_num_spec_norm(
+        draft_index=1,
+        old_common_metadata=common,
+        batch_size=2,
+        input_batch_size=8,
+        used_update_positions=torch.tensor([127, 255]),
+        aclgraph_runtime_mode=CUDAGraphMode.FULL,
+        attn_group=group,
+    )
+    requests = 3 if nano_enabled else 8
+    assert result.num_reqs == requests
+    assert result.query_start_loc.tolist() == list(range(requests + 1))
+    assert result.block_table_tensor.shape[0] == result.seq_lens.numel() == requests
+    assert result.num_input_tokens == 8
+    assert result.positions[:2].tolist() == [128, 256]
+    assert (result.slot_mapping[2:] == -1).all()
+    # The next draft step retains the same request layout.
+    later, _ = proposer.attn_update_stack_num_spec_norm(
+        draft_index=2,
+        old_common_metadata=result,
+        batch_size=2,
+        input_batch_size=8,
+        used_update_positions=torch.tensor([128, 256]),
+        aclgraph_runtime_mode=CUDAGraphMode.FULL,
+        attn_group=group,
+    )
+    assert later.num_reqs == requests
+    assert later.query_start_loc.numel() == requests + 1
+
+
 class TestMultimodalImageTokenIndex:
     @pytest.mark.parametrize(
         "model_name",

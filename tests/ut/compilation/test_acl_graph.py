@@ -122,6 +122,7 @@ class TestACLGraphWrapper(TestBase):
         self.mock_get_ascend_config = self.get_ascend_config_patcher.start()
         self.addCleanup(self.get_ascend_config_patcher.stop)
         self.mock_get_ascend_config.return_value.ascend_compilation_config.enable_super_kernel = False
+        self.mock_get_ascend_config.return_value.sparse_kv_offload_config.enabled = False
 
         # Mock VllmConfig
         self.mock_vllm_config = MagicMock(spec=VllmConfig)
@@ -311,8 +312,18 @@ class TestACLGraphWrapper(TestBase):
         # Create a real torch tensor for the test, not a mock
         test_tensor = torch.tensor([1, 2, 3])
 
-        # Call the wrapper
-        result = wrapper(test_tensor, "arg2")
+        # Nano joins the D2H branch inside the capture, after the complete
+        # runnable (which may contain all merged MTP steps) has executed.
+        cfg = self.mock_get_ascend_config.return_value.sparse_kv_offload_config
+        cfg.enabled = cfg.use_nano = True
+        order = []
+        self.mock_runnable.side_effect = lambda *args: order.append("forward") or "test_output"
+        mock_graph_context.__exit__.side_effect = lambda *args: order.append("capture_end")
+        with patch("vllm_ascend.compilation.acl_graph.get_sparse_kv_offload_manager") as manager:
+            manager.return_value.join_nano_d2h.side_effect = lambda: order.append("join")
+            result = wrapper(test_tensor, "arg2")
+            manager.return_value.join_nano_d2h.assert_called_once_with()
+        self.assertEqual(order, ["forward", "join", "capture_end"])
 
         # Verify graph capture happened
         mock_validate_cudagraph_capturing_enabled.assert_called_once()

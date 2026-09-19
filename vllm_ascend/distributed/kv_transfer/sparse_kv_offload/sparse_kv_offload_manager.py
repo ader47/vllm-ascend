@@ -45,6 +45,8 @@ OFFLOAD_V_CACHE_CPU_INDEX = 3
 OFFLOAD_TOPK_BUFFER_K_INDEX = 4
 OFFLOAD_TOPK_BUFFER_V_INDEX = 5
 OFFLOAD_STORE_PORT_BASE = 8500
+NANO_TAIL_BLOCK_SIZE = 128
+NANO_GRAPH_PADDING_REQUESTS = 2
 
 FSA_EXTERNAL_PLAN_READY_MARKER = 0x5A45
 FSA_PAIRED_SELECTION_COPY_MARKER = 0x5A56
@@ -82,6 +84,65 @@ _SPARSE_KV_OFFLOAD_OP_NAMES = (
     "sparse_kv_restore_bfloat16_tensor",
     "sparse_kv_restore_int16_tensor",
 )
+
+
+def _nano_finalized_block_slots(
+    seq_lens: torch.Tensor,
+    query_ends: torch.Tensor,
+    rejected_rows: torch.Tensor,
+    pools: torch.Tensor,
+    active: torch.Tensor,
+    block_table: torch.Tensor,
+    stride_blocks: int,
+    hot_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build one full-page flush candidate per request after MTP rejection."""
+    starts = torch.cat((torch.zeros_like(query_ends[:1]), query_ends[:-1]))
+    widths = query_ends - starts
+    rejected_rows = rejected_rows.to(dtype=widths.dtype, device=widths.device)
+    valid_rejection = (rejected_rows >= 0) & (rejected_rows <= widths)
+    committed_rows = torch.where(
+        valid_rejection,
+        (widths - rejected_rows).clamp(0, NANO_TAIL_BLOCK_SIZE),
+        torch.zeros_like(widths),
+    )
+    previous_lens = seq_lens - widths
+    committed_lens = previous_lens + committed_rows
+    completed_blocks = torch.div(
+        committed_lens,
+        NANO_TAIL_BLOCK_SIZE,
+        rounding_mode="floor",
+    ) - torch.div(
+        previous_lens,
+        NANO_TAIL_BLOCK_SIZE,
+        rounding_mode="floor",
+    )
+    completed_logical_blocks = (
+        torch.div(
+            committed_lens,
+            NANO_TAIL_BLOCK_SIZE,
+            rounding_mode="floor",
+        )
+        - 1
+    )
+    safe_logical_blocks = completed_logical_blocks.clamp(0, block_table.shape[1] - 1).to(torch.int64)
+    physical_blocks = block_table.gather(1, safe_logical_blocks[:, None]).squeeze(1).to(torch.int64)
+    flush_active = (
+        active
+        & valid_rejection
+        & (completed_blocks == 1)
+        & (completed_logical_blocks >= 0)
+        & (completed_logical_blocks < block_table.shape[1])
+        & (physical_blocks >= 0)
+    )
+    safe_pools = pools.to(torch.int64).clamp_min(0)
+    source_slots = (
+        safe_pools * stride_blocks * NANO_TAIL_BLOCK_SIZE
+        + hot_tokens
+        + completed_logical_blocks.to(torch.int64).remainder(2) * NANO_TAIL_BLOCK_SIZE
+    )
+    destination_slots = physical_blocks.clamp_min(0) * NANO_TAIL_BLOCK_SIZE
+    return source_slots, destination_slots, flush_active, committed_lens
 
 
 def get_subscribed_compute_streams() -> set:
@@ -123,6 +184,9 @@ def allocate_kv_offload_topk_buffer_pair(
     )
     if sparse_kv_offload_config.use_nano:
         max_num_topk_rows = max(max_num_topk_rows, 2 * (vllm_config.scheduler_config.max_num_seqs + 2))
+        # Keep two request-local tail pages in the same allocation as the
+        # compute-visible top-k rows. Decode KV is written directly into these
+        # ping-pong pages, so no separate staging-to-top-k copy is needed.
         topk_buffer_size += 2 * vllm_config.cache_config.block_size
     topk_buffer_k_size_bytes = max_num_topk_rows * topk_buffer_size * num_kv_heads * k_dim * torch.bfloat16.itemsize
     topk_buffer_v_size_bytes = max_num_topk_rows * topk_buffer_size * num_kv_heads * v_dim * torch.bfloat16.itemsize
@@ -499,6 +563,7 @@ class SparseKVOffloadManager:
         self.topk = sparse_kv_offload_config.topk
         self.use_fused_overlap = sparse_kv_offload_config.use_fused_overlap
         self.use_nano = sparse_kv_offload_config.use_nano
+        self.nano_tail_states: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -605,6 +670,8 @@ class SparseKVOffloadManager:
             self.num_target_layers,
         )
         self.mtp_layer_id = self.num_layers - 1 if self.num_layers != self.num_target_layers else -1
+        if self.use_nano and self.num_layers - self.num_target_layers > 1:
+            raise ValueError("nano MTP currently requires a single physical draft KV layer reused by every step")
         if self.tp_rank == 0:
             preview_layer_names = self.offload_layer_names[:4]
             if len(self.offload_layer_names) > 4:
@@ -759,6 +826,9 @@ class SparseKVOffloadManager:
                 self.k_caches_cpu.append(cache_or_caches[OFFLOAD_K_CACHE_CPU_INDEX])
                 self.v_caches_cpu.append(cache_or_caches[OFFLOAD_V_CACHE_CPU_INDEX])
 
+        if self.use_nano:
+            self._validate_nano_shared_block_layout()
+
         kv_head_num = self.topk_buffers_k[0].size(-2)
         head_dim_k = self.topk_buffers_k[0].size(-1)
         head_dim_v = self.topk_buffers_v[0].size(-1)
@@ -798,6 +868,46 @@ class SparseKVOffloadManager:
             self.current_kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.d2h_size_npu = torch.empty(1, dtype=torch.int32, device=device)
         self.d2h_token_indices_npu = torch.arange(self.max_num_tokens, dtype=torch.int64, device=device)
+        if self.use_nano:
+            self.nano_completion_token = torch.zeros(1, dtype=torch.int32, device=device)
+            nano_request_capacity = self.max_num_reqs + NANO_GRAPH_PADDING_REQUESTS
+            self.nano_plan_capacity = 2 * nano_request_capacity
+            self.nano_rejected_rows_npu = torch.zeros(
+                nano_request_capacity,
+                dtype=torch.int32,
+                device=device,
+            )
+            # Same-iteration target confirmation consumed by padded MTP
+            # metadata. Pool slot plus generation makes request reordering
+            # harmless without introducing a scheduler-visible state machine.
+            self.nano_confirmed_generations = torch.full(
+                (self.nano_plan_capacity,),
+                -1,
+                dtype=torch.int64,
+                device=device,
+            )
+            self.nano_confirmed_src_slots = torch.zeros(
+                self.nano_plan_capacity,
+                dtype=torch.int64,
+                device=device,
+            )
+            self.nano_confirmed_dst_slots = torch.zeros_like(self.nano_confirmed_src_slots)
+            self.nano_confirmed_active = torch.zeros(
+                self.nano_plan_capacity,
+                dtype=torch.bool,
+                device=device,
+            )
+        if self.use_nano and self.tp_rank == 0:
+            nano_descriptor_rows = (self.max_num_reqs + NANO_GRAPH_PADDING_REQUESTS) * 2
+            self.nano_d2h_src_ptrs_npu = torch.empty(nano_descriptor_rows, dtype=torch.int64, device=device)
+            self.nano_d2h_dst_ptrs_npu = torch.empty(nano_descriptor_rows, dtype=torch.int64, device=device)
+            self.nano_d2h_lengths_npu = torch.empty(nano_descriptor_rows, dtype=torch.int32, device=device)
+            self.nano_d2h_size_npu = torch.empty(1, dtype=torch.int32, device=device)
+            self.nano_d2h_stream = torch_npu.npu.Stream()
+            current_stream = torch_npu.npu.current_stream()
+            self.nano_d2h_inputs_ready = [torch_npu.npu.Event() for _ in range(self.num_layers)]
+            self.nano_d2h_done = torch_npu.npu.Event()
+            self.nano_d2h_done.record(current_stream)
 
         pages_per_row = self.topk_buffer_size // self.block_size
         self.current_slots_npu = torch.empty(
@@ -1128,11 +1238,251 @@ class SparseKVOffloadManager:
             torch.add(dst_off.view(2, -1), device_bases, out=self.nano_copy_dst[:n].view(2, -1))
             self.copy_nano_kv(self.nano_copy_src[:n], self.nano_copy_dst[:n], lengths, count)
 
+    def _validate_nano_shared_block_layout(self) -> None:
+        """Validate the one logical block plan shared by all Nano layers."""
+        if len(self.kv_cache_config.kv_cache_groups) != 1:
+            raise ValueError("nano block D2H requires exactly one KV cache group")
+
+        def token_layout(tensor: torch.Tensor) -> tuple[torch.dtype, tuple[int, int], int]:
+            row_shape = (tensor.size(-2), tensor.size(-1))
+            return tensor.dtype, row_shape, tensor.numel() // (row_shape[0] * row_shape[1])
+
+        reference_device_layout = (token_layout(self.topk_buffers_k[0]), token_layout(self.topk_buffers_v[0]))
+        for layer_id, (device_k, device_v) in enumerate(zip(self.topk_buffers_k, self.topk_buffers_v)):
+            if (token_layout(device_k), token_layout(device_v)) != reference_device_layout:
+                raise ValueError(f"nano block D2H requires identical device tail layout; layer_id={layer_id}")
+
+        if self.tp_rank != 0:
+            return
+        reference_host_layout = (token_layout(self.k_caches_cpu[0]), token_layout(self.v_caches_cpu[0]))
+        for layer_id, (host_k, host_v) in enumerate(zip(self.k_caches_cpu, self.v_caches_cpu)):
+            if (token_layout(host_k), token_layout(host_v)) != reference_host_layout:
+                raise ValueError(f"nano block D2H requires identical Host block layout; layer_id={layer_id}")
+
     def copy_nano_kv(self, sources, destinations, lengths, count) -> None:
         """Enqueue bounded descriptor copies on the current compute stream."""
         result = offload.sparse_copy(sources, destinations, lengths, count, sources.device)
         if result not in (None, 0):
             raise RuntimeError(f"memfabric nano tail H2D failed with result={result}")
+
+    def register_nano_tail_state(
+        self,
+        layer_name: str,
+        generations: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        """Register layer-local residency watermarks for post-sampling fixup."""
+        if not self.use_nano:
+            return
+        self._get_offload_layer_id(layer_name)
+        self.nano_tail_states[layer_name] = (generations, seq_lens)
+
+    def join_nano_d2h(self) -> None:
+        """Join copies submitted so far, at a real graph/iteration boundary.
+
+        Captured calls record AND wait, so replay covers that graph's copies.
+        Outside capture this also covers eager target and all draft steps.
+        This is a device dependency, not a CPU publication notification.
+        """
+        if not self.use_nano or self.tp_rank != 0:
+            return
+        # Establish a fork even when a padded batch submits no copies. Capture
+        # must not wait on an event recorded on an unrelated, uncaptured stream.
+        compute_stream = torch_npu.npu.current_stream()
+        self.nano_d2h_stream.wait_stream(compute_stream)
+        self.nano_d2h_done.record(self.nano_d2h_stream)
+        compute_stream.wait_event(self.nano_d2h_done)
+
+    def gather_nano_confirmed_plan(
+        self,
+        pools: torch.Tensor,
+        generations: torch.Tensor,
+        active: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather the finalized target plan in the current MTP row order."""
+        safe_pools = pools.to(torch.int64).clamp(0, self.nano_plan_capacity - 1)
+        matched = (
+            active
+            & (pools >= 0)
+            & (pools < self.max_num_reqs)
+            & (self.nano_confirmed_generations[safe_pools] == generations)
+        )
+        return (
+            self.nano_confirmed_src_slots[safe_pools],
+            self.nano_confirmed_dst_slots[safe_pools],
+            matched & self.nano_confirmed_active[safe_pools],
+        )
+
+    def wait_for_nano_host_copies(self) -> None:
+        """Order result delivery and all TP Host consumers after pending copies."""
+        if not self.use_nano:
+            return
+        self.join_nano_d2h()
+        if get_tensor_model_parallel_world_size() > 1:
+            # TP0 owns Host writes. A local wait on TP0 alone does not protect
+            # another rank's next-iteration Host reads. One device collective
+            # at the consumer boundary carries the dependency to every rank.
+            get_tp_group().all_reduce(self.nano_completion_token)
+
+    def finalize_nano_full_blocks(
+        self,
+        metadata,
+        num_rejected_rows: torch.Tensor | None,
+    ) -> None:
+        """Freeze the accepted-row plan before the drafter reuses metadata."""
+        if not self.use_nano or metadata is None or not metadata.nano_enabled:
+            return
+        count = metadata.nano_pool_entries.numel()
+        capacity = self.max_num_reqs + NANO_GRAPH_PADDING_REQUESTS
+        if count > capacity:
+            raise ValueError(f"nano finalize request count exceeds capacity: got {count}, capacity={capacity}")
+
+        rejected_rows = self.nano_rejected_rows_npu[:count]
+        rejected_rows.zero_()
+        if num_rejected_rows is not None:
+            if num_rejected_rows.numel() > count:
+                raise ValueError(
+                    "nano rejected-row count exceeds target request count: "
+                    f"got {num_rejected_rows.numel()}, target={count}"
+                )
+            rejected_rows[: num_rejected_rows.numel()].copy_(num_rejected_rows)
+
+        source_slots, destination_slots, flush_active, committed_lens = _nano_finalized_block_slots(
+            metadata.nano_seq_lens,
+            metadata.nano_query_ends,
+            rejected_rows,
+            metadata.nano_pool_entries,
+            metadata.nano_active,
+            metadata.nano_source_block_table,
+            self.topk_buffer_size // NANO_TAIL_BLOCK_SIZE + 2,
+            self.topk_buffer_size,
+        )
+        pools = metadata.nano_pool_entries.to(torch.int64)
+        safe_pools = pools.clamp(0, self.nano_plan_capacity - 1)
+        plan_rows = metadata.nano_active & (pools >= 0) & (pools < self.max_num_reqs)
+        old_generations = self.nano_confirmed_generations[safe_pools]
+        old_src_slots = self.nano_confirmed_src_slots[safe_pools]
+        old_dst_slots = self.nano_confirmed_dst_slots[safe_pools]
+        old_active = self.nano_confirmed_active[safe_pools]
+        self.nano_confirmed_generations.scatter_(
+            0,
+            safe_pools,
+            torch.where(plan_rows, metadata.nano_generations, old_generations),
+        )
+        self.nano_confirmed_src_slots.scatter_(
+            0,
+            safe_pools,
+            torch.where(plan_rows, source_slots, old_src_slots),
+        )
+        self.nano_confirmed_dst_slots.scatter_(
+            0,
+            safe_pools,
+            torch.where(plan_rows, destination_slots, old_dst_slots),
+        )
+        self.nano_confirmed_active.scatter_(
+            0,
+            safe_pools,
+            torch.where(plan_rows, flush_active, old_active),
+        )
+
+        for generations, seq_lens in self.nano_tail_states.values():
+            resident_lens = seq_lens[pools]
+            resident_generations = generations[pools]
+            matched = metadata.nano_active & (resident_generations == metadata.nano_generations)
+            seq_lens.scatter_(
+                0,
+                pools,
+                torch.where(matched, torch.minimum(committed_lens, resident_lens), resident_lens),
+            )
+
+    def offload_nano_full_blocks(
+        self,
+        layer_name: str,
+        source_slots: torch.Tensor,
+        destination_slots: torch.Tensor,
+        active: torch.Tensor,
+    ) -> None:
+        """Copy one layer's candidate full tail blocks on the D2H stream."""
+        if not self.use_nano or self.tp_rank != 0:
+            return
+        layer_id = self._get_offload_layer_id(layer_name)
+        blocks = source_slots.numel()
+        if destination_slots.numel() != blocks or active.numel() != blocks:
+            raise ValueError("nano D2H source, destination, and active vectors must have the same length")
+        capacity = self.max_num_reqs + NANO_GRAPH_PADDING_REQUESTS
+        if blocks > capacity:
+            raise ValueError(f"nano D2H block count exceeds capacity: got {blocks}, capacity={capacity}")
+
+        inputs_ready = self.nano_d2h_inputs_ready[layer_id]
+        inputs_ready.record(torch_npu.npu.current_stream())
+        with torch_npu.npu.stream(self.nano_d2h_stream):
+            self.nano_d2h_stream.wait_event(inputs_ready)
+            self._offload_nano_full_blocks_on_current_stream(
+                layer_id,
+                source_slots,
+                destination_slots,
+                active,
+            )
+
+    def _offload_nano_full_blocks_on_current_stream(
+        self,
+        layer_id: int,
+        source_slots: torch.Tensor,
+        destination_slots: torch.Tensor,
+        active: torch.Tensor,
+    ) -> None:
+        k_cache_npu = self.topk_buffers_k[layer_id]
+        v_cache_npu = self.topk_buffers_v[layer_id]
+        k_cache_cpu = self.k_caches_cpu[layer_id]
+        v_cache_cpu = self.v_caches_cpu[layer_id]
+        device = k_cache_npu.device
+        source_slots = source_slots.reshape(-1).to(device=device, dtype=torch.int64)
+        destination_slots = destination_slots.reshape(-1).to(device=device, dtype=torch.int64)
+        active = active.reshape(-1).to(device=device, dtype=torch.bool)
+        blocks = source_slots.numel()
+
+        num_source_slots = k_cache_npu.numel() * k_cache_npu.element_size() // self.token_size_bytes_k
+        num_source_v_slots = v_cache_npu.numel() * v_cache_npu.element_size() // self.token_size_bytes_v
+        num_destination_slots = k_cache_cpu.numel() * k_cache_cpu.element_size() // self.token_size_bytes_k
+        num_destination_v_slots = v_cache_cpu.numel() * v_cache_cpu.element_size() // self.token_size_bytes_v
+        if num_source_slots != num_source_v_slots or num_destination_slots != num_destination_v_slots:
+            raise ValueError(
+                "nano D2H K/V token capacities differ: "
+                f"source=({num_source_slots}, {num_source_v_slots}), "
+                f"destination=({num_destination_slots}, {num_destination_v_slots})"
+            )
+        valid = (
+            active
+            & (source_slots >= 0)
+            & (source_slots + NANO_TAIL_BLOCK_SIZE <= num_source_slots)
+            & (destination_slots >= 0)
+            & (destination_slots + NANO_TAIL_BLOCK_SIZE <= num_destination_slots)
+        )
+        safe_source_slots = source_slots.clamp(0, max(num_source_slots - NANO_TAIL_BLOCK_SIZE, 0))
+        safe_destination_slots = destination_slots.clamp(0, max(num_destination_slots - NANO_TAIL_BLOCK_SIZE, 0))
+        src_k = int(k_cache_npu.data_ptr()) + safe_source_slots * self.token_size_bytes_k
+        src_v = int(v_cache_npu.data_ptr()) + safe_source_slots * self.token_size_bytes_v
+        dst_k = int(k_cache_cpu.data_ptr()) + safe_destination_slots * self.token_size_bytes_k
+        dst_v = int(v_cache_cpu.data_ptr()) + safe_destination_slots * self.token_size_bytes_v
+
+        self.nano_d2h_src_ptrs_npu[:blocks].copy_(src_k)
+        self.nano_d2h_src_ptrs_npu[blocks : 2 * blocks].copy_(src_v)
+        self.nano_d2h_dst_ptrs_npu[:blocks].copy_(dst_k)
+        self.nano_d2h_dst_ptrs_npu[blocks : 2 * blocks].copy_(dst_v)
+        self.nano_d2h_lengths_npu[:blocks].fill_(NANO_TAIL_BLOCK_SIZE * self.token_size_bytes_k)
+        self.nano_d2h_lengths_npu[blocks : 2 * blocks].fill_(NANO_TAIL_BLOCK_SIZE * self.token_size_bytes_v)
+        self.nano_d2h_lengths_npu[:blocks].masked_fill_(~valid, 0)
+        self.nano_d2h_lengths_npu[blocks : 2 * blocks].masked_fill_(~valid, 0)
+        self.nano_d2h_size_npu.fill_(2 * blocks)
+        result = offload.sparse_copy(
+            self.nano_d2h_src_ptrs_npu,
+            self.nano_d2h_dst_ptrs_npu,
+            self.nano_d2h_lengths_npu,
+            self.nano_d2h_size_npu,
+            device,
+        )
+        if result not in (None, 0):
+            raise RuntimeError(f"memfabric nano block D2H failed with result={result}")
 
     def offload_new_kv(
         self,
@@ -1183,15 +1533,14 @@ class SparseKVOffloadManager:
         slot_mapping: torch.Tensor,
         k_cache_cpu: torch.Tensor | None,
         v_cache_cpu: torch.Tensor | None,
-        k_cache_npu: torch.Tensor | None,  # prefill (colocate debug only): cache_npu[slot] -> cache_cpu[slot]
-        v_cache_npu: torch.Tensor | None,  # prefill (colocate debug only): cache_npu[slot] -> cache_cpu[slot]
+        k_cache_npu: torch.Tensor | None,
+        v_cache_npu: torch.Tensor | None,
         k: torch.Tensor | None,  # decode: k/v -> cache_cpu[slot]
         v: torch.Tensor | None,  # decode: k/v -> cache_cpu[slot]
         has_prefill: bool = False,
-        capturing: bool = False,
     ) -> None:
-        # the has_prefill path (NPU paged cache -> CPU pool D2H) only exists
-        # for single-node PD-colocate debug.
+        # The has_prefill path reads the paged NPU cache. Decode uses the
+        # materialized current-token K/V tensors.
         if self.tp_rank != 0:
             # Decode-produced K/V is replicated across TP ranks, so TP0 alone
             # writes new decode tokens. PD pull fills disjoint parts of this

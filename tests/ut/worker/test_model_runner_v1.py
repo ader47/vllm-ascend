@@ -45,6 +45,191 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 
 
+class TestNanoIterationCompletion(unittest.TestCase):
+    def test_mtp_join_precedes_bookkeeping_connector_and_async_output(self):
+        for asynchronous in (False, True):
+            with self.subTest(asynchronous=asynchronous):
+                runner = NPUModelRunner.__new__(NPUModelRunner)
+                calls = []
+                scheduler_output = SimpleNamespace(total_num_scheduled_tokens=1)
+                runner.kv_connector_output = None
+                runner.speculative_config = SimpleNamespace(use_eagle=lambda: True, disable_padded_drafter_batch=False)
+                runner.execute_model_state = (
+                    scheduler_output,
+                    None,
+                    None,
+                    object(),
+                    None,
+                    None,
+                    None,
+                    object(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                sampled = torch.tensor([[3]])
+                runner._sample = lambda *args, sampled=sampled: SimpleNamespace(
+                    sampled_token_ids=sampled, logprobs_tensors=None
+                )
+                runner.need_accepted_tokens = False
+                runner.sparse_kv_offload_enabled = True
+                runner.sparse_kv_offload_config = SimpleNamespace(use_nano=True)
+                runner.sparse_kv_offload_manager = SimpleNamespace(
+                    wait_for_nano_host_copies=lambda calls=calls: calls.append("join")
+                )
+                runner.propose_draft_token_ids = lambda *args, calls=calls, sampled=sampled, **kwargs: (
+                    calls.append("mtp") or sampled
+                )
+                runner._copy_draft_token_ids_to_cpu = lambda *args, calls=calls: calls.append("draft_output")
+                runner._bookkeeping_sync = lambda *args, calls=calls: (
+                    calls.append("bookkeeping")
+                    or (
+                        {},
+                        None,
+                        None,
+                        [[3]],
+                        {},
+                        ["request"],
+                        {"request": 0},
+                        [],
+                    )
+                )
+                runner.finalize_kv_connector = lambda calls=calls: calls.append("connector")
+                runner.input_batch = SimpleNamespace(
+                    sampling_metadata=None,
+                    vocab_size=10,
+                    set_async_sampled_token_ids=lambda *args: None,
+                )
+                runner.supports_mm_inputs = runner.dynamic_eplb = runner.routed_experts_initialized = False
+                runner._finalize_dump_data = lambda: None
+                runner.use_async_scheduling = asynchronous
+                runner.async_output_copy_stream = None
+
+                def async_output(calls=calls, sampled=sampled, **kwargs):
+                    calls.append("async_output")
+                    return SimpleNamespace(sampled_token_ids_cpu=sampled, async_copy_ready_event=object())
+
+                module = "vllm_ascend.worker.model_runner_v1"
+                with (
+                    patch(module + ".get_pp_group", return_value=SimpleNamespace(world_size=1)),
+                    patch(module + ".record_function_or_nullcontext", side_effect=lambda *args: nullcontext()),
+                    patch(module + ".ModelRunnerOutput", side_effect=lambda **kwargs: SimpleNamespace(**kwargs)),
+                    patch(module + ".AsyncGPUModelRunnerOutput", side_effect=async_output),
+                    patch(module + ".nans_to_dict", None),
+                ):
+                    runner.sample_tokens(None)
+                expected = ["mtp", "join", "draft_output", "bookkeeping", "connector"]
+                if asynchronous:
+                    expected.append("async_output")
+                self.assertEqual(calls, expected)
+
+
+class TestNanoRequestSlotLifecycle(unittest.TestCase):
+    @staticmethod
+    def _runner(req_id: str, num_computed_tokens: int) -> NPUModelRunner:
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.max_num_reqs = 2
+        runner._offload_pool_slots = SimpleNamespace(
+            np=np.zeros(4, dtype=np.int32),
+            copy_to_gpu=lambda _count: None,
+        )
+        runner._offload_pool_generations = SimpleNamespace(
+            np=np.zeros(4, dtype=np.int64),
+            copy_to_gpu=lambda _count: None,
+        )
+        runner._offload_request_slots = {}
+        runner._offload_slot_generation = 0
+        runner._offload_slot_generations = {}
+        runner._prebound_nano_slots = lambda: {}
+        runner._offload_slot_last_prefix = {}
+        runner.cache_config = SimpleNamespace(block_size=128)
+        runner._nano_preempted_req_ids = {req_id}
+        runner.input_batch = SimpleNamespace(
+            req_ids=[req_id],
+            req_id_to_index={req_id: 0},
+            num_computed_tokens_cpu=np.array([num_computed_tokens], dtype=np.int32),
+        )
+        return runner
+
+    def test_preempted_request_must_resume_at_full_block_boundary(self):
+        runner = self._runner("request-0", 129)
+
+        with self.assertRaisesRegex(RuntimeError, "non-Host-visible partial tail"):
+            runner._prepare_nano_request_slots(1, 1, dummy=False)
+
+    def test_preempted_request_can_resume_at_full_block_boundary(self):
+        runner = self._runner("request-0", 128)
+
+        runner._prepare_nano_request_slots(1, 1, dummy=False)
+
+        self.assertEqual(runner._offload_pool_slots.np[0], 0)
+        self.assertNotIn("request-0", runner._nano_preempted_req_ids)
+
+    def test_pd_prebound_slot_is_preserved_while_waiting(self):
+        runner = self._runner("request-0", 128)
+        runner._nano_preempted_req_ids.clear()
+        runner._prebound_nano_slots = lambda: {"waiting": 0, "request-0": 1}
+        runner._offload_request_slots = {"waiting": 0}
+        runner._offload_slot_generations = {0: 7}
+        runner._offload_slot_generation = 7
+
+        runner._prepare_nano_request_slots(1, 1, dummy=False)
+
+        self.assertEqual(runner._offload_request_slots, {"waiting": 0, "request-0": 1})
+        self.assertEqual(runner._offload_pool_slots.np[0], 1)
+        self.assertNotIn("waiting", runner._nano_preempted_req_ids)
+
+    def test_preempted_request_keeps_unaligned_tail_while_slot_is_owned(self):
+        runner = self._runner("request-0", 129)
+        runner._offload_request_slots = {"request-0": 1}
+        runner._offload_slot_generations = {1: 7}
+
+        runner._prepare_nano_request_slots(1, 1, dummy=False)
+
+        self.assertEqual(runner._offload_pool_slots.np[0], 1)
+        self.assertEqual(runner._offload_pool_generations.np[0], 7)
+        self.assertNotIn("request-0", runner._nano_preempted_req_ids)
+
+    def test_unscheduled_request_cannot_restore_a_lost_partial_tail(self):
+        runner = self._runner("other", 0)
+        runner._offload_request_slots = {"paused": 0}
+        runner._offload_slot_generations = {0: 7}
+        runner._offload_slot_generation = 7
+        runner._nano_preempted_req_ids.clear()
+        runner._prepare_nano_request_slots(1, 1, dummy=False)
+        self.assertIn("paused", runner._nano_preempted_req_ids)
+        runner.input_batch.req_ids = ["paused"]
+        runner.input_batch.req_id_to_index = {"paused": 0}
+        runner.input_batch.num_computed_tokens_cpu[0] = 129
+        with self.assertRaisesRegex(RuntimeError, "non-Host-visible partial tail"):
+            runner._prepare_nano_request_slots(1, 1, dummy=False)
+        # A scheduler rewind to a complete Host block is safe.
+        runner.input_batch.num_computed_tokens_cpu[0] = 128
+        runner._prepare_nano_request_slots(1, 1, dummy=False)
+        self.assertGreater(runner._offload_pool_generations.np[0], 7)
+
+    def test_update_states_tracks_preemption_lifecycle(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.sparse_kv_offload_enabled = True
+        runner.sparse_kv_offload_config = SimpleNamespace(use_nano=True)
+        runner._nano_preempted_req_ids = {"finished"}
+        runner._offload_request_slots = {"finished": 0}
+        runner.use_async_scheduling = False
+        runner._apply_pp_sampled_tokens_from_scheduler_output = MagicMock()
+        runner._track_tmp_encoder_cache_refs = MagicMock()
+        scheduler_output = SimpleNamespace(
+            scheduled_cached_reqs=SimpleNamespace(),
+            preempted_req_ids={"paused"},
+            finished_req_ids={"finished"},
+        )
+
+        with patch.object(GPUModelRunner, "_update_states", return_value=None):
+            runner._update_states(scheduler_output)
+
+        self.assertEqual(runner._nano_preempted_req_ids, {"paused"})
+
+
 class TestGlm5MtpGraphMetadata(unittest.TestCase):
     @staticmethod
     def _build_dispatch_runner(speculative: bool) -> NPUModelRunner:

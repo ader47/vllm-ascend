@@ -26,7 +26,6 @@ def make_impl():
     impl.nano_miss_src = torch.zeros((4, 32768), dtype=torch.int32, device=device)
     impl.nano_miss_dst = torch.zeros_like(impl.nano_miss_src)
     impl.nano_misses = torch.full((4,), TOPK, dtype=torch.int32, device=device)
-    impl.nano_reuse_cache_tokens = torch.full((4,), TOPK, dtype=torch.int32, device=device)
     impl.nano_reuse_topk_misses = torch.zeros(8, dtype=torch.int32, device=device)
     impl.nano_reuse_misses = torch.zeros(4, dtype=torch.int32, device=device)
     impl.nano_reuse_request_count = 2
@@ -36,19 +35,27 @@ def make_impl():
     impl.kv_lora_rank = 512
     impl.qk_rope_head_dim = 64
     impl.scale = 1 / math.sqrt(576)
+    impl.sfa_sparse_topk = TOPK
     return impl
 
 
-def metadata():
+def metadata(tail_rows=1, history=TOPK):
     device = "npu:0"
     pools = torch.tensor([1, 5], dtype=torch.int32, device=device)
+    blocks = torch.arange(STRIDE_BLOCKS, dtype=torch.int32, device=device)[None]
+    cache = torch.tensor([history, TOPK], dtype=torch.int32, device=device)
+    cache_blocks = cache[:, None] // BLOCK
+    table = pools[:, None] * STRIDE_BLOCKS + torch.where(blocks < cache_blocks, blocks, STRIDE_BLOCKS - 2 + blocks % 2)
     return SimpleNamespace(
         num_decode_tokens=2,
         nano_pool_entries=pools,
         nano_token_active=torch.tensor([True, False], device=device),
         nano_query_ends=torch.tensor([1, 2], dtype=torch.int32, device=device),
-        nano_hbm_block_table=pools[:, None] * STRIDE_BLOCKS
-        + torch.arange(STRIDE_BLOCKS, dtype=torch.int32, device=device)[None],
+        nano_prefix_lens=torch.tensor([history, 0], dtype=torch.int32, device=device),
+        nano_seq_lens=torch.tensor([history + tail_rows, 1], dtype=torch.int32, device=device),
+        nano_cache_tokens=cache,
+        nano_logical_lens=torch.tensor([history + tail_rows, TOPK], dtype=torch.int32, device=device),
+        nano_hbm_block_table=table,
         nano_source_block_table=torch.arange(256, dtype=torch.int32, device=device).reshape(2, 128),
     )
 
@@ -91,20 +98,28 @@ def test_compaction_ignores_graph_padding_rows():
 
 
 @pytest.mark.parametrize("graph", [False, True])
-def test_later_draft_reuses_compacted_selection_without_copy(graph):
+@pytest.mark.parametrize("tail_rows", [1, 129])
+@pytest.mark.parametrize("history", [128, TOPK])
+def test_later_draft_reuses_compacted_selection_without_copy(graph, tail_rows, history):
     enable_custom_op()
     torch.manual_seed(37)
-    impl, md = make_impl(), metadata()
+    impl, md = make_impl(), metadata(tail_rows, history)
     seed_step0_rows(impl)
     impl.nano_topk_src[1].copy_(torch.arange(TOPK, dtype=torch.int32, device="npu:0").view(1, -1))
     impl.compact_nano_topk_metadata(torch.tensor([1, 6], dtype=torch.int32, device="npu:0"))
 
     hbm_k = torch.full((8 * STRIDE_BLOCKS, BLOCK, 1, 512), 7.0, dtype=torch.bfloat16, device="npu:0")
     hbm_r = torch.full((8 * STRIDE_BLOCKS, BLOCK, 1, 64), 9.0, dtype=torch.bfloat16, device="npu:0")
-    selected_k = torch.randn((TOPK, 512), dtype=torch.bfloat16, device="npu:0")
-    selected_r = torch.randn((TOPK, 64), dtype=torch.bfloat16, device="npu:0")
-    hbm_k[STRIDE_BLOCKS : STRIDE_BLOCKS + TOPK // BLOCK].reshape(-1, 512).copy_(selected_k)
-    hbm_r[STRIDE_BLOCKS : STRIDE_BLOCKS + TOPK // BLOCK].reshape(-1, 64).copy_(selected_r)
+    selected_k = torch.randn((history, 512), dtype=torch.bfloat16, device="npu:0")
+    selected_r = torch.randn((history, 64), dtype=torch.bfloat16, device="npu:0")
+    hbm_k[STRIDE_BLOCKS : STRIDE_BLOCKS + history // BLOCK].reshape(-1, 512).copy_(selected_k)
+    hbm_r[STRIDE_BLOCKS : STRIDE_BLOCKS + history // BLOCK].reshape(-1, 64).copy_(selected_r)
+    tail_k = torch.randn((tail_rows, 512), dtype=torch.bfloat16, device="npu:0")
+    tail_r = torch.randn((tail_rows, 64), dtype=torch.bfloat16, device="npu:0")
+    tail_positions = torch.arange(history, history + tail_rows, device="npu:0")
+    tail_slots = md.nano_hbm_block_table[0, tail_positions // BLOCK].long() * BLOCK + tail_positions % BLOCK
+    hbm_k.view(-1, 512)[tail_slots] = tail_k
+    hbm_r.view(-1, 64)[tail_slots] = tail_r
 
     # Poison the source cache and ordinary miss counts. Direct reuse must read
     # the populated step-0 HBM selection and the persistent zero-count buffers.
@@ -119,8 +134,10 @@ def test_later_draft_reuses_compacted_selection_without_copy(graph):
     )
     query = torch.randn((2, 16, 512), dtype=torch.bfloat16, device="npu:0")
     rope = torch.randn((2, 16, 64), dtype=torch.bfloat16, device="npu:0")
-    scores = (query[0].float() @ selected_k.float().T + rope[0].float() @ selected_r.float().T) * impl.scale
-    expected = torch.softmax(scores, dim=-1) @ selected_k.float()
+    visible_k = torch.cat((selected_k, tail_k)).float()
+    visible_r = torch.cat((selected_r, tail_r)).float()
+    scores = (query[0].float() @ visible_k.T + rope[0].float() @ visible_r.T) * impl.scale
+    expected = torch.softmax(scores, dim=-1) @ visible_k
 
     def forward():
         return impl._nano_attention(query, rope, impl.nano_topk_src, md, manager, "mtp.attn")

@@ -158,6 +158,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
     apply_layerwise_kv_cache_plan,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+    NANO_TAIL_BLOCK_SIZE,
     allocate_kv_cache_tensors_for_sparse_kv_offload,
     allocate_kv_offload_topk_profile_buffers,
     get_sparse_kv_offload_manager,
@@ -648,6 +649,7 @@ class NPUModelRunner(GPUModelRunner):
         self.sparse_kv_offload_config = self.ascend_config.sparse_kv_offload_config
         self.sparse_kv_offload_enabled = self.sparse_kv_offload_config.enabled
         self.sparse_kv_offload_manager = None
+        self._nano_rejected_tokens_gpu: torch.Tensor | None = None
         self.tp_rank = get_tensor_model_parallel_rank() if model_parallel_is_initialized() else 0
 
         # Per-request metadata consumed by the Sparse KV offload resident LRU.
@@ -660,6 +662,7 @@ class NPUModelRunner(GPUModelRunner):
         self._offload_slot_generations: dict[int, int] = {}
         self._offload_slot_last_prefix: dict[int, int] = {}
         self._nano_need_eager_tail_restore = False
+        self._nano_preempted_req_ids: set[str] = set()
         if self.sparse_kv_offload_enabled:
             self._offload_req_ids_tensor = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
             self._offload_token_to_req = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
@@ -902,6 +905,18 @@ class NPUModelRunner(GPUModelRunner):
         # Temporary rewind guard for KV-load-failure recompute.
         # This can be removed after the upstream fix is merged.
         req_data = scheduler_output.scheduled_cached_reqs
+        if self.sparse_kv_offload_enabled and self.sparse_kv_offload_config.use_nano:
+            # A request may safely lose its request-local partial tail only when
+            # it resumes from a Host-visible full-block boundary. Record the
+            # lifecycle transition here and validate that invariant when the
+            # request is admitted again.
+            finished_req_ids = getattr(scheduler_output, "finished_req_ids", None) or ()
+            self._nano_preempted_req_ids.difference_update(finished_req_ids)
+            for req_id in finished_req_ids:
+                self._offload_request_slots.pop(req_id, None)
+            self._nano_preempted_req_ids.update(
+                getattr(scheduler_output, "preempted_req_ids", None) or ()
+            )
 
         if self.use_async_scheduling:
             for i, req_id in enumerate(req_data.req_ids):
@@ -1835,8 +1850,10 @@ class NPUModelRunner(GPUModelRunner):
         aux_hidden_states: torch.Tensor = None,
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
+        nano_target_attn_metadata=None,
     ) -> list[list[int]] | None:
         self._log_propose_draft_token_ids_entry(spec_decode_metadata, num_scheduled_tokens)
+        self._nano_rejected_tokens_gpu = None
 
         # Reset cached draft probs from the previous step so that stale data
         # is never used when the drafter does not produce fresh probabilities.
@@ -2010,12 +2027,21 @@ class NPUModelRunner(GPUModelRunner):
                             common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
                         )
                     )
+                self._nano_rejected_tokens_gpu = num_rejected_tokens_gpu
                 target_token_ids = self.input_ids.gpu[token_indices]
                 target_positions = self._get_positions(token_indices)
                 if self.use_aux_hidden_state_outputs:
                     target_hidden_states = torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)
                 else:
                     target_hidden_states = hidden_states[token_indices]
+            # Freeze the target acceptance plan as soon as rejection metadata
+            # exists. The MTP forward may build more attention metadata, but it
+            # must not become a second authority for the committed target rows.
+            self._finalize_nano_tail_plan(
+                nano_target_attn_metadata,
+                spec_decode_metadata,
+            )
+            common_attn_metadata.nano_draft = True
             assert self.drafter is not None
             # Dynamic SD: pass the scheduled per-step K explicitly, unified with
             # the other proposers (ngram/suffix/medusa/extract) and matching
@@ -2514,6 +2540,9 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if self.speculative_config is None and self.sparse_kv_offload_enabled:
+                # Before connector completion and the existing output D2H.
+                self.sparse_kv_offload_manager.wait_for_nano_host_copies()
             self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
                 profiling_chunk_config,
                 execution_start_time,
@@ -2647,6 +2676,10 @@ class NPUModelRunner(GPUModelRunner):
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        if self.speculative_config is None:
+            self._nano_rejected_tokens_gpu = None
+            self._finalize_nano_tail_plan(attn_metadata, spec_decode_metadata)
+
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
                 self.sampling_done_event = torch.npu.Event()
@@ -2669,13 +2702,16 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states,
                 aux_hidden_states,
                 sample_hidden_states,
-                batch_desc,
+                target_model_batch_desc=batch_desc,
+                nano_target_attn_metadata=attn_metadata,
             )
+            if self.sparse_kv_offload_enabled:
+                self.sparse_kv_offload_manager.wait_for_nano_host_copies()
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         output_spec_token_ids = None
         use_padded_batch = False
-        early_pp_padded_drafter = False
+        early_padded_drafter = False
         if self.speculative_config:
             use_padded_batch = (
                 self.speculative_config.use_eagle()
@@ -2683,12 +2719,11 @@ class NPUModelRunner(GPUModelRunner):
                 or self.speculative_config.uses_extract_hidden_states()
                 or self.speculative_config.use_ngram_gpu()
             ) and not self.speculative_config.disable_padded_drafter_batch
-            early_pp_padded_drafter = (
-                use_pp_spec_decode
-                and not self.use_async_scheduling
-                and use_padded_batch
+            early_padded_drafter = use_padded_batch and (
+                (use_pp_spec_decode and not self.use_async_scheduling)
+                or (self.sparse_kv_offload_enabled and self.sparse_kv_offload_config.use_nano)
             )
-            if early_pp_padded_drafter:
+            if early_padded_drafter:
                 self._draft_token_ids = None
                 self._draft_token_req_ids = None
                 with record_function_or_nullcontext("draft_token"):
@@ -2714,10 +2749,10 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
-                if not early_pp_padded_drafter:
+                if not early_padded_drafter:
                     self._draft_token_ids = None
                     self._draft_token_req_ids = None
-                if use_padded_batch and not early_pp_padded_drafter:
+                if use_padded_batch and not early_padded_drafter:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
@@ -3197,13 +3232,9 @@ class NPUModelRunner(GPUModelRunner):
         )
         has_lora = num_active_loras > 0 if force_has_lora is None else force_has_lora
 
-        nano_requires_eager = (
-            self.sparse_kv_offload_enabled and self.sparse_kv_offload_config.use_nano
-            and force_uniform_decode is None and not self._nano_batch_eligible(num_reqs)
-        )
         # ruff: noqa: E731
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
-            if force_eager or nano_requires_eager:
+            if force_eager:
                 return (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
 
             return self.cudagraph_dispatcher.dispatch(
@@ -3263,12 +3294,39 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats,
         )
 
-    def _nano_batch_eligible(self, num_reqs: int) -> bool:
-        # Prompt lengths are immutable lower bounds in decode. Keep short
-        # prompts on the existing eager offload path, even if generation later
-        # grows them past TopK. This avoids reading rejection-adjusted lengths
-        # back from the device merely to choose a graph specialization.
-        return bool(np.all(self.input_batch.num_prompt_tokens[:num_reqs] >= 2048 + 128 + 7))
+    @staticmethod
+    def _find_nano_target_metadata(attn_metadata):
+        """Return the one target Nano metadata object shared by its layers."""
+        metadata_groups = attn_metadata if isinstance(attn_metadata, list) else [attn_metadata]
+        nano_metadata = None
+        for metadata_group in metadata_groups:
+            for metadata in metadata_group.values():
+                if not getattr(metadata, "nano_enabled", False):
+                    continue
+                if nano_metadata is not None and metadata is not nano_metadata:
+                    raise RuntimeError("nano tail finalization does not support multiple target metadata groups")
+                nano_metadata = metadata
+        return nano_metadata
+
+    def _finalize_nano_tail_plan(
+        self,
+        attn_metadata,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        if not (self.sparse_kv_offload_enabled and self.sparse_kv_offload_config.use_nano):
+            return
+        assert self.sparse_kv_offload_manager is not None
+        nano_metadata = self._find_nano_target_metadata(attn_metadata)
+        if nano_metadata is None:
+            return
+        if spec_decode_metadata is not None and self._nano_rejected_tokens_gpu is None:
+            raise RuntimeError(
+                "nano MTP requires device-side rejected-row counts before tail confirmation"
+            )
+        self.sparse_kv_offload_manager.finalize_nano_full_blocks(
+            nano_metadata,
+            self._nano_rejected_tokens_gpu,
+        )
 
     def _prebound_nano_slots(self) -> dict[str, int]:
         if not has_kv_transfer_group():
@@ -3292,7 +3350,11 @@ class NPUModelRunner(GPUModelRunner):
             # PD binds rows at alloc time. Keep those reservations even when the
             # request is waiting for KV and is not in the current decode batch.
             prebound = self._prebound_nano_slots()
+            # Batch compaction preserves ownership. Both preemption and an
+            # unscheduled iteration can remove a request from the batch.
+            # Remember every released tail, not just explicit preemptions.
             live = self.input_batch.req_id_to_index
+            self._nano_preempted_req_ids.update(self._offload_request_slots.keys() - live.keys() - prebound.keys())
             self._offload_request_slots = {
                 req: slot
                 for req, slot in self._offload_request_slots.items()
@@ -3302,10 +3364,19 @@ class NPUModelRunner(GPUModelRunner):
             available = iter(slot for slot in range(capacity) if slot not in used)
             for row, req in enumerate(self.input_batch.req_ids[:num_reqs]):
                 if req not in self._offload_request_slots:
+                    if req in self._nano_preempted_req_ids:
+                        previous_len = int(self.input_batch.num_computed_tokens_cpu[row])
+                        if previous_len % NANO_TAIL_BLOCK_SIZE:
+                            raise RuntimeError(
+                                "nano cannot resume a request whose tail slot was released with a "
+                                "non-Host-visible partial tail: "
+                                f"request_id={req}, num_computed_tokens={previous_len}"
+                            )
                     slot = prebound[req] if req in prebound else next(available)
                     self._offload_request_slots[req] = slot
                     self._offload_slot_generation += 1
                     self._offload_slot_generations[slot] = self._offload_slot_generation
+                self._nano_preempted_req_ids.discard(req)
                 slot = self._offload_request_slots[req]
                 slots[row] = slot
                 generations[row] = self._offload_slot_generations[slot]
@@ -3564,8 +3635,10 @@ class NPUModelRunner(GPUModelRunner):
                                    if self._offload_pool_slots is not None else None),
             req_topk_buffer_generations=(self._offload_pool_generations.gpu[:num_reqs_padded]
                                          if self._offload_pool_generations is not None else None),
-            nano_eligible=(offload_dummy or self._nano_batch_eligible(num_reqs))
-                          if self._offload_pool_slots is not None else False,
+            # Dense short histories use the same Nano layout as long ones.
+            # Switching the whole batch to the old path would lose the
+            # unoffloaded partial tails of its existing Nano requests.
+            nano_eligible=self._offload_pool_slots is not None,
             offload_dummy=offload_dummy,
             mm_req_doc_ranges=req_doc_ranges,
         )
@@ -4088,6 +4161,8 @@ class NPUModelRunner(GPUModelRunner):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
                 )
+                if self.sparse_kv_offload_manager is not None:
+                    self.sparse_kv_offload_manager.join_nano_d2h()
             if active_device_metadata_executor is not None:
                 active_device_metadata_executor.release()
             self.kvpp.complete_forward()
@@ -4308,6 +4383,10 @@ class NPUModelRunner(GPUModelRunner):
                 breakable_cudagraph.is_breakable_cudagraph_enabled()
                 and cudagraph_mode != CUDAGraphMode.NONE
             ):
+                if self.sparse_kv_offload_enabled and self.sparse_kv_offload_config.use_nano:
+                    raise ValueError(
+                        "nano D2H supports ACLGraphWrapper capture, not breakable graphs; use FULL or eager"
+                    )
                 self.model = BreakableACLGraphWrapper(
                     self.model,
                     self.vllm_config,
