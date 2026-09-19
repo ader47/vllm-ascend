@@ -93,10 +93,11 @@ def test_device_lengths_tail_geometry_and_rejection():
     # Current query KV is scattered locally: descriptors still describe prior KV
     # so prefix rollback can eager-restore. PD decode skips the graph H2D.
     assert metadata.nano_skip_tail_restore is True
-    assert metadata.nano_tail_lengths.cpu().tolist() == [[127, 0], [0, 0]]
     assert metadata.nano_copy_count.item() == 8
     assert metadata.nano_copy_lengths.cpu().tolist() == [127 * 1024, 0, 0, 0, 127 * 128, 0, 0, 0]
-    assert metadata.nano_tail_src.cpu().tolist() == [[10240, 10368], [24704, 24832]]
+    assert metadata.nano_copy_src_offsets.cpu().tolist() == [
+        pos * size for size in (1024, 128) for pos in (10240, 10368, 24704, 24832)
+    ]
     assert metadata.nano_hbm_block_table[:, 64:66].cpu().tolist() == [[130, 131], [65, 64]]
     stride = 8192 + 256
     assert metadata.nano_device_slots.cpu().tolist() == [stride + 8192 + pos % 256 for pos in range(10367, 10371)] + [
@@ -136,7 +137,7 @@ def test_inactive_capture_becomes_active_on_graph_replay():
     # Private pools 4 and 5; positive cache budgets avoid copy-SFA's cold-fill predicate.
     assert metadata.nano_pool_entries.cpu().tolist() == [4, 5]
     assert metadata.nano_cache_tokens.cpu().tolist() == [2048, 2048]
-    assert metadata.nano_tail_lengths.count_nonzero().item() == 0
+    assert metadata.nano_copy_lengths.count_nonzero().item() == 0
     assert metadata.nano_device_slots.min().item() >= 4 * (8192 + 256)
     for _ in range(3):
         impl._prepare_nano_lim_state(metadata)

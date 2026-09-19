@@ -192,6 +192,33 @@ def test_nano_draft_metadata_keeps_full_block_in_tail_and_uses_actual_positions(
         first = builder._populate_offload_metadata(SimpleNamespace(), cm)
         assert first.nano_prefix_lens.tolist() == [base]
         assert first.nano_flush_active.tolist() == [True]
+        assert first.nano_copy_count.tolist() == [4]
+        assert first.nano_copy_src_offsets.tolist() == [
+            base * 1024,
+            (base + 128) * 1024,
+            base * 128,
+            (base + 128) * 128,
+        ]
+        tail_dst = [8448 + 8192 + pos % 256 for pos in (base, base + 128)]
+        assert first.nano_copy_dst_offsets.tolist() == [pos * size for size in (1024, 128) for pos in tail_dst]
+        assert first.nano_copy_lengths.tolist() == [126 * 1024, 0, 126 * 128, 0]
+        copy_fields = (
+            "nano_copy_src_offsets",
+            "nano_copy_dst_offsets",
+            "nano_copy_lengths",
+            "nano_copy_count",
+            "nano_flush_src_slots",
+            "nano_flush_dst_slots",
+            "nano_flush_active",
+        )
+        saved_copies = {name: getattr(first, name).clone() for name in copy_fields}
+        copy_addresses = {name: getattr(first, name).data_ptr() for name in copy_fields}
+        # Copy storage is step-0-only, not multiplied by speculative K.
+        assert builder.nano_copy_src_offsets.shape == (builder.nano_pool_capacity * 4,)
+        assert builder.nano_flush_src_slots.shape == (builder.nano_pool_capacity,)
+        for name in ("nano_tail_src", "nano_tail_dst", "nano_tail_lengths"):
+            assert not hasattr(builder, name)
+            assert not hasattr(first, name)
         saved_table = first.nano_hbm_block_table.clone()
         # Rejection kept only two of step 0's four rows. The actual next
         # position is 128, although the optimistic seq_len says 131.
@@ -200,16 +227,29 @@ def test_nano_draft_metadata_keeps_full_block_in_tail_and_uses_actual_positions(
         cm.seq_lens = torch.tensor([base + 131], dtype=torch.int32)
         cm.max_query_len = cm.num_input_tokens = 1
         for step in (1, 2):
-            md = builder._populate_offload_metadata(SimpleNamespace(), cm, draft_index=step)
+            # Also clear stale descriptors if metadata was shallow-copied.
+            md = builder._populate_offload_metadata(SimpleNamespace(**vars(first)), cm, draft_index=step)
             assert md.nano_seq_lens.tolist() == [base + 128 + step]
             assert md.nano_prefix_lens.tolist() == [base]
             assert md.nano_logical_lens.tolist() == [min(base, 8192) + 128 + step]
-            assert not md.nano_flush_active[0]
+            for name in copy_fields:
+                assert getattr(md, name) is None
+                torch.testing.assert_close(getattr(first, name), saved_copies[name])
+            manager.gather_nano_confirmed_plan.assert_called_once()
             assert md.nano_device_slots.tolist() == [8448 + 8192 + (base + 127 + step) % 256]
             torch.testing.assert_close(md.nano_hbm_block_table, saved_table)
+            torch.testing.assert_close(md.nano_source_block_table, first.nano_source_block_table)
             cm.positions += 1
         assert first.nano_seq_lens.tolist() == [base + 130]
         assert first.nano_flush_active.tolist() == [True]
+        # The next iteration updates contents without moving captured addresses.
+        cm.query_start_loc = cm.query_start_loc_cpu = torch.tensor([0, 4], dtype=torch.int32)
+        cm.seq_lens = torch.tensor([base + 131], dtype=torch.int32)
+        cm.max_query_len = cm.num_input_tokens = 4
+        revised = builder._populate_offload_metadata(SimpleNamespace(), cm)
+        for name in copy_fields:
+            assert getattr(revised, name).data_ptr() == copy_addresses[name]
+        assert revised.nano_copy_lengths.tolist() == [127 * 1024, 0, 127 * 128, 0]
 
 
 def test_nano_partial_tail_stays_resident_until_state_is_discontinuous():
@@ -372,9 +412,9 @@ def test_nano_decode_writes_kv_directly_to_topk_tail(draft_step, host_visibility
         nano_skip_tail_restore=pd_tail_ready,
         nano_device_slots=torch.tensor([4, 5], dtype=torch.int64),
         nano_token_active=torch.tensor([True, False]),
-        nano_flush_src_slots=torch.tensor([4, 0], dtype=torch.int64),
-        nano_flush_dst_slots=torch.tensor([128, 0], dtype=torch.int64),
-        nano_flush_active=torch.tensor([True, False]),
+        nano_flush_src_slots=torch.tensor([4, 0], dtype=torch.int64) if draft_step <= 0 else None,
+        nano_flush_dst_slots=torch.tensor([128, 0], dtype=torch.int64) if draft_step <= 0 else None,
+        nano_flush_active=torch.tensor([True, False]) if draft_step <= 0 else None,
     )
     fused_kv = MagicMock()
 
