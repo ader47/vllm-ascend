@@ -702,6 +702,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         with self.runner.synchronize_input_prep():
             if aclgraph_runtime_mode == CUDAGraphMode.FULL and len(self.runner.attn_groups) > 0:
                 num_computed_tokens_cpu = self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+                nano_capture = (
+                    getattr(self.runner, "sparse_kv_offload_enabled", False)
+                    and self.runner.sparse_kv_offload_config.use_nano
+                )
 
                 # num_reqs is already the padded version
                 self.query_start_loc.cpu[: num_reqs + 1].copy_(self.runner.query_start_loc.cpu[: num_reqs + 1])
@@ -753,6 +757,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         else None
                     ),
                     nano_eligible=True,
+                    nano_draft=nano_capture,
                     offload_dummy=True,
                     req_ids_tensor=req_ids_tensor,
                     token_to_req=token_to_req,
@@ -763,8 +768,28 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
                 assert len(self.draft_attn_groups) > 0
                 builder = self.draft_attn_groups[0].get_metadata_builder()
+                # Capture must use the same per-step query layout and builder
+                # slots as _propose. All dummy rows are inactive; advance private
+                # positions without modifying the runner's real input buffers.
+                nano_positions = torch.zeros_like(self._get_positions(num_reqs)) if nano_capture else None
                 # update the tensor's address for each step.
                 for draft_index in range(self.num_speculative_tokens):
+                    if nano_capture and draft_index > 0:
+                        per_layer_attn_metadata = {}
+                        for attn_group in self.draft_attn_groups:
+                            common_attn_metadata, attn_metadata = self.attn_update_stack_num_spec_norm(
+                                draft_index,
+                                common_attn_metadata,
+                                batch_size=num_reqs,
+                                input_batch_size=num_tokens,
+                                used_update_positions=nano_positions,
+                                aclgraph_runtime_mode=aclgraph_runtime_mode,
+                                attn_group=attn_group,
+                            )
+                            for layer_name in self._get_attn_metadata_layer_names(attn_group):
+                                per_layer_attn_metadata[layer_name] = attn_metadata
+                        multi_steps_attn_metadata.append(per_layer_attn_metadata)
+                        continue
                     common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
                     extra_attn_metadata_args: dict = {}
                     if self.use_compress:
