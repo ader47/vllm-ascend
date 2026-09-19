@@ -363,9 +363,6 @@ class AscendSFAMetadata:
     nano_active: torch.Tensor | None = None
     nano_hbm_block_table: torch.Tensor | None = None
     nano_source_block_table: torch.Tensor | None = None
-    nano_tail_src: torch.Tensor | None = None
-    nano_tail_dst: torch.Tensor | None = None
-    nano_tail_lengths: torch.Tensor | None = None
     nano_device_slots: torch.Tensor | None = None
     nano_token_active: torch.Tensor | None = None
     nano_flush_src_slots: torch.Tensor | None = None

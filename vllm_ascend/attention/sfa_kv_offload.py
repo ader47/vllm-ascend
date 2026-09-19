@@ -224,20 +224,19 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         self.nano_token_positions = torch.arange(tokens, dtype=torch.int64, device=device)
         self.nano_device_slots = torch.empty((steps, tokens), dtype=torch.int64, device=device)
         self.nano_token_active = torch.empty((steps, tokens), dtype=torch.bool, device=device)
-        self.nano_tail_src = torch.empty((steps, requests, 2), dtype=torch.int64, device=device)
-        self.nano_tail_dst = torch.empty_like(self.nano_tail_src)
-        self.nano_tail_lengths = torch.empty((steps, requests, 2), dtype=torch.int32, device=device)
-        self.nano_flush_src_slots = torch.empty((steps, requests), dtype=torch.int64, device=device)
+        # Only Target / MTP step 0 consumes copy descriptors. Later draft
+        # steps retain their own attention metadata but never restore or flush.
+        self.nano_flush_src_slots = torch.empty(requests, dtype=torch.int64, device=device)
         self.nano_flush_dst_slots = torch.empty_like(self.nano_flush_src_slots)
-        self.nano_flush_active = torch.empty((steps, requests), dtype=torch.bool, device=device)
+        self.nano_flush_active = torch.empty(requests, dtype=torch.bool, device=device)
         hf_config = vllm_config.model_config.hf_text_config
         self.nano_token_bytes = torch.tensor(
             [hf_config.kv_lora_rank * 2, hf_config.qk_rope_head_dim * 2], dtype=torch.int64, device=device
         ).view(2, 1, 1)
-        self.nano_copy_src_offsets = torch.empty((steps, requests * 4), dtype=torch.int64, device=device)
+        self.nano_copy_src_offsets = torch.empty(requests * 4, dtype=torch.int64, device=device)
         self.nano_copy_dst_offsets = torch.empty_like(self.nano_copy_src_offsets)
-        self.nano_copy_lengths = torch.empty((steps, requests * 4), dtype=torch.int32, device=device)
-        self.nano_copy_count = torch.empty((steps, 1), dtype=torch.int32, device=device)
+        self.nano_copy_lengths = torch.empty(requests * 4, dtype=torch.int32, device=device)
+        self.nano_copy_count = torch.empty(1, dtype=torch.int32, device=device)
 
     def _populate_offload_metadata(
         self,
@@ -341,38 +340,38 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
                 )
             self.nano_source_block_table[draft_index, :count].copy_(source)
             metadata.nano_source_block_table = self.nano_source_block_table[draft_index, :count]
-            tail_blocks = prefix[:, None].to(torch.int64) // 128 + self.nano_parts
-            source_ids = source.gather(1, tail_blocks.clamp(0, source.shape[1] - 1)).to(torch.int64)
-            # Restore previously computed KV only. Every TP rank scatters
-            # its current query KV directly into its local tails, so it never
-            # races a read of another TP rank's current-token D2H write.
-            lengths = (seq_lens[:, None] - widths[:, None] - prefix[:, None] - self.nano_parts * 128).clamp(0, 128)
-            lengths = torch.where(active[:, None] & (tail_blocks < source.shape[1]) & (source_ids >= 0), lengths, 0)
-            self.nano_tail_src[draft_index, :count].copy_(source_ids.clamp_min(0) * 128)
-            self.nano_tail_dst[draft_index, :count].copy_(
-                safe_pools[:, None].to(torch.int64) * self.nano_stride_blocks * 128
-                + self.nano_hot_tokens
-                + tail_blocks % 2 * 128
-            )
-            self.nano_tail_lengths[draft_index, :count].copy_(lengths)
-            metadata.nano_tail_src = self.nano_tail_src[draft_index, :count]
-            metadata.nano_tail_dst = self.nano_tail_dst[draft_index, :count]
-            metadata.nano_tail_lengths = self.nano_tail_lengths[draft_index, :count]
-            descriptor_count = count * 4
-            self.nano_copy_src_offsets[draft_index, :descriptor_count].copy_(
-                (metadata.nano_tail_src[None] * self.nano_token_bytes).reshape(-1)
-            )
-            self.nano_copy_dst_offsets[draft_index, :descriptor_count].copy_(
-                (metadata.nano_tail_dst[None] * self.nano_token_bytes).reshape(-1)
-            )
-            self.nano_copy_lengths[draft_index, :descriptor_count].copy_(
-                (metadata.nano_tail_lengths[None] * self.nano_token_bytes).reshape(-1)
-            )
-            self.nano_copy_count[draft_index].fill_(descriptor_count)
-            metadata.nano_copy_src_offsets = self.nano_copy_src_offsets[draft_index, :descriptor_count]
-            metadata.nano_copy_dst_offsets = self.nano_copy_dst_offsets[draft_index, :descriptor_count]
-            metadata.nano_copy_lengths = self.nano_copy_lengths[draft_index, :descriptor_count]
-            metadata.nano_copy_count = self.nano_copy_count[draft_index]
+            if draft_index == 0:
+                tail_blocks = prefix[:, None].to(torch.int64) // 128 + self.nano_parts
+                source_ids = source.gather(1, tail_blocks.clamp(0, source.shape[1] - 1)).to(torch.int64)
+                # Restore only prior KV; current query KV is scattered locally.
+                # Keep token offsets local and store only the byte descriptors
+                # consumed by H2D at stable addresses.
+                lengths = (seq_lens[:, None] - widths[:, None] - prefix[:, None] - self.nano_parts * 128).clamp(0, 128)
+                lengths = torch.where(active[:, None] & (tail_blocks < source.shape[1]) & (source_ids >= 0), lengths, 0)
+                tail_src = source_ids.clamp_min(0) * 128
+                tail_dst = (
+                    safe_pools[:, None].to(torch.int64) * self.nano_stride_blocks * 128
+                    + self.nano_hot_tokens
+                    + tail_blocks % 2 * 128
+                )
+                descriptor_count = count * 4
+                self.nano_copy_src_offsets[:descriptor_count].copy_(
+                    (tail_src[None] * self.nano_token_bytes).reshape(-1)
+                )
+                self.nano_copy_dst_offsets[:descriptor_count].copy_(
+                    (tail_dst[None] * self.nano_token_bytes).reshape(-1)
+                )
+                self.nano_copy_lengths[:descriptor_count].copy_((lengths[None] * self.nano_token_bytes).reshape(-1))
+                self.nano_copy_count.fill_(descriptor_count)
+                metadata.nano_copy_src_offsets = self.nano_copy_src_offsets[:descriptor_count]
+                metadata.nano_copy_dst_offsets = self.nano_copy_dst_offsets[:descriptor_count]
+                metadata.nano_copy_lengths = self.nano_copy_lengths[:descriptor_count]
+                metadata.nano_copy_count = self.nano_copy_count
+            else:
+                metadata.nano_copy_src_offsets = None
+                metadata.nano_copy_dst_offsets = None
+                metadata.nano_copy_lengths = None
+                metadata.nano_copy_count = None
             tokens = common_attn_metadata.num_input_tokens
             positions = self.nano_token_positions[:tokens]
             token_rows = torch.searchsorted(ends.contiguous(), positions.to(torch.int32), right=True).clamp_max(
@@ -395,37 +394,37 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             # can cross the boundary. Target copies remain private until
             # rejection sampling confirms the committed length. Draft/MTP
             # metadata is built after rejection, so its mask is already final.
-            if getattr(common_attn_metadata, "nano_draft", False):
-                (
-                    flush_src_slots,
-                    flush_dst_slots,
-                    flush_active,
-                ) = get_sparse_kv_offload_manager().gather_nano_confirmed_plan(
-                    safe_pools,
-                    generations[:count],
-                    active,
-                )
-                if draft_index > 0:
-                    # Step 0 processes the accepted target rows. Later MTP
-                    # steps only append provisional draft rows beyond the
-                    # committed boundary and must not recopy the same block.
-                    flush_active = torch.zeros_like(flush_active)
+            if draft_index == 0:
+                if getattr(common_attn_metadata, "nano_draft", False):
+                    (
+                        flush_src_slots,
+                        flush_dst_slots,
+                        flush_active,
+                    ) = get_sparse_kv_offload_manager().gather_nano_confirmed_plan(
+                        safe_pools,
+                        generations[:count],
+                        active,
+                    )
+                else:
+                    flush_src_slots, flush_dst_slots, flush_active = _nano_candidate_block_slots(
+                        seq_lens,
+                        widths,
+                        safe_pools,
+                        active,
+                        metadata.nano_source_block_table,
+                        self.nano_stride_blocks,
+                        self.nano_hot_tokens,
+                    )
+                self.nano_flush_src_slots[:count].copy_(flush_src_slots)
+                self.nano_flush_dst_slots[:count].copy_(flush_dst_slots)
+                self.nano_flush_active[:count].copy_(flush_active)
+                metadata.nano_flush_src_slots = self.nano_flush_src_slots[:count]
+                metadata.nano_flush_dst_slots = self.nano_flush_dst_slots[:count]
+                metadata.nano_flush_active = self.nano_flush_active[:count]
             else:
-                flush_src_slots, flush_dst_slots, flush_active = _nano_candidate_block_slots(
-                    seq_lens,
-                    widths,
-                    safe_pools,
-                    active,
-                    metadata.nano_source_block_table,
-                    self.nano_stride_blocks,
-                    self.nano_hot_tokens,
-                )
-            self.nano_flush_src_slots[draft_index, :count].copy_(flush_src_slots)
-            self.nano_flush_dst_slots[draft_index, :count].copy_(flush_dst_slots)
-            self.nano_flush_active[draft_index, :count].copy_(flush_active)
-            metadata.nano_flush_src_slots = self.nano_flush_src_slots[draft_index, :count]
-            metadata.nano_flush_dst_slots = self.nano_flush_dst_slots[draft_index, :count]
-            metadata.nano_flush_active = self.nano_flush_active[draft_index, :count]
+                metadata.nano_flush_src_slots = None
+                metadata.nano_flush_dst_slots = None
+                metadata.nano_flush_active = None
             # Target and MTP step 0 may copy; step 1+ only appends resident KV.
             metadata.nano_draft_step = draft_index
             metadata.num_prefills = 0
