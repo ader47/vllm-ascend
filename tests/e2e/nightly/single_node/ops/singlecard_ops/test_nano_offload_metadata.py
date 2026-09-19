@@ -235,26 +235,41 @@ def test_draft_metadata_remains_valid_until_its_step_executes():
         if name.startswith("nano_") and isinstance(value, torch.Tensor)
     }
     # The proposer builds both subsequent Q1 steps before executing the Q4
-    # first step. Neither query prefixes nor tail/copy geometry may alias.
+    # first step. Attention metadata is per step; copies belong only to step 0.
     second = populate(builder, common([1, 2], [10372, 8325]), draft_index=1)
     third = populate(builder, common([1, 2], [10373, 8326]), draft_index=2)
     torch.npu.synchronize()
     for name, expected in saved.items():
         torch.testing.assert_close(getattr(first, name), expected)
+        if name.startswith(("nano_copy_", "nano_flush_")):
+            assert getattr(second, name) is None
+            assert getattr(third, name) is None
+            continue
         addresses = {getattr(md, name).data_ptr() for md in (first, second, third)}
         assert len(addresses) == 3, name
     assert first.nano_query_ends.cpu().tolist() == [4, 8]
     assert second.nano_seq_lens.cpu().tolist() == [10372, 8325]
     assert third.nano_seq_lens.cpu().tolist() == [10373, 8326]
 
-    # A captured consumer must continue reading its own stable step address.
-    observed = torch.empty_like(first.nano_query_ends)
+    # Capture a consumer of every step, including step-0-only copy lengths.
+    steps = (first, second, third)
+    observed = [torch.empty_like(md.nano_query_ends) for md in steps]
+    observed_slots = [torch.empty_like(md.nano_device_slots) for md in steps]
+    observed_copy_lengths = torch.empty_like(first.nano_copy_lengths)
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
-        observed.copy_(first.nano_query_ends)
+        for md, queries, slots in zip(steps, observed, observed_slots):
+            queries.copy_(md.nano_query_ends)
+            slots.copy_(md.nano_device_slots)
+        observed_copy_lengths.copy_(first.nano_copy_lengths)
     for ends, lengths in (([4, 5], [10374, 8327]), ([4, 8], [10375, 8328])):
-        populate(builder, common(ends, lengths))
+        cm = common(ends, lengths)
+        cm.num_input_tokens = first.nano_device_slots.numel()  # keep the captured token bucket
+        populate(builder, cm)
         populate(builder, common([1, 2], [10376, 8329]), draft_index=1)
         populate(builder, common([1, 2], [10377, 8330]), draft_index=2)
         graph.replay()
-        assert observed.cpu().tolist() == ends
+        assert [queries.cpu().tolist() for queries in observed] == [ends, [1, 2], [1, 2]]
+        for md, slots in zip(steps, observed_slots):
+            torch.testing.assert_close(slots, md.nano_device_slots)
+        torch.testing.assert_close(observed_copy_lengths, first.nano_copy_lengths)

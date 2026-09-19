@@ -26,6 +26,8 @@ import pytest
 import torch
 from vllm.config import CUDAGraphMode
 
+from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadMetadataBuilder
+from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.spec_decode.llm_base_proposer import (
     AscendSpecDecodeBaseProposer,
     _draft_embed_accepts_mm,
@@ -129,6 +131,184 @@ def test_nano_draft_graph_padding_keeps_request_capacity(nano_enabled):
     )
     assert later.num_reqs == requests
     assert later.query_start_loc.numel() == requests + 1
+
+
+@pytest.mark.parametrize("draft_steps,num_tokens", [(1, 4), (3, 8), (3, 10), (6, 16)])
+def test_nano_dummy_capture_matches_runtime_step_layout(draft_steps, num_tokens):
+    # Exercise dummy_run -> the real step updater -> the real Nano builder.
+    # Only model execution, device context and unrelated base SFA metadata
+    # are mocked. In particular, do not mock the capture builder dispatch.
+    query_width = draft_steps + 1
+    ends = [0, query_width, 2 * query_width]
+    if num_tokens > ends[-1]:
+        ends.append(num_tokens)
+    num_reqs = len(ends) - 1
+    capacity = 16
+
+    def buffer(data):
+        cpu = data.clone()
+        gpu = data.clone()
+        return SimpleNamespace(cpu=cpu, gpu=gpu, copy_to_gpu=lambda: gpu.copy_(cpu))
+
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=capacity),
+        speculative_config=SimpleNamespace(num_speculative_tokens=draft_steps),
+        model_config=SimpleNamespace(
+            max_model_len=1024, hf_text_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
+        ),
+    )
+    builder = AscendSFAKVOffloadMetadataBuilder.__new__(AscendSFAKVOffloadMetadataBuilder)
+    builder.use_nano = builder.is_pd_decode_consumer = True
+    builder.decode_threshold = query_width
+    with patch(
+        "vllm_ascend.attention.sfa_kv_offload.get_ascend_config",
+        return_value=SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(topk_buffer_size=2048)),
+    ):
+        builder._init_nano_metadata_buffers(config, torch.device("cpu"))
+
+    group = SimpleNamespace(layer_names=["mtp"], get_metadata_builder=lambda: builder)
+    proposer = AscendSpecDecodeBaseProposer.__new__(AscendSpecDecodeBaseProposer)
+    proposer.vllm_config = config
+    proposer.num_speculative_tokens = draft_steps
+    proposer.use_cuda_graph = True
+    proposer.use_compress = proposer.uses_mrope = proposer.has_gdn = proposer.supports_mm_inputs = False
+    proposer.method = "mtp"
+    proposer.dcp_size = proposer.extra_slots_per_request = 1
+    proposer.kv_cache_gid = 0
+    proposer.block_size = 128
+    proposer.max_model_len = 1024
+    proposer.sliding_window = None
+    proposer.draft_attn_groups = [group]
+    proposer.attn_layer_names = group.layer_names
+    proposer.arange = torch.arange(capacity + 1, dtype=torch.int32)
+    proposer.token_arange_np = proposer.arange.numpy()
+    proposer.positions = torch.full((capacity,), 17, dtype=torch.int64)
+    proposer._get_positions = lambda count: proposer.positions[:count]
+    proposer.query_start_loc = buffer(torch.tensor(ends, dtype=torch.int32))
+    proposer.slot_mapping_group = torch.empty((draft_steps, capacity), dtype=torch.int32)
+    proposer.seq_lens_group = torch.empty((draft_steps, capacity), dtype=torch.int32)
+    proposer.query_start_loc_group = torch.empty((draft_steps, capacity + 1), dtype=torch.int32)
+    proposer.token_indices_to_sample = torch.zeros(capacity, dtype=torch.int64)
+    proposer._runnable = MagicMock()
+    block_table = torch.arange(num_reqs * 8, dtype=torch.int32).view(num_reqs, 8)
+    proposer.runner = SimpleNamespace(
+        sparse_kv_offload_enabled=True,
+        sparse_kv_offload_config=SimpleNamespace(use_nano=True),
+        sparse_kv_offload_manager=SimpleNamespace(join_nano_d2h=MagicMock()),
+        _sync_metadata_across_dp=lambda n, **kwargs: (n, None, None),
+        synchronize_input_prep=nullcontext,
+        _prepare_nano_request_slots=MagicMock(),
+        attn_groups=[group],
+        input_batch=SimpleNamespace(
+            num_computed_tokens_cpu_tensor=torch.zeros(num_reqs, dtype=torch.int32),
+            block_table=[
+                SimpleNamespace(
+                    get_device_tensor=lambda: block_table,
+                    slot_mapping=buffer(torch.arange(capacity, dtype=torch.int32)),
+                )
+            ],
+        ),
+        query_start_loc=buffer(torch.tensor(ends, dtype=torch.int32)),
+        optimistic_seq_lens_cpu=torch.full((num_reqs,), 128, dtype=torch.int32),
+        seq_lens=torch.full((num_reqs,), 128, dtype=torch.int32),
+        positions=torch.full((capacity,), 23, dtype=torch.int64),
+        actual_seq_lengths_q=ends[1:],
+        attn_state=None,
+        decode_token_per_req=query_width,
+        group_len=buffer(torch.zeros(num_reqs, dtype=torch.int32)),
+        group_key_idx=buffer(torch.zeros(num_reqs, dtype=torch.int32)),
+        group_key_cache_idx=buffer(torch.zeros(num_reqs, dtype=torch.int32)),
+        _offload_pool_slots=buffer(torch.arange(num_reqs, dtype=torch.int32) + 4),
+        _offload_pool_generations=buffer(torch.full((num_reqs,), -1, dtype=torch.int64)),
+        _offload_req_ids_tensor=None,
+        _offload_token_to_req=None,
+        dynamic_eplb=False,
+    )
+    manager = SimpleNamespace(
+        gather_nano_confirmed_plan=MagicMock(
+            return_value=(
+                torch.zeros(num_reqs, dtype=torch.int64),
+                torch.zeros(num_reqs, dtype=torch.int64),
+                torch.zeros(num_reqs, dtype=torch.bool),
+            )
+        )
+    )
+    module = "vllm_ascend.spec_decode.llm_base_proposer"
+    with (
+        patch(module + ".AscendCommonAttentionMetadata", side_effect=lambda **kw: SimpleNamespace(**kw)),
+        patch(module + ".prepare_sparse_kv_offload_mtp_dummy_metadata", return_value=(None, None)),
+        patch(module + ".set_ascend_forward_context", return_value=nullcontext()),
+        patch(module + ".get_forward_context", return_value=SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL)),
+        patch(module + "._EXTRA_CTX", SimpleNamespace(capturing=True)),
+        patch.object(AscendSFAMetadataBuilder, "_build", side_effect=lambda *a, **kw: SimpleNamespace()),
+        patch(
+            "vllm_ascend.attention.sfa_kv_offload.split_decodes_and_prefills",
+            side_effect=lambda cm, **kw: (cm.num_reqs, 0, cm.num_input_tokens, 0),
+        ),
+        patch("vllm_ascend.attention.sfa_kv_offload.get_sparse_kv_offload_manager", return_value=manager),
+    ):
+        proposer.dummy_run(num_tokens, num_reqs=num_reqs, aclgraph_runtime_mode=CUDAGraphMode.FULL)
+        captured = [entry["mtp"] for entry in proposer._runnable.call_args.kwargs["multi_steps_attn_metadata"]]
+        assert [md.nano_draft_step for md in captured] == list(range(draft_steps))
+        assert captured[0].nano_query_ends.tolist() == ends[1:]
+        assert captured[0].nano_copy_count.tolist() == [4 * num_reqs]
+        manager.gather_nano_confirmed_plan.assert_called_once()
+        per_step_fields = ("nano_device_slots", "nano_query_ends", "nano_hbm_block_table", "nano_token_active")
+        for name in per_step_fields:
+            assert len({getattr(md, name).data_ptr() for md in captured}) == draft_steps
+        for step, md in enumerate(captured):
+            assert md.nano_device_slots.numel() == num_tokens
+            assert not md.nano_active.any()
+            assert not md.nano_token_active.any()
+            if step:
+                assert md.nano_query_ends.tolist() == list(range(1, num_reqs + 1))
+                assert md.num_decode_tokens == num_reqs
+                assert md.nano_copy_count is None
+                assert md.nano_flush_active is None
+
+        # Rebuild with the runtime updater and verify the exact addresses and
+        # query shapes a captured graph will read, including request padding.
+        runtime_common = SimpleNamespace(
+            num_reqs=num_reqs,
+            num_input_tokens=num_tokens,
+            max_query_len=query_width,
+            query_start_loc=proposer.query_start_loc_group[0][: num_reqs + 1],
+            query_start_loc_cpu=torch.tensor(ends, dtype=torch.int32),
+            seq_lens=torch.full((num_reqs,), 128, dtype=torch.int32),
+            seq_lens_cpu=torch.full((num_reqs,), 128, dtype=torch.int32),
+            _seq_lens_cpu=None,
+            num_computed_tokens_cpu=None,
+            block_table_tensor=block_table,
+            positions=proposer.positions.clone(),
+            slot_mapping=proposer.slot_mapping_group[0],
+            req_topk_buffer_slots=torch.arange(num_reqs, dtype=torch.int32),
+            req_topk_buffer_generations=torch.tensor([11, 12] + [-1] * (num_reqs - 2)),
+            nano_eligible=True,
+            nano_draft=True,
+            offload_dummy=False,
+            req_ids_tensor=None,
+            token_to_req=None,
+        )
+        runtime = [builder.build(0, runtime_common)]
+        positions = torch.tensor([127, 127], dtype=torch.int64)
+        for step in range(1, draft_steps):
+            runtime_common, md = proposer.attn_update_stack_num_spec_norm(
+                step,
+                runtime_common,
+                batch_size=2,
+                input_batch_size=num_tokens,
+                used_update_positions=positions,
+                aclgraph_runtime_mode=CUDAGraphMode.FULL,
+                attn_group=group,
+            )
+            runtime.append(md)
+        for capture_md, runtime_md in zip(captured, runtime):
+            assert capture_md.num_decode_tokens == runtime_md.num_decode_tokens
+            for name in per_step_fields:
+                assert getattr(capture_md, name).shape == getattr(runtime_md, name).shape
+                assert getattr(capture_md, name).data_ptr() == getattr(runtime_md, name).data_ptr()
+        assert (proposer.positions == 17).all()
+        assert (proposer.runner.positions == 23).all()
 
 
 class TestMultimodalImageTokenIndex:
