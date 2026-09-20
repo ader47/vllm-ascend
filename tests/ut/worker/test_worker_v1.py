@@ -156,6 +156,47 @@ class TestNPUWorker(TestBase):
         self.assertEqual((num_layers, num_slots), (7, 3))
         self.assertEqual(factor, expected_logical_bytes / expected_physical_bytes)
 
+    def test_layer_reuse_memory_factor_uses_largest_dsv4_component(self):
+        from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.model_config = MagicMock()
+        worker.parallel_config = MagicMock()
+        worker.model_config.get_num_layers.return_value = 4
+        small_spec = AscendMLAAttentionSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=4,
+            dtype=torch.bfloat16,
+            model_version="deepseek_v4",
+            tokens_per_state=1,
+        )
+        large_spec = AscendMLAAttentionSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.int8,
+            scale_dim=1,
+            scale_dtype=torch.float16,
+            model_version="deepseek_v4",
+            tokens_per_state=1,
+        )
+        specs = {
+            f"model.layers.{layer}.self_attn.attn": spec
+            for layer, spec in enumerate((small_spec, small_spec, large_spec, small_spec))
+        }
+
+        num_layers, num_slots, factor = worker._get_layerwise_kv_cache_memory_info(
+            specs,
+            {"layerwise_num_shared_buffers": 1},
+        )
+
+        expected_logical_bytes = 3 * small_spec.page_size_bytes + large_spec.page_size_bytes
+        expected_physical_bytes = small_spec.page_size_bytes + large_spec.page_size_bytes
+        self.assertEqual((num_layers, num_slots), (4, 2))
+        self.assertEqual(factor, expected_logical_bytes / expected_physical_bytes)
+
     def test_incomplete_layer_layout_does_not_scale_memory_budget(self):
         from vllm_ascend.worker.worker import NPUWorker
 

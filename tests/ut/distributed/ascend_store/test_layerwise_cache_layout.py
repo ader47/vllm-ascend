@@ -10,7 +10,11 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
+from vllm_ascend.core.kv_cache_interface import (
+    AscendMLAAttentionSpec,
+    AscendSFAIndexerCacheSpec,
+    AscendSlidingWindowMLASpec,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
     build_layerwise_cache_layout,
@@ -70,6 +74,7 @@ def test_no_reuse_skips_topology_validation():
     ]
     layer_names = [get_kv_cache_tensor_layers(tensor)[0] for tensor in original_tensors]
     kv_cache_config = SimpleNamespace(
+        num_blocks=1,
         kv_cache_tensors=original_tensors.copy(),
         kv_cache_groups=[
             SimpleNamespace(
@@ -92,6 +97,7 @@ def test_base_layers_are_merged_into_shared_slots():
     layer_names = [get_kv_cache_tensor_layers(tensor)[0] for tensor in original_tensors]
     spec = _make_full_attention_spec()
     kv_cache_config = SimpleNamespace(
+        num_blocks=1,
         kv_cache_tensors=original_tensors,
         kv_cache_groups=[
             SimpleNamespace(
@@ -218,6 +224,7 @@ def test_incompatible_cache_specs_use_separate_slots():
     layer_specs = {layer_name: first_spec for layer_name in layer_names}
     layer_specs[layer_names[2]] = incompatible_spec
     kv_cache_config = SimpleNamespace(
+        num_blocks=1,
         kv_cache_tensors=[_make_kv_cache_tensor(32, [layer_name]) for layer_name in layer_names],
         kv_cache_groups=[
             SimpleNamespace(
@@ -247,6 +254,7 @@ def test_partial_layout_skips_tensor_merge():
     original_tensors = [_make_kv_cache_tensor(16, [layer_name]) for layer_name in layer_names]
     spec = _make_full_attention_spec()
     kv_cache_config = SimpleNamespace(
+        num_blocks=1,
         kv_cache_tensors=original_tensors.copy(),
         kv_cache_groups=[
             SimpleNamespace(
@@ -419,6 +427,7 @@ def test_multi_group_sfa_descriptors_are_merged_by_main_component():
         scale_dtype=torch.float16,
     )
     kv_cache_config = SimpleNamespace(
+        num_blocks=1,
         kv_cache_tensors=[
             *(_make_kv_cache_tensor(main_spec.page_size_bytes, [name]) for name in main_names),
             *(_make_kv_cache_tensor(indexer_spec.page_size_bytes, [name]) for name in indexer_names),
@@ -493,6 +502,7 @@ def test_component_sharing_merges_main_across_a_and_b_layers():
     }
     indexer_by_layer = {layer: f"model.layers.{layer}.self_attn.indexer.k_cache" for layer in a_layers}
     kv_cache_config = SimpleNamespace(
+        num_blocks=1,
         kv_cache_tensors=[
             *(_make_kv_cache_tensor(main_spec.page_size_bytes, [name]) for name in main_by_layer.values()),
             *(_make_kv_cache_tensor(indexer_spec.page_size_bytes, [name]) for name in indexer_by_layer.values()),
@@ -537,7 +547,132 @@ def test_component_sharing_merges_main_across_a_and_b_layers():
     assert indexer_shared_by == [[indexer_by_layer[1]], [indexer_by_layer[4]]]
 
 
-def test_non_attention_cache_spec_is_rejected():
+def test_deepseek_v4_mixed_components_share_by_role_and_keep_extra_specs():
+    num_blocks = 3
+    attn_spec = AscendMLAAttentionSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.bfloat16,
+        model_version="deepseek_v4",
+        tokens_per_state=1,
+    )
+    c4_spec = AscendMLAAttentionSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=4,
+        dtype=torch.bfloat16,
+        model_version="deepseek_v4",
+        tokens_per_state=1,
+    )
+    c128_spec = AscendMLAAttentionSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.int8,
+        scale_dim=1,
+        scale_dtype=torch.float16,
+        model_version="deepseek_v4",
+        tokens_per_state=1,
+    )
+    c4_state_spec = AscendSlidingWindowMLASpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+        sliding_window=32,
+        compress_ratio=4,
+        model_version="deepseek_v4",
+    )
+    c128_state_spec = AscendSlidingWindowMLASpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=4,
+        dtype=torch.float32,
+        sliding_window=32,
+        compress_ratio=128,
+        model_version="deepseek_v4",
+    )
+    attn_names = [
+        *(f"model.layers.{layer}.self_attn.attn" for layer in range(4)),
+        "model.mtp.0.self_attn.attn",
+    ]
+    indexer_names = [
+        *(f"model.layers.{layer}.self_attn.indexer.k_cache" for layer in range(4)),
+        "model.mtp.0.self_attn.indexer.k_cache",
+    ]
+    state_names = [
+        "model.layers.1.self_attn.indexer.compressor.state_cache",
+        "model.layers.2.self_attn.indexer.compressor.state_cache",
+        "model.layers.3.self_attn.indexer.compressor.state_cache",
+    ]
+    indexer_specs = {
+        indexer_names[0]: c4_spec,
+        indexer_names[1]: c4_spec,
+        indexer_names[2]: c128_spec,
+        indexer_names[3]: c4_spec,
+        indexer_names[4]: c128_spec,
+    }
+    all_specs = {
+        **dict.fromkeys(attn_names, attn_spec),
+        **indexer_specs,
+        state_names[0]: c4_state_spec,
+        state_names[1]: c128_state_spec,
+        state_names[2]: c4_state_spec,
+    }
+    backing_size = sum(spec.page_size_bytes for spec in all_specs.values()) * num_blocks
+    kv_cache_config = SimpleNamespace(
+        num_blocks=num_blocks,
+        # The input already contains multi-layer descriptors with real layout
+        # geometry. The layerwise planner consumes only their layer ownership.
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=backing_size,
+                layers=attn_names,
+                layer_stride=attn_spec.page_size_bytes * num_blocks,
+                block_stride=attn_spec.page_size_bytes,
+            ),
+            KVCacheTensor(
+                size=backing_size,
+                layers=indexer_names,
+                layer_stride=c128_spec.page_size_bytes * num_blocks,
+                block_stride=c128_spec.page_size_bytes,
+            ),
+            KVCacheTensor(
+                size=backing_size,
+                layers=state_names,
+                layer_stride=c4_state_spec.page_size_bytes * num_blocks,
+                block_stride=c4_state_spec.page_size_bytes,
+            ),
+        ],
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=list(all_specs),
+                kv_cache_spec=UniformTypeKVCacheSpecs(
+                    block_size=8,
+                    kv_cache_specs=all_specs,
+                ),
+            )
+        ],
+    )
+    config = _make_vllm_config(4, 1)
+
+    assert apply_layerwise_kv_cache_plan(kv_cache_config, config)
+
+    planned_layers = [get_kv_cache_tensor_layers(tensor) for tensor in kv_cache_config.kv_cache_tensors]
+    assert sorted(name for names in planned_layers for name in names) == sorted(all_specs)
+    reused_indexer_names = indexer_names[1:]
+    mixed_indexer_tensor = next(
+        tensor
+        for tensor in kv_cache_config.kv_cache_tensors
+        if get_kv_cache_tensor_layers(tensor) == reused_indexer_names
+    )
+    assert mixed_indexer_tensor.size == num_blocks * c128_spec.page_size_bytes
+    assert [state_names[0], state_names[2]] in planned_layers
+    assert [state_names[1]] in planned_layers
+
+
+def test_non_attention_cache_spec_remains_private():
     mamba_spec = MambaSpec(
         block_size=2,
         shapes=((1,),),
@@ -545,15 +680,17 @@ def test_non_attention_cache_spec_is_rejected():
     )
     layer_specs = {f"model.layers.{layer}.mixer": mamba_spec for layer in range(3)}
 
-    with pytest.raises(NotImplementedError, match="attention cache specs only"):
-        build_layerwise_reuse_layout(
-            layer_specs,
-            3,
-            {"layerwise_num_shared_buffers": 1},
-        )
+    layout = build_layerwise_reuse_layout(
+        layer_specs,
+        3,
+        {"layerwise_num_shared_buffers": 1},
+    )
+
+    assert layout.has_layer_reuse is False
+    assert layout.independent_layers == [0, 1, 2]
 
 
-def test_packed_cache_tensor_descriptors_are_rejected():
+def test_existing_descriptor_geometry_is_replaced_by_the_reuse_plan():
     layer_names = [
         "model.layers.0.self_attn",
         "model.layers.1.self_attn",
@@ -561,6 +698,7 @@ def test_packed_cache_tensor_descriptors_are_rejected():
     ]
     spec = _make_full_attention_spec()
     kv_cache_config = SimpleNamespace(
+        num_blocks=1,
         kv_cache_tensors=[
             (KVCacheTensor(size=16, layers=[layer_name], layer_stride=16, block_stride=32, offset=8))
             for layer_name in layer_names
@@ -576,8 +714,14 @@ def test_packed_cache_tensor_descriptors_are_rejected():
         ],
     )
 
-    with pytest.raises(NotImplementedError, match="pre-shared or packed"):
-        apply_layerwise_kv_cache_plan(
-            kv_cache_config,
-            _make_vllm_config(3, 1),
-        )
+    assert apply_layerwise_kv_cache_plan(
+        kv_cache_config,
+        _make_vllm_config(3, 1),
+    )
+    assert [get_kv_cache_tensor_layers(tensor) for tensor in kv_cache_config.kv_cache_tensors] == [
+        [layer_names[0]],
+        [layer_names[1], layer_names[2]],
+    ]
+    assert all(
+        tensor.offset == tensor.layer_stride == tensor.block_stride == 0 for tensor in kv_cache_config.kv_cache_tensors
+    )

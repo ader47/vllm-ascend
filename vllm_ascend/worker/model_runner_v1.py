@@ -4256,7 +4256,10 @@ class NPUModelRunner(GPUModelRunner):
         self._mamba_bufs = None
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
-        apply_layerwise_kv_cache_plan(kv_cache_config, self.vllm_config)
+        layerwise_reuse_applied = apply_layerwise_kv_cache_plan(
+            kv_cache_config,
+            self.vllm_config,
+        )
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
         self.initialize_attn_backend(kv_cache_config)
@@ -4275,6 +4278,7 @@ class NPUModelRunner(GPUModelRunner):
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config,
             kv_cache_allocation_context=kv_cache_allocation_context,
+            layerwise_reuse_applied=layerwise_reuse_applied,
         )
         # TODO: refactor the logic of attention
         if (
@@ -4338,6 +4342,8 @@ class NPUModelRunner(GPUModelRunner):
         self,
         kv_cache_config: KVCacheConfig,
         kv_cache_allocation_context: AbstractContextManager | None = None,
+        *,
+        layerwise_reuse_applied: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Initialize the memory buffer for KV cache.
@@ -4346,13 +4352,18 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_config: The KV cache config
             kv_cache_allocation_context: Sleep-mode pool used only for discardable
             KV backing allocations. Sharing, reshape, and bind stay outside.
+            layerwise_reuse_applied: Whether the descriptors were rewritten as
+                layerwise component lanes.
         Returns:
             Dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
         allocation_context = kv_cache_allocation_context or nullcontext()
         with allocation_context:
-            kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+            kv_cache_raw_tensors = self._allocate_kv_cache_tensors(
+                kv_cache_config,
+                layerwise_reuse_applied=layerwise_reuse_applied,
+            )
         # Change the memory buffer to the desired shape
         kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
 
@@ -4522,7 +4533,12 @@ class NPUModelRunner(GPUModelRunner):
 
         return dsa_k_tensor, dsa_k_scale_tensor
 
-    def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
+    def _allocate_kv_cache_tensors(
+        self,
+        kv_cache_config: KVCacheConfig,
+        *,
+        layerwise_reuse_applied: bool = False,
+    ) -> dict[str, torch.Tensor]:
         """
         Initializes the KV cache buffer with the correct size. The buffer needs
         to be reshaped to the desired shape before being used by the models.
@@ -4532,6 +4548,8 @@ class NPUModelRunner(GPUModelRunner):
 
         Args:
             kv_cache_config: The KV cache config
+            layerwise_reuse_applied: Whether the descriptors represent
+                layerwise component lanes instead of the standard layout.
         Returns:
             dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
@@ -4604,13 +4622,46 @@ class NPUModelRunner(GPUModelRunner):
                 for layer_name in shared_layers:
                     kv_cache_raw_tensors[layer_name] = backing
 
+        # A layerwise component lane is one descriptor and therefore one
+        # allocation. Layers in the lane alias its beginning; a smaller DSV4
+        # component receives only the prefix required by its own spec.
+        if is_dsv4_main and layerwise_reuse_applied:
+            for descriptor in kv_cache_config.kv_cache_tensors:
+                shared_layers = get_kv_cache_tensor_layers(descriptor)
+                if not shared_layers or not all(
+                    isinstance(layer_kv_cache_spec[layer_name], AscendMLAAttentionSpec)
+                    and layer_kv_cache_spec[layer_name].model_version == "deepseek_v4"
+                    for layer_name in shared_layers
+                ):
+                    continue
+                backing = self._allocate_int8_cache_tensor(
+                    descriptor.size,
+                    alignment,
+                )
+                for layer_name in shared_layers:
+                    layer_size = (
+                        kv_cache_config.num_blocks
+                        * layer_kv_cache_spec[layer_name].page_size_bytes
+                    )
+                    if layer_size > descriptor.size:
+                        raise ValueError(
+                            f"DeepSeek-V4 component {layer_name} requires "
+                            f"{layer_size} bytes, but its shared descriptor has "
+                            f"only {descriptor.size} bytes."
+                        )
+                    kv_cache_raw_tensors[layer_name] = backing[:layer_size]
+
         # The restored DSV4 planner on main emits multiple descriptors into a
         # single shared-tuple backing. Its memory budget is computed for that
         # one backing, so allocating ``descriptor.size`` for every descriptor
         # over-commits the device. Validate the complete geometry first, then
         # allocate exactly once and expose the contiguous per-layer regions
         # consumed by the existing page-strided DSV4 reshape path.
-        if is_dsv4_main and kv_cache_config.kv_cache_tensors:
+        if (
+            is_dsv4_main
+            and not layerwise_reuse_applied
+            and kv_cache_config.kv_cache_tensors
+        ):
             tensor_sizes = {
                 descriptor.size
                 for descriptor in kv_cache_config.kv_cache_tensors

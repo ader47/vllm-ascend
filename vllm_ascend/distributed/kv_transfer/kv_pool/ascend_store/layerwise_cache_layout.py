@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     get_layerwise_protocol,
 )
@@ -67,6 +68,7 @@ class LayerwiseLayerCacheSpecs:
 class LayerwiseReuseLayout:
     layer_cache_specs: dict[int, LayerwiseLayerCacheSpecs]
     buffer_slots: tuple[tuple[int, ...], ...]
+    component_lanes: dict[tuple[int, tuple[Any, ...]], tuple[NamedKVCacheSpec, ...]]
     prefetch_layer_map: dict[int, int]
     independent_layers: list[int]
     num_prefetch_layers: int
@@ -212,7 +214,7 @@ def build_layerwise_reuse_layout(
     base_layers: int,
     extra_config: dict[str, Any],
 ) -> LayerwiseReuseLayout:
-    """Build reusable physical-layer slots by grouping layers on their main cache spec."""
+    """Build physical-layer slots and the component lanes inside each slot."""
     named_specs_by_layer: dict[int, list[NamedKVCacheSpec]] = {}
     for layer_name, layer_spec in layer_specs.items():
         physical_layer = get_layerwise_physical_layer_index(layer_name, base_layers)
@@ -246,13 +248,18 @@ def build_layerwise_reuse_layout(
             extra_main_specs=extra_specs,
         )
 
-    signature_buckets: list[tuple[KVCacheSpec, list[int]]] = []
+    signature_buckets: list[tuple[Any, list[int]]] = []
     for physical_layer in physical_layers:
         if physical_layer in independent_layer_set:
             continue
-        # TODO(lf): Plan shared buffers independently for every cache spec.
-        # Slots are grouped by main spec. Indexer specs are validated separately.
-        signature = layer_cache_specs[physical_layer].main.spec
+        main_spec = layer_cache_specs[physical_layer].main.spec
+        # DSV4 C4/C128 layers use different specs but execute at different
+        # times, so their same-role contiguous raw components can share a slot.
+        signature = (
+            "deepseek_v4_contiguous_raw"
+            if isinstance(main_spec, AscendMLAAttentionSpec) and main_spec.model_version == "deepseek_v4"
+            else main_spec
+        )
         for bucket_signature, bucket_layers in signature_buckets:
             if signature == bucket_signature:
                 bucket_layers.append(physical_layer)
@@ -261,51 +268,73 @@ def build_layerwise_reuse_layout(
             signature_buckets.append((signature, [physical_layer]))
 
     buffer_slots: list[tuple[int, ...]] = [(layer,) for layer in independent_layers]
-    prefetch_layer_map: dict[int, int] = {}
     for _, bucket_layers in signature_buckets:
         num_shared_buffers = min(base_layout.num_shared_buffers, len(bucket_layers))
         for buffer_index in range(num_shared_buffers):
             layers_sharing_buffer = tuple(bucket_layers[buffer_index::num_shared_buffers])
             buffer_slots.append(layers_sharing_buffer)
-            for owner_index in range(1, len(layers_sharing_buffer)):
-                prefetch_layer_map[layers_sharing_buffer[owner_index]] = layers_sharing_buffer[owner_index - 1]
 
-    if prefetch_layer_map:
-        unsupported_specs = [
-            named_spec
-            for named_specs in named_specs_by_layer.values()
-            for named_spec in named_specs
-            if not isinstance(named_spec.spec, AttentionSpec)
-        ]
-        if unsupported_specs:
-            named_spec = unsupported_specs[0]
-            raise NotImplementedError(
-                "Layerwise KV cache reuse supports attention cache specs only; "
-                f"{named_spec.layer_name} uses {type(named_spec.spec).__name__}."
+    lane_components: dict[tuple[int, tuple[Any, ...]], list[NamedKVCacheSpec]] = {}
+    for slot_id, slot in enumerate(buffer_slots):
+        for physical_layer in slot:
+            layer_specs_for_physical_layer = layer_cache_specs[physical_layer]
+            named_specs = (
+                layer_specs_for_physical_layer.main,
+                *layer_specs_for_physical_layer.extra_main_specs,
             )
+            if layer_specs_for_physical_layer.indexer is not None:
+                named_specs += (layer_specs_for_physical_layer.indexer,)
+            for named_spec in named_specs:
+                role_match = re.search(
+                    r"(?:^|\.)(?:mtp(?:\.layers)?|layers)\.\d+\.",
+                    named_spec.layer_name,
+                )
+                role = named_spec.layer_name[role_match.end() :] if role_match is not None else named_spec.layer_name
+                spec = named_spec.spec
+                if isinstance(spec, AscendMLAAttentionSpec) and spec.model_version == "deepseek_v4":
+                    reuse_key = ("deepseek_v4_contiguous_raw", role)
+                elif isinstance(spec, AttentionSpec):
+                    reuse_key = ("identical_attention_spec", role, spec)
+                else:
+                    # State caches are preserved but remain private until their
+                    # allocation representation has an explicit reuse contract.
+                    reuse_key = ("private", named_spec.layer_name)
+                lane_components.setdefault((slot_id, reuse_key), []).append(named_spec)
+
+    component_lanes = {lane_key: tuple(components) for lane_key, components in lane_components.items()}
+    shared_slot_ids = {lane_key[0] for lane_key, components in component_lanes.items() if len(components) > 1}
+    prefetch_layer_map: dict[int, int] = {}
+    all_independent_layers = set(independent_layers)
+    for slot_id, slot in enumerate(buffer_slots):
+        if slot_id not in shared_slot_ids:
+            all_independent_layers.update(slot)
+            continue
+        for owner_index in range(1, len(slot)):
+            prefetch_layer_map[slot[owner_index]] = slot[owner_index - 1]
 
     return LayerwiseReuseLayout(
         layer_cache_specs=layer_cache_specs,
         buffer_slots=tuple(buffer_slots),
+        component_lanes=component_lanes,
         prefetch_layer_map=prefetch_layer_map,
-        independent_layers=independent_layers,
+        independent_layers=sorted(all_independent_layers),
         num_prefetch_layers=base_layout.num_prefetch_layers,
-        has_layer_reuse=bool(prefetch_layer_map),
+        has_layer_reuse=bool(shared_slot_ids),
     )
 
 
 def apply_layerwise_kv_cache_plan(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
-) -> None:
-    """Rewrite logical layer tensors to use shared physical KV buffers."""
+) -> bool:
+    """Rewrite logical layer tensors and report whether reuse was applied."""
     extra_config = get_layerwise_reuse_config(vllm_config.kv_transfer_config)
     if extra_config is None:
-        return
+        return False
 
     old_tensors = kv_cache_config.kv_cache_tensors
-    if len(old_tensors) <= 1:
-        return
+    if not old_tensors:
+        return False
 
     base_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
     layer_specs = get_layerwise_kv_cache_specs(kv_cache_config)
@@ -316,14 +345,7 @@ def apply_layerwise_kv_cache_plan(
     )
     actual_layers = len(reuse_layout.layer_cache_specs)
     if not reuse_layout.has_layer_reuse:
-        return
-    if any(
-        len(get_kv_cache_tensor_layers(tensor)) != 1 or tensor.offset != 0 or tensor.block_stride != 0
-        for tensor in old_tensors
-    ):
-        raise NotImplementedError(
-            "Layerwise KV cache reuse does not support pre-shared or packed KV cache tensor descriptors."
-        )
+        return False
 
     if actual_layers < base_layers:
         logger.warning(
@@ -331,7 +353,7 @@ def apply_layerwise_kv_cache_plan(
             base_layers,
             actual_layers,
         )
-        return
+        return False
     if actual_layers > base_layers:
         logger.info(
             "Layer reuse includes %d base and %d MTP/spec-decode layer(s).",
@@ -339,39 +361,40 @@ def apply_layerwise_kv_cache_plan(
             actual_layers - base_layers,
         )
 
-    tensors_by_name = {get_kv_cache_tensor_layers(tensor)[0]: tensor for tensor in old_tensors}
-
-    def _merge_specs(named_specs: list[NamedKVCacheSpec]) -> None:
-        shared_by = [named_spec.layer_name for named_spec in named_specs]
-        cache_tensors = [tensors_by_name[layer_name] for layer_name in shared_by]
-        tensor_sizes = {tensor.size for tensor in cache_tensors}
-        if len(tensor_sizes) != 1:
-            raise ValueError("Layers sharing layerwise KV buffers must have equal tensor sizes for every cache spec.")
-        reference_spec = layer_specs[shared_by[0]]
-        if any(layer_specs[layer_name] != reference_spec for layer_name in shared_by[1:]):
-            raise ValueError(
-                "Layers sharing layerwise KV buffers must have identical cache specs for every named cache spec."
-            )
-        new_tensors.append(
-            KVCacheTensor(
-                layers=shared_by,
-                size=cache_tensors[0].size,
-                layer_stride=cache_tensors[0].layer_stride,
-                block_stride=cache_tensors[0].block_stride,
-                offset=cache_tensors[0].offset,
-            )
+    tensors_by_name: dict[str, KVCacheTensor] = {}
+    for tensor in old_tensors:
+        for layer_name in get_kv_cache_tensor_layers(tensor):
+            if layer_name in tensors_by_name:
+                raise ValueError(f"KV cache layer {layer_name} is owned by more than one descriptor.")
+            tensors_by_name[layer_name] = tensor
+    if set(tensors_by_name) != set(layer_specs):
+        missing = sorted(set(layer_specs) - set(tensors_by_name))
+        unexpected = sorted(set(tensors_by_name) - set(layer_specs))
+        raise ValueError(
+            f"KV cache descriptors do not match the planned cache specs; missing={missing}, unexpected={unexpected}."
         )
 
     new_tensors: list[KVCacheTensor] = []
-    for slot in reuse_layout.buffer_slots:
-        _merge_specs([reuse_layout.layer_cache_specs[layer].main for layer in slot])
-        indexer_specs: list[NamedKVCacheSpec] = []
-        for layer in slot:
-            indexer = reuse_layout.layer_cache_specs[layer].indexer
-            if indexer is not None:
-                indexer_specs.append(indexer)
-        if indexer_specs:
-            _merge_specs(indexer_specs)
+    for named_specs in reuse_layout.component_lanes.values():
+        layer_names = [named_spec.layer_name for named_spec in named_specs]
+        source_tensors = [tensors_by_name[layer_name] for layer_name in layer_names]
+        host_resident = {getattr(tensor, "host_resident", False) for tensor in source_tensors}
+        block_pool_ids = {getattr(tensor, "block_pool_id", 0) for tensor in source_tensors}
+        if len(host_resident) != 1 or len(block_pool_ids) != 1:
+            raise ValueError("Layers sharing a component must use the same memory location and block pool.")
+        tensor_args: dict[str, Any] = {
+            "layers": layer_names,
+            "size": max(kv_cache_config.num_blocks * named_spec.spec.page_size_bytes for named_spec in named_specs),
+            "layer_stride": 0,
+            "block_stride": 0,
+            "offset": 0,
+        }
+        tensor_fields = KVCacheTensor.__dataclass_fields__
+        if "host_resident" in tensor_fields:
+            tensor_args["host_resident"] = host_resident.pop()
+        if "block_pool_id" in tensor_fields:
+            tensor_args["block_pool_id"] = block_pool_ids.pop()
+        new_tensors.append(KVCacheTensor(**tensor_args))
     kv_cache_config.kv_cache_tensors = new_tensors
     logger.info(
         "Layerwise KV cache reuse merged %d descriptors into %d descriptors using %d buffer assignments.",
@@ -379,3 +402,4 @@ def apply_layerwise_kv_cache_plan(
         len(new_tensors),
         len(reuse_layout.buffer_slots),
     )
+    return True
