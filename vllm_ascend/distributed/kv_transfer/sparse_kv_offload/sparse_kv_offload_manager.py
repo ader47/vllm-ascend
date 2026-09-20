@@ -870,6 +870,7 @@ class SparseKVOffloadManager:
         self.d2h_token_indices_npu = torch.arange(self.max_num_tokens, dtype=torch.int64, device=device)
         if self.use_nano:
             self.nano_completion_token = torch.zeros(1, dtype=torch.int32, device=device)
+        if self.use_nano and self.vllm_config.speculative_config is not None:
             nano_request_capacity = self.max_num_reqs + NANO_GRAPH_PADDING_REQUESTS
             self.nano_plan_capacity = 2 * nano_request_capacity
             self.nano_rejected_rows_npu = torch.zeros(
@@ -904,10 +905,8 @@ class SparseKVOffloadManager:
             self.nano_d2h_lengths_npu = torch.empty(nano_descriptor_rows, dtype=torch.int32, device=device)
             self.nano_d2h_size_npu = torch.empty(1, dtype=torch.int32, device=device)
             self.nano_d2h_stream = torch_npu.npu.Stream()
-            current_stream = torch_npu.npu.current_stream()
             self.nano_d2h_inputs_ready = [torch_npu.npu.Event() for _ in range(self.num_layers)]
             self.nano_d2h_done = torch_npu.npu.Event()
-            self.nano_d2h_done.record(current_stream)
 
         pages_per_row = self.topk_buffer_size // self.block_size
         self.current_slots_npu = torch.empty(

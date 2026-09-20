@@ -355,6 +355,7 @@ class AscendSFAMetadata:
     nano_enabled: bool = False
     nano_query_ends: torch.Tensor | None = None
     nano_seq_lens: torch.Tensor | None = None
+    nano_previous_lens: torch.Tensor | None = None
     nano_prefix_lens: torch.Tensor | None = None
     nano_cache_tokens: torch.Tensor | None = None
     nano_logical_lens: torch.Tensor | None = None

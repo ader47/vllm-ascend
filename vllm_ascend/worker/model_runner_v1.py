@@ -2676,10 +2676,6 @@ class NPUModelRunner(GPUModelRunner):
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
-        if self.speculative_config is None:
-            self._nano_rejected_tokens_gpu = None
-            self._finalize_nano_tail_plan(attn_metadata, spec_decode_metadata)
-
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
                 self.sampling_done_event = torch.npu.Event()
@@ -3313,7 +3309,11 @@ class NPUModelRunner(GPUModelRunner):
         attn_metadata,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> None:
-        if not (self.sparse_kv_offload_enabled and self.sparse_kv_offload_config.use_nano):
+        # Without speculation, each layer already recorded its final KV length
+        # during forward and no drafter consumes a confirmed full-block plan.
+        if self.speculative_config is None or not (
+            self.sparse_kv_offload_enabled and self.sparse_kv_offload_config.use_nano
+        ):
             return
         assert self.sparse_kv_offload_manager is not None
         nano_metadata = self._find_nano_target_metadata(attn_metadata)

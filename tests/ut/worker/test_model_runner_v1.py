@@ -46,6 +46,36 @@ from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 
 
 class TestNanoIterationCompletion(unittest.TestCase):
+    def test_non_mtp_skips_nano_finalization(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.speculative_config = None
+        runner.sparse_kv_offload_enabled = True
+        runner.sparse_kv_offload_config = SimpleNamespace(use_nano=True)
+        runner.sparse_kv_offload_manager = MagicMock()
+        runner._find_nano_target_metadata = MagicMock()
+        runner._nano_rejected_tokens_gpu = None
+
+        runner._finalize_nano_tail_plan(object(), None)
+
+        runner._find_nano_target_metadata.assert_not_called()
+        runner.sparse_kv_offload_manager.finalize_nano_full_blocks.assert_not_called()
+
+    def test_mtp_keeps_nano_finalization(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.speculative_config = SimpleNamespace(method="mtp")
+        runner.sparse_kv_offload_enabled = True
+        runner.sparse_kv_offload_config = SimpleNamespace(use_nano=True)
+        runner.sparse_kv_offload_manager = MagicMock()
+        metadata = object()
+        runner._find_nano_target_metadata = MagicMock(return_value=metadata)
+        runner._nano_rejected_tokens_gpu = torch.tensor([1], dtype=torch.int32)
+
+        runner._finalize_nano_tail_plan(object(), object())
+
+        runner.sparse_kv_offload_manager.finalize_nano_full_blocks.assert_called_once_with(
+            metadata, runner._nano_rejected_tokens_gpu
+        )
+
     def test_mtp_join_precedes_bookkeeping_connector_and_async_output(self):
         for asynchronous in (False, True):
             with self.subTest(asynchronous=asynchronous):

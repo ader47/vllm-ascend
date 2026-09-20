@@ -224,8 +224,9 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         self.nano_token_positions = torch.arange(tokens, dtype=torch.int64, device=device)
         self.nano_device_slots = torch.empty((steps, tokens), dtype=torch.int64, device=device)
         self.nano_token_active = torch.empty((steps, tokens), dtype=torch.bool, device=device)
-        # Only Target / MTP step 0 consumes copy descriptors. Later draft
-        # steps retain their own attention metadata but never restore or flush.
+        # Only Target / MTP step 0 checks tail residency or consumes copy
+        # descriptors. Later steps must not overwrite this shared storage.
+        self.nano_previous_lens = torch.empty(requests, dtype=torch.int32, device=device)
         self.nano_flush_src_slots = torch.empty(requests, dtype=torch.int64, device=device)
         self.nano_flush_dst_slots = torch.empty_like(self.nano_flush_src_slots)
         self.nano_flush_active = torch.empty(requests, dtype=torch.bool, device=device)
@@ -288,7 +289,6 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             # padding. S=Q makes the kernel write a complete safe TopK output;
             # S=0 would skip LI and could leave selections from an earlier
             # active replay in these shared output rows.
-            seq_lens = torch.where(active, common_attn_metadata.seq_lens[:count], widths)
             if draft_index > 0:
                 # Padded step 0 retains rejected rows in its shape. Later
                 # steps start at the selected accepted row, not that shape's
@@ -296,11 +296,16 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
                 positions = common_attn_metadata.positions[:count]
                 active = active & (common_attn_metadata.slot_mapping[:count] >= 0)
                 seq_lens = torch.where(active, positions.to(torch.int32) + 1, widths)
-            prefix = torch.div((seq_lens - widths).clamp_min(0), 128, rounding_mode="floor") * 128
-            if draft_index > 0:
                 # Newly full draft pages stay in HBM throughout this proposal.
                 # Advancing the boundary here would load uncommitted Host KV.
                 prefix = torch.where(active, self.nano_vectors["prefix_lens"][0, :count], 0)
+                metadata.nano_previous_lens = None
+            else:
+                seq_lens = torch.where(active, common_attn_metadata.seq_lens[:count], widths)
+                previous_lens = seq_lens - widths
+                prefix = torch.div(previous_lens.clamp_min(0), 128, rounding_mode="floor") * 128
+                self.nano_previous_lens[:count].copy_(previous_lens)
+                metadata.nano_previous_lens = self.nano_previous_lens[:count]
             cache = torch.where(active, prefix.clamp_max(self.nano_hot_tokens), 2048)
             safe_pools = torch.where(active, pools[:count], self.nano_rows[:count] + self.nano_pool_capacity)
             logical = torch.where(active, cache + seq_lens - prefix, cache)
@@ -347,7 +352,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
                 # Restore only prior KV; current query KV is scattered locally.
                 # Keep token offsets local and store only the byte descriptors
                 # consumed by H2D at stable addresses.
-                lengths = (seq_lens[:, None] - widths[:, None] - prefix[:, None] - self.nano_parts * 128).clamp(0, 128)
+                lengths = (previous_lens[:, None] - prefix[:, None] - self.nano_parts * 128).clamp(0, 128)
                 lengths = torch.where(active[:, None] & (tail_blocks < source.shape[1]) & (source_ids >= 0), lengths, 0)
                 tail_src = source_ids.clamp_min(0) * 128
                 tail_dst = (
@@ -842,12 +847,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         """Decide whether the committed partial tail must be restored."""
         count = metadata.nano_pool_entries.numel()
         pools = metadata.nano_pool_entries.to(torch.int64)
-        ends = metadata.nano_query_ends
-        starts = torch.roll(ends, 1)
-        starts[0] = 0
-        previous_lens = metadata.nano_seq_lens - (ends - starts)
         resident_lens = self.nano_tail_seq_len[pools]
-        rollback = resident_lens - previous_lens
+        # Shared across layers; only Target / MTP step 0 restores the tail.
+        rollback = resident_lens - metadata.nano_previous_lens
         resident = (
             metadata.nano_active
             & (self.nano_tail_generation[pools] == metadata.nano_generations)

@@ -190,6 +190,8 @@ def test_nano_draft_metadata_keeps_full_block_in_tail_and_uses_actual_positions(
         patch("vllm_ascend.attention.sfa_kv_offload.get_sparse_kv_offload_manager", return_value=manager),
     ):
         first = builder._populate_offload_metadata(SimpleNamespace(), cm)
+        assert first.nano_previous_lens.tolist() == [base + 126]
+        previous_lens_address = first.nano_previous_lens.data_ptr()
         assert first.nano_prefix_lens.tolist() == [base]
         assert first.nano_flush_active.tolist() == [True]
         assert first.nano_copy_count.tolist() == [4]
@@ -203,6 +205,7 @@ def test_nano_draft_metadata_keeps_full_block_in_tail_and_uses_actual_positions(
         assert first.nano_copy_dst_offsets.tolist() == [pos * size for size in (1024, 128) for pos in tail_dst]
         assert first.nano_copy_lengths.tolist() == [126 * 1024, 0, 126 * 128, 0]
         copy_fields = (
+            "nano_previous_lens",
             "nano_copy_src_offsets",
             "nano_copy_dst_offsets",
             "nano_copy_lengths",
@@ -216,6 +219,8 @@ def test_nano_draft_metadata_keeps_full_block_in_tail_and_uses_actual_positions(
         # Copy storage is step-0-only, not multiplied by speculative K.
         assert builder.nano_copy_src_offsets.shape == (builder.nano_pool_capacity * 4,)
         assert builder.nano_flush_src_slots.shape == (builder.nano_pool_capacity,)
+        assert builder.nano_previous_lens.shape == (builder.nano_pool_capacity,)
+        assert "previous_lens" not in builder.nano_vectors
         for name in ("nano_tail_src", "nano_tail_dst", "nano_tail_lengths"):
             assert not hasattr(builder, name)
             assert not hasattr(first, name)
@@ -241,15 +246,36 @@ def test_nano_draft_metadata_keeps_full_block_in_tail_and_uses_actual_positions(
             torch.testing.assert_close(md.nano_source_block_table, first.nano_source_block_table)
             cm.positions += 1
         assert first.nano_seq_lens.tolist() == [base + 130]
+        assert first.nano_previous_lens.tolist() == [base + 126]
         assert first.nano_flush_active.tolist() == [True]
         # The next iteration updates contents without moving captured addresses.
         cm.query_start_loc = cm.query_start_loc_cpu = torch.tensor([0, 4], dtype=torch.int32)
         cm.seq_lens = torch.tensor([base + 131], dtype=torch.int32)
         cm.max_query_len = cm.num_input_tokens = 4
         revised = builder._populate_offload_metadata(SimpleNamespace(), cm)
+        assert revised.nano_previous_lens.tolist() == [base + 127]
+        assert revised.nano_previous_lens.data_ptr() == previous_lens_address
         for name in copy_fields:
             assert getattr(revised, name).data_ptr() == copy_addresses[name]
         assert revised.nano_copy_lengths.tolist() == [127 * 1024, 0, 127 * 128, 0]
+
+        # Widths can differ by request; inactive padding must use its harmless
+        # query width rather than a stale sequence length from a prior replay.
+        cm.num_reqs = 3
+        cm.num_input_tokens = 6
+        cm.max_query_len = 3
+        cm.query_start_loc = cm.query_start_loc_cpu = torch.tensor([0, 3, 5, 6], dtype=torch.int32)
+        cm.seq_lens = torch.tensor([base + 130, base + 131, 9999], dtype=torch.int32)
+        cm.req_topk_buffer_slots = torch.tensor([1, 0, -1], dtype=torch.int32)
+        cm.req_topk_buffer_generations = torch.tensor([11, 12, -1], dtype=torch.int64)
+        cm.block_table_tensor = cm.block_table_tensor[:1].repeat(3, 1)
+        manager.gather_nano_confirmed_plan.return_value = (
+            torch.zeros(3, dtype=torch.int64),
+            torch.zeros(3, dtype=torch.int64),
+            torch.zeros(3, dtype=torch.bool),
+        )
+        padded = builder._populate_offload_metadata(SimpleNamespace(), cm)
+        assert padded.nano_previous_lens.tolist() == [base + 127, base + 129, 0]
 
 
 def test_nano_partial_tail_stays_resident_until_state_is_discontinuous():
@@ -262,6 +288,7 @@ def test_nano_partial_tail_stays_resident_until_state_is_discontinuous():
         nano_pool_entries=torch.tensor([0], dtype=torch.int32),
         nano_query_ends=torch.tensor([1], dtype=torch.int32),
         nano_seq_lens=torch.tensor([101], dtype=torch.int32),
+        nano_previous_lens=torch.tensor([100], dtype=torch.int32),
         nano_prefix_lens=torch.tensor([0], dtype=torch.int32),
         nano_generations=torch.tensor([7], dtype=torch.int64),
         nano_active=torch.tensor([True]),
@@ -273,10 +300,12 @@ def test_nano_partial_tail_stays_resident_until_state_is_discontinuous():
     # Each layer records its own write before the next draft step runs.
     impl._update_nano_tail_state(metadata)
     metadata.nano_seq_lens[0] = 102
+    metadata.nano_previous_lens[0] = 101
     impl._prepare_nano_tail_state(metadata)
     assert not impl.nano_restore_active[0]
 
     metadata.nano_seq_lens[0] = 500
+    metadata.nano_previous_lens[0] = 499
     impl._prepare_nano_tail_state(metadata)
     assert impl.nano_restore_active[0]
 
@@ -291,12 +320,14 @@ def test_nano_each_draft_write_advances_residency_without_moving_tail_base():
         nano_pool_entries=torch.tensor([0], dtype=torch.int32),
         nano_query_ends=torch.tensor([1], dtype=torch.int32),
         nano_seq_lens=torch.tensor([127], dtype=torch.int32),
+        nano_previous_lens=torch.tensor([126], dtype=torch.int32),
         nano_prefix_lens=torch.tensor([0], dtype=torch.int32),
         nano_generations=torch.tensor([7], dtype=torch.int64),
         nano_active=torch.tensor([True]),
     )
     for end in (127, 128, 129):
         md.nano_seq_lens.fill_(end)
+        md.nano_previous_lens.fill_(end - 1)
         impl._prepare_nano_tail_state(md)
         assert not impl.nano_restore_active[0]
         impl._update_nano_tail_state(md)
