@@ -723,15 +723,20 @@ class MembPullReadThread(threading.Thread):
                 local_chunks.append(cl)
                 length_chunks.append(coalesced_lengths)
 
-        self._append_nano_tail_descriptors(
-            layer,
-            ext_req_id,
-            p_main_block_ids_for_tail,
-            main_start_block,
-            peer_chunks,
-            local_chunks,
-            length_chunks,
-        )
+        # Main MLA is replicated across P ranks. Like the Host main-cache pull,
+        # only the first contributor in an unequal-TP group should preload the
+        # request-local Nano tail; every D rank still receives its own member-0
+        # contribution.
+        if group_member_idx == 0:
+            self._append_nano_tail_descriptors(
+                layer,
+                ext_req_id,
+                p_main_block_ids_for_tail,
+                main_start_block,
+                peer_chunks,
+                local_chunks,
+                length_chunks,
+            )
 
         if not peer_chunks:
             logger.debug(
