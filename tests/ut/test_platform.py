@@ -15,6 +15,7 @@ from vllm_ascend.ascend_forward_context import MoECommType, override_mrv2_in_pro
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.platform import (
     NPUPlatform,
+    _disable_nano_pd_decode_prefix_caching,
     _setup_compile_backend,
     _validate_eplb_config,
     _validate_sfa_dcp_kv_sp,
@@ -25,6 +26,39 @@ from vllm_ascend.utils import (
     AscendDeviceType,
     vllm_version_is,
 )
+
+
+@pytest.mark.parametrize("prefix_caching", [False, True])
+@pytest.mark.parametrize("offload_enabled", [False, True])
+@pytest.mark.parametrize("use_nano", [False, True])
+@pytest.mark.parametrize(
+    ("connector", "role", "disable"),
+    [
+        ("SfaRemoteD2HConnector", "kv_consumer", True),
+        ("SfaRemoteD2HConnector", "kv_producer", False),
+        ("SfaRemoteD2HConnector", "kv_both", False),
+        ("OtherConnector", "kv_consumer", False),
+        (None, None, False),
+    ],
+)
+def test_nano_pd_decode_prefix_caching_policy(prefix_caching, offload_enabled, use_nano, connector, role, disable):
+    config = SimpleNamespace(
+        kv_transfer_config=(SimpleNamespace(kv_connector=connector, kv_role=role) if connector is not None else None),
+        cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
+    )
+    ascend_config = SimpleNamespace(
+        sparse_kv_offload_config=SimpleNamespace(enabled=offload_enabled, use_nano=use_nano),
+    )
+    disable = disable and offload_enabled and use_nano
+    with patch("vllm_ascend.platform.logger.warning_once") as warning:
+        _disable_nano_pd_decode_prefix_caching(config, ascend_config)
+        assert config.cache_config.enable_prefix_caching == (prefix_caching and not disable)
+        assert warning.call_count == int(prefix_caching and disable)
+
+        # Reinitialization must not re-enable the cache or repeat the warning.
+        _disable_nano_pd_decode_prefix_caching(config, ascend_config)
+        assert config.cache_config.enable_prefix_caching == (prefix_caching and not disable)
+        assert warning.call_count == int(prefix_caching and disable)
 
 
 class TestNPUPlatform(TestBase):
