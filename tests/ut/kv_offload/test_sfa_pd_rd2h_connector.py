@@ -1602,6 +1602,40 @@ def test_nano_tail_d2d_appends_to_every_decode_rank():
     assert lengths == [3 * 10, 3 * 20]
 
 
+def test_nano_tail_d2d_uses_only_first_unequal_tp_contributor():
+    layer = _make_layer(k_cpu_ptr=None, v_cpu_ptr=None, has_indexer=False)
+    layer["p_k_len"] = 1280
+    layer["p_v_len"] = 2560
+
+    first = _make_tail_read_thread()
+    first_local, first_peer, first_lengths, _ = first._build_req_descriptors(
+        layer,
+        "req-0",
+        p_main_block_ids=[5],
+        p_indexer_block_ids=[],
+        want_info=False,
+        group_member_idx=0,
+        ratio=2,
+    )
+    duplicate = _make_tail_read_thread()
+    duplicate_local, duplicate_peer, duplicate_lengths, _ = duplicate._build_req_descriptors(
+        layer,
+        "req-0",
+        p_main_block_ids=[5],
+        p_indexer_block_ids=[],
+        want_info=False,
+        group_member_idx=1,
+        ratio=2,
+    )
+
+    assert first_local == [103_840, 207_680]
+    assert first_peer == [7_400, 14_800]
+    assert first_lengths == [30, 60]
+    assert duplicate_local == []
+    assert duplicate_peer == []
+    assert duplicate_lengths == []
+
+
 def test_nano_tail_d2d_skips_when_last_block_is_not_in_chunk():
     layer = _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000, has_indexer=False)
     layer["p_k_len"] = 1280
