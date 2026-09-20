@@ -4651,6 +4651,57 @@ class NPUModelRunner(GPUModelRunner):
                         )
                     kv_cache_raw_tensors[layer_name] = backing[:layer_size]
 
+        # Ascend SFA indexers may use BF16 or C8 storage for the same logical
+        # component. A layerwise descriptor means those mutually exclusive
+        # components share one raw allocation; each spec binds only the K and
+        # optional scale ranges it actually consumes.
+        if layerwise_reuse_applied:
+            for descriptor in kv_cache_config.kv_cache_tensors:
+                shared_layers = get_kv_cache_tensor_layers(descriptor)
+                if not shared_layers or not all(
+                    isinstance(layer_kv_cache_spec[layer_name], AscendSFAIndexerCacheSpec)
+                    for layer_name in shared_layers
+                ):
+                    continue
+                backing = self._allocate_int8_cache_tensor(descriptor.size, alignment)
+                for layer_name in shared_layers:
+                    spec = layer_kv_cache_spec[layer_name]
+                    assert isinstance(spec, AscendSFAIndexerCacheSpec)
+                    k_size = (
+                        kv_cache_config.num_blocks
+                        * spec.sfa_dcp_replicated_indexer_size
+                        * spec.block_size
+                        * spec.num_kv_heads
+                        * spec.head_size
+                        * get_dtype_size(spec.dtype)
+                    )
+                    raw_cache: tuple[torch.Tensor, ...]
+                    if spec.scale_dim:
+                        scale_size = (
+                            kv_cache_config.num_blocks
+                            * spec.sfa_dcp_replicated_indexer_size
+                            * spec.block_size
+                            * spec.num_kv_heads
+                            * spec.scale_dim
+                            * get_dtype_size(spec.scale_dtype)
+                        )
+                        scale_offset = self._align_up(k_size, get_dtype_size(spec.scale_dtype))
+                        if scale_offset + scale_size > descriptor.size:
+                            raise ValueError(
+                                f"SFA indexer component {layer_name} exceeds its shared descriptor."
+                            )
+                        raw_cache = (
+                            backing[:k_size],
+                            backing[scale_offset : scale_offset + scale_size],
+                        )
+                    else:
+                        if k_size > descriptor.size:
+                            raise ValueError(
+                                f"SFA indexer component {layer_name} exceeds its shared descriptor."
+                            )
+                        raw_cache = (backing[:k_size],)
+                    kv_cache_raw_tensors[layer_name] = raw_cache
+
         # The restored DSV4 planner on main emits multiple descriptors into a
         # single shared-tuple backing. Its memory budget is computed for that
         # one backing, so allocating ``descriptor.size`` for every descriptor
@@ -4881,6 +4932,10 @@ class NPUModelRunner(GPUModelRunner):
                         assert self.use_sparse, "Sparse KV offload only support sparse attention."
                         assert not current_sparse_sfa_c8, "Sparse KV offload do not support sparse SFA C8."
                         assert v_tensor_size is not None
+                        if layerwise_reuse_applied and len(shared_layers) > 1:
+                            raise NotImplementedError(
+                                "Sparse KV offload does not support layerwise shared attention lanes."
+                            )
                         for layer_name_inner in shared_layers:
                             if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
                                 kv_cache_raw_tensors[layer_name_inner] = (
@@ -4894,25 +4949,46 @@ class NPUModelRunner(GPUModelRunner):
                                     )
                                 )
                         continue
-                    # main: every layer owns its own region; give each layer a
-                    # private (k, v) so block indices don't collide across layers.
-                    for layer_name_inner in shared_layers:
-                        if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
-                            k_tensor = self._allocate_int8_cache_tensor(
-                                k_tensor_size,
+                    if layerwise_reuse_applied:
+                        k_tensor = self._allocate_int8_cache_tensor(
+                            k_tensor_size,
+                            alignment,
+                        )
+                        v_tensor = None
+                        if v_tensor_size is not None:
+                            v_tensor = self._allocate_int8_cache_tensor(
+                                v_tensor_size,
                                 alignment,
                             )
-                            v_tensor = None
-                            if v_tensor_size is not None:
-                                v_tensor = self._allocate_int8_cache_tensor(
-                                    v_tensor_size,
+                        for layer_name_inner in shared_layers:
+                            if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
+                                if current_sparse_sfa_c8:
+                                    kv_cache_raw_tensors[layer_name_inner] = (k_tensor,)
+                                else:
+                                    assert v_tensor is not None
+                                    kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor)
+                    else:
+                        # Standardized descriptors list independent regions in
+                        # one backing. Keep allocating private contiguous K/V
+                        # tensors unless the layerwise planner explicitly
+                        # rewrote the descriptor as a shared lane.
+                        for layer_name_inner in shared_layers:
+                            if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
+                                k_tensor = self._allocate_int8_cache_tensor(
+                                    k_tensor_size,
                                     alignment,
                                 )
-                            if current_sparse_sfa_c8:
-                                kv_cache_raw_tensors[layer_name_inner] = (k_tensor,)
-                            else:
-                                assert v_tensor is not None
-                                kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor)
+                                v_tensor = None
+                                if v_tensor_size is not None:
+                                    v_tensor = self._allocate_int8_cache_tensor(
+                                        v_tensor_size,
+                                        alignment,
+                                    )
+                                if current_sparse_sfa_c8:
+                                    kv_cache_raw_tensors[layer_name_inner] = (k_tensor,)
+                                else:
+                                    assert v_tensor is not None
+                                    kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor)
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
             for layer_name in group.layer_names:

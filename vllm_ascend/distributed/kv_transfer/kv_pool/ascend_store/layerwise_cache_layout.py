@@ -14,7 +14,10 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.core.kv_cache_interface import (
+    AscendMLAAttentionSpec,
+    AscendSFAIndexerCacheSpec,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     get_layerwise_protocol,
 )
@@ -240,8 +243,12 @@ def build_layerwise_reuse_layout(
             )
         # Select '.attn' as main spec, rest as extra
         main_spec = next((s for s in main_specs if s.layer_name.endswith(".attn")), main_specs[0])
-        extra_specs = tuple(s for s in main_specs if s is not main_spec)
         indexer_spec = indexer_specs[0] if indexer_specs else None
+        # Keep every remaining named component. ``extra_main_specs`` predates
+        # component lanes, but it is also the least invasive place to retain a
+        # second indexer or any other component that is neither the selected
+        # main nor the primary indexer.
+        extra_specs = tuple(s for s in named_specs if s is not main_spec and s is not indexer_spec)
         layer_cache_specs[physical_layer] = LayerwiseLayerCacheSpecs(
             main=main_spec,
             indexer=indexer_spec,
@@ -293,6 +300,19 @@ def build_layerwise_reuse_layout(
                 spec = named_spec.spec
                 if isinstance(spec, AscendMLAAttentionSpec) and spec.model_version == "deepseek_v4":
                     reuse_key = ("deepseek_v4_contiguous_raw", role)
+                elif isinstance(spec, AscendSFAIndexerCacheSpec):
+                    # BF16 and C8 indexers can interpret different prefixes of
+                    # one contiguous raw allocation. Geometry that changes the
+                    # logical indexer shape remains part of the compatibility
+                    # key; dtype/scale layout deliberately does not.
+                    reuse_key = (
+                        "sfa_indexer_contiguous_raw",
+                        role,
+                        spec.block_size,
+                        spec.num_kv_heads,
+                        spec.head_size,
+                        spec.sfa_dcp_replicated_indexer_size,
+                    )
                 elif isinstance(spec, AttentionSpec):
                     reuse_key = ("identical_attention_spec", role, spec)
                 else:
@@ -336,29 +356,37 @@ def apply_layerwise_kv_cache_plan(
     if not old_tensors:
         return False
 
-    base_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+    local_base_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+    total_base_layers = vllm_config.model_config.get_total_num_hidden_layers()
     layer_specs = get_layerwise_kv_cache_specs(kv_cache_config)
+    physical_layers = {get_layerwise_physical_layer_index(layer_name, total_base_layers) for layer_name in layer_specs}
+    base_layer_start, base_layer_end = vllm_config.model_config.get_layers_start_end_indices(
+        vllm_config.parallel_config
+    )
+    expected_base_layers = set(range(base_layer_start, base_layer_end))
+    actual_base_layers = {layer for layer in physical_layers if 0 <= layer < total_base_layers}
+    if actual_base_layers != expected_base_layers:
+        logger.warning(
+            "Layer reuse has missing base layers %s and unexpected base layers %s; skip tensor merge.",
+            sorted(expected_base_layers - actual_base_layers),
+            sorted(actual_base_layers - expected_base_layers),
+        )
+        return False
+
     reuse_layout = build_layerwise_reuse_layout(
         layer_specs,
-        base_layers,
+        total_base_layers,
         extra_config,
     )
     actual_layers = len(reuse_layout.layer_cache_specs)
     if not reuse_layout.has_layer_reuse:
         return False
 
-    if actual_layers < base_layers:
-        logger.warning(
-            "Layer reuse expected at least %d layers, got %d; skip tensor merge.",
-            base_layers,
-            actual_layers,
-        )
-        return False
-    if actual_layers > base_layers:
+    if actual_layers > local_base_layers:
         logger.info(
             "Layer reuse includes %d base and %d MTP/spec-decode layer(s).",
-            base_layers,
-            actual_layers - base_layers,
+            local_base_layers,
+            actual_layers - local_base_layers,
         )
 
     tensors_by_name: dict[str, KVCacheTensor] = {}
@@ -372,6 +400,15 @@ def apply_layerwise_kv_cache_plan(
         unexpected = sorted(set(tensors_by_name) - set(layer_specs))
         raise ValueError(
             f"KV cache descriptors do not match the planned cache specs; missing={missing}, unexpected={unexpected}."
+        )
+    planned_names = {
+        named_spec.layer_name for named_specs in reuse_layout.component_lanes.values() for named_spec in named_specs
+    }
+    if planned_names != set(layer_specs):
+        missing = sorted(set(layer_specs) - planned_names)
+        unexpected = sorted(planned_names - set(layer_specs))
+        raise ValueError(
+            f"Layerwise component plan does not match the cache specs; missing={missing}, unexpected={unexpected}."
         )
 
     new_tensors: list[KVCacheTensor] = []
