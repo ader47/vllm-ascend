@@ -345,7 +345,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
                 )
             self.nano_source_block_table[draft_index, :count].copy_(source)
             metadata.nano_source_block_table = self.nano_source_block_table[draft_index, :count]
-            metadata.nano_skip_tail_restore = self.is_pd_decode_consumer
+            metadata.nano_prefill_tail_preloaded = self.is_pd_decode_consumer
             if draft_index == 0:
                 tail_blocks = prefix[:, None].to(torch.int64) // 128 + self.nano_parts
                 source_ids = source.gather(1, tail_blocks.clamp(0, source.shape[1] - 1)).to(torch.int64)
@@ -850,13 +850,21 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         resident_lens = self.nano_tail_seq_len[pools]
         # Shared across layers; only Target / MTP step 0 restores the tail.
         rollback = resident_lens - metadata.nano_previous_lens
+        same_generation = self.nano_tail_generation[pools] == metadata.nano_generations
         resident = (
             metadata.nano_active
-            & (self.nano_tail_generation[pools] == metadata.nano_generations)
+            & same_generation
             & (self.nano_tail_start[pools] <= metadata.nano_prefix_lens)
             & (rollback >= 0)
             & (rollback < 2 * _NANO_TAIL_BLOCK_SIZE)
         )
+        if metadata.nano_prefill_tail_preloaded:
+            # A fresh PD request is admitted only after its initial tail was
+            # received into the prebound slot. Released-slot resumes must be
+            # block-aligned (runner guard), so they need no partial-tail H2D.
+            # Do not let an old slot owner's watermark trigger a Host restore:
+            # Host does not contain live requests' unoffloaded partial tails.
+            resident = resident | (metadata.nano_active & ~same_generation)
         self.nano_restore_active[:count].copy_(metadata.nano_active & ~resident)
 
     def _update_nano_tail_state(self, metadata) -> None:
@@ -974,8 +982,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 assert self.kv_a_layernorm is not None
                 if attn_metadata.nano_draft_step <= 0:
                     self._prepare_nano_tail_state(attn_metadata)
-                    if not attn_metadata.nano_skip_tail_restore:
-                        self._nano_restore_tail(attn_metadata, manager, layer_name)
+                    self._nano_restore_tail(attn_metadata, manager, layer_name)
                 # Step 1+ appends to this proposal's resident tail. It must
                 # neither restore speculative bytes from Host nor touch the
                 # confirmed full page that step 0 may still be copying.

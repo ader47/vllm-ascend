@@ -172,7 +172,6 @@ class TestNanoRequestSlotLifecycle(unittest.TestCase):
         runner._offload_slot_generation = 0
         runner._offload_slot_generations = {}
         runner._prebound_nano_slots = lambda: {}
-        runner._offload_slot_last_prefix = {}
         runner.cache_config = SimpleNamespace(block_size=128)
         runner._nano_preempted_req_ids = {req_id}
         runner.input_batch = SimpleNamespace(

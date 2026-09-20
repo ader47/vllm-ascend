@@ -286,6 +286,7 @@ def test_nano_partial_tail_stays_resident_until_state_is_discontinuous():
     impl.nano_restore_active = torch.empty(2, dtype=torch.bool)
     metadata = SimpleNamespace(
         nano_pool_entries=torch.tensor([0], dtype=torch.int32),
+        nano_prefill_tail_preloaded=False,
         nano_query_ends=torch.tensor([1], dtype=torch.int32),
         nano_seq_lens=torch.tensor([101], dtype=torch.int32),
         nano_previous_lens=torch.tensor([100], dtype=torch.int32),
@@ -310,6 +311,97 @@ def test_nano_partial_tail_stays_resident_until_state_is_discontinuous():
     assert impl.nano_restore_active[0]
 
 
+@pytest.mark.parametrize("pd_preloaded", [False, True])
+def test_nano_slot_reuse_and_rollback_only_restore_the_affected_request(pd_preloaded):
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    # Slot 0 belonged to a long, finished request. Slot 1 is a live request
+    # whose one-row partial tail only exists in HBM, not in Host memory.
+    impl.nano_tail_generation = torch.tensor([1, 2, -1], dtype=torch.int64)
+    impl.nano_tail_seq_len = torch.tensor([4097, 257, 0], dtype=torch.int32)
+    impl.nano_tail_start = torch.tensor([4096, 256, 0], dtype=torch.int32)
+    impl.nano_restore_active = torch.empty(3, dtype=torch.bool)
+    metadata = SimpleNamespace(
+        nano_prefill_tail_preloaded=pd_preloaded,
+        nano_pool_entries=torch.tensor([0, 1, 2], dtype=torch.int32),
+        nano_previous_lens=torch.tensor([129, 257, 0], dtype=torch.int32),
+        nano_prefix_lens=torch.tensor([128, 256, 0], dtype=torch.int32),
+        nano_generations=torch.tensor([3, 2, -1], dtype=torch.int64),
+        nano_active=torch.tensor([True, True, False]),
+        nano_copy_src_offsets=torch.zeros(12, dtype=torch.int64),
+        nano_copy_dst_offsets=torch.zeros(12, dtype=torch.int64),
+        nano_copy_lengths=torch.tensor([8, 0, 8, 0, 0, 0, 4, 0, 4, 0, 0, 0], dtype=torch.int32),
+        nano_copy_count=torch.tensor([12], dtype=torch.int32),
+    )
+    impl.nano_host_bases = torch.tensor([1000, 2000], dtype=torch.int64).view(2, 1)
+    impl.nano_device_bases = torch.tensor([3000, 4000], dtype=torch.int64).view(2, 1)
+    impl.nano_copy_src = torch.empty(12, dtype=torch.int64)
+    impl.nano_copy_dst = torch.empty_like(impl.nano_copy_src)
+    impl.nano_copy_lengths = torch.empty(12, dtype=torch.int32)
+    manager = SimpleNamespace(copy_nano_kv=MagicMock())
+
+    impl._prepare_nano_tail_state(metadata)
+    assert impl.nano_restore_active.tolist() == [not pd_preloaded, False, False]
+    impl._nano_restore_tail(metadata, manager, "layer")
+    copied = manager.copy_nano_kv.call_args.args[2].view(2, 3, 2)
+    assert copied[:, 1:].count_nonzero() == 0  # live neighbor and graph padding
+    assert copied[:, 0].sum() == (0 if pd_preloaded else 12)
+
+    # A true rollback of the SAME owner must not be suppressed by the PD flag.
+    impl.nano_tail_generation[0] = 3
+    impl._prepare_nano_tail_state(metadata)
+    assert impl.nano_restore_active.tolist() == [True, False, False]
+    impl._nano_restore_tail(metadata, manager, "layer")
+    copied = manager.copy_nano_kv.call_args.args[2].view(2, 3, 2)
+    assert copied[:, 0].sum() == 12
+    assert copied[:, 1:].count_nonzero() == 0
+
+
+def test_nano_aligned_prompt_first_decode_reads_preloaded_last_block():
+    builder = AscendSFAKVOffloadMetadataBuilder.__new__(AscendSFAKVOffloadMetadataBuilder)
+    builder.use_nano = True
+    builder.decode_threshold = 7
+    builder.is_pd_decode_consumer = True
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=8),
+        speculative_config=None,
+        model_config=SimpleNamespace(
+            max_model_len=8192,
+            hf_text_config=SimpleNamespace(kv_lora_rank=4, qk_rope_head_dim=2),
+        ),
+    )
+    with patch(
+        "vllm_ascend.attention.sfa_kv_offload.get_ascend_config",
+        return_value=SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(topk_buffer_size=8192)),
+    ):
+        builder._init_nano_metadata_buffers(config, torch.device("cpu"))
+    cm = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([4096], dtype=torch.int32),
+        req_topk_buffer_slots=torch.tensor([0], dtype=torch.int32),
+        req_topk_buffer_generations=torch.tensor([1], dtype=torch.int64),
+        block_table_tensor=torch.arange(64, dtype=torch.int32).view(1, -1),
+        req_ids_tensor=None,
+        token_to_req=None,
+        nano_eligible=True,
+        nano_draft=False,
+        offload_dummy=False,
+        max_query_len=1,
+        num_reqs=1,
+        num_input_tokens=1,
+    )
+    with patch("vllm_ascend.attention.sfa_kv_offload.split_decodes_and_prefills", return_value=(1, 0, 1, 0)):
+        metadata = builder._populate_offload_metadata(SimpleNamespace(), cm)
+    assert metadata.nano_previous_lens.tolist() == [4095]
+    assert metadata.nano_prefix_lens.tolist() == [3968]
+    assert metadata.nano_prefill_tail_preloaded
+    # PD preloads logical block 31 into ring page 1. Recompute only overwrites
+    # its final row; the other 127 rows are the received prompt KV.
+    assert metadata.nano_copy_dst_offsets[0] == (8192 + 128) * 8
+    assert metadata.nano_copy_lengths[0] == 127 * 8
+    assert metadata.nano_device_slots.tolist() == [8192 + 255]
+
+
 def test_nano_each_draft_write_advances_residency_without_moving_tail_base():
     impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
     impl.nano_tail_generation = torch.tensor([7, -1], dtype=torch.int64)
@@ -318,6 +410,7 @@ def test_nano_each_draft_write_advances_residency_without_moving_tail_base():
     impl.nano_restore_active = torch.empty(1, dtype=torch.bool)
     md = SimpleNamespace(
         nano_pool_entries=torch.tensor([0], dtype=torch.int32),
+        nano_prefill_tail_preloaded=False,
         nano_query_ends=torch.tensor([1], dtype=torch.int32),
         nano_seq_lens=torch.tensor([127], dtype=torch.int32),
         nano_previous_lens=torch.tensor([126], dtype=torch.int32),
@@ -440,7 +533,7 @@ def test_nano_decode_writes_kv_directly_to_topk_tail(draft_step, host_visibility
         num_decodes=2,
         nano_enabled=True,
         nano_draft_step=draft_step,
-        nano_skip_tail_restore=pd_tail_ready,
+        nano_prefill_tail_preloaded=pd_tail_ready,
         nano_device_slots=torch.tensor([4, 5], dtype=torch.int64),
         nano_token_active=torch.tensor([True, False]),
         nano_flush_src_slots=torch.tensor([4, 0], dtype=torch.int64) if draft_step <= 0 else None,
@@ -475,10 +568,7 @@ def test_nano_decode_writes_kv_directly_to_topk_tail(draft_step, host_visibility
     assert fused_args[6].data_ptr() == topk_k.data_ptr()
     impl._update_nano_tail_state.assert_called_once_with(metadata)
     if draft_step <= 0:
-        if pd_tail_ready:
-            impl._nano_restore_tail.assert_not_called()
-        else:
-            impl._nano_restore_tail.assert_called_once_with(metadata, manager, impl.layer_name)
+        impl._nano_restore_tail.assert_called_once_with(metadata, manager, impl.layer_name)
         manager.offload_nano_full_blocks.assert_called_once_with(
             layer_name=impl.layer_name,
             source_slots=metadata.nano_flush_src_slots,

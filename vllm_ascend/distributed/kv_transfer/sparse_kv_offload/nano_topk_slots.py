@@ -14,14 +14,15 @@ def nano_pool_capacity(max_num_seqs: int) -> int:
 def nano_tail_geometry(kv_tokens: int, block_size: int) -> tuple[int, int]:
     """Return ``(tail_tokens, tail_block_index)`` for a finished prefill prefix.
 
-    The circular tail only stores the incomplete last block. A 128-aligned
-    prefix has nothing to prefetch.
+    Include the last full block for an aligned prefix: after remote receipt,
+    the scheduler may rewind to N - 1 to recompute the final prompt token.
+    That first decode needs the preceding rows of the same block in the ring.
     """
     if kv_tokens <= 0 or block_size <= 0:
         return 0, 0
     tail_tokens = kv_tokens % block_size
     if tail_tokens == 0:
-        return 0, 0
+        return block_size, kv_tokens // block_size - 1
     return tail_tokens, kv_tokens // block_size
 
 

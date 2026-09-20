@@ -5,6 +5,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch_npu  # noqa: F401
 
@@ -91,8 +92,9 @@ def test_device_lengths_tail_geometry_and_rejection():
     assert metadata.nano_cache_tokens.cpu().tolist() == [8192, 8192]
     assert metadata.nano_logical_lens.cpu().tolist() == [8323, 8193]
     # Current query KV is scattered locally: descriptors still describe prior KV
-    # so prefix rollback can eager-restore. PD decode skips the graph H2D.
-    assert metadata.nano_skip_tail_restore is True
+    # so a per-request rollback can restore inside the graph. Initial PD tails
+    # are already resident; subsequent decisions use generation and range.
+    assert metadata.nano_prefill_tail_preloaded is True
     assert metadata.nano_copy_count.item() == 8
     assert metadata.nano_copy_lengths.cpu().tolist() == [127 * 1024, 0, 0, 0, 127 * 128, 0, 0, 0]
     assert metadata.nano_copy_src_offsets.cpu().tolist() == [
@@ -161,8 +163,10 @@ def test_inactive_capture_becomes_active_on_graph_replay():
     assert impl.nano_last_generation[1].item() == 11
 
 
-def test_partial_tail_restore_decision_during_graph_replay():
+@pytest.mark.parametrize("pd_preloaded", [False, True])
+def test_partial_tail_restore_decision_during_graph_replay(pd_preloaded):
     builder, impl = make_builder(), make_impl()
+    builder.is_pd_decode_consumer = pd_preloaded
     cm = common([1], [127], pools=(1,), generations=(11,))
     metadata = populate(builder, cm)
     graph = torch.npu.NPUGraph()
@@ -172,7 +176,7 @@ def test_partial_tail_restore_decision_during_graph_replay():
     impl.nano_tail_generation.fill_(-1)
     impl.nano_tail_seq_len.zero_()
     graph.replay()
-    assert impl.nano_restore_active[0].item()
+    assert impl.nano_restore_active[0].item() == (not pd_preloaded)
 
     # Simulate this layer's completed write (not another layer's finalizer).
     impl.nano_tail_generation[1] = 11
@@ -184,6 +188,18 @@ def test_partial_tail_restore_decision_during_graph_replay():
     # Scheduled boundary crossing starts a candidate D2H. Rejection sampling
     # later decides whether the copied bytes become logically visible.
     assert metadata.nano_flush_active[0].item()
+
+    # The same captured graph must restore an existing owner whose required
+    # page is no longer resident, including on PD consumers.
+    impl.nano_tail_start[1] = 128
+    graph.replay()
+    assert impl.nano_restore_active[0].item()
+
+    # Slot reuse is a new PD preload, not a rollback of the old owner.
+    cm.req_topk_buffer_generations[0] = 12
+    populate(builder, cm)
+    graph.replay()
+    assert impl.nano_restore_active[0].item() == (not pd_preloaded)
 
 
 def test_eager_sp_padding_uses_private_tail_and_exact_query_count():
@@ -211,6 +227,7 @@ def test_runner_pool_ownership_survives_compaction_and_dummy_run():
     runner._offload_slot_generation = 0
     runner._offload_slot_generations = {}
     runner._nano_preempted_req_ids = set()
+    runner._prebound_nano_slots = lambda: {}
     runner.input_batch = SimpleNamespace(req_ids=["a", "b"], req_id_to_index={"a": 0, "b": 1})
     runner._prepare_nano_request_slots(2, 3, dummy=False)
     assert runner._offload_pool_slots.np[:3].tolist() == [0, 1, 6]

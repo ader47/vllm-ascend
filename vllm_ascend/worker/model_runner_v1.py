@@ -161,7 +161,6 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     NANO_TAIL_BLOCK_SIZE,
     allocate_kv_cache_tensors_for_sparse_kv_offload,
     allocate_kv_offload_topk_profile_buffers,
-    get_sparse_kv_offload_manager,
     init_sparse_kv_offload_manager,
     reshape_kv_cache_tensors_for_sparse_kv_offload,
     update_sparse_kv_offload_metadata,
@@ -660,8 +659,6 @@ class NPUModelRunner(GPUModelRunner):
         self._offload_request_slots: dict[str, int] = {}
         self._offload_slot_generation = 0
         self._offload_slot_generations: dict[int, int] = {}
-        self._offload_slot_last_prefix: dict[int, int] = {}
-        self._nano_need_eager_tail_restore = False
         self._nano_preempted_req_ids: set[str] = set()
         if self.sparse_kv_offload_enabled:
             self._offload_req_ids_tensor = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
@@ -3345,7 +3342,6 @@ class NPUModelRunner(GPUModelRunner):
         generations = self._offload_pool_generations.np
         slots[:padded_reqs] = np.arange(padded_reqs, dtype=np.int32) + capacity
         generations[:padded_reqs] = -1
-        self._nano_need_eager_tail_restore = False
         if not dummy:
             # PD binds rows at alloc time. Keep those reservations even when the
             # request is waiting for KV and is not in the current decode batch.
@@ -3380,33 +3376,8 @@ class NPUModelRunner(GPUModelRunner):
                 slot = self._offload_request_slots[req]
                 slots[row] = slot
                 generations[row] = self._offload_slot_generations[slot]
-            if prebound:
-                block_size = self.cache_config.block_size
-                computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
-                for row in range(num_reqs):
-                    slot = int(slots[row])
-                    prefix = (int(computed[row]) // block_size) * block_size
-                    last_prefix = self._offload_slot_last_prefix.get(slot)
-                    if last_prefix is not None and prefix < last_prefix:
-                        self._nano_need_eager_tail_restore = True
-                    self._offload_slot_last_prefix[slot] = prefix
         self._offload_pool_slots.copy_to_gpu(padded_reqs)
         self._offload_pool_generations.copy_to_gpu(padded_reqs)
-
-    def _maybe_eager_restore_nano_tails(self, attn_metadata: PerLayerAttnMetadata) -> None:
-        if not self._nano_need_eager_tail_restore:
-            return
-        self._nano_need_eager_tail_restore = False
-        groups = attn_metadata if isinstance(attn_metadata, list) else [attn_metadata]
-        for group in groups:
-            if not isinstance(group, dict):
-                continue
-            for metadata in group.values():
-                if getattr(metadata, "nano_enabled", False) and getattr(
-                    metadata, "nano_copy_src_offsets", None
-                ) is not None:
-                    get_sparse_kv_offload_manager().restore_nano_tails(metadata)
-                    return
 
     def _build_attention_metadata(
         self,
@@ -3829,7 +3800,6 @@ class NPUModelRunner(GPUModelRunner):
                 device_metadata_tasks,
                 batch_descriptor if cudagraph_runtime_mode == CUDAGraphMode.FULL else None,
             )
-        self._maybe_eager_restore_nano_tails(attn_metadata)
         return attn_metadata, spec_decode_common_attn_metadata
 
     def _should_build_dummy_attn_metadata(

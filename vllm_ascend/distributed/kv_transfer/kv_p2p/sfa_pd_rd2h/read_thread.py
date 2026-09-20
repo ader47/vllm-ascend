@@ -505,7 +505,7 @@ class MembPullReadThread(threading.Thread):
         local_chunks: list[np.ndarray],
         length_chunks: list[np.ndarray],
     ) -> None:
-        """D2D the last incomplete main block into this rank's circular tail."""
+        """D2D the final prompt block into this rank's circular tail."""
         state = self._state
         tail = state.nano_tail_by_req.get(ext_req_id)
         if tail is None or tail.tail_tokens <= 0:
@@ -519,9 +519,7 @@ class MembPullReadThread(threading.Thread):
             return
         offload_id = layer["offload_id"]
         if offload_id >= len(state.topk_k_bases) or offload_id >= len(state.topk_v_bases):
-            raise RuntimeError(
-                f"MembPull nano tail is missing topk buffer bases for {layer['layer_name']}"
-            )
+            raise RuntimeError(f"MembPull nano tail is missing topk buffer bases for {layer['layer_name']}")
         p_k_len = int(layer["p_k_len"])
         p_v_len = int(layer["p_v_len"])
         if p_k_len % state.block_size or p_v_len % state.block_size:
