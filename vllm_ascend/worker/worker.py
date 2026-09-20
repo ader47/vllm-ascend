@@ -49,6 +49,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.v1.core import kv_cache_utils
 from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -1101,6 +1102,11 @@ class NPUWorker(WorkerBase):
         num_buffer_assignments = len(reuse_layout.component_lanes)
 
         logical_page_bytes = sum(spec.page_size_bytes for spec in kv_cache_spec.values())
+        if any(getattr(spec, "model_version", None) == "deepseek_v4" for spec in kv_cache_spec.values()):
+            kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+            # The DSV4 planner packs page-size buckets into shared tuples, so
+            # its bytes-per-block divisor is not necessarily the sum above.
+            logical_page_bytes = kv_cache_utils._pool_bytes_per_block(kv_cache_groups)
         physical_page_bytes = sum(
             max(component.spec.page_size_bytes for component in components)
             for components in reuse_layout.component_lanes.values()

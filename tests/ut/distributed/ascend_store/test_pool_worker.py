@@ -18,7 +18,7 @@
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 
@@ -534,6 +534,33 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
                 2: [(0, 2)],
             },
         )
+        worker.group_block_len = {0: [16, 16, 16], 1: [8, 8]}
+        worker.group_num_layers = {0: 3, 1: 2}
+        self.assertEqual(worker._global_group_alloc_size(0), 5 * 16)
+        self.assertEqual(worker._global_group_alloc_size(1), 4 * 8)
+
+        worker.backend_name = "memcache"
+        worker.use_block_key_layerwise = False
+        worker._compute_reachable_store_masks = MagicMock(return_value=None)
+        worker._process_save_for_layer_batch = MagicMock()
+        worker._prepare_load_gvas = MagicMock()
+        worker._alloc_gvas_for_save = MagicMock()
+        worker._build_shared_save_data = MagicMock()
+        worker._process_load_for_layer_batch = MagicMock()
+        worker._build_shared_load_data = MagicMock()
+        request = MagicMock()
+
+        worker.process_layer_data([request])
+
+        expected_calls = [
+            call([request], 0, 0, 0),
+            call([request], 0, 1, 0),
+            call([request], 1, 0, 1),
+            call([request], 1, 1, 1),
+            call([request], 2, 0, 2),
+        ]
+        self.assertEqual(worker._process_save_for_layer_batch.call_args_list, expected_calls)
+        self.assertEqual(worker._process_load_for_layer_batch.call_args_list, expected_calls)
 
     def test_incomplete_concrete_layout_is_not_reenabled_from_layer_count(self):
         import torch

@@ -468,6 +468,7 @@ class KVPoolWorker:
                     global_layer: local_layer for local_layer, global_layer in enumerate(sorted(physical_layers))
                 }
                 effective_num_layers = max(self.num_layers, len(physical_layers))
+                self.layerwise_key_layers = effective_num_layers
                 if effective_num_layers != self.num_layers:
                     logger.info(
                         "KVPoolWorker: updated num_layers %d -> %d from cache group layout.",
@@ -875,7 +876,8 @@ class KVPoolWorker:
         if n_local <= 0:
             return sum(gbl)
         per_layer = sum(gbl) // n_local
-        n_global = max(total_layers, int(self.num_layers), n_local)
+        layer_offset = int(getattr(self, "layerwise_key_layer_offset", 0))
+        n_global = max(total_layers, layer_offset + n_local)
         return per_layer * n_global
 
     def _infer_cache_group_metadata(self, group_id: int, layer_names: list[str]):
@@ -2275,21 +2277,14 @@ class KVPoolWorker:
             return
         # Keep this method safe for direct callers as well as start_load_kv().
         # Worker threads may still own the lists from the preceding step.
-        # PP fix: num_layers may be widened to the GLOBAL layer count by the
-        # cache-group layout update, but only the per-stage LOCAL layers are
-        # forwarded. Map the local layer counter to the global physical layer
-        # via the PP offset so task lists are indexed by LOCAL layer id
-        # (matching save_kv_layer's current_layer) while group lookups hit the
-        # real physical_layer_to_group_layers entries.
         # Under PP>1 use the per-stage LOCAL layer count; otherwise keep the
         # legacy self.num_layers so post-init mutations are respected.
+        # physical_layer_to_group_layers is also stage-local: its global layer
+        # ids were normalized by _global_to_local_layer during initialization.
         if getattr(self, "pp_size", 1) > 1:
             num_local = getattr(self, "layerwise_key_layers", 0) or self.num_layers
         else:
             num_local = self.num_layers
-        layer_offset = getattr(self, "layerwise_key_layer_offset", 0)
-        if not isinstance(layer_offset, int):
-            layer_offset = 0
         self.layer_save_tasks = [[] for _ in range(self.num_layers)]
         self.layer_load_tasks = [[] for _ in range(self.num_layers)]
         if self.backend_name == "mooncake" and self.use_block_key_layerwise:
@@ -2297,8 +2292,7 @@ class KVPoolWorker:
         for request in requests:
             request.store_masks = self._compute_reachable_store_masks(request)
         for local_layer in range(num_local):
-            physical_layer = local_layer + layer_offset
-            group_layers = self.physical_layer_to_group_layers.get(physical_layer, [(0, local_layer)])
+            group_layers = self.physical_layer_to_group_layers.get(local_layer, [(0, local_layer)])
             for group_id, layer_idx_in_group in group_layers:
                 self._process_save_for_layer_batch(requests, local_layer, group_id, layer_idx_in_group)
         # Protect the previous partial before allocating the next snapshot.
@@ -2306,8 +2300,7 @@ class KVPoolWorker:
         self._alloc_gvas_for_save(requests)
         self._build_shared_save_data()
         for local_layer in range(num_local):
-            physical_layer = local_layer + layer_offset
-            group_layers = self.physical_layer_to_group_layers.get(physical_layer, [(0, local_layer)])
+            group_layers = self.physical_layer_to_group_layers.get(local_layer, [(0, local_layer)])
             for group_id, layer_idx_in_group in group_layers:
                 self._process_load_for_layer_batch(requests, local_layer, group_id, layer_idx_in_group)
         self._build_shared_load_data()
