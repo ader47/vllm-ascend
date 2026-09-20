@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import nano_pool_capacity
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 
 # Main BF16 cache:
@@ -871,7 +872,10 @@ class SparseKVOffloadManager:
         if self.use_nano:
             self.nano_completion_token = torch.zeros(1, dtype=torch.int32, device=device)
         if self.use_nano and self.vllm_config.speculative_config is not None:
-            nano_request_capacity = self.max_num_reqs + NANO_GRAPH_PADDING_REQUESTS
+            # PD can assign every slot in this pool to a real request. Dummy
+            # slots start after it; max_num_reqs only bounds batch concurrency.
+            self.nano_pool_capacity = nano_pool_capacity(self.max_num_reqs)
+            nano_request_capacity = self.nano_pool_capacity
             self.nano_plan_capacity = 2 * nano_request_capacity
             self.nano_rejected_rows_npu = torch.zeros(
                 nano_request_capacity,
@@ -1258,7 +1262,7 @@ class SparseKVOffloadManager:
         matched = (
             active
             & (pools >= 0)
-            & (pools < self.max_num_reqs)
+            & (pools < self.nano_pool_capacity)
             & (self.nano_confirmed_generations[safe_pools] == generations)
         )
         return (
@@ -1313,7 +1317,7 @@ class SparseKVOffloadManager:
         )
         pools = metadata.nano_pool_entries.to(torch.int64)
         safe_pools = pools.clamp(0, self.nano_plan_capacity - 1)
-        plan_rows = metadata.nano_active & (pools >= 0) & (pools < self.max_num_reqs)
+        plan_rows = metadata.nano_active & (pools >= 0) & (pools < self.nano_pool_capacity)
         old_generations = self.nano_confirmed_generations[safe_pools]
         old_src_slots = self.nano_confirmed_src_slots[safe_pools]
         old_dst_slots = self.nano_confirmed_dst_slots[safe_pools]

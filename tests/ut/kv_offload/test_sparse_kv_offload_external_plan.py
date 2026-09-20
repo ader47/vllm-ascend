@@ -12,6 +12,10 @@ pytest.importorskip("memfabric_hybrid")
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import (  # noqa: E402
     sparse_kv_offload_manager as manager_module,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import (  # noqa: E402
+    NanoTopkSlotAllocator,
+    nano_pool_capacity,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (  # noqa: E402
     FSA_EXTERNAL_PLAN_READY_MARKER,
     FSA_PAIRED_SELECTION_COPY_MARKER,
@@ -447,6 +451,7 @@ def test_nano_finalize_truncates_residency_but_does_not_invent_mtp_writes():
     manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
     manager.use_nano = True
     manager.max_num_reqs = 2
+    manager.nano_pool_capacity = nano_pool_capacity(manager.max_num_reqs)
     manager.nano_plan_capacity = 2
     manager.topk_buffer_size = 4096
     manager.nano_rejected_rows_npu = torch.zeros(2, dtype=torch.int32)
@@ -495,6 +500,7 @@ def test_nano_finalize_truncates_residency_but_does_not_invent_mtp_writes():
 def test_nano_mtp_gathers_confirmed_plan_by_pool_and_generation():
     manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
     manager.max_num_reqs = 3
+    manager.nano_pool_capacity = nano_pool_capacity(manager.max_num_reqs)
     manager.nano_plan_capacity = 3
     manager.nano_confirmed_generations = torch.tensor([10, 20, 30], dtype=torch.int64)
     manager.nano_confirmed_src_slots = torch.tensor([100, 200, 300], dtype=torch.int64)
@@ -517,6 +523,7 @@ def test_nano_confirmation_dummy_slot_cannot_alias_real_pool(max_real_reqs):
     manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
     manager.use_nano = True
     manager.max_num_reqs = max_real_reqs
+    manager.nano_pool_capacity = nano_pool_capacity(manager.max_num_reqs)
     manager.nano_plan_capacity = 8
     manager.topk_buffer_size = 4096
     manager.nano_rejected_rows_npu = torch.zeros(2, dtype=torch.int32)
@@ -543,6 +550,107 @@ def test_nano_confirmation_dummy_slot_cannot_alias_real_pool(max_real_reqs):
     assert manager.nano_confirmed_generations[max_real_reqs - 1].item() == 7
     assert manager.nano_confirmed_active[max_real_reqs - 1].item()
     assert manager.nano_confirmed_generations[4].item() == -1
+
+
+def _make_nano_confirmation_manager(max_num_reqs):
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.use_nano = True
+    manager.max_num_reqs = max_num_reqs
+    manager.nano_pool_capacity = nano_pool_capacity(max_num_reqs)
+    manager.nano_plan_capacity = 2 * manager.nano_pool_capacity
+    manager.topk_buffer_size = 4096
+    manager.nano_rejected_rows_npu = torch.zeros(manager.nano_pool_capacity, dtype=torch.int32)
+    manager.nano_confirmed_generations = torch.full((manager.nano_plan_capacity,), -1, dtype=torch.int64)
+    manager.nano_confirmed_src_slots = torch.zeros(manager.nano_plan_capacity, dtype=torch.int64)
+    manager.nano_confirmed_dst_slots = torch.zeros_like(manager.nano_confirmed_src_slots)
+    manager.nano_confirmed_active = torch.zeros(manager.nano_plan_capacity, dtype=torch.bool)
+    manager.nano_tail_states = {}
+    return manager
+
+
+@pytest.mark.parametrize("max_num_reqs", [2, 4])
+@pytest.mark.parametrize("rejected_rows", [0, 2, 3, 4])
+def test_nano_mtp_confirmation_survives_pd_slot_turnover(max_num_reqs, rejected_rows):
+    manager = _make_nano_confirmation_manager(max_num_reqs)
+    allocator = NanoTopkSlotAllocator(manager.nano_pool_capacity)
+    # Finished requests return their slots to the queue's tail. The next two
+    # real requests therefore use the extra slots, without exceeding concurrency.
+    for index in range(max_num_reqs):
+        request_id = f"finished-{index}"
+        allocator.bind(request_id)
+        allocator.release(request_id)
+    pools = [allocator.bind("request-a"), allocator.bind("request-b")]
+    assert pools == [max_num_reqs, max_num_reqs + 1]
+
+    dummy_pool = manager.nano_pool_capacity
+    metadata = SimpleNamespace(
+        nano_enabled=True,
+        nano_seq_lens=torch.tensor([130, 130, 1], dtype=torch.int32),
+        nano_query_ends=torch.tensor([4, 8, 9], dtype=torch.int32),
+        nano_pool_entries=torch.tensor([*pools, dummy_pool], dtype=torch.int32),
+        nano_generations=torch.tensor([7, 9, -1], dtype=torch.int64),
+        nano_active=torch.tensor([True, True, False]),
+        nano_source_block_table=torch.tensor([[10], [11], [-1]], dtype=torch.int32),
+    )
+    manager.finalize_nano_full_blocks(
+        metadata,
+        torch.tensor([rejected_rows, rejected_rows], dtype=torch.int32),
+    )
+
+    expected_active = rejected_rows <= 2  # Previous length 126; the boundary is 128.
+    assert manager.nano_confirmed_generations[pools].tolist() == [7, 9]
+    assert manager.nano_confirmed_active[pools].tolist() == [expected_active, expected_active]
+    assert manager.nano_confirmed_generations[dummy_pool].item() == -1
+    assert not manager.nano_confirmed_active[dummy_pool].item()
+
+    # MTP can use a different row order. Gather must follow slot ownership,
+    # not the target batch row or the maximum number of concurrent requests.
+    order = torch.tensor([1, 0, 2])
+    source, destination, active = manager.gather_nano_confirmed_plan(
+        metadata.nano_pool_entries[order],
+        metadata.nano_generations[order],
+        metadata.nano_active[order],
+    )
+    assert active.tolist() == [expected_active, expected_active, False]
+    if expected_active:
+        stride = manager.topk_buffer_size + 2 * manager_module.NANO_TAIL_BLOCK_SIZE
+        assert source[:2].tolist() == [pool * stride + manager.topk_buffer_size for pool in reversed(pools)]
+        assert destination[:2].tolist() == [11 * 128, 10 * 128]
+
+    # Reusing a slot for a new generation must not inherit the previous plan.
+    _, _, stale_active = manager.gather_nano_confirmed_plan(
+        metadata.nano_pool_entries[:2],
+        metadata.nano_generations[:2] + 1,
+        metadata.nano_active[:2],
+    )
+    assert stale_active.tolist() == [False, False]
+
+
+@pytest.mark.parametrize("pool", [-1, 4, 7])
+def test_nano_confirmation_excludes_slots_outside_real_pool(pool):
+    manager = _make_nano_confirmation_manager(max_num_reqs=2)
+    metadata = SimpleNamespace(
+        nano_enabled=True,
+        nano_seq_lens=torch.tensor([128], dtype=torch.int32),
+        nano_query_ends=torch.tensor([1], dtype=torch.int32),
+        nano_pool_entries=torch.tensor([pool], dtype=torch.int32),
+        nano_generations=torch.tensor([7], dtype=torch.int64),
+        nano_active=torch.tensor([True]),
+        nano_source_block_table=torch.tensor([[10]], dtype=torch.int32),
+    )
+    manager.finalize_nano_full_blocks(metadata, None)
+    assert manager.nano_confirmed_generations.eq(-1).all()
+    assert not manager.nano_confirmed_active.any()
+
+    # Even a populated entry in the dummy arena must fail the gather bound.
+    manager.nano_confirmed_generations.fill_(7)
+    manager.nano_confirmed_active.fill_(True)
+    _, _, active = manager.gather_nano_confirmed_plan(
+        metadata.nano_pool_entries,
+        metadata.nano_generations,
+        metadata.nano_active,
+    )
+    assert active.tolist() == [False]
 
 
 def test_nano_shared_plan_rejects_different_layer_tail_layouts():
