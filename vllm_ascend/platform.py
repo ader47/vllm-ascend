@@ -474,6 +474,7 @@ class NPUPlatform(Platform):
         # (fused MC2 exclusivity + scheduler extension policies)
         # ascend_config is only used for verification, this object must NOT be modified here
         ascend_config = init_ascend_config(vllm_config)
+        _disable_nano_pd_decode_prefix_caching(vllm_config, ascend_config)
         _check_ascend_config(vllm_config, ascend_config)
 
         # 6.Update compilation / cudagraph modes (ascend_config -> vllm_config).
@@ -904,6 +905,36 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
         )
     elif vllm_config.parallel_config.enable_eplb:
         raise ValueError("Upstream EPLB is only supported by Model Runner V2 on Ascend.")
+
+
+def _disable_nano_pd_decode_prefix_caching(vllm_config: VllmConfig, ascend_config) -> None:
+    """Disable Nano D-local sharing using the validated offload configuration."""
+    sparse_config = ascend_config.sparse_kv_offload_config
+    transfer_config = vllm_config.kv_transfer_config
+    if (
+        not sparse_config.enabled
+        or not sparse_config.use_nano
+        or transfer_config is None
+        or transfer_config.kv_connector != "SfaRemoteD2HConnector"
+        or transfer_config.kv_role != "kv_consumer"
+        or not vllm_config.cache_config.enable_prefix_caching
+    ):
+        return
+
+    # The scheduler can register a Decode block that will become full in this
+    # batch before its KV is computed or copied to Host. A locally resumed
+    # request can hit that block and consume it in the same batch, without
+    # another P-to-D transfer. The batch-end D2H wait is too late to protect
+    # this read. Nano's conservative non-MTP prefix-cache path therefore waits
+    # at every layer, sacrificing D2H/Attention overlap even in normal batches.
+    # Disable local sharing until cache readiness is enforced at admission or
+    # consumption; sampling-time KV confirmation does not gate cache lookup.
+    # P and non-Nano paths retain their existing prefix-cache configuration.
+    logger.warning_once(
+        "Nano Decode nodes using SfaRemoteD2HConnector do not support local prefix caching; "
+        "setting enable_prefix_caching=False. Prefill and non-Nano paths are unchanged."
+    )
+    vllm_config.cache_config.enable_prefix_caching = False
 
 
 def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
