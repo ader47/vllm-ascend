@@ -161,6 +161,33 @@ def test_pd_decode_consumer_still_rejects_long_prefill_classification():
     assert metadata.num_decode_tokens == 0
 
 
+@pytest.mark.parametrize(
+    ("width", "prefills", "eligible"),
+    [(8, 0, True), (1, 1, True), (1, 0, False)],
+)
+def test_nano_rejects_unsafe_fallback(width, prefills, eligible):
+    builder = AscendSFAKVOffloadMetadataBuilder.__new__(AscendSFAKVOffloadMetadataBuilder)
+    builder.use_nano = True
+    builder.is_pd_decode_consumer = True
+    builder.decode_threshold = 7
+    common = SimpleNamespace(
+        nano_eligible=eligible,
+        offload_dummy=False,
+        max_query_len=width,
+        req_ids_tensor=None,
+        token_to_req=None,
+    )
+
+    with (
+        patch(
+            MODULE + ".split_decodes_and_prefills",
+            return_value=(1, prefills, width, 0),
+        ),
+        pytest.raises(ValueError, match="discard resident partial tails"),
+    ):
+        builder._populate_offload_metadata(SimpleNamespace(), common)
+
+
 def test_nano_full_pool_generation_and_padding_are_isolated():
     builder = _make_nano_builder(max_num_seqs=2)
     count = builder.nano_pool_capacity
@@ -256,6 +283,7 @@ def test_nano_reused_topk_passes_resident_tail_to_attention():
     impl.kv_lora_rank = 4
     impl.qk_rope_head_dim = 2
     impl.scale = 1.0
+    impl.sfa_sparse_topk = 2048
     impl.nano_reuse_topk_misses = torch.zeros(1, dtype=torch.int32)
     impl.nano_reuse_misses = torch.zeros(1, dtype=torch.int32)
     impl.nano_topk_src = torch.zeros((1, 1, 2048), dtype=torch.int32)
@@ -304,6 +332,34 @@ def test_nano_reused_topk_passes_resident_tail_to_attention():
     assert captured["cache_tokens"].tolist() == [2048]
     assert captured["logical_lens"].tolist() == [2177]
     assert bool((output == 1).all())
+
+
+def test_nano_short_history_uses_dense_identity_rows_only_when_cold():
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.sfa_sparse_topk = 2048
+    impl.nano_dense_slots = torch.arange(2048, dtype=torch.int32)
+    impl.nano_miss_src = torch.full((4, 2048), -1, dtype=torch.int32)
+    impl.nano_miss_dst = impl.nano_miss_src.clone()
+    impl.nano_misses = torch.tensor([0, 0, 7, 0], dtype=torch.int32)
+    impl.nano_states = torch.tensor([-2, -1, -2, -3], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        nano_pool_entries=torch.arange(4),
+        nano_prefix_lens=torch.tensor([128, 256, 4096, 128], dtype=torch.int32),
+        nano_active=torch.tensor([True, True, True, False]),
+    )
+
+    impl._prepare_nano_dense_prefix(metadata)
+
+    assert impl.nano_misses.tolist() == [128, 0, 7, 0]
+    torch.testing.assert_close(
+        impl.nano_miss_src[0, :128],
+        torch.arange(128, dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        impl.nano_miss_dst[0, :128],
+        impl.nano_miss_src[0, :128],
+    )
+    assert bool((impl.nano_miss_src[2:] == -1).all())
 
 
 def _make_fused_overlap_impl() -> AscendSFAKVOffloadImpl:

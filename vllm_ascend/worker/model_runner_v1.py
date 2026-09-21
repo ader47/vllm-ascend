@@ -3201,13 +3201,9 @@ class NPUModelRunner(GPUModelRunner):
         )
         has_lora = num_active_loras > 0 if force_has_lora is None else force_has_lora
 
-        nano_requires_eager = (
-            self.sparse_kv_offload_enabled and self.sparse_kv_offload_config.use_nano
-            and force_uniform_decode is None and not self._nano_batch_eligible(num_reqs)
-        )
         # ruff: noqa: E731
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
-            if force_eager or nano_requires_eager:
+            if force_eager:
                 return (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
 
             return self.cudagraph_dispatcher.dispatch(
@@ -3266,13 +3262,6 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens_across_dp,
             cudagraph_stats,
         )
-
-    def _nano_batch_eligible(self, num_reqs: int) -> bool:
-        # Prompt lengths are immutable lower bounds in decode. Keep short
-        # prompts on the existing eager offload path, even if generation later
-        # grows them past TopK. This avoids reading rejection-adjusted lengths
-        # back from the device merely to choose a graph specialization.
-        return bool(np.all(self.input_batch.num_prompt_tokens[:num_reqs] >= 2048 + 128 + 7))
 
     def _prebound_nano_slots(self) -> dict[str, int]:
         if not has_kv_transfer_group():
@@ -3568,8 +3557,9 @@ class NPUModelRunner(GPUModelRunner):
                                    if self._offload_pool_slots is not None else None),
             req_topk_buffer_generations=(self._offload_pool_generations.gpu[:num_reqs_padded]
                                          if self._offload_pool_generations is not None else None),
-            nano_eligible=(offload_dummy or self._nano_batch_eligible(num_reqs))
-                          if self._offload_pool_slots is not None else False,
+            # Short histories use the same Nano layout with a dense prefix.
+            # Never demote a live Nano request to the ordinary Host path.
+            nano_eligible=self._offload_pool_slots is not None,
             offload_dummy=offload_dummy,
             mm_req_doc_ranges=req_doc_ranges,
         )

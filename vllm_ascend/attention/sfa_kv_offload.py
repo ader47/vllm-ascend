@@ -217,6 +217,11 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             and (num_prefills == 0 or common_attn_metadata.offload_dummy)
             and 1 <= common_attn_metadata.max_query_len <= 7
         )
+        if self.use_nano and not metadata.nano_enabled and not common_attn_metadata.offload_dummy:
+            raise ValueError(
+                "nano requires decode metadata with 1–7 query rows per request; "
+                "falling back would discard resident partial tails"
+            )
         if metadata.nano_enabled:
             # Include graph padding in the operator batch. These addresses
             # remain fixed from capture through replay; only device contents
@@ -453,6 +458,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 self.nano_miss_src = torch.empty((requests, 32768), dtype=torch.int32, device=device)
                 self.nano_miss_dst = torch.empty_like(self.nano_miss_src)
                 self.nano_misses = torch.zeros(requests, dtype=torch.int32, device=device)
+                self.nano_dense_slots = torch.arange(offload_cfg.topk, dtype=torch.int32, device=device)
                 self.nano_reuse_topk_misses = torch.zeros(output_tokens, dtype=torch.int32, device=device)
                 self.nano_reuse_misses = torch.zeros(requests, dtype=torch.int32, device=device)
                 self.nano_reuse_request_count = 0
@@ -664,11 +670,29 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             self.nano_miss_dst[:count],
             self.nano_misses[:count],
         )
+        self._prepare_nano_dense_prefix(metadata)
         # MTP draft step 0 owns the only LIM invocation. Later steps reuse its
         # compacted sparse selection while their metadata keeps the resident
         # tail length current.
         self.nano_reuse_request_count = count
         return self.nano_topk_src[:tokens]
+
+    def _prepare_nano_dense_prefix(self, metadata) -> None:
+        """Load short history densely when it is below the LIM TopK width."""
+        count = metadata.nano_pool_entries.numel()
+        prefix = metadata.nano_prefix_lens
+        dense = metadata.nano_active & (prefix > 0) & (prefix < self.sfa_sparse_topk)
+        slots = self.nano_dense_slots[None, :]
+        for buffer in (self.nano_miss_src, self.nano_miss_dst):
+            rows = buffer[:count, : self.sfa_sparse_topk]
+            rows.copy_(torch.where(dense[:, None], slots, rows))
+        self.nano_misses[:count].copy_(
+            torch.where(
+                dense,
+                torch.where(self.nano_states[:count] == -2, prefix, 0),
+                self.nano_misses[:count],
+            )
+        )
 
     def bind_nano_kv_cache(self, manager, layer_name) -> None:
         """Bind immutable layer addresses after cache registration, before capture."""
@@ -738,6 +762,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 self._nano_restore_tail(metadata, manager, layer_name)
             topk_misses = owner.nano_topk_misses[:tokens]
             misses = owner.nano_misses[:count]
+        # copy-SFA accepts either no sparse prefix or at least TopK entries.
+        # A shorter prefix is already present as dense identity rows in HBM.
+        attention_cache_tokens = torch.where(cache_tokens < self.sfa_sparse_topk, 0, cache_tokens)
         heads = query.shape[1]
         q, qr = prepare_copy_sfa_queries(query[:tokens], query_rope[:tokens])
         out = torch.empty_like(q)
@@ -746,7 +773,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             q,
             metadata.nano_query_ends,
             logical_lens,
-            cache_tokens,
+            attention_cache_tokens,
             owner.nano_topk_dst[:tokens],
             owner.nano_topk_src[:tokens],
             topk_misses,

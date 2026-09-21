@@ -714,6 +714,37 @@ class TestShortRequestFirstConfig(TestBase):
 
 
 class TestSparseKVOffloadConfig(TestBase):
+    @staticmethod
+    def _nano_vllm_config(
+        *,
+        speculative: bool = True,
+        method: str = "mtp",
+        num_speculative_tokens: int = 2,
+        disable_padded_drafter_batch: bool = False,
+        dynamic_schedule=None,
+        block_size: int = 128,
+    ):
+        speculative_config = None
+        if speculative:
+            speculative_config = SimpleNamespace(
+                method=method,
+                num_speculative_tokens=num_speculative_tokens,
+                num_speculative_tokens_per_batch_size=dynamic_schedule,
+                disable_padded_drafter_batch=disable_padded_drafter_batch,
+            )
+        return SimpleNamespace(
+            model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=2048)),
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                pipeline_parallel_size=1,
+            ),
+            kv_transfer_config=SimpleNamespace(is_kv_consumer=True),
+            cache_config=SimpleNamespace(block_size=block_size),
+            use_v2_model_runner=False,
+            speculative_config=speculative_config,
+        )
+
     def test_disabled_string_false_does_not_enter_enabled_path(self):
         config = SparseKVOffloadConfig.from_additional_config(SimpleNamespace(), {"enabled": "false"})
 
@@ -755,6 +786,96 @@ class TestSparseKVOffloadConfig(TestBase):
     def test_non_dict_config_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "sparse_kv_offload_config must be a dict"):
             SparseKVOffloadConfig.from_additional_config(SimpleNamespace(), [])
+
+    def test_nano_allows_plain_decode(self):
+        config = SparseKVOffloadConfig.from_additional_config(
+            self._nano_vllm_config(speculative=False),
+            {
+                "enabled": True,
+                "fused_op_type": "nano",
+                "topk_buffer_size": 8192,
+            },
+        )
+
+        self.assertTrue(config.use_nano)
+
+    def test_nano_rejects_non_128_block_size(self):
+        with self.assertRaisesRegex(ValueError, "requires block_size=128"):
+            SparseKVOffloadConfig.from_additional_config(
+                self._nano_vllm_config(block_size=64),
+                {
+                    "enabled": True,
+                    "fused_op_type": "nano",
+                    "topk_buffer_size": 8192,
+                },
+            )
+
+    def test_nano_rejects_non_mtp_speculation(self):
+        with self.assertRaisesRegex(ValueError, "requires method=mtp"):
+            SparseKVOffloadConfig.from_additional_config(
+                self._nano_vllm_config(method="eagle"),
+                {
+                    "enabled": True,
+                    "fused_op_type": "nano",
+                    "topk_buffer_size": 8192,
+                },
+            )
+
+    def test_nano_rejects_query_width_above_seven(self):
+        with self.assertRaisesRegex(ValueError, "1–7 query rows"):
+            SparseKVOffloadConfig.from_additional_config(
+                self._nano_vllm_config(num_speculative_tokens=7),
+                {
+                    "enabled": True,
+                    "fused_op_type": "nano",
+                    "topk_buffer_size": 16256,
+                },
+            )
+
+    def test_nano_rejects_unpadded_mtp(self):
+        with self.assertRaisesRegex(ValueError, "requires padded drafter batches"):
+            SparseKVOffloadConfig.from_additional_config(
+                self._nano_vllm_config(disable_padded_drafter_batch=True),
+                {
+                    "enabled": True,
+                    "fused_op_type": "nano",
+                    "topk_buffer_size": 8192,
+                },
+            )
+
+    def test_nano_rejects_zero_draft_tokens(self):
+        with self.assertRaisesRegex(ValueError, "at least one draft token"):
+            SparseKVOffloadConfig.from_additional_config(
+                self._nano_vllm_config(num_speculative_tokens=0),
+                {
+                    "enabled": True,
+                    "fused_op_type": "nano",
+                    "topk_buffer_size": 8192,
+                },
+            )
+
+    def test_nano_rejects_dynamic_zero_draft_tokens(self):
+        with self.assertRaisesRegex(ValueError, "K=0 skips"):
+            SparseKVOffloadConfig.from_additional_config(
+                self._nano_vllm_config(dynamic_schedule=[(1, 32, 2), (33, 64, 0)]),
+                {
+                    "enabled": True,
+                    "fused_op_type": "nano",
+                    "topk_buffer_size": 8192,
+                },
+            )
+
+    def test_nano_rejects_colocated_prefill_fallback(self):
+        with self.assertRaisesRegex(ValueError, "prefill/mixed fallback"):
+            SparseKVOffloadConfig.from_additional_config(
+                self._nano_vllm_config(),
+                {
+                    "enabled": True,
+                    "fused_op_type": "nano",
+                    "topk_buffer_size": 8192,
+                    "keep_device_kv_cache": True,
+                },
+            )
 
 
 class TestSchedulerConfig(TestBase):

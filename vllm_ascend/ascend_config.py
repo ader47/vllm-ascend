@@ -1454,11 +1454,35 @@ class SparseKVOffloadConfig:
 
         self.topk = vllm_config.model_config.hf_text_config.index_topk
         if self.use_nano:
-            width = 1 + (vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config else 0)
+            if self.keep_device_kv_cache:
+                raise ValueError(
+                    "nano requires decode-only offload without keep_device_kv_cache; "
+                    "prefill/mixed fallback cannot preserve resident partial tails"
+                )
+            speculative_config = vllm_config.speculative_config
+            width = 1 + (speculative_config.num_speculative_tokens if speculative_config else 0)
+            if vllm_config.cache_config.block_size != 128:
+                raise ValueError("nano serving currently requires block_size=128")
             if self.topk != 2048 or not 1 <= width <= 7:
                 raise ValueError("nano serving requires TopK=2048 and 1–7 query rows per request")
             if not width * self.topk <= self.topk_buffer_size <= 16256 or self.topk_buffer_size % 128:
                 raise ValueError("nano hot budget must be block-aligned in [Q_max*2048, 16256]")
+            if speculative_config is not None:
+                if speculative_config.method != "mtp":
+                    raise ValueError("nano speculative serving currently requires method=mtp")
+                if getattr(speculative_config, "disable_padded_drafter_batch", False):
+                    raise ValueError("nano MTP requires padded drafter batches for device-side rejection finalization")
+                dynamic_schedule = getattr(
+                    speculative_config,
+                    "num_speculative_tokens_per_batch_size",
+                    None,
+                )
+                dynamic_ks = [entry[2] for entry in dynamic_schedule] if dynamic_schedule is not None else []
+                if speculative_config.num_speculative_tokens < 1 or any(k < 1 for k in dynamic_ks):
+                    raise ValueError(
+                        "nano MTP requires at least one draft token in every decode step; "
+                        "K=0 skips the MTP KV tail update"
+                    )
         if self.topk_buffer_size < self.topk:
             raise ValueError(
                 "sparse_kv_offload_config.topk_buffer_size must be >= topk, "

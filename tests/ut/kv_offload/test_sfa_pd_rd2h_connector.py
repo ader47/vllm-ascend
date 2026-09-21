@@ -40,9 +40,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (  #
     get_external_request_id,
     infer_sfa_component_group_ids,
 )
-from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import (  # noqa: E402
-    NanoTopkSlotAllocator,
-)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.read_thread import (  # noqa: E402
     ConsumerReadState,
     MembPullReadThread,
@@ -58,6 +55,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.send_thread import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.worker import (  # noqa: E402
     SFAPDRD2HConsumerWorker,
     SFAPDRD2HProducerWorker,
+)
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import (  # noqa: E402
+    NanoTopkSlotAllocator,
 )
 from vllm_ascend.distributed.kv_transfer.utils.memfabric_transfer_engine import (  # noqa: E402
     BACKEND_MEMFABRIC,
@@ -1484,7 +1484,11 @@ def test_pp_producer_requires_structured_mf_meta_ack():
     assert "tcp://d:1" in thread._mf_meta_sent_paths
 
 
-def test_consumer_scheduler_binds_nano_tail_at_alloc():
+@pytest.mark.parametrize(
+    ("prompt_len", "tail_tokens", "tail_block_index"),
+    [(10367, 127, 80), (10240, 128, 79)],
+)
+def test_consumer_scheduler_binds_nano_tail_at_alloc(prompt_len, tail_tokens, tail_block_index):
     scheduler = SFAPDRD2HScheduler.__new__(SFAPDRD2HScheduler)
     scheduler.main_group_idx = 0
     scheduler.indexer_group_idx = 1
@@ -1514,20 +1518,20 @@ def test_consumer_scheduler_binds_nano_tail_at_alloc():
         request_id="req-tail",
         kv_transfer_params=params,
         num_computed_tokens=0,
-        prompt_token_ids=list(range(10367)),
+        prompt_token_ids=list(range(prompt_len)),
     )
     blocks = MagicMock()
     blocks.get_block_ids.return_value = ([1, 2], [3])
 
-    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=10367)
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=prompt_len)
     meta = scheduler.build_connector_meta(MagicMock())
 
     assert len(meta.requests) == 1
     req_meta = meta.requests[0]
     assert req_meta.pool_slot == 0
-    assert req_meta.tail_tokens == 127
-    assert req_meta.tail_block_index == 80
-    assert req_meta.kv_tokens == 10367
+    assert req_meta.tail_tokens == tail_tokens
+    assert req_meta.tail_block_index == tail_block_index
+    assert req_meta.kv_tokens == prompt_len
 
     scheduler.request_finished_all_groups(request, ([1, 2], [3]))
     assert scheduler._nano_slot_allocator.get("req-tail") is None
@@ -1582,11 +1586,17 @@ def _make_tail_read_thread(*, tp_rank: int = 0, tp_size: int = 1) -> MembPullRea
     return thread
 
 
-def test_nano_tail_d2d_appends_to_every_decode_rank():
+@pytest.mark.parametrize("tail_tokens", [3, 128])
+def test_nano_tail_d2d_appends_to_every_decode_rank(tail_tokens):
     layer = _make_layer(k_cpu_ptr=None, v_cpu_ptr=None, has_indexer=False)
     layer["p_k_len"] = 1280
     layer["p_v_len"] = 2560
     thread = _make_tail_read_thread()
+    thread._state.nano_tail_by_req["req-0"] = NanoTailDest(
+        pool_slot=1,
+        tail_tokens=tail_tokens,
+        tail_block_index=0,
+    )
 
     local, peer, lengths, _ = thread._build_req_descriptors(
         layer,
@@ -1599,7 +1609,7 @@ def test_nano_tail_d2d_appends_to_every_decode_rank():
     # dst_token = slot 1 * 256 + 128 + 0 = 384
     assert local == [100_000 + 384 * 10, 200_000 + 384 * 20]
     assert peer == [1000 + 5 * 1280, 2000 + 5 * 2560]
-    assert lengths == [3 * 10, 3 * 20]
+    assert lengths == [tail_tokens * 10, tail_tokens * 20]
 
 
 def test_nano_tail_d2d_uses_only_first_unequal_tp_contributor():
@@ -1656,4 +1666,3 @@ def test_nano_tail_d2d_skips_when_last_block_is_not_in_chunk():
     assert local == [3000, 4000]
     assert peer == [1000 + 1280, 2000 + 2560]
     assert lengths == [1280, 2560]
-

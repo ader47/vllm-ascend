@@ -35,6 +35,7 @@ def make_impl():
     impl.kv_lora_rank = 512
     impl.qk_rope_head_dim = 64
     impl.scale = 1 / math.sqrt(576)
+    impl.sfa_sparse_topk = TOPK
     return impl
 
 
