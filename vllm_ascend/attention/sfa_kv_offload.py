@@ -233,6 +233,13 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             # S=0 would skip LI and could leave selections from an earlier
             # active replay in these shared output rows.
             seq_lens = torch.where(active, common_attn_metadata.seq_lens[:count], widths)
+            if draft_index > 0:
+                # The verify-step shape retains rejected rows, while later
+                # MTP steps start from the accepted token position. Use the
+                # actual per-step positions instead of the optimistic shape.
+                positions = common_attn_metadata.positions[:count]
+                active = active & (common_attn_metadata.slot_mapping[:count] >= 0)
+                seq_lens = torch.where(active, positions.to(torch.int32) + 1, widths)
             prefix = torch.div((seq_lens - widths).clamp_min(0), 128, rounding_mode="floor") * 128
             cache = torch.where(active, prefix.clamp_max(self.nano_hot_tokens), 2048)
             safe_pools = torch.where(active, pools[:count], self.nano_rows[:count] + self.nano_pool_capacity)
