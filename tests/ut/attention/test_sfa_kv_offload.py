@@ -20,6 +20,49 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT,
 )
 
+MODULE = "vllm_ascend.attention.sfa_kv_offload"
+
+
+def _make_nano_builder(max_num_seqs: int = 2):
+    builder = AscendSFAKVOffloadMetadataBuilder.__new__(AscendSFAKVOffloadMetadataBuilder)
+    builder.use_nano = True
+    builder.decode_threshold = 4
+    builder.is_pd_decode_consumer = True
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=16,
+        ),
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        model_config=SimpleNamespace(
+            max_model_len=16384,
+            hf_text_config=SimpleNamespace(
+                kv_lora_rank=4,
+                qk_rope_head_dim=2,
+            ),
+        ),
+    )
+    with patch(
+        MODULE + ".get_ascend_config",
+        return_value=SimpleNamespace(
+            sparse_kv_offload_config=SimpleNamespace(topk_buffer_size=8192),
+        ),
+    ):
+        builder._init_nano_metadata_buffers(config, torch.device("cpu"))
+    return builder
+
+
+def _populate_nano_metadata(builder, common, draft_index: int = 0):
+    with patch(
+        MODULE + ".split_decodes_and_prefills",
+        return_value=(common.num_reqs, 0, common.num_input_tokens, 0),
+    ):
+        return builder._populate_offload_metadata(
+            SimpleNamespace(),
+            common,
+            draft_index=draft_index,
+        )
+
 
 def _make_boundary_decode_metadata():
     return SimpleNamespace(
@@ -45,7 +88,15 @@ def _make_boundary_decode_metadata():
 )
 def test_pd_decode_consumer_is_derived_from_kv_role(kv_transfer_config, expected):
     vllm_config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
-    with patch.object(AscendSFAMetadataBuilder, "__init__", return_value=None):
+    with (
+        patch.object(AscendSFAMetadataBuilder, "__init__", return_value=None),
+        patch(
+            MODULE + ".get_ascend_config",
+            return_value=SimpleNamespace(
+                sparse_kv_offload_config=SimpleNamespace(use_nano=False),
+            ),
+        ),
+    ):
         builder = AscendSFAKVOffloadMetadataBuilder(
             kv_cache_spec=None,
             layer_names=[],
@@ -69,6 +120,7 @@ def test_boundary_token_classification_depends_on_pd_decode_role(
     expected_prefills,
 ):
     builder = AscendSFAKVOffloadMetadataBuilder.__new__(AscendSFAKVOffloadMetadataBuilder)
+    builder.use_nano = False
     builder.decode_threshold = 1
     builder.is_pd_decode_consumer = is_pd_decode_consumer
     metadata = SimpleNamespace(attn_state=AscendAttentionState.DecodeOnly)
@@ -89,6 +141,7 @@ def test_boundary_token_classification_depends_on_pd_decode_role(
 
 def test_pd_decode_consumer_still_rejects_long_prefill_classification():
     builder = AscendSFAKVOffloadMetadataBuilder.__new__(AscendSFAKVOffloadMetadataBuilder)
+    builder.use_nano = False
     builder.decode_threshold = 1
     builder.is_pd_decode_consumer = True
     metadata = SimpleNamespace()
@@ -106,6 +159,151 @@ def test_pd_decode_consumer_still_rejects_long_prefill_classification():
     assert metadata.num_decodes == 0
     assert metadata.num_prefills == 1
     assert metadata.num_decode_tokens == 0
+
+
+def test_nano_full_pool_generation_and_padding_are_isolated():
+    builder = _make_nano_builder(max_num_seqs=2)
+    count = builder.nano_pool_capacity
+    common = SimpleNamespace(
+        query_start_loc=torch.arange(count + 1, dtype=torch.int32),
+        query_start_loc_cpu=torch.arange(count + 1, dtype=torch.int32),
+        seq_lens=torch.tensor([129, 999, 999, 999], dtype=torch.int32),
+        # Slot 3 is the second extra legal pool row. The other rows model an
+        # out-of-range slot, a negative slot, and ordinary graph padding.
+        req_topk_buffer_slots=torch.tensor([3, 4, -1, 1], dtype=torch.int32),
+        req_topk_buffer_generations=torch.tensor([7, 8, 9, -1], dtype=torch.int64),
+        block_table_tensor=torch.arange(count * 128, dtype=torch.int32).view(count, -1),
+        positions=torch.arange(count, dtype=torch.int64),
+        slot_mapping=torch.arange(count, dtype=torch.int64),
+        req_ids_tensor=None,
+        token_to_req=None,
+        nano_eligible=True,
+        offload_dummy=False,
+        max_query_len=1,
+        num_reqs=count,
+        num_input_tokens=count,
+    )
+
+    metadata = _populate_nano_metadata(builder, common)
+
+    assert builder.nano_pool_capacity == 4
+    assert metadata.nano_active.tolist() == [True, False, False, False]
+    assert metadata.nano_pool_entries.tolist() == [3, 5, 6, 7]
+    private_start = builder.nano_pool_capacity * builder.nano_stride_blocks * 128
+    assert metadata.nano_device_slots[0] < private_start
+    assert bool((metadata.nano_device_slots[1:] >= private_start).all())
+
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.nano_states = torch.empty(count, dtype=torch.int32)
+    impl.nano_last_generation = torch.full((count * 2,), -1, dtype=torch.int64)
+    impl.nano_last_prefix = torch.zeros(count * 2, dtype=torch.int32)
+    impl.nano_last_cache = torch.zeros(count * 2, dtype=torch.int32)
+    impl._prepare_nano_lim_state(metadata)
+    assert impl.nano_states.tolist() == [-2, -3, -3, -3]
+    impl._prepare_nano_lim_state(metadata)
+    assert impl.nano_states.tolist() == [-1, -3, -3, -3]
+    metadata.nano_generations[0] += 1
+    impl._prepare_nano_lim_state(metadata)
+    assert impl.nano_states.tolist() == [-2, -3, -3, -3]
+
+
+def test_nano_later_draft_keeps_step_zero_prefix_and_full_tail():
+    builder = _make_nano_builder()
+    base = 8192
+    common = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 4], dtype=torch.int32),
+        seq_lens=torch.tensor([base + 130], dtype=torch.int32),
+        req_topk_buffer_slots=torch.tensor([1], dtype=torch.int32),
+        req_topk_buffer_generations=torch.tensor([11], dtype=torch.int64),
+        block_table_tensor=torch.arange(128, dtype=torch.int32).view(1, -1),
+        positions=torch.arange(base + 126, base + 130, dtype=torch.int64),
+        slot_mapping=torch.arange(4, dtype=torch.int64),
+        req_ids_tensor=None,
+        token_to_req=None,
+        nano_eligible=True,
+        offload_dummy=False,
+        max_query_len=4,
+        num_reqs=1,
+        num_input_tokens=4,
+    )
+    step_zero = _populate_nano_metadata(builder, common)
+    assert step_zero.nano_prefix_lens.tolist() == [base]
+
+    # Rejection leaves the next MTP row at position base + 128. Recomputing
+    # floor((S-Q)/128) here would advance the prefix and hide the full page
+    # that was not part of step zero's sparse TopK selection.
+    common.query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
+    common.query_start_loc_cpu = torch.tensor([0, 1], dtype=torch.int32)
+    common.seq_lens = torch.tensor([base + 131], dtype=torch.int32)
+    common.positions = torch.tensor([base + 128], dtype=torch.int64)
+    common.slot_mapping = torch.tensor([base + 128], dtype=torch.int64)
+    common.max_query_len = 1
+    common.num_input_tokens = 1
+    later = _populate_nano_metadata(builder, common, draft_index=1)
+
+    assert later.nano_seq_lens.tolist() == [base + 129]
+    assert later.nano_prefix_lens.tolist() == [base]
+    assert later.nano_cache_tokens.tolist() == [base]
+    assert later.nano_logical_lens.tolist() == [base + 129]
+
+
+def test_nano_reused_topk_passes_resident_tail_to_attention():
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.nano_indexer_owner = impl
+    impl.skip_topk = True
+    impl.has_indexer = True
+    impl.kv_lora_rank = 4
+    impl.qk_rope_head_dim = 2
+    impl.scale = 1.0
+    impl.nano_reuse_topk_misses = torch.zeros(1, dtype=torch.int32)
+    impl.nano_reuse_misses = torch.zeros(1, dtype=torch.int32)
+    impl.nano_topk_src = torch.zeros((1, 1, 2048), dtype=torch.int32)
+    impl.nano_topk_dst = torch.zeros_like(impl.nano_topk_src)
+    impl.nano_miss_src = torch.zeros((1, 2048), dtype=torch.int32)
+    impl.nano_miss_dst = torch.zeros_like(impl.nano_miss_src)
+    metadata = SimpleNamespace(
+        num_decode_tokens=1,
+        nano_pool_entries=torch.tensor([0], dtype=torch.int32),
+        nano_cache_tokens=torch.tensor([2048], dtype=torch.int32),
+        nano_logical_lens=torch.tensor([2177], dtype=torch.int32),
+        nano_query_ends=torch.tensor([1], dtype=torch.int32),
+        nano_token_active=torch.tensor([True]),
+        nano_hbm_block_table=torch.arange(18, dtype=torch.int32).view(1, -1),
+        nano_source_block_table=torch.arange(18, dtype=torch.int32).view(1, -1),
+    )
+    manager = SimpleNamespace(
+        _get_offload_layer_id=lambda _: 0,
+        topk_buffers_k=[torch.zeros((18, 128, 1, 4))],
+        topk_buffers_v=[torch.zeros((18, 128, 1, 2))],
+        k_caches_cpu=[torch.zeros((18, 128, 4))],
+        v_caches_cpu=[torch.zeros((18, 128, 2))],
+    )
+    captured = {}
+
+    def copy_sfa(*args):
+        captured["logical_lens"] = args[3].clone()
+        captured["cache_tokens"] = args[4].clone()
+        args[-1].fill_(1)
+
+    with patch.object(
+        torch.ops._C_ascend,
+        "npu_fused_copy_sfa_mtp",
+        side_effect=copy_sfa,
+        create=True,
+    ):
+        output = impl._nano_attention(
+            torch.zeros((1, 8, 4)),
+            torch.zeros((1, 8, 2)),
+            None,
+            metadata,
+            manager,
+            "mtp",
+        )
+
+    assert captured["cache_tokens"].tolist() == [2048]
+    assert captured["logical_lens"].tolist() == [2177]
+    assert bool((output == 1).all())
 
 
 def _make_fused_overlap_impl() -> AscendSFAKVOffloadImpl:

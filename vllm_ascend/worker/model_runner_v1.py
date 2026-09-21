@@ -157,6 +157,9 @@ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import (
+    nano_pool_capacity,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     allocate_kv_cache_tensors_for_sparse_kv_offload,
     allocate_kv_offload_topk_profile_buffers,
@@ -664,8 +667,9 @@ class NPUModelRunner(GPUModelRunner):
             self._offload_req_ids_tensor = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
             self._offload_token_to_req = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
             if self.sparse_kv_offload_config.use_nano:
-                self._offload_pool_slots = self._make_buffer(self.max_num_reqs + 2, dtype=torch.int32)
-                self._offload_pool_generations = self._make_buffer(self.max_num_reqs + 2, dtype=torch.int64)
+                capacity = nano_pool_capacity(self.max_num_reqs)
+                self._offload_pool_slots = self._make_buffer(capacity, dtype=torch.int32)
+                self._offload_pool_generations = self._make_buffer(capacity, dtype=torch.int64)
 
     @property
     def use_dcp(self) -> bool:
@@ -3282,7 +3286,7 @@ class NPUModelRunner(GPUModelRunner):
     def _prepare_nano_request_slots(self, num_reqs: int, padded_reqs: int, *, dummy: bool) -> None:
         if self._offload_pool_slots is None:
             return
-        capacity = self.max_num_reqs + 2
+        capacity = nano_pool_capacity(self.max_num_reqs)
         slots = self._offload_pool_slots.np
         generations = self._offload_pool_generations.np
         slots[:padded_reqs] = np.arange(padded_reqs, dtype=np.int32) + capacity

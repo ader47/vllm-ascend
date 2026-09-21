@@ -260,7 +260,7 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
                 get_num_layers=MagicMock(return_value=1),
                 max_model_len=128,
             ),
-            parallel_config=SimpleNamespace(),
+            parallel_config=SimpleNamespace(data_parallel_index=0),
             scheduler_config=SimpleNamespace(
                 max_num_seqs=1,
                 max_num_batched_tokens=1,
@@ -271,6 +271,7 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
             topk_buffer_size=1,
             topk=1,
             use_fused_overlap=False,
+            use_nano=False,
             dram_size_per_dp_GB=dram_size_per_dp_gb,
         )
         return vllm_config, kv_cache_config, offload_config

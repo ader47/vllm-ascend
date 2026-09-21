@@ -47,6 +47,9 @@ from vllm_ascend.attention.utils import (
     split_decodes_and_prefills,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import (
+    nano_pool_capacity,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT,
     FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT,
@@ -140,7 +143,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
 
     def _init_nano_metadata_buffers(self, vllm_config, device) -> None:
         cfg = get_ascend_config().sparse_kv_offload_config
-        requests = vllm_config.scheduler_config.max_num_seqs + 2
+        requests = nano_pool_capacity(vllm_config.scheduler_config.max_num_seqs)
         self.nano_pool_capacity = requests
         # The proposer builds all draft metadata before executing any step.
         # Keep each step's derived tensors alive at distinct, stable addresses.
@@ -227,7 +230,13 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             pools = common_attn_metadata.req_topk_buffer_slots
             if generations is None or pools is None:
                 raise RuntimeError("nano offload requires runner-owned request slots and generations")
-            active = (generations[:count] >= 0) & (widths > 0)
+            request_pools = pools[:count]
+            active = (
+                (generations[:count] >= 0)
+                & (widths > 0)
+                & (request_pools >= 0)
+                & (request_pools < self.nano_pool_capacity)
+            )
             # State -3 runs ordinary causal LI on just Q harmless keys for
             # padding. S=Q makes the kernel write a complete safe TopK output;
             # S=0 would skip LI and could leave selections from an earlier
@@ -240,9 +249,14 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
                 positions = common_attn_metadata.positions[:count]
                 active = active & (common_attn_metadata.slot_mapping[:count] >= 0)
                 seq_lens = torch.where(active, positions.to(torch.int32) + 1, widths)
-            prefix = torch.div((seq_lens - widths).clamp_min(0), 128, rounding_mode="floor") * 128
+                # Step 0 selected sparse history before the proposal started.
+                # Keep that boundary fixed so a block completed during the
+                # proposal remains visible through the resident tail pages.
+                prefix = torch.where(active, self.nano_vectors["prefix_lens"][0, :count], 0)
+            else:
+                prefix = torch.div((seq_lens - widths).clamp_min(0), 128, rounding_mode="floor") * 128
             cache = torch.where(active, prefix.clamp_max(self.nano_hot_tokens), 2048)
-            safe_pools = torch.where(active, pools[:count], self.nano_rows[:count] + self.nano_pool_capacity)
+            safe_pools = torch.where(active, request_pools, self.nano_rows[:count] + self.nano_pool_capacity)
             logical = torch.where(active, cache + seq_lens - prefix, cache)
             for name, value in (
                 ("query_ends", ends),
@@ -415,7 +429,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         if self.use_nano:
             if self.enable_sparse_li_c8:
                 raise NotImplementedError("MTP C8 LIM is built but nano C8 serving is not enabled yet")
-            requests = self.vllm_config.scheduler_config.max_num_seqs + 2
+            requests = nano_pool_capacity(self.vllm_config.scheduler_config.max_num_seqs)
             tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
             device = torch.device("npu")
             self.nano_states = torch.full((requests,), -3, dtype=torch.int32, device=device)
@@ -439,7 +453,6 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 self.nano_miss_src = torch.empty((requests, 32768), dtype=torch.int32, device=device)
                 self.nano_miss_dst = torch.empty_like(self.nano_miss_src)
                 self.nano_misses = torch.zeros(requests, dtype=torch.int32, device=device)
-                self.nano_reuse_cache_tokens = torch.empty(requests, dtype=torch.int32, device=device)
                 self.nano_reuse_topk_misses = torch.zeros(output_tokens, dtype=torch.int32, device=device)
                 self.nano_reuse_misses = torch.zeros(requests, dtype=torch.int32, device=device)
                 self.nano_reuse_request_count = 0
@@ -651,11 +664,10 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             self.nano_miss_dst[:count],
             self.nano_misses[:count],
         )
-        # MTP draft step 0 owns the only LIM invocation. Preserve its cache
-        # budget so later draft steps can reuse the compacted LIM outputs
-        # without rebuilding source-to-slot metadata.
+        # MTP draft step 0 owns the only LIM invocation. Later steps reuse its
+        # compacted sparse selection while their metadata keeps the resident
+        # tail length current.
         self.nano_reuse_request_count = count
-        self.nano_reuse_cache_tokens[:count].copy_(cache)
         return self.nano_topk_src[:tokens]
 
     def bind_nano_kv_cache(self, manager, layer_name) -> None:
@@ -713,19 +725,17 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         hbm_v = manager.topk_buffers_v[layer_id].view(-1, 128, 1, self.qk_rope_head_dim)
         host_k = manager.k_caches_cpu[layer_id].view(-1, 128, self.kv_lora_rank)
         host_v = manager.v_caches_cpu[layer_id].view(-1, 128, self.qk_rope_head_dim)
+        cache_tokens = metadata.nano_cache_tokens
+        logical_lens = metadata.nano_logical_lens
         if reuse_indices:
             # The proposer compacts the complete step-0 LIM result alongside
-            # the shared logical TopK rows. All selected sources are resident
-            # after step 0, so later steps issue no cache copies.
-            cache_tokens = self.nano_reuse_cache_tokens[:count]
-            logical_lens = cache_tokens  # exact saved selection; no extra tail
+            # the shared logical TopK rows. Sparse selections need no further
+            # copies, but the complete resident tail remains part of Attention.
             topk_misses = self.nano_reuse_topk_misses[:tokens]
             misses = self.nano_reuse_misses[:count]
         else:
             if not metadata.nano_skip_tail_restore:
                 self._nano_restore_tail(metadata, manager, layer_name)
-            cache_tokens = metadata.nano_cache_tokens
-            logical_lens = metadata.nano_logical_lens
             topk_misses = owner.nano_topk_misses[:tokens]
             misses = owner.nano_misses[:count]
         heads = query.shape[1]

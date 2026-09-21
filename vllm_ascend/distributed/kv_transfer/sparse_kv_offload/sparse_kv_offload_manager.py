@@ -31,6 +31,9 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import (
+    nano_pool_capacity,
+)
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 
 # Main BF16 cache:
@@ -122,7 +125,10 @@ def allocate_kv_offload_topk_buffer_pair(
         vllm_config.scheduler_config.max_num_seqs * decode_width,
     )
     if sparse_kv_offload_config.use_nano:
-        max_num_topk_rows = max(max_num_topk_rows, 2 * (vllm_config.scheduler_config.max_num_seqs + 2))
+        max_num_topk_rows = max(
+            max_num_topk_rows,
+            2 * nano_pool_capacity(vllm_config.scheduler_config.max_num_seqs),
+        )
         topk_buffer_size += 2 * vllm_config.cache_config.block_size
     topk_buffer_k_size_bytes = max_num_topk_rows * topk_buffer_size * num_kv_heads * k_dim * torch.bfloat16.itemsize
     topk_buffer_v_size_bytes = max_num_topk_rows * topk_buffer_size * num_kv_heads * v_dim * torch.bfloat16.itemsize
@@ -1091,7 +1097,7 @@ class SparseKVOffloadManager:
         if not self.k_caches_cpu or not self.topk_buffers_k:
             raise RuntimeError("nano tail restore requires host and device KV bases")
         device = self.topk_buffers_k[0].device
-        descriptor_rows = 4 * (self.max_num_reqs + 2)
+        descriptor_rows = 4 * nano_pool_capacity(self.max_num_reqs)
         self.nano_copy_src = torch.empty(descriptor_rows, dtype=torch.int64, device=device)
         self.nano_copy_dst = torch.empty_like(self.nano_copy_src)
         self.nano_host_bases = []
