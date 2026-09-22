@@ -410,9 +410,15 @@ class TestNanoD2HPlanner(unittest.TestCase):
         class FakeEvent:
             def __init__(self, name):
                 self.name = name
+                self.fail_synchronize = False
 
             def record(self, stream):
                 calls.append(("record", self.name, stream))
+
+            def synchronize(self):
+                calls.append(("synchronize", self.name))
+                if self.fail_synchronize:
+                    raise RuntimeError("event synchronize failed")
 
         class FakeStream:
             def __init__(self, name):
@@ -458,6 +464,7 @@ class TestNanoD2HPlanner(unittest.TestCase):
 
         manager = TestNanoD2HPlanner._manager(max_num_reqs=2)
         manager.tp_rank = 0
+        manager.tp_size = 1
         manager.num_layers = 1
         manager.token_size_bytes_k = 4
         manager.token_size_bytes_v = 6
@@ -836,6 +843,115 @@ class TestNanoD2HPlanner(unittest.TestCase):
         manager._npu_runtime.capturing = True
         with self.assertRaisesRegex(RuntimeError, "during graph capture"):
             manager.record_nano_d2h_source_ready()
+
+    def test_local_retire_advances_only_matching_generations_and_reuses_plan(self):
+        manager, calls = self._manager_with_execution_state()
+        manager.initialize_nano_d2h_slots(
+            np.array([0, 1]),
+            np.array([3, 4]),
+            np.array([0, 0]),
+        )
+        manager.plan_nano_d2h_requests(
+            np.array([128, 128]),
+            np.array([0, 1]),
+            np.array([3, 4]),
+            np.array([[7, 9], [8, 10]], dtype=np.int32),
+            np.array([True, True]),
+        )
+        manager.record_nano_d2h_source_ready()
+        with patch.object(
+            manager_module,
+            "offload",
+            SimpleNamespace(sparse_copy=MagicMock(return_value=0)),
+            create=True,
+        ):
+            manager.launch_nano_d2h()
+
+        manager.nano_d2h_owner_generations_cpu[1] = 40
+        manager.nano_d2h_stable_prefixes_cpu[1] = 256
+        calls.clear()
+        self.assertEqual(manager.retire_nano_d2h_local(), 1)
+
+        self.assertEqual(calls, [("synchronize", "event-2")])
+        self.assertEqual(manager.nano_d2h_stable_prefixes_cpu[:2].tolist(), [128, 256])
+        self.assertFalse(manager.nano_d2h_inflight_batch_active)
+        self.assertFalse(manager.nano_d2h_inflight_launched)
+        self.assertFalse(manager.nano_d2h_inflight_active_cpu.any())
+        self.assertTrue(np.all(manager.nano_d2h_inflight_generations_cpu == -1))
+        self.assertEqual(manager.retire_nano_d2h_local(), 0)
+        self.assertEqual(calls, [("synchronize", "event-2")])
+
+        count = manager.plan_nano_d2h_requests(
+            np.array([256]),
+            np.array([0]),
+            np.array([3]),
+            np.array([[7, 9]], dtype=np.int32),
+            np.array([True]),
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(manager.nano_d2h_inflight_destination_slots_cpu[0], 9)
+
+    def test_local_retire_rejects_unlaunched_batch_without_waiting(self):
+        manager, calls = self._manager_with_execution_state()
+        manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([3]),
+            np.array([0]),
+        )
+        manager.plan_nano_d2h_requests(
+            np.array([128]),
+            np.array([0]),
+            np.array([3]),
+            np.array([[7]], dtype=np.int32),
+            np.array([True]),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "unlaunched"):
+            manager.retire_nano_d2h_local()
+        self.assertEqual(calls, [])
+        self.assertTrue(manager.nano_d2h_inflight_batch_active)
+
+    def test_completion_wait_failure_keeps_inflight_state_protected(self):
+        manager, calls = self._manager_with_execution_state()
+        manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([3]),
+            np.array([0]),
+        )
+        manager.plan_nano_d2h_requests(
+            np.array([128]),
+            np.array([0]),
+            np.array([3]),
+            np.array([[7]], dtype=np.int32),
+            np.array([True]),
+        )
+        manager.record_nano_d2h_source_ready()
+        with patch.object(
+            manager_module,
+            "offload",
+            SimpleNamespace(sparse_copy=MagicMock(return_value=0)),
+            create=True,
+        ):
+            manager.launch_nano_d2h()
+        manager.nano_d2h_complete_event.fail_synchronize = True
+        calls.clear()
+
+        with self.assertRaisesRegex(RuntimeError, "synchronize failed"):
+            manager.retire_nano_d2h_local()
+
+        self.assertEqual(calls, [("synchronize", "event-2")])
+        self.assertTrue(manager.nano_d2h_inflight_batch_active)
+        self.assertTrue(manager.nano_d2h_inflight_launched)
+        self.assertTrue(manager.nano_d2h_inflight_active_cpu[0])
+        self.assertEqual(manager.nano_d2h_stable_prefixes_cpu[0], 0)
+
+    def test_local_retire_rejects_multi_tp_until_collective_is_added(self):
+        manager, calls = self._manager_with_execution_state()
+        manager.tp_size = 2
+
+        with self.assertRaisesRegex(RuntimeError, "completion collective"):
+            manager.retire_nano_d2h_local()
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

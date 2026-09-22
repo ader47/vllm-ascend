@@ -778,6 +778,49 @@ class SparseKVOffloadManager:
         self.nano_d2h_inflight_launched = True
         return True
 
+    def _consume_nano_d2h_completion(self) -> int:
+        """Advance matching owners and release the completed plan buffer."""
+        if not self.nano_d2h_inflight_batch_active:
+            return 0
+        if not self.nano_d2h_inflight_launched:
+            raise RuntimeError("Nano D2H cannot consume an unlaunched inflight batch")
+
+        active = self.nano_d2h_inflight_active_cpu != 0
+        if not np.any(active):
+            raise RuntimeError("Nano D2H inflight batch has no active requests")
+        matching = active & (self.nano_d2h_inflight_generations_cpu == self.nano_d2h_owner_generations_cpu)
+        if np.any(matching):
+            expected = self.nano_d2h_stable_prefixes_cpu[matching] + self.block_size
+            targets = self.nano_d2h_inflight_target_prefixes_cpu[matching]
+            if np.any(targets != expected):
+                raise RuntimeError("Nano D2H completion target is not the next stable block boundary")
+            self.nano_d2h_stable_prefixes_cpu[matching] = targets
+
+        self.nano_d2h_inflight_active_cpu.fill(False)
+        self.nano_d2h_inflight_generations_cpu.fill(NANO_D2H_INVALID_GENERATION)
+        self.nano_d2h_inflight_source_slots_cpu.fill(0)
+        self.nano_d2h_inflight_destination_slots_cpu.fill(0)
+        self.nano_d2h_inflight_target_prefixes_cpu.fill(0)
+        self.nano_d2h_inflight_batch_active = False
+        self.nano_d2h_inflight_launched = False
+        return int(np.count_nonzero(matching))
+
+    def retire_nano_d2h_local(self) -> int:
+        """Wait for and consume one TP=1 delayed Nano D2H batch."""
+        if self.tp_rank != 0:
+            raise RuntimeError("Local Nano D2H retire is TP0-only")
+        if self.tp_size != 1:
+            raise RuntimeError("TP>1 Nano D2H retire requires the completion collective")
+        if not self.nano_d2h_inflight_batch_active:
+            return 0
+        if not self.nano_d2h_inflight_launched:
+            raise RuntimeError("Nano D2H cannot retire an unlaunched inflight batch")
+        if self._npu_runtime.is_current_stream_capturing():
+            raise RuntimeError("Nano D2H retire must remain outside graph capture")
+
+        self.nano_d2h_complete_event.synchronize()
+        return self._consume_nano_d2h_completion()
+
     def initialize_nano_d2h_slots(
         self,
         pool_slots: np.ndarray,
