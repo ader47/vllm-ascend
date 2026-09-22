@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import (
@@ -389,6 +390,183 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
 
         offload_backend.OffloadConfig.assert_not_called()
         offload_backend.initialize.assert_not_called()
+
+
+class TestNanoD2HPlanner(unittest.TestCase):
+    @staticmethod
+    def _manager(max_num_reqs: int = 4) -> SparseKVOffloadManager:
+        manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+        manager.max_num_reqs = max_num_reqs
+        manager.block_size = 128
+        manager.topk_buffer_size = 8192
+        manager._allocate_nano_d2h_planner_state()
+        return manager
+
+    def test_full_block_boundary_freezes_one_plan_without_advancing_prefix(self):
+        manager = self._manager()
+        manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([10]),
+            np.array([0]),
+        )
+        block_table = np.array([[7, 8]], dtype=np.int32)
+
+        count = manager.plan_nano_d2h_requests(
+            np.array([127]),
+            np.array([0]),
+            np.array([10]),
+            block_table,
+            np.array([True]),
+        )
+        self.assertEqual(count, 0)
+        self.assertFalse(manager.nano_d2h_inflight_batch_active)
+
+        count = manager.plan_nano_d2h_requests(
+            np.array([128]),
+            np.array([0]),
+            np.array([10]),
+            block_table,
+            np.array([True]),
+        )
+
+        self.assertEqual(count, 1)
+        self.assertTrue(manager.nano_d2h_inflight_batch_active)
+        self.assertEqual(np.flatnonzero(manager.nano_d2h_inflight_active_cpu).tolist(), [0])
+        self.assertEqual(manager.nano_d2h_inflight_generations_cpu[0], 10)
+        self.assertEqual(manager.nano_d2h_inflight_source_slots_cpu[0], 8192)
+        self.assertEqual(manager.nano_d2h_inflight_destination_slots_cpu[0], 7)
+        self.assertEqual(manager.nano_d2h_inflight_target_prefixes_cpu[0], 128)
+        self.assertEqual(manager.nano_d2h_stable_prefixes_cpu[0], 0)
+
+    def test_next_full_block_uses_other_tail_page_and_next_host_block(self):
+        manager = self._manager()
+        manager.initialize_nano_d2h_slots(
+            np.array([2]),
+            np.array([21]),
+            np.array([128]),
+        )
+
+        count = manager.plan_nano_d2h_requests(
+            np.array([256]),
+            np.array([2]),
+            np.array([21]),
+            np.array([[30, 31, 32]], dtype=np.int32),
+            np.array([True]),
+        )
+
+        request_stride = manager.topk_buffer_size + 2 * manager.block_size
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            manager.nano_d2h_inflight_source_slots_cpu[2],
+            2 * request_stride + manager.topk_buffer_size + manager.block_size,
+        )
+        self.assertEqual(manager.nano_d2h_inflight_destination_slots_cpu[2], 31)
+        self.assertEqual(manager.nano_d2h_inflight_target_prefixes_cpu[2], 256)
+        self.assertEqual(manager.nano_d2h_stable_prefixes_cpu[2], 128)
+
+    def test_multiple_ready_requests_share_one_fixed_capacity_batch(self):
+        manager = self._manager(max_num_reqs=3)
+        manager.initialize_nano_d2h_slots(
+            np.array([0, 4]),
+            np.array([5, 9]),
+            np.array([0, 128]),
+        )
+
+        count = manager.plan_nano_d2h_requests(
+            np.array([128, 999, 256]),
+            np.array([0, manager.nano_d2h_capacity + 8, 4]),
+            np.array([5, -1, 9]),
+            np.array([[10, 11], [-1, -1], [20, 21]], dtype=np.int32),
+            np.array([True, False, True]),
+        )
+
+        self.assertEqual(count, 2)
+        self.assertEqual(np.flatnonzero(manager.nano_d2h_inflight_active_cpu).tolist(), [0, 4])
+        self.assertEqual(manager.nano_d2h_inflight_destination_slots_cpu[[0, 4]].tolist(), [10, 21])
+
+    def test_rejection_corrected_length_is_the_only_boundary_input(self):
+        for corrected_length, expected_count in ((127, 0), (128, 1)):
+            with self.subTest(corrected_length=corrected_length):
+                manager = self._manager()
+                manager.initialize_nano_d2h_slots(
+                    np.array([1]),
+                    np.array([12]),
+                    np.array([0]),
+                )
+                count = manager.plan_nano_d2h_requests(
+                    np.array([corrected_length]),
+                    np.array([1]),
+                    np.array([12]),
+                    np.array([[40]], dtype=np.int32),
+                    np.array([True]),
+                )
+                self.assertEqual(count, expected_count)
+
+    def test_generation_mismatch_cannot_plan_for_reused_slot(self):
+        manager = self._manager()
+        manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([3]),
+            np.array([0]),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            manager.plan_nano_d2h_requests(
+                np.array([128]),
+                np.array([0]),
+                np.array([4]),
+                np.array([[2]], dtype=np.int32),
+                np.array([True]),
+            )
+        self.assertFalse(manager.nano_d2h_inflight_batch_active)
+        self.assertFalse(manager.nano_d2h_inflight_active_cpu.any())
+
+    def test_two_unretired_blocks_are_rejected(self):
+        manager = self._manager()
+        manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([1]),
+            np.array([0]),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "two unretired full blocks"):
+            manager.plan_nano_d2h_requests(
+                np.array([256]),
+                np.array([0]),
+                np.array([1]),
+                np.array([[2, 3]], dtype=np.int32),
+                np.array([True]),
+            )
+
+    def test_inflight_slot_cannot_be_rebound_or_replanned(self):
+        manager = self._manager()
+        manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([1]),
+            np.array([0]),
+        )
+        manager.plan_nano_d2h_requests(
+            np.array([128]),
+            np.array([0]),
+            np.array([1]),
+            np.array([[2]], dtype=np.int32),
+            np.array([True]),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "cannot be rebound"):
+            manager.initialize_nano_d2h_slots(
+                np.array([0]),
+                np.array([2]),
+                np.array([0]),
+            )
+        with self.assertRaisesRegex(RuntimeError, "retire the current inflight batch"):
+            manager.plan_nano_d2h_requests(
+                np.array([129]),
+                np.array([0]),
+                np.array([1]),
+                np.array([[2]], dtype=np.int32),
+                np.array([True]),
+            )
 
 
 if __name__ == "__main__":

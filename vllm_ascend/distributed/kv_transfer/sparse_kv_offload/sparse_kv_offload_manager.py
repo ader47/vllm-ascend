@@ -48,6 +48,7 @@ OFFLOAD_V_CACHE_CPU_INDEX = 3
 OFFLOAD_TOPK_BUFFER_K_INDEX = 4
 OFFLOAD_TOPK_BUFFER_V_INDEX = 5
 OFFLOAD_STORE_PORT_BASE = 8500
+NANO_D2H_INVALID_GENERATION = -1
 
 FSA_EXTERNAL_PLAN_READY_MARKER = 0x5A45
 FSA_PAIRED_SELECTION_COPY_MARKER = 0x5A56
@@ -535,6 +536,8 @@ class SparseKVOffloadManager:
             device="cpu",
             pin_memory=True,
         )
+        if self.use_nano:
+            self._allocate_nano_d2h_planner_state()
         self._npu_runtime = torch_npu.npu
 
         _sparse_kv_ops()
@@ -588,6 +591,146 @@ class SparseKVOffloadManager:
         if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
             kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
         return kv_cache_spec.block_size
+
+    def _allocate_nano_d2h_planner_state(self) -> None:
+        """Allocate the dormant CPU control state for delayed Nano D2H."""
+        capacity = nano_pool_capacity(self.max_num_reqs)
+        self.nano_d2h_capacity = capacity
+        self.nano_d2h_owner_generations_cpu = np.full(
+            capacity,
+            NANO_D2H_INVALID_GENERATION,
+            dtype=np.int64,
+        )
+        self.nano_d2h_stable_prefixes_cpu = np.zeros(capacity, dtype=np.int64)
+        self.nano_d2h_inflight_active_cpu = np.zeros(capacity, dtype=np.bool_)
+        self.nano_d2h_inflight_generations_cpu = np.full(
+            capacity,
+            NANO_D2H_INVALID_GENERATION,
+            dtype=np.int64,
+        )
+        self.nano_d2h_inflight_source_slots_cpu = np.zeros(capacity, dtype=np.int64)
+        self.nano_d2h_inflight_destination_slots_cpu = np.zeros(capacity, dtype=np.int64)
+        self.nano_d2h_inflight_target_prefixes_cpu = np.zeros(capacity, dtype=np.int64)
+        self.nano_d2h_inflight_batch_active = False
+
+    def initialize_nano_d2h_slots(
+        self,
+        pool_slots: np.ndarray,
+        generations: np.ndarray,
+        stable_prefixes: np.ndarray,
+    ) -> None:
+        """Bind idle Nano pool slots to request generations.
+
+        Lifecycle integration must call this only after DMA using an older
+        owner of the same slot has completed.
+        """
+        slots = np.asarray(pool_slots, dtype=np.int64)
+        owners = np.asarray(generations, dtype=np.int64)
+        prefixes = np.asarray(stable_prefixes, dtype=np.int64)
+        if slots.ndim != 1 or owners.shape != slots.shape or prefixes.shape != slots.shape:
+            raise ValueError("Nano D2H slot, generation, and stable-prefix vectors must be one-dimensional and equal")
+        if np.any((slots < 0) | (slots >= self.nano_d2h_capacity)):
+            raise ValueError("Nano D2H pool slot is outside the configured capacity")
+        if np.unique(slots).size != slots.size:
+            raise ValueError("Nano D2H pool slots must be unique")
+        if np.any(owners < 0):
+            raise ValueError("Nano D2H owner generations must be non-negative")
+        if np.any(prefixes < 0) or np.any(prefixes % self.block_size != 0):
+            raise ValueError("Nano D2H stable prefixes must be non-negative and block aligned")
+        if np.any(self.nano_d2h_inflight_active_cpu[slots]):
+            raise RuntimeError("Nano D2H pool slot cannot be rebound while its block is inflight")
+
+        self.nano_d2h_owner_generations_cpu[slots] = owners
+        self.nano_d2h_stable_prefixes_cpu[slots] = prefixes
+        self.nano_d2h_inflight_generations_cpu[slots] = NANO_D2H_INVALID_GENERATION
+        self.nano_d2h_inflight_source_slots_cpu[slots] = 0
+        self.nano_d2h_inflight_destination_slots_cpu[slots] = 0
+        self.nano_d2h_inflight_target_prefixes_cpu[slots] = 0
+
+    def plan_nano_d2h_requests(
+        self,
+        num_computed_tokens: np.ndarray,
+        pool_slots: np.ndarray,
+        generations: np.ndarray,
+        block_table: np.ndarray,
+        active: np.ndarray,
+    ) -> int:
+        """Freeze one request-level full-block D2H batch on the CPU.
+
+        The input length is the existing, rejection-corrected
+        ``num_computed_tokens``. This method only freezes a plan; it does not
+        launch a copy or advance ``stable_prefix``.
+        """
+        if self.nano_d2h_inflight_batch_active:
+            raise RuntimeError("Nano D2H must retire the current inflight batch before planning another")
+
+        computed = np.asarray(num_computed_tokens, dtype=np.int64)
+        slots = np.asarray(pool_slots, dtype=np.int64)
+        request_generations = np.asarray(generations, dtype=np.int64)
+        active_rows = np.asarray(active, dtype=np.bool_)
+        table = np.asarray(block_table)
+        row_count = computed.size
+        if (
+            computed.ndim != 1
+            or slots.shape != (row_count,)
+            or request_generations.shape != (row_count,)
+            or active_rows.shape != (row_count,)
+            or table.ndim != 2
+            or table.shape[0] < row_count
+        ):
+            raise ValueError("Nano D2H planner inputs have incompatible shapes")
+
+        self.nano_d2h_inflight_active_cpu.fill(False)
+        self.nano_d2h_inflight_generations_cpu.fill(NANO_D2H_INVALID_GENERATION)
+        self.nano_d2h_inflight_source_slots_cpu.fill(0)
+        self.nano_d2h_inflight_destination_slots_cpu.fill(0)
+        self.nano_d2h_inflight_target_prefixes_cpu.fill(0)
+
+        if not np.any(active_rows):
+            return 0
+        active_slots = slots[active_rows]
+        if np.any((active_slots < 0) | (active_slots >= self.nano_d2h_capacity)):
+            raise ValueError("Active Nano D2H request has an invalid pool slot")
+        if np.unique(active_slots).size != active_slots.size:
+            raise ValueError("Active Nano D2H requests must not share a pool slot")
+        active_generations = request_generations[active_rows]
+        if np.any(active_generations < 0):
+            raise ValueError("Active Nano D2H request has an invalid generation")
+        owners = self.nano_d2h_owner_generations_cpu[active_slots]
+        if np.any(active_generations != owners):
+            raise RuntimeError("Active Nano D2H request does not match the pool slot owner")
+
+        stable_prefixes = self.nano_d2h_stable_prefixes_cpu[active_slots]
+        active_computed = computed[active_rows]
+        lag = active_computed - stable_prefixes
+        if np.any(lag < 0):
+            raise RuntimeError("Nano D2H stable prefix is ahead of num_computed_tokens")
+        if np.any(lag >= 2 * self.block_size):
+            raise RuntimeError("Nano D2H planner observed two unretired full blocks")
+
+        ready_in_active = lag >= self.block_size
+        if not np.any(ready_in_active):
+            return 0
+        ready_slots = active_slots[ready_in_active]
+        ready_generations = active_generations[ready_in_active]
+        ready_prefixes = stable_prefixes[ready_in_active]
+        ready_rows = np.flatnonzero(active_rows)[ready_in_active]
+        logical_blocks = ready_prefixes // self.block_size
+        if np.any(logical_blocks >= table.shape[1]):
+            raise RuntimeError("Nano D2H logical block is outside the request block table")
+        destination_slots = table[ready_rows, logical_blocks]
+        if np.any(destination_slots < 0):
+            raise RuntimeError("Nano D2H full block has no Host destination slot")
+
+        request_stride = self.topk_buffer_size + 2 * self.block_size
+        source_slots = ready_slots * request_stride + self.topk_buffer_size + ready_prefixes % (2 * self.block_size)
+        self.nano_d2h_inflight_active_cpu[ready_slots] = True
+        self.nano_d2h_inflight_generations_cpu[ready_slots] = ready_generations
+        self.nano_d2h_inflight_source_slots_cpu[ready_slots] = source_slots
+        self.nano_d2h_inflight_destination_slots_cpu[ready_slots] = destination_slots
+        self.nano_d2h_inflight_target_prefixes_cpu[ready_slots] = ready_prefixes + self.block_size
+        self.nano_d2h_inflight_batch_active = True
+        return int(ready_slots.size)
 
     @staticmethod
     def _as_cache_tuple(cache_or_caches) -> tuple[torch.Tensor, ...]:
