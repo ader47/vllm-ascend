@@ -49,6 +49,12 @@ OFFLOAD_TOPK_BUFFER_K_INDEX = 4
 OFFLOAD_TOPK_BUFFER_V_INDEX = 5
 OFFLOAD_STORE_PORT_BASE = 8500
 NANO_D2H_INVALID_GENERATION = -1
+NANO_D2H_PLAN_ACTIVE_ROW = 0
+NANO_D2H_PLAN_GENERATION_ROW = 1
+NANO_D2H_PLAN_SOURCE_SLOT_ROW = 2
+NANO_D2H_PLAN_DESTINATION_SLOT_ROW = 3
+NANO_D2H_PLAN_TARGET_PREFIX_ROW = 4
+NANO_D2H_PLAN_FIELD_COUNT = 5
 
 FSA_EXTERNAL_PLAN_READY_MARKER = 0x5A45
 FSA_PAIRED_SELECTION_COPY_MARKER = 0x5A56
@@ -602,16 +608,115 @@ class SparseKVOffloadManager:
             dtype=np.int64,
         )
         self.nano_d2h_stable_prefixes_cpu = np.zeros(capacity, dtype=np.int64)
-        self.nano_d2h_inflight_active_cpu = np.zeros(capacity, dtype=np.bool_)
-        self.nano_d2h_inflight_generations_cpu = np.full(
-            capacity,
-            NANO_D2H_INVALID_GENERATION,
-            dtype=np.int64,
+        self.nano_d2h_plan_host = torch.zeros(
+            (NANO_D2H_PLAN_FIELD_COUNT, capacity),
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=True,
         )
-        self.nano_d2h_inflight_source_slots_cpu = np.zeros(capacity, dtype=np.int64)
-        self.nano_d2h_inflight_destination_slots_cpu = np.zeros(capacity, dtype=np.int64)
-        self.nano_d2h_inflight_target_prefixes_cpu = np.zeros(capacity, dtype=np.int64)
+        self.nano_d2h_inflight_active_host = self.nano_d2h_plan_host[NANO_D2H_PLAN_ACTIVE_ROW]
+        self.nano_d2h_inflight_generations_host = self.nano_d2h_plan_host[NANO_D2H_PLAN_GENERATION_ROW]
+        self.nano_d2h_inflight_source_slots_host = self.nano_d2h_plan_host[NANO_D2H_PLAN_SOURCE_SLOT_ROW]
+        self.nano_d2h_inflight_destination_slots_host = self.nano_d2h_plan_host[NANO_D2H_PLAN_DESTINATION_SLOT_ROW]
+        self.nano_d2h_inflight_target_prefixes_host = self.nano_d2h_plan_host[NANO_D2H_PLAN_TARGET_PREFIX_ROW]
+        self.nano_d2h_inflight_generations_host.fill_(NANO_D2H_INVALID_GENERATION)
+        self.nano_d2h_inflight_active_cpu = self.nano_d2h_inflight_active_host.numpy()
+        self.nano_d2h_inflight_generations_cpu = self.nano_d2h_inflight_generations_host.numpy()
+        self.nano_d2h_inflight_source_slots_cpu = self.nano_d2h_inflight_source_slots_host.numpy()
+        self.nano_d2h_inflight_destination_slots_cpu = self.nano_d2h_inflight_destination_slots_host.numpy()
+        self.nano_d2h_inflight_target_prefixes_cpu = self.nano_d2h_inflight_target_prefixes_host.numpy()
         self.nano_d2h_inflight_batch_active = False
+
+    def _allocate_nano_d2h_descriptor_state(self, device: torch.device) -> None:
+        """Allocate one fixed request plan and its all-layer descriptors."""
+        if self.tp_rank != 0:
+            return
+        capacity = self.nano_d2h_capacity
+        self.nano_d2h_plan_npu = torch.empty(
+            (NANO_D2H_PLAN_FIELD_COUNT, capacity),
+            dtype=torch.int64,
+            device=device,
+        )
+        self.nano_d2h_plan_active_npu = self.nano_d2h_plan_npu[NANO_D2H_PLAN_ACTIVE_ROW]
+        self.nano_d2h_plan_generations_npu = self.nano_d2h_plan_npu[NANO_D2H_PLAN_GENERATION_ROW]
+        self.nano_d2h_plan_source_slots_npu = self.nano_d2h_plan_npu[NANO_D2H_PLAN_SOURCE_SLOT_ROW]
+        self.nano_d2h_plan_destination_slots_npu = self.nano_d2h_plan_npu[NANO_D2H_PLAN_DESTINATION_SLOT_ROW]
+        self.nano_d2h_plan_target_prefixes_npu = self.nano_d2h_plan_npu[NANO_D2H_PLAN_TARGET_PREFIX_ROW]
+
+        descriptor_shape = (self.num_layers, 2, capacity)
+        self.nano_d2h_source_ptrs_npu = torch.empty(descriptor_shape, dtype=torch.int64, device=device)
+        self.nano_d2h_destination_ptrs_npu = torch.empty(descriptor_shape, dtype=torch.int64, device=device)
+        self.nano_d2h_lengths_npu = torch.empty(descriptor_shape, dtype=torch.int32, device=device)
+        self.nano_d2h_address_offsets_npu = torch.empty((1, 2, capacity), dtype=torch.int64, device=device)
+        self.nano_d2h_descriptor_count = self.num_layers * 2 * capacity
+        self.nano_d2h_descriptor_count_npu = torch.full(
+            (1,),
+            self.nano_d2h_descriptor_count,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        source_bases = [[self.addr_k_bases[layer], self.addr_v_bases[layer]] for layer in range(self.num_layers)]
+        destination_bases = [[self.gvas_k_bases[layer], self.gvas_v_bases[layer]] for layer in range(self.num_layers)]
+        self.nano_d2h_source_bases_npu = torch.tensor(source_bases, dtype=torch.int64, device=device).unsqueeze(-1)
+        self.nano_d2h_destination_bases_npu = torch.tensor(
+            destination_bases,
+            dtype=torch.int64,
+            device=device,
+        ).unsqueeze(-1)
+        self.nano_d2h_token_bytes_npu = torch.tensor(
+            [self.token_size_bytes_k, self.token_size_bytes_v],
+            dtype=torch.int64,
+            device=device,
+        ).view(1, 2, 1)
+        self.nano_d2h_block_bytes_npu = torch.tensor(
+            [
+                self.block_size * self.token_size_bytes_k,
+                self.block_size * self.token_size_bytes_v,
+            ],
+            dtype=torch.int64,
+            device=device,
+        ).view(1, 2, 1)
+
+    def prepare_nano_d2h_descriptors(self) -> int:
+        """Copy the frozen request plan and expand all-layer K/V addresses.
+
+        The caller will place this method on the dedicated D2H stream. It
+        deliberately does not launch ``sparse_copy``.
+        """
+        if self.tp_rank != 0:
+            raise RuntimeError("Only TP0 owns Nano D2H descriptors")
+        if not self.nano_d2h_inflight_batch_active:
+            raise RuntimeError("Nano D2H has no inflight request plan to expand")
+
+        self.nano_d2h_plan_npu.copy_(self.nano_d2h_plan_host, non_blocking=True)
+
+        torch.mul(
+            self.nano_d2h_plan_source_slots_npu.view(1, 1, -1),
+            self.nano_d2h_token_bytes_npu,
+            out=self.nano_d2h_address_offsets_npu,
+        )
+        torch.add(
+            self.nano_d2h_source_bases_npu,
+            self.nano_d2h_address_offsets_npu,
+            out=self.nano_d2h_source_ptrs_npu,
+        )
+        torch.mul(
+            self.nano_d2h_plan_destination_slots_npu.view(1, 1, -1),
+            self.nano_d2h_block_bytes_npu,
+            out=self.nano_d2h_address_offsets_npu,
+        )
+        torch.add(
+            self.nano_d2h_destination_bases_npu,
+            self.nano_d2h_address_offsets_npu,
+            out=self.nano_d2h_destination_ptrs_npu,
+        )
+        self.nano_d2h_lengths_npu.copy_(self.nano_d2h_block_bytes_npu)
+        self.nano_d2h_lengths_npu.masked_fill_(
+            self.nano_d2h_plan_active_npu.view(1, 1, -1) == 0,
+            0,
+        )
+        return self.nano_d2h_descriptor_count
 
     def initialize_nano_d2h_slots(
         self,
@@ -1022,6 +1127,7 @@ class SparseKVOffloadManager:
             )
         if self.use_nano:
             self._bind_nano_copy_bases()
+            self._allocate_nano_d2h_descriptor_state(device)
 
         gvas_buffer_offset = 0
         gvas_buffer_size_bytes = self.max_num_topk_rows * self.topk * 2 * 8  # 2: k+v, 8: int64

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import torch
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import (
@@ -438,6 +439,24 @@ class TestNanoD2HPlanner(unittest.TestCase):
         self.assertEqual(manager.nano_d2h_inflight_target_prefixes_cpu[0], 128)
         self.assertEqual(manager.nano_d2h_stable_prefixes_cpu[0], 0)
 
+    def test_cpu_plan_fields_share_one_pinned_host_staging_buffer(self):
+        manager = self._manager()
+
+        manager.nano_d2h_inflight_generations_cpu[1] = 42
+        manager.nano_d2h_inflight_target_prefixes_cpu[1] = 128
+
+        self.assertEqual(manager.nano_d2h_inflight_generations_host[1].item(), 42)
+        self.assertEqual(manager.nano_d2h_inflight_target_prefixes_host[1].item(), 128)
+        plan_storage = manager.nano_d2h_plan_host.untyped_storage().data_ptr()
+        for field in (
+            manager.nano_d2h_inflight_active_host,
+            manager.nano_d2h_inflight_generations_host,
+            manager.nano_d2h_inflight_source_slots_host,
+            manager.nano_d2h_inflight_destination_slots_host,
+            manager.nano_d2h_inflight_target_prefixes_host,
+        ):
+            self.assertEqual(field.untyped_storage().data_ptr(), plan_storage)
+
     def test_next_full_block_uses_other_tail_page_and_next_host_block(self):
         manager = self._manager()
         manager.initialize_nano_d2h_slots(
@@ -567,6 +586,79 @@ class TestNanoD2HPlanner(unittest.TestCase):
                 np.array([[2]], dtype=np.int32),
                 np.array([True]),
             )
+
+    def test_request_plan_expands_all_layer_kv_descriptors(self):
+        manager = self._manager(max_num_reqs=2)
+        manager.tp_rank = 0
+        manager.num_layers = 2
+        manager.token_size_bytes_k = 4
+        manager.token_size_bytes_v = 6
+        manager.addr_k_bases = [1_000, 3_000]
+        manager.addr_v_bases = [2_000, 4_000]
+        manager.gvas_k_bases = [100_000, 300_000]
+        manager.gvas_v_bases = [200_000, 400_000]
+        manager._allocate_nano_d2h_descriptor_state(torch.device("cpu"))
+        manager.initialize_nano_d2h_slots(
+            np.array([1]),
+            np.array([9]),
+            np.array([0]),
+        )
+        manager.plan_nano_d2h_requests(
+            np.array([0, 128]),
+            np.array([manager.nano_d2h_capacity + 1, 1]),
+            np.array([-1, 9]),
+            np.array([[-1], [7]], dtype=np.int32),
+            np.array([False, True]),
+        )
+
+        count = manager.prepare_nano_d2h_descriptors()
+
+        capacity = manager.nano_d2h_capacity
+        request_stride = manager.topk_buffer_size + 2 * manager.block_size
+        source_slot = request_stride + manager.topk_buffer_size
+        self.assertEqual(count, manager.num_layers * 2 * capacity)
+        self.assertTrue(torch.equal(manager.nano_d2h_plan_npu, manager.nano_d2h_plan_host))
+        self.assertEqual(manager.nano_d2h_plan_generations_npu[1].item(), 9)
+        self.assertEqual(manager.nano_d2h_plan_target_prefixes_npu[1].item(), 128)
+        plan_storage = manager.nano_d2h_plan_npu.untyped_storage().data_ptr()
+        for field in (
+            manager.nano_d2h_plan_active_npu,
+            manager.nano_d2h_plan_generations_npu,
+            manager.nano_d2h_plan_source_slots_npu,
+            manager.nano_d2h_plan_destination_slots_npu,
+            manager.nano_d2h_plan_target_prefixes_npu,
+        ):
+            self.assertEqual(field.untyped_storage().data_ptr(), plan_storage)
+        self.assertEqual(
+            manager.nano_d2h_source_ptrs_npu[:, :, 1].tolist(),
+            [
+                [1_000 + source_slot * 4, 2_000 + source_slot * 6],
+                [3_000 + source_slot * 4, 4_000 + source_slot * 6],
+            ],
+        )
+        self.assertEqual(
+            manager.nano_d2h_destination_ptrs_npu[:, :, 1].tolist(),
+            [
+                [100_000 + 7 * 128 * 4, 200_000 + 7 * 128 * 6],
+                [300_000 + 7 * 128 * 4, 400_000 + 7 * 128 * 6],
+            ],
+        )
+        self.assertEqual(
+            manager.nano_d2h_lengths_npu[:, :, 1].tolist(),
+            [[128 * 4, 128 * 6], [128 * 4, 128 * 6]],
+        )
+        self.assertTrue(torch.all(manager.nano_d2h_lengths_npu[:, :, 0] == 0))
+        self.assertTrue(torch.all(manager.nano_d2h_lengths_npu[:, :, 2:] == 0))
+
+    def test_descriptor_expansion_requires_tp0_and_an_inflight_batch(self):
+        manager = self._manager()
+        manager.tp_rank = 1
+        with self.assertRaisesRegex(RuntimeError, "Only TP0"):
+            manager.prepare_nano_d2h_descriptors()
+
+        manager.tp_rank = 0
+        with self.assertRaisesRegex(RuntimeError, "no inflight"):
+            manager.prepare_nano_d2h_descriptors()
 
 
 if __name__ == "__main__":
