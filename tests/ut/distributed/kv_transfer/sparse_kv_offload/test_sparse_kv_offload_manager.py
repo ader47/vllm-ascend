@@ -403,6 +403,73 @@ class TestNanoD2HPlanner(unittest.TestCase):
         manager._allocate_nano_d2h_planner_state()
         return manager
 
+    @staticmethod
+    def _manager_with_execution_state():
+        calls = []
+
+        class FakeEvent:
+            def __init__(self, name):
+                self.name = name
+
+            def record(self, stream):
+                calls.append(("record", self.name, stream))
+
+        class FakeStream:
+            def __init__(self, name):
+                self.name = name
+
+            def wait_event(self, event):
+                calls.append(("wait", self.name, event.name))
+
+        class FakeStreamContext:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                calls.append(("enter", self.stream.name))
+                return self.stream
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                calls.append(("exit", self.stream.name))
+
+        class FakeRuntime:
+            def __init__(self):
+                self.compute_stream = FakeStream("compute")
+                self.d2h_stream = FakeStream("d2h")
+                self.event_count = 0
+                self.capturing = False
+
+            def Stream(self):
+                return self.d2h_stream
+
+            def Event(self):
+                event = FakeEvent(f"event-{self.event_count}")
+                self.event_count += 1
+                return event
+
+            def current_stream(self):
+                return self.compute_stream
+
+            def is_current_stream_capturing(self):
+                return self.capturing
+
+            def stream(self, stream):
+                return FakeStreamContext(stream)
+
+        manager = TestNanoD2HPlanner._manager(max_num_reqs=2)
+        manager.tp_rank = 0
+        manager.num_layers = 1
+        manager.token_size_bytes_k = 4
+        manager.token_size_bytes_v = 6
+        manager.addr_k_bases = [1_000]
+        manager.addr_v_bases = [2_000]
+        manager.gvas_k_bases = [100_000]
+        manager.gvas_v_bases = [200_000]
+        manager._allocate_nano_d2h_descriptor_state(torch.device("cpu"))
+        manager._npu_runtime = FakeRuntime()
+        manager._allocate_nano_d2h_execution_state()
+        return manager, calls
+
     def test_full_block_boundary_freezes_one_plan_without_advancing_prefix(self):
         manager = self._manager()
         manager.initialize_nano_d2h_slots(
@@ -659,6 +726,116 @@ class TestNanoD2HPlanner(unittest.TestCase):
         manager.tp_rank = 0
         with self.assertRaisesRegex(RuntimeError, "no inflight"):
             manager.prepare_nano_d2h_descriptors()
+
+    def test_source_ready_events_rotate_only_when_recorded(self):
+        manager, calls = self._manager_with_execution_state()
+
+        self.assertTrue(manager.record_nano_d2h_source_ready())
+        self.assertTrue(manager.record_nano_d2h_source_ready())
+
+        self.assertEqual(
+            calls,
+            [
+                ("record", "event-0", manager._npu_runtime.compute_stream),
+                ("record", "event-1", manager._npu_runtime.compute_stream),
+            ],
+        )
+        self.assertEqual(manager.nano_d2h_source_epoch, 2)
+        self.assertEqual(manager.nano_d2h_latest_source_event_slot, 1)
+
+    def test_launch_orders_descriptor_work_before_source_wait_and_copy_after(self):
+        manager, calls = self._manager_with_execution_state()
+        manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([3]),
+            np.array([0]),
+        )
+        manager.plan_nano_d2h_requests(
+            np.array([128]),
+            np.array([0]),
+            np.array([3]),
+            np.array([[7]], dtype=np.int32),
+            np.array([True]),
+        )
+        manager.record_nano_d2h_source_ready()
+        calls.clear()
+        prepare = manager.prepare_nano_d2h_descriptors
+        manager.prepare_nano_d2h_descriptors = MagicMock(side_effect=lambda: (calls.append(("prepare",)), prepare())[1])
+
+        def sparse_copy(sources, destinations, lengths, count, device):
+            calls.append(
+                (
+                    "sparse_copy",
+                    sources.numel(),
+                    destinations.numel(),
+                    lengths.numel(),
+                    count.item(),
+                    device,
+                )
+            )
+            return 0
+
+        with patch.object(
+            manager_module,
+            "offload",
+            SimpleNamespace(sparse_copy=sparse_copy),
+            create=True,
+        ):
+            self.assertTrue(manager.launch_nano_d2h())
+
+        descriptor_count = manager.nano_d2h_descriptor_count
+        self.assertEqual(
+            calls,
+            [
+                ("enter", "d2h"),
+                ("prepare",),
+                ("wait", "d2h", "event-0"),
+                (
+                    "sparse_copy",
+                    descriptor_count,
+                    descriptor_count,
+                    descriptor_count,
+                    descriptor_count,
+                    torch.device("cpu"),
+                ),
+                ("record", "event-2", manager._npu_runtime.d2h_stream),
+                ("exit", "d2h"),
+            ],
+        )
+        self.assertTrue(manager.nano_d2h_inflight_launched)
+        with self.assertRaisesRegex(RuntimeError, "already been launched"):
+            manager.launch_nano_d2h()
+
+    def test_launch_requires_plan_and_source_frontier_and_is_tp0_only(self):
+        manager, calls = self._manager_with_execution_state()
+        self.assertFalse(manager.launch_nano_d2h())
+        self.assertEqual(calls, [])
+
+        manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([3]),
+            np.array([0]),
+        )
+        manager.plan_nano_d2h_requests(
+            np.array([128]),
+            np.array([0]),
+            np.array([3]),
+            np.array([[7]], dtype=np.int32),
+            np.array([True]),
+        )
+        with self.assertRaisesRegex(RuntimeError, "no source-ready"):
+            manager.launch_nano_d2h()
+
+        manager.tp_rank = 1
+        self.assertFalse(manager.record_nano_d2h_source_ready())
+        self.assertFalse(manager.launch_nano_d2h())
+        self.assertEqual(calls, [])
+
+    def test_source_record_and_launch_are_forbidden_during_capture(self):
+        manager, _calls = self._manager_with_execution_state()
+        manager._npu_runtime.capturing = True
+        with self.assertRaisesRegex(RuntimeError, "during graph capture"):
+            manager.record_nano_d2h_source_ready()
 
 
 if __name__ == "__main__":

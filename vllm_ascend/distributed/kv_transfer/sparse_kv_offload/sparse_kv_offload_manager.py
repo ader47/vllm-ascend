@@ -55,6 +55,7 @@ NANO_D2H_PLAN_SOURCE_SLOT_ROW = 2
 NANO_D2H_PLAN_DESTINATION_SLOT_ROW = 3
 NANO_D2H_PLAN_TARGET_PREFIX_ROW = 4
 NANO_D2H_PLAN_FIELD_COUNT = 5
+NANO_D2H_SOURCE_EVENT_COUNT = 2
 
 FSA_EXTERNAL_PLAN_READY_MARKER = 0x5A45
 FSA_PAIRED_SELECTION_COPY_MARKER = 0x5A56
@@ -626,6 +627,7 @@ class SparseKVOffloadManager:
         self.nano_d2h_inflight_destination_slots_cpu = self.nano_d2h_inflight_destination_slots_host.numpy()
         self.nano_d2h_inflight_target_prefixes_cpu = self.nano_d2h_inflight_target_prefixes_host.numpy()
         self.nano_d2h_inflight_batch_active = False
+        self.nano_d2h_inflight_launched = False
 
     def _allocate_nano_d2h_descriptor_state(self, device: torch.device) -> None:
         """Allocate one fixed request plan and its all-layer descriptors."""
@@ -678,6 +680,30 @@ class SparseKVOffloadManager:
             device=device,
         ).view(1, 2, 1)
 
+    def _allocate_nano_d2h_execution_state(self) -> None:
+        """Allocate the minimal TP0 stream/event state for one D2H batch."""
+        if self.tp_rank != 0:
+            return
+        runtime = self._npu_runtime
+        self.nano_d2h_stream = runtime.Stream()
+        self.nano_d2h_source_ready_events = tuple(runtime.Event() for _ in range(NANO_D2H_SOURCE_EVENT_COUNT))
+        self.nano_d2h_complete_event = runtime.Event()
+        self.nano_d2h_source_epoch = 0
+        self.nano_d2h_latest_source_event_slot: int | None = None
+
+    def record_nano_d2h_source_ready(self) -> bool:
+        """Record the latest real compute frontier after its final KV writer."""
+        if self.tp_rank != 0:
+            return False
+        runtime = self._npu_runtime
+        if runtime.is_current_stream_capturing():
+            raise RuntimeError("Nano D2H source-ready cannot be recorded during graph capture")
+        slot = self.nano_d2h_source_epoch % NANO_D2H_SOURCE_EVENT_COUNT
+        self.nano_d2h_source_ready_events[slot].record(runtime.current_stream())
+        self.nano_d2h_latest_source_event_slot = slot
+        self.nano_d2h_source_epoch += 1
+        return True
+
     def prepare_nano_d2h_descriptors(self) -> int:
         """Copy the frozen request plan and expand all-layer K/V addresses.
 
@@ -717,6 +743,40 @@ class SparseKVOffloadManager:
             0,
         )
         return self.nano_d2h_descriptor_count
+
+    def launch_nano_d2h(self) -> bool:
+        """Asynchronously launch the frozen full-block batch on TP0."""
+        if self.tp_rank != 0:
+            return False
+        if not self.nano_d2h_inflight_batch_active:
+            return False
+        if self.nano_d2h_inflight_launched:
+            raise RuntimeError("Nano D2H inflight batch has already been launched")
+        source_slot = self.nano_d2h_latest_source_event_slot
+        if source_slot is None:
+            raise RuntimeError("Nano D2H has no source-ready compute frontier")
+        runtime = self._npu_runtime
+        if runtime.is_current_stream_capturing():
+            raise RuntimeError("Nano D2H launch must remain outside graph capture")
+
+        with runtime.stream(self.nano_d2h_stream):
+            self.prepare_nano_d2h_descriptors()
+            self.nano_d2h_stream.wait_event(self.nano_d2h_source_ready_events[source_slot])
+            # TODO: use an asynchronous SDMA copy API after its descriptor and
+            # completion semantics are available; keep the existing MTE path
+            # for the first implementation.
+            result = offload.sparse_copy(
+                self.nano_d2h_source_ptrs_npu.view(-1),
+                self.nano_d2h_destination_ptrs_npu.view(-1),
+                self.nano_d2h_lengths_npu.view(-1),
+                self.nano_d2h_descriptor_count_npu,
+                self.nano_d2h_source_ptrs_npu.device,
+            )
+            if result not in (None, 0):
+                raise RuntimeError(f"memfabric delayed Nano D2H failed with result={result}")
+            self.nano_d2h_complete_event.record(self.nano_d2h_stream)
+        self.nano_d2h_inflight_launched = True
+        return True
 
     def initialize_nano_d2h_slots(
         self,
@@ -1128,6 +1188,7 @@ class SparseKVOffloadManager:
         if self.use_nano:
             self._bind_nano_copy_bases()
             self._allocate_nano_d2h_descriptor_state(device)
+            self._allocate_nano_d2h_execution_state()
 
         gvas_buffer_offset = 0
         gvas_buffer_size_bytes = self.max_num_topk_rows * self.topk * 2 * 8  # 2: k+v, 8: int64
