@@ -400,11 +400,12 @@ class TestNanoD2HPlanner(unittest.TestCase):
         manager.max_num_reqs = max_num_reqs
         manager.block_size = 128
         manager.topk_buffer_size = 8192
+        manager.tp_size = 1
         manager._allocate_nano_d2h_planner_state()
         return manager
 
     @staticmethod
-    def _manager_with_execution_state():
+    def _manager_with_execution_state(tp_size: int = 1, tp_rank: int = 0):
         calls = []
 
         class FakeEvent:
@@ -463,8 +464,8 @@ class TestNanoD2HPlanner(unittest.TestCase):
                 return FakeStreamContext(stream)
 
         manager = TestNanoD2HPlanner._manager(max_num_reqs=2)
-        manager.tp_rank = 0
-        manager.tp_size = 1
+        manager.tp_rank = tp_rank
+        manager.tp_size = tp_size
         manager.num_layers = 1
         manager.token_size_bytes_k = 4
         manager.token_size_bytes_v = 6
@@ -952,6 +953,156 @@ class TestNanoD2HPlanner(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "completion collective"):
             manager.retire_nano_d2h_local()
         self.assertEqual(calls, [])
+
+    def test_distributed_retire_skips_collective_without_inflight_batch(self):
+        manager, calls = self._manager_with_execution_state(tp_size=2)
+        manager.tp_group = SimpleNamespace(broadcast_object=MagicMock())
+
+        self.assertEqual(manager.retire_nano_d2h(), 0)
+        manager.tp_group.broadcast_object.assert_not_called()
+        self.assertEqual(calls, [])
+
+    def test_distributed_retire_broadcasts_tp0_completion_epoch(self):
+        manager, calls = self._manager_with_execution_state(tp_size=2)
+
+        def broadcast_object(epoch, src):
+            calls.append(("broadcast_object", epoch, src))
+            return epoch
+
+        manager.tp_group = SimpleNamespace(broadcast_object=broadcast_object)
+        manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([3]),
+            np.array([0]),
+        )
+        manager.plan_nano_d2h_requests(
+            np.array([128]),
+            np.array([0]),
+            np.array([3]),
+            np.array([[7]], dtype=np.int32),
+            np.array([True]),
+        )
+        manager.record_nano_d2h_source_ready()
+        with patch.object(
+            manager_module,
+            "offload",
+            SimpleNamespace(sparse_copy=MagicMock(return_value=0)),
+            create=True,
+        ):
+            manager.launch_nano_d2h()
+        calls.clear()
+
+        self.assertEqual(manager.retire_nano_d2h(), 1)
+
+        self.assertEqual(
+            calls,
+            [
+                ("synchronize", "event-2"),
+                ("broadcast_object", 0, 0),
+            ],
+        )
+        self.assertEqual(manager.nano_d2h_stable_prefixes_cpu[0], 128)
+        self.assertEqual(manager.nano_d2h_inflight_batch_epoch, -1)
+
+    def test_non_tp0_retires_only_after_receiving_matching_epoch(self):
+        manager, calls = self._manager_with_execution_state(tp_size=2, tp_rank=1)
+
+        def broadcast_object(epoch, src):
+            calls.append(("broadcast_object", epoch, src))
+            return 0
+
+        manager.tp_group = SimpleNamespace(broadcast_object=broadcast_object)
+        manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([3]),
+            np.array([0]),
+        )
+        manager.plan_nano_d2h_requests(
+            np.array([128]),
+            np.array([0]),
+            np.array([3]),
+            np.array([[7]], dtype=np.int32),
+            np.array([True]),
+        )
+        self.assertFalse(manager.launch_nano_d2h())
+        calls.clear()
+
+        self.assertEqual(manager.retire_nano_d2h(), 1)
+
+        self.assertEqual(
+            calls,
+            [
+                ("broadcast_object", None, 0),
+            ],
+        )
+        self.assertEqual(manager.nano_d2h_stable_prefixes_cpu[0], 128)
+
+    def test_completion_epoch_mismatch_keeps_inflight_state(self):
+        manager, _calls = self._manager_with_execution_state(tp_size=2, tp_rank=1)
+
+        def broadcast_object(epoch, src):
+            return 9
+
+        manager.tp_group = SimpleNamespace(broadcast_object=broadcast_object)
+        manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([3]),
+            np.array([0]),
+        )
+        manager.plan_nano_d2h_requests(
+            np.array([128]),
+            np.array([0]),
+            np.array([3]),
+            np.array([[7]], dtype=np.int32),
+            np.array([True]),
+        )
+        manager.launch_nano_d2h()
+
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            manager.retire_nano_d2h()
+
+        self.assertTrue(manager.nano_d2h_inflight_batch_active)
+        self.assertTrue(manager.nano_d2h_inflight_launched)
+        self.assertEqual(manager.nano_d2h_stable_prefixes_cpu[0], 0)
+
+    def test_tp0_completion_failure_is_broadcast_without_consuming_plan(self):
+        manager, calls = self._manager_with_execution_state(tp_size=2)
+
+        def broadcast_object(epoch, src):
+            calls.append(("broadcast_object", epoch, src))
+            return epoch
+
+        manager.tp_group = SimpleNamespace(broadcast_object=broadcast_object)
+        manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([3]),
+            np.array([0]),
+        )
+        manager.plan_nano_d2h_requests(
+            np.array([128]),
+            np.array([0]),
+            np.array([3]),
+            np.array([[7]], dtype=np.int32),
+            np.array([True]),
+        )
+        manager.record_nano_d2h_source_ready()
+        with patch.object(
+            manager_module,
+            "offload",
+            SimpleNamespace(sparse_copy=MagicMock(return_value=0)),
+            create=True,
+        ):
+            manager.launch_nano_d2h()
+        manager.nano_d2h_complete_event.fail_synchronize = True
+        calls.clear()
+
+        with self.assertRaisesRegex(RuntimeError, "TP0 failed"):
+            manager.retire_nano_d2h()
+
+        self.assertIn(("broadcast_object", -2, 0), calls)
+        self.assertTrue(manager.nano_d2h_inflight_batch_active)
+        self.assertTrue(manager.nano_d2h_inflight_launched)
+        self.assertEqual(manager.nano_d2h_stable_prefixes_cpu[0], 0)
 
 
 if __name__ == "__main__":

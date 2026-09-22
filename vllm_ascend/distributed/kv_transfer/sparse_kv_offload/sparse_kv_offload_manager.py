@@ -49,6 +49,8 @@ OFFLOAD_TOPK_BUFFER_K_INDEX = 4
 OFFLOAD_TOPK_BUFFER_V_INDEX = 5
 OFFLOAD_STORE_PORT_BASE = 8500
 NANO_D2H_INVALID_GENERATION = -1
+NANO_D2H_INVALID_EPOCH = -1
+NANO_D2H_FAILED_EPOCH = -2
 NANO_D2H_PLAN_ACTIVE_ROW = 0
 NANO_D2H_PLAN_GENERATION_ROW = 1
 NANO_D2H_PLAN_SOURCE_SLOT_ROW = 2
@@ -628,6 +630,8 @@ class SparseKVOffloadManager:
         self.nano_d2h_inflight_target_prefixes_cpu = self.nano_d2h_inflight_target_prefixes_host.numpy()
         self.nano_d2h_inflight_batch_active = False
         self.nano_d2h_inflight_launched = False
+        self.nano_d2h_next_batch_epoch = 0
+        self.nano_d2h_inflight_batch_epoch = NANO_D2H_INVALID_EPOCH
 
     def _allocate_nano_d2h_descriptor_state(self, device: torch.device) -> None:
         """Allocate one fixed request plan and its all-layer descriptors."""
@@ -746,19 +750,21 @@ class SparseKVOffloadManager:
 
     def launch_nano_d2h(self) -> bool:
         """Asynchronously launch the frozen full-block batch on TP0."""
-        if self.tp_rank != 0:
-            return False
         if not self.nano_d2h_inflight_batch_active:
             return False
         if self.nano_d2h_inflight_launched:
             raise RuntimeError("Nano D2H inflight batch has already been launched")
-        source_slot = self.nano_d2h_latest_source_event_slot
-        if source_slot is None:
-            raise RuntimeError("Nano D2H has no source-ready compute frontier")
         runtime = self._npu_runtime
         if runtime.is_current_stream_capturing():
             raise RuntimeError("Nano D2H launch must remain outside graph capture")
-
+        if self.tp_rank != 0:
+            # Every rank owns the same frozen Host plan. Non-TP0 ranks mark
+            # that shared batch submitted but never issue the physical copy.
+            self.nano_d2h_inflight_launched = True
+            return False
+        source_slot = self.nano_d2h_latest_source_event_slot
+        if source_slot is None:
+            raise RuntimeError("Nano D2H has no source-ready compute frontier")
         with runtime.stream(self.nano_d2h_stream):
             self.prepare_nano_d2h_descriptors()
             self.nano_d2h_stream.wait_event(self.nano_d2h_source_ready_events[source_slot])
@@ -803,6 +809,7 @@ class SparseKVOffloadManager:
         self.nano_d2h_inflight_target_prefixes_cpu.fill(0)
         self.nano_d2h_inflight_batch_active = False
         self.nano_d2h_inflight_launched = False
+        self.nano_d2h_inflight_batch_epoch = NANO_D2H_INVALID_EPOCH
         return int(np.count_nonzero(matching))
 
     def retire_nano_d2h_local(self) -> int:
@@ -819,6 +826,47 @@ class SparseKVOffloadManager:
             raise RuntimeError("Nano D2H retire must remain outside graph capture")
 
         self.nano_d2h_complete_event.synchronize()
+        return self._consume_nano_d2h_completion()
+
+    def retire_nano_d2h(self) -> int:
+        """Retire one real batch after propagating TP0 D2H completion."""
+        if self.tp_size == 1:
+            return self.retire_nano_d2h_local()
+        if not self.nano_d2h_inflight_batch_active:
+            return 0
+        if not self.nano_d2h_inflight_launched:
+            raise RuntimeError("Nano D2H cannot retire an unlaunched inflight batch")
+        runtime = self._npu_runtime
+        if runtime.is_current_stream_capturing():
+            raise RuntimeError("Nano D2H retire must remain outside graph capture")
+
+        batch_epoch = self.nano_d2h_inflight_batch_epoch
+        if batch_epoch < 0:
+            raise RuntimeError("Nano D2H inflight batch has no valid epoch")
+
+        wait_error: Exception | None = None
+        completion_epoch = batch_epoch
+        if self.tp_rank == 0:
+            try:
+                self.nano_d2h_complete_event.synchronize()
+            except Exception as exc:
+                wait_error = exc
+                completion_epoch = NANO_D2H_FAILED_EPOCH
+
+        # Retire is already a Host-visible boundary. Broadcast the small Host
+        # epoch directly so completion validation adds no NPU->CPU ``item()``
+        # and no extra device stream dependency.
+        received_epoch = self.tp_group.broadcast_object(
+            completion_epoch if self.tp_rank == 0 else None,
+            src=0,
+        )
+        if received_epoch == NANO_D2H_FAILED_EPOCH:
+            raise RuntimeError("TP0 failed while waiting for Nano D2H completion") from wait_error
+        if received_epoch != batch_epoch:
+            raise RuntimeError(
+                "Nano D2H completion epoch does not match the local inflight batch: "
+                f"received={received_epoch}, expected={batch_epoch}"
+            )
         return self._consume_nano_d2h_completion()
 
     def initialize_nano_d2h_slots(
@@ -937,6 +985,8 @@ class SparseKVOffloadManager:
         self.nano_d2h_inflight_source_slots_cpu[ready_slots] = source_slots
         self.nano_d2h_inflight_destination_slots_cpu[ready_slots] = destination_slots
         self.nano_d2h_inflight_target_prefixes_cpu[ready_slots] = ready_prefixes + self.block_size
+        self.nano_d2h_inflight_batch_epoch = self.nano_d2h_next_batch_epoch
+        self.nano_d2h_next_batch_epoch += 1
         self.nano_d2h_inflight_batch_active = True
         return int(ready_slots.size)
 

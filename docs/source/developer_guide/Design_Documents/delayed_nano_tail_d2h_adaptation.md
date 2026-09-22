@@ -408,6 +408,8 @@ D2H 完成后，需要把该批完成结果传播给其他 rank。每个 rank �
 - 所有 rank 必须根据一致的 Host 侧 `inflight_batch_active` 和 batch epoch，以相同顺序参加
   同一批 completion collective。不能读取本地 NPU tensor 或 `event.query()` 后各自决定。
 - TP0 必须先得到 Host-visible D2H completion，才能发布该批成功 status。
+- completion status 直接通过 Host 控制通道广播 batch epoch；不要为了校验该标量新增
+  NPU tensor 回读、`.item()` 或 completion device stream。
 - collective 成功后，各 rank 使用本地冻结的 generation/target-prefix；迟到的旧完成仍需
   通过 generation 校验，不能推进复用 slot 的新请求。
 - CPU/device `stable_prefix` 更新都排在 collective 完成之后。
