@@ -658,6 +658,7 @@ class NPUModelRunner(GPUModelRunner):
         self._offload_token_to_req = None
         self._offload_pool_slots = None
         self._offload_pool_generations = None
+        self._offload_stable_prefixes = None
         self._offload_request_slots: dict[str, int] = {}
         self._offload_slot_generation = 0
         self._offload_slot_generations: dict[int, int] = {}
@@ -670,6 +671,7 @@ class NPUModelRunner(GPUModelRunner):
                 capacity = nano_pool_capacity(self.max_num_reqs)
                 self._offload_pool_slots = self._make_buffer(capacity, dtype=torch.int32)
                 self._offload_pool_generations = self._make_buffer(capacity, dtype=torch.int64)
+                self._offload_stable_prefixes = self._make_buffer(capacity, dtype=torch.int32)
 
     @property
     def use_dcp(self) -> bool:
@@ -3278,8 +3280,11 @@ class NPUModelRunner(GPUModelRunner):
         capacity = nano_pool_capacity(self.max_num_reqs)
         slots = self._offload_pool_slots.np
         generations = self._offload_pool_generations.np
+        assert self._offload_stable_prefixes is not None
+        stable_prefixes = self._offload_stable_prefixes.np
         slots[:padded_reqs] = np.arange(padded_reqs, dtype=np.int32) + capacity
         generations[:padded_reqs] = -1
+        stable_prefixes[:padded_reqs] = 0
         self._nano_need_eager_tail_restore = False
         if not dummy:
             # PD binds rows at alloc time. Keep those reservations even when the
@@ -3302,6 +3307,24 @@ class NPUModelRunner(GPUModelRunner):
                 slot = self._offload_request_slots[req]
                 slots[row] = slot
                 generations[row] = self._offload_slot_generations[slot]
+            manager = self.sparse_kv_offload_manager
+            if manager is None:
+                raise RuntimeError("Nano stable-prefix metadata requires the sparse KV offload manager")
+            active_slots = slots[:num_reqs].astype(np.int64, copy=False)
+            active_generations = generations[:num_reqs]
+            owner_generations = manager.nano_d2h_owner_generations_cpu[active_slots]
+            newly_bound = owner_generations != active_generations
+            if np.any(newly_bound):
+                computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                initial_prefixes = (
+                    computed[newly_bound] // self.cache_config.block_size * self.cache_config.block_size
+                )
+                manager.initialize_nano_d2h_slots(
+                    active_slots[newly_bound],
+                    active_generations[newly_bound],
+                    initial_prefixes,
+                )
+            stable_prefixes[:num_reqs] = manager.nano_d2h_stable_prefixes_cpu[active_slots]
             if prebound:
                 block_size = self.cache_config.block_size
                 computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
@@ -3314,6 +3337,7 @@ class NPUModelRunner(GPUModelRunner):
                     self._offload_slot_last_prefix[slot] = prefix
         self._offload_pool_slots.copy_to_gpu(padded_reqs)
         self._offload_pool_generations.copy_to_gpu(padded_reqs)
+        self._offload_stable_prefixes.copy_to_gpu(padded_reqs)
 
     def _maybe_eager_restore_nano_tails(self, attn_metadata: PerLayerAttnMetadata) -> None:
         if not self._nano_need_eager_tail_restore:
@@ -3557,6 +3581,11 @@ class NPUModelRunner(GPUModelRunner):
                                    if self._offload_pool_slots is not None else None),
             req_topk_buffer_generations=(self._offload_pool_generations.gpu[:num_reqs_padded]
                                          if self._offload_pool_generations is not None else None),
+            req_topk_buffer_stable_prefixes=(
+                self._offload_stable_prefixes.gpu[:num_reqs_padded]
+                if self._offload_stable_prefixes is not None
+                else None
+            ),
             # Short histories use the same Nano layout with a dense prefix.
             # Never demote a live Nano request to the ordinary Host path.
             nano_eligible=self._offload_pool_slots is not None,

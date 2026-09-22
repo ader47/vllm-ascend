@@ -233,8 +233,9 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             widths = ends - starts
             generations = common_attn_metadata.req_topk_buffer_generations
             pools = common_attn_metadata.req_topk_buffer_slots
-            if generations is None or pools is None:
-                raise RuntimeError("nano offload requires runner-owned request slots and generations")
+            stable_prefixes = common_attn_metadata.req_topk_buffer_stable_prefixes
+            if generations is None or pools is None or stable_prefixes is None:
+                raise RuntimeError("nano offload requires runner-owned request slots, generations, and stable prefixes")
             request_pools = pools[:count]
             active = (
                 (generations[:count] >= 0)
@@ -259,7 +260,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
                 # proposal remains visible through the resident tail pages.
                 prefix = torch.where(active, self.nano_vectors["prefix_lens"][0, :count], 0)
             else:
-                prefix = torch.div((seq_lens - widths).clamp_min(0), 128, rounding_mode="floor") * 128
+                prefix = torch.where(active, stable_prefixes[:count], 0)
             cache = torch.where(active, prefix.clamp_max(self.nano_hot_tokens), 2048)
             safe_pools = torch.where(active, request_pools, self.nano_rows[:count] + self.nano_pool_capacity)
             logical = torch.where(active, cache + seq_lens - prefix, cache)

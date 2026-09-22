@@ -199,6 +199,7 @@ def test_nano_full_pool_generation_and_padding_are_isolated():
         # out-of-range slot, a negative slot, and ordinary graph padding.
         req_topk_buffer_slots=torch.tensor([3, 4, -1, 1], dtype=torch.int32),
         req_topk_buffer_generations=torch.tensor([7, 8, 9, -1], dtype=torch.int64),
+        req_topk_buffer_stable_prefixes=torch.tensor([0, 0, 0, 0], dtype=torch.int32),
         block_table_tensor=torch.arange(count * 128, dtype=torch.int32).view(count, -1),
         positions=torch.arange(count, dtype=torch.int64),
         slot_mapping=torch.arange(count, dtype=torch.int64),
@@ -243,6 +244,7 @@ def test_nano_later_draft_keeps_step_zero_prefix_and_full_tail():
         seq_lens=torch.tensor([base + 130], dtype=torch.int32),
         req_topk_buffer_slots=torch.tensor([1], dtype=torch.int32),
         req_topk_buffer_generations=torch.tensor([11], dtype=torch.int64),
+        req_topk_buffer_stable_prefixes=torch.tensor([base], dtype=torch.int32),
         block_table_tensor=torch.arange(128, dtype=torch.int32).view(1, -1),
         positions=torch.arange(base + 126, base + 130, dtype=torch.int64),
         slot_mapping=torch.arange(4, dtype=torch.int64),
@@ -265,6 +267,9 @@ def test_nano_later_draft_keeps_step_zero_prefix_and_full_tail():
     common.seq_lens = torch.tensor([base + 131], dtype=torch.int32)
     common.positions = torch.tensor([base + 128], dtype=torch.int64)
     common.slot_mapping = torch.tensor([base + 128], dtype=torch.int64)
+    # Even if a later metadata input observes a newer published prefix, all
+    # proposal steps must retain step 0's sparse-history boundary.
+    common.req_topk_buffer_stable_prefixes.fill_(base + 128)
     common.max_query_len = 1
     common.num_input_tokens = 1
     later = _populate_nano_metadata(builder, common, draft_index=1)
@@ -273,6 +278,40 @@ def test_nano_later_draft_keeps_step_zero_prefix_and_full_tail():
     assert later.nano_prefix_lens.tolist() == [base]
     assert later.nano_cache_tokens.tolist() == [base]
     assert later.nano_logical_lens.tolist() == [base + 129]
+
+
+def test_nano_prefix_advances_only_after_published_completion():
+    builder = _make_nano_builder()
+    base = 8192
+    common = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([base + 129], dtype=torch.int32),
+        req_topk_buffer_slots=torch.tensor([1], dtype=torch.int32),
+        req_topk_buffer_generations=torch.tensor([11], dtype=torch.int64),
+        req_topk_buffer_stable_prefixes=torch.tensor([base], dtype=torch.int32),
+        block_table_tensor=torch.arange(128, dtype=torch.int32).view(1, -1),
+        positions=torch.tensor([base + 128], dtype=torch.int64),
+        slot_mapping=torch.tensor([base + 128], dtype=torch.int64),
+        req_ids_tensor=None,
+        token_to_req=None,
+        nano_eligible=True,
+        offload_dummy=False,
+        max_query_len=1,
+        num_reqs=1,
+        num_input_tokens=1,
+    )
+
+    before_completion = _populate_nano_metadata(builder, common)
+    assert before_completion.nano_prefix_lens.tolist() == [base]
+    assert before_completion.nano_tail_lengths.tolist() == [[128, 0]]
+    assert before_completion.nano_logical_lens.tolist() == [base + 129]
+
+    common.req_topk_buffer_stable_prefixes.fill_(base + 128)
+    after_completion = _populate_nano_metadata(builder, common)
+    assert after_completion.nano_prefix_lens.tolist() == [base + 128]
+    assert after_completion.nano_tail_lengths.tolist() == [[0, 0]]
+    assert after_completion.nano_logical_lens.tolist() == [base + 1]
 
 
 def test_nano_reused_topk_passes_resident_tail_to_attention():

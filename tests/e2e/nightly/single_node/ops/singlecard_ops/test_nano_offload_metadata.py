@@ -36,8 +36,12 @@ def make_builder():
     return builder
 
 
-def common(ends, lengths, pools=(1, 0), generations=(11, 12)):
+def common(ends, lengths, pools=(1, 0), generations=(11, 12), stable_prefixes=None):
     count = len(lengths)
+    if stable_prefixes is None:
+        starts = [0, *ends[:-1]]
+        widths = [end - start for start, end in zip(starts, ends)]
+        stable_prefixes = [(length - width) // 128 * 128 for length, width in zip(lengths, widths)]
     return SimpleNamespace(
         query_start_loc=torch.tensor([0, *ends], dtype=torch.int32, device="npu"),
         query_start_loc_cpu=torch.tensor([0, *ends], dtype=torch.int32),
@@ -45,6 +49,7 @@ def common(ends, lengths, pools=(1, 0), generations=(11, 12)):
         seq_lens=torch.tensor(lengths, dtype=torch.int32, device="npu"),
         req_topk_buffer_slots=torch.tensor(pools, dtype=torch.int32, device="npu"),
         req_topk_buffer_generations=torch.tensor(generations, dtype=torch.int64, device="npu"),
+        req_topk_buffer_stable_prefixes=torch.tensor(stable_prefixes, dtype=torch.int32, device="npu"),
         block_table_tensor=torch.arange(count * 128, dtype=torch.int32, device="npu").reshape(count, 128),
         req_ids_tensor=None,
         token_to_req=None,
@@ -100,7 +105,8 @@ def test_device_lengths_tail_geometry_and_rejection():
     cm.seq_lens.copy_(torch.tensor([10243, 8321], dtype=torch.int32, device="npu"))
     revised = populate(builder, cm)
     assert revised.nano_prefix_lens.data_ptr() == address
-    assert revised.nano_prefix_lens.cpu().tolist() == [10112, 8320]
+    # Sequence length changes cannot publish a block before D2H completion.
+    assert revised.nano_prefix_lens.cpu().tolist() == [10240, 8320]
 
 
 def test_generation_compaction_and_prefix_rollback_reset():
@@ -119,6 +125,7 @@ def test_generation_compaction_and_prefix_rollback_reset():
     # New generation and rollback independently force cold fill.
     cm.req_topk_buffer_generations[0] = 13
     cm.seq_lens[1] = 10243
+    cm.req_topk_buffer_stable_prefixes[1] = 10112
     impl._prepare_nano_lim_state(populate(builder, cm))
     assert impl.nano_states[:2].cpu().tolist() == [-2, -2]
 
@@ -141,6 +148,7 @@ def test_inactive_capture_becomes_active_on_graph_replay():
     cm.seq_lens.copy_(torch.tensor([10371, 0], dtype=torch.int32, device="npu"))
     cm.req_topk_buffer_generations[0] = 11
     cm.req_topk_buffer_slots[0] = 1
+    cm.req_topk_buffer_stable_prefixes[0] = 10240
     populate(builder, cm)
     graph.replay()
     assert impl.nano_states[:2].cpu().tolist() == [-2, -3]
@@ -175,24 +183,53 @@ def test_runner_pool_ownership_survives_compaction_and_dummy_run():
     runner.max_num_reqs = 2
     runner._offload_pool_slots = SimpleNamespace(np=np.zeros(4, dtype=np.int32), copy_to_gpu=lambda n: None)
     runner._offload_pool_generations = SimpleNamespace(np=np.zeros(4, dtype=np.int64), copy_to_gpu=lambda n: None)
+    runner._offload_stable_prefixes = SimpleNamespace(np=np.zeros(4, dtype=np.int32), copy_to_gpu=lambda n: None)
     runner._offload_request_slots = {}
     runner._offload_slot_generation = 0
     runner._offload_slot_generations = {}
-    runner.input_batch = SimpleNamespace(req_ids=["a", "b"], req_id_to_index={"a": 0, "b": 1})
+    runner.cache_config = SimpleNamespace(block_size=128)
+    owner_generations = np.full(4, -1, dtype=np.int64)
+    stable_prefixes = np.zeros(4, dtype=np.int64)
+
+    def initialize(slots, generations, prefixes):
+        owner_generations[slots] = generations
+        stable_prefixes[slots] = prefixes
+
+    runner.sparse_kv_offload_manager = SimpleNamespace(
+        nano_d2h_owner_generations_cpu=owner_generations,
+        nano_d2h_stable_prefixes_cpu=stable_prefixes,
+        initialize_nano_d2h_slots=initialize,
+    )
+    runner.input_batch = SimpleNamespace(
+        req_ids=["a", "b"],
+        req_id_to_index={"a": 0, "b": 1},
+        num_computed_tokens_cpu=np.array([128, 257], dtype=np.int64),
+    )
     runner._prepare_nano_request_slots(2, 3, dummy=False)
     assert runner._offload_pool_slots.np[:3].tolist() == [0, 1, 6]
     assert runner._offload_pool_generations.np[:3].tolist() == [1, 2, -1]
+    assert runner._offload_stable_prefixes.np[:3].tolist() == [128, 256, 0]
+    # Simulate one completed D2H for b. Batch compaction must preserve this
+    # published prefix instead of deriving it again from computed tokens.
+    stable_prefixes[1] = 384
     # Removing a compacts b; new c may reuse a's slot, with a new generation.
-    runner.input_batch = SimpleNamespace(req_ids=["b", "c"], req_id_to_index={"b": 0, "c": 1})
+    runner.input_batch = SimpleNamespace(
+        req_ids=["b", "c"],
+        req_id_to_index={"b": 0, "c": 1},
+        num_computed_tokens_cpu=np.array([514, 385], dtype=np.int64),
+    )
     runner._prepare_nano_request_slots(2, 3, dummy=False)
     assert runner._offload_pool_slots.np[:3].tolist() == [1, 0, 6]
     assert runner._offload_pool_generations.np[:3].tolist() == [2, 3, -1]
+    assert runner._offload_stable_prefixes.np[:3].tolist() == [384, 384, 0]
     runner._prepare_nano_request_slots(2, 3, dummy=True)
     assert runner._offload_pool_slots.np[:3].tolist() == [4, 5, 6]
     assert runner._offload_pool_generations.np[:3].tolist() == [-1, -1, -1]
+    assert runner._offload_stable_prefixes.np[:3].tolist() == [0, 0, 0]
     assert runner._offload_request_slots == {"b": 1, "c": 0}
     runner._prepare_nano_request_slots(2, 3, dummy=False)
     assert runner._offload_pool_generations.np[:3].tolist() == [2, 3, -1]
+    assert runner._offload_stable_prefixes.np[:3].tolist() == [384, 384, 0]
 
 
 def test_draft_metadata_remains_valid_until_its_step_executes():

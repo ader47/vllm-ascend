@@ -756,6 +756,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         if self.runner._offload_pool_generations is not None
                         else None
                     ),
+                    req_topk_buffer_stable_prefixes=(
+                        self.runner._offload_stable_prefixes.gpu[:num_reqs]
+                        if self.runner._offload_stable_prefixes is not None
+                        else None
+                    ),
                     nano_eligible=True,
                     offload_dummy=True,
                     req_ids_tensor=req_ids_tensor,
@@ -2278,6 +2283,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             group_key_cache_idx=common_attn_metadata.group_key_cache_idx,
             req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
             req_topk_buffer_generations=common_attn_metadata.req_topk_buffer_generations,
+            req_topk_buffer_stable_prefixes=common_attn_metadata.req_topk_buffer_stable_prefixes,
             nano_eligible=common_attn_metadata.nano_eligible,
             offload_dummy=common_attn_metadata.offload_dummy,
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
@@ -2379,6 +2385,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             group_key_cache_idx=common_attn_metadata.group_key_cache_idx,
             req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
             req_topk_buffer_generations=common_attn_metadata.req_topk_buffer_generations,
+            req_topk_buffer_stable_prefixes=common_attn_metadata.req_topk_buffer_stable_prefixes,
             nano_eligible=common_attn_metadata.nano_eligible,
             offload_dummy=common_attn_metadata.offload_dummy,
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
