@@ -2160,15 +2160,20 @@ class TestDelayedNanoD2HRunnerHooks(unittest.TestCase):
         manager.plan_nano_d2h_requests.return_value = plan_count
         manager.retire_nano_d2h.return_value = 2
         manager.record_nano_d2h_source_ready.return_value = True
+        manager.nano_host_kv_cache_group_id = 1
         runner.sparse_kv_offload_manager = manager
         runner._offload_pool_slots = SimpleNamespace(np=np.array([3, 1], dtype=np.int32))
         runner._offload_pool_generations = SimpleNamespace(np=np.array([7, 9], dtype=np.int64))
-        block_table = np.array([[10, 11], [20, 21]], dtype=np.int32)
+        indexer_block_table = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        host_block_table = np.array([[10, 11], [20, 21]], dtype=np.int32)
         runner.input_batch = SimpleNamespace(
             num_computed_tokens_cpu=np.array([128, 255], dtype=np.int64),
-            block_table=[SimpleNamespace(get_numpy_array=lambda: block_table)],
+            block_table=[
+                SimpleNamespace(get_numpy_array=lambda: indexer_block_table),
+                SimpleNamespace(get_numpy_array=lambda: host_block_table),
+            ],
         )
-        return runner, manager, block_table
+        return runner, manager, host_block_table
 
     def test_plan_uses_cpu_request_state_and_launches_only_nonempty_batch(self):
         runner, manager, block_table = self._build_runner()

@@ -402,6 +402,11 @@ class TestNanoD2HPlanner(unittest.TestCase):
         manager.topk_buffer_size = 8192
         manager.tp_size = 1
         manager._allocate_nano_d2h_planner_state()
+        manager.nano_host_kv_cache_group_id = 0
+        manager.nano_d2h_host_num_blocks = 4096
+        manager.nano_d2h_source_token_capacity = (
+            2 * manager.nano_d2h_capacity * (manager.topk_buffer_size + 2 * manager.block_size)
+        )
         return manager
 
     @staticmethod
@@ -595,6 +600,69 @@ class TestNanoD2HPlanner(unittest.TestCase):
                     np.array([True]),
                 )
                 self.assertEqual(count, expected_count)
+
+    def test_host_destination_must_be_inside_allocated_block_pool(self):
+        valid_manager = self._manager()
+        valid_manager.nano_d2h_host_num_blocks = 8
+        valid_manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([12]),
+            np.array([0]),
+        )
+        self.assertEqual(
+            valid_manager.plan_nano_d2h_requests(
+                np.array([128]),
+                np.array([0]),
+                np.array([12]),
+                np.array([[7]], dtype=np.int32),
+                np.array([True]),
+            ),
+            1,
+        )
+
+        manager = self._manager()
+        manager.nano_d2h_host_num_blocks = 8
+        manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([12]),
+            np.array([0]),
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"host_group=0, host_num_blocks=8.*destination_slot': 8",
+        ):
+            manager.plan_nano_d2h_requests(
+                np.array([128]),
+                np.array([0]),
+                np.array([12]),
+                np.array([[8]], dtype=np.int32),
+                np.array([True]),
+            )
+
+        self.assertFalse(manager.nano_d2h_inflight_batch_active)
+        self.assertFalse(manager.nano_d2h_inflight_active_cpu.any())
+
+    def test_resident_source_must_be_inside_allocated_buffer(self):
+        manager = self._manager()
+        manager.nano_d2h_source_token_capacity = manager.topk_buffer_size + manager.block_size - 1
+        manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([12]),
+            np.array([0]),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "resident source block is outside"):
+            manager.plan_nano_d2h_requests(
+                np.array([128]),
+                np.array([0]),
+                np.array([12]),
+                np.array([[7]], dtype=np.int32),
+                np.array([True]),
+            )
+
+        self.assertFalse(manager.nano_d2h_inflight_batch_active)
+        self.assertFalse(manager.nano_d2h_inflight_active_cpu.any())
 
     def test_generation_mismatch_cannot_plan_for_reused_slot(self):
         manager = self._manager()

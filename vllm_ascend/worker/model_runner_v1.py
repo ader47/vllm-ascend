@@ -3331,12 +3331,13 @@ class NPUModelRunner(GPUModelRunner):
         assert self.sparse_kv_offload_manager is not None
         assert self._offload_pool_slots is not None
         assert self._offload_pool_generations is not None
+        host_group_id = self.sparse_kv_offload_manager.nano_host_kv_cache_group_id
 
         count = self.sparse_kv_offload_manager.plan_nano_d2h_requests(
             self.input_batch.num_computed_tokens_cpu[:num_reqs],
             self._offload_pool_slots.np[:num_reqs],
             self._offload_pool_generations.np[:num_reqs],
-            self.input_batch.block_table[0].get_numpy_array()[:num_reqs],
+            self.input_batch.block_table[host_group_id].get_numpy_array()[:num_reqs],
             np.ones(num_reqs, dtype=np.bool_),
         )
         if count:

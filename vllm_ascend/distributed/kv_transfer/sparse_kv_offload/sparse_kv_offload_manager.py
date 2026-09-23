@@ -511,6 +511,8 @@ class SparseKVOffloadManager:
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_group = get_tp_group()
         self.block_size = self._infer_group_block_sizes(self.kv_cache_config)
+        self.nano_host_kv_cache_group_id = self._infer_host_kv_cache_group_id(self.kv_cache_config)
+        self.nano_d2h_host_num_blocks = kv_cache_config.num_blocks
         self.topk_buffer_size = sparse_kv_offload_config.topk_buffer_size
         self.topk = sparse_kv_offload_config.topk
         self.use_fused_overlap = sparse_kv_offload_config.use_fused_overlap
@@ -600,6 +602,22 @@ class SparseKVOffloadManager:
         if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
             kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
         return kv_cache_spec.block_size
+
+    @staticmethod
+    def _infer_host_kv_cache_group_id(kv_cache_config: KVCacheConfig) -> int:
+        host_group_ids = []
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            group_spec = group.kv_cache_spec
+            specs = (
+                group_spec.kv_cache_specs.values() if isinstance(group_spec, UniformTypeKVCacheSpecs) else (group_spec,)
+            )
+            if any(getattr(spec, "store_on_host", False) for spec in specs):
+                host_group_ids.append(group_id)
+        if len(host_group_ids) != 1:
+            raise ValueError(
+                f"Sparse KV offload requires exactly one Host KV cache group, got group ids {host_group_ids}"
+            )
+        return host_group_ids[0]
 
     def _allocate_nano_d2h_planner_state(self) -> None:
         """Allocate the dormant CPU control state for delayed Nano D2H."""
@@ -771,15 +789,24 @@ class SparseKVOffloadManager:
             # TODO: use an asynchronous SDMA copy API after its descriptor and
             # completion semantics are available; keep the existing MTE path
             # for the first implementation.
-            result = offload.sparse_copy(
-                self.nano_d2h_source_ptrs_npu.view(-1),
-                self.nano_d2h_destination_ptrs_npu.view(-1),
-                self.nano_d2h_lengths_npu.view(-1),
-                self.nano_d2h_descriptor_count_npu,
-                self.nano_d2h_source_ptrs_npu.device,
-            )
+            try:
+                result = offload.sparse_copy(
+                    self.nano_d2h_source_ptrs_npu.view(-1),
+                    self.nano_d2h_destination_ptrs_npu.view(-1),
+                    self.nano_d2h_lengths_npu.view(-1),
+                    self.nano_d2h_descriptor_count_npu,
+                    self.nano_d2h_source_ptrs_npu.device,
+                )
+            except Exception:
+                logger.exception(
+                    "Nano D2H sparse_copy submission failed: %s",
+                    self._nano_d2h_inflight_diagnostics(),
+                )
+                raise
             if result not in (None, 0):
-                raise RuntimeError(f"memfabric delayed Nano D2H failed with result={result}")
+                diagnostics = self._nano_d2h_inflight_diagnostics()
+                logger.error("Nano D2H sparse_copy returned result=%s: %s", result, diagnostics)
+                raise RuntimeError(f"memfabric delayed Nano D2H failed with result={result}; {diagnostics}")
             self.nano_d2h_complete_event.record(self.nano_d2h_stream)
         self.nano_d2h_inflight_launched = True
         return True
@@ -825,7 +852,14 @@ class SparseKVOffloadManager:
         if self._npu_runtime.is_current_stream_capturing():
             raise RuntimeError("Nano D2H retire must remain outside graph capture")
 
-        self.nano_d2h_complete_event.synchronize()
+        try:
+            self.nano_d2h_complete_event.synchronize()
+        except Exception:
+            logger.exception(
+                "Nano D2H completion wait failed: %s",
+                self._nano_d2h_inflight_diagnostics(),
+            )
+            raise
         return self._consume_nano_d2h_completion()
 
     def retire_nano_d2h(self) -> int:
@@ -852,6 +886,10 @@ class SparseKVOffloadManager:
             except Exception as exc:
                 wait_error = exc
                 completion_epoch = NANO_D2H_FAILED_EPOCH
+                logger.exception(
+                    "Nano D2H TP0 completion wait failed: %s",
+                    self._nano_d2h_inflight_diagnostics(),
+                )
 
         # Retire is already a Host-visible boundary. Broadcast the small Host
         # epoch directly so completion validation adds no NPU->CPU ``item()``
@@ -861,7 +899,9 @@ class SparseKVOffloadManager:
             src=0,
         )
         if received_epoch == NANO_D2H_FAILED_EPOCH:
-            raise RuntimeError("TP0 failed while waiting for Nano D2H completion") from wait_error
+            raise RuntimeError(
+                f"TP0 failed while waiting for Nano D2H completion; {self._nano_d2h_inflight_diagnostics()}"
+            ) from wait_error
         if received_epoch != batch_epoch:
             raise RuntimeError(
                 "Nano D2H completion epoch does not match the local inflight batch: "
@@ -1008,11 +1048,42 @@ class SparseKVOffloadManager:
         if np.any(logical_blocks >= table.shape[1]):
             raise RuntimeError("Nano D2H logical block is outside the request block table")
         destination_slots = table[ready_rows, logical_blocks]
-        if np.any(destination_slots < 0):
-            raise RuntimeError("Nano D2H full block has no Host destination slot")
+        invalid_destinations = (destination_slots < 0) | (destination_slots >= self.nano_d2h_host_num_blocks)
+        if np.any(invalid_destinations):
+            bad = np.flatnonzero(invalid_destinations)[:8]
+            entries = [
+                {
+                    "request_row": int(ready_rows[index]),
+                    "pool_slot": int(ready_slots[index]),
+                    "logical_block": int(logical_blocks[index]),
+                    "destination_slot": int(destination_slots[index]),
+                }
+                for index in bad
+            ]
+            raise RuntimeError(
+                "Nano D2H Host destination block is outside the allocated pool: "
+                f"host_group={self.nano_host_kv_cache_group_id}, "
+                f"host_num_blocks={self.nano_d2h_host_num_blocks}, entries={entries}"
+            )
 
         request_stride = self.topk_buffer_size + 2 * self.block_size
         source_slots = ready_slots * request_stride + self.topk_buffer_size + ready_prefixes % (2 * self.block_size)
+        invalid_sources = (source_slots < 0) | (source_slots + self.block_size > self.nano_d2h_source_token_capacity)
+        if np.any(invalid_sources):
+            bad = np.flatnonzero(invalid_sources)[:8]
+            entries = [
+                {
+                    "request_row": int(ready_rows[index]),
+                    "pool_slot": int(ready_slots[index]),
+                    "source_slot": int(source_slots[index]),
+                    "source_end": int(source_slots[index] + self.block_size),
+                }
+                for index in bad
+            ]
+            raise RuntimeError(
+                "Nano D2H resident source block is outside the allocated buffer: "
+                f"source_token_capacity={self.nano_d2h_source_token_capacity}, entries={entries}"
+            )
         self.nano_d2h_inflight_active_cpu[ready_slots] = True
         self.nano_d2h_inflight_generations_cpu[ready_slots] = ready_generations
         self.nano_d2h_inflight_source_slots_cpu[ready_slots] = source_slots
@@ -1022,6 +1093,65 @@ class SparseKVOffloadManager:
         self.nano_d2h_next_batch_epoch += 1
         self.nano_d2h_inflight_batch_active = True
         return int(ready_slots.size)
+
+    def _nano_d2h_inflight_diagnostics(self) -> str:
+        active_slots = np.flatnonzero(self.nano_d2h_inflight_active_cpu)
+        entries = [
+            {
+                "pool_slot": int(pool_slot),
+                "generation": int(self.nano_d2h_inflight_generations_cpu[pool_slot]),
+                "source_slot": int(self.nano_d2h_inflight_source_slots_cpu[pool_slot]),
+                "destination_slot": int(self.nano_d2h_inflight_destination_slots_cpu[pool_slot]),
+                "target_prefix": int(self.nano_d2h_inflight_target_prefixes_cpu[pool_slot]),
+            }
+            for pool_slot in active_slots[:8]
+        ]
+        source_capacity = getattr(self, "nano_d2h_source_token_capacity", 0)
+        host_num_blocks = getattr(self, "nano_d2h_host_num_blocks", 0)
+        source_ranges = []
+        destination_ranges = []
+        source_over_48_bits = []
+        destination_over_48_bits = []
+        address_limit = 1 << 48
+        for layer_id, (source_k, source_v, destination_k, destination_v) in enumerate(
+            zip(self.addr_k_bases, self.addr_v_bases, self.gvas_k_bases, self.gvas_v_bases)
+        ):
+            source_k_end = source_k + source_capacity * self.token_size_bytes_k
+            source_v_end = source_v + source_capacity * self.token_size_bytes_v
+            destination_k_end = destination_k + host_num_blocks * self.block_size * self.token_size_bytes_k
+            destination_v_end = destination_v + host_num_blocks * self.block_size * self.token_size_bytes_v
+            source_ranges.append(
+                (
+                    layer_id,
+                    f"{source_k:#x}..{source_k_end:#x}",
+                    f"{source_v:#x}..{source_v_end:#x}",
+                )
+            )
+            destination_ranges.append(
+                (
+                    layer_id,
+                    f"{destination_k:#x}..{destination_k_end:#x}",
+                    f"{destination_v:#x}..{destination_v_end:#x}",
+                )
+            )
+            if min(source_k, source_v) < 0 or max(source_k_end, source_v_end) > address_limit:
+                source_over_48_bits.append(layer_id)
+            if min(destination_k, destination_v) < 0 or max(destination_k_end, destination_v_end) > address_limit:
+                destination_over_48_bits.append(layer_id)
+
+        def sample_ranges(ranges):
+            return ranges if len(ranges) <= 6 else ranges[:3] + [("...", "...", "...")] + ranges[-3:]
+
+        return (
+            f"epoch={self.nano_d2h_inflight_batch_epoch}, "
+            f"host_group={getattr(self, 'nano_host_kv_cache_group_id', 'unknown')}, "
+            f"host_num_blocks={host_num_blocks}, source_token_capacity={source_capacity}, "
+            f"active_count={active_slots.size}, entries={entries}, "
+            f"source_ranges={sample_ranges(source_ranges)}, "
+            f"destination_ranges={sample_ranges(destination_ranges)}, "
+            f"source_over_48_bits={source_over_48_bits}, "
+            f"destination_over_48_bits={destination_over_48_bits}"
+        )
 
     @staticmethod
     def _as_cache_tuple(cache_or_caches) -> tuple[torch.Tensor, ...]:
@@ -1211,6 +1341,27 @@ class SparseKVOffloadManager:
             )
         self.token_size_bytes_k = kv_head_num * head_dim_k * dtype.itemsize
         self.token_size_bytes_v = kv_head_num * head_dim_v * dtype.itemsize
+        source_token_capacities = {
+            tensor.numel() * tensor.element_size() // token_bytes
+            for tensors, token_bytes in (
+                (self.topk_buffers_k, self.token_size_bytes_k),
+                (self.topk_buffers_v, self.token_size_bytes_v),
+            )
+            for tensor in tensors
+        }
+        if len(source_token_capacities) != 1:
+            raise RuntimeError(
+                f"Nano D2H resident K/V buffers have inconsistent token capacities: {sorted(source_token_capacities)}"
+            )
+        self.nano_d2h_source_token_capacity = next(iter(source_token_capacities))
+        if self.tp_rank == 0:
+            host_block_capacities = {int(tensor.shape[0]) for tensor in (*self.k_caches_cpu, *self.v_caches_cpu)}
+            if host_block_capacities != {self.nano_d2h_host_num_blocks}:
+                raise RuntimeError(
+                    "Nano D2H Host K/V block capacity does not match kv_cache_config: "
+                    f"actual={sorted(host_block_capacities)}, "
+                    f"configured={self.nano_d2h_host_num_blocks}"
+                )
         if self.topk_buffer_size % self.block_size != 0:
             raise ValueError(
                 "Sparse KV offload topk_buffer_size must be divisible by "
