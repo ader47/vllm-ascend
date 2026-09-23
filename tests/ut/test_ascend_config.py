@@ -739,7 +739,10 @@ class TestSparseKVOffloadConfig(TestBase):
                 decode_context_parallel_size=1,
                 pipeline_parallel_size=1,
             ),
-            kv_transfer_config=SimpleNamespace(is_kv_consumer=True),
+            kv_transfer_config=SimpleNamespace(
+                is_kv_consumer=True,
+                kv_connector="SfaRemoteD2HConnector",
+            ),
             cache_config=SimpleNamespace(block_size=block_size),
             use_v2_model_runner=False,
             speculative_config=speculative_config,
@@ -790,6 +793,46 @@ class TestSparseKVOffloadConfig(TestBase):
     def test_nano_allows_plain_decode(self):
         config = SparseKVOffloadConfig.from_additional_config(
             self._nano_vllm_config(speculative=False),
+            {
+                "enabled": True,
+                "fused_op_type": "nano",
+                "topk_buffer_size": 8192,
+            },
+        )
+
+        self.assertTrue(config.use_nano)
+
+    def test_nano_requires_delayed_free_lifecycle_connector(self):
+        vllm_config = self._nano_vllm_config()
+        vllm_config.kv_transfer_config.kv_connector = "OtherConnector"
+
+        with self.assertRaisesRegex(ValueError, "requires SfaRemoteD2HConnector"):
+            SparseKVOffloadConfig.from_additional_config(
+                vllm_config,
+                {
+                    "enabled": True,
+                    "fused_op_type": "nano",
+                    "topk_buffer_size": 8192,
+                },
+            )
+
+    def test_nano_accepts_lifecycle_connector_inside_multi_connector(self):
+        vllm_config = self._nano_vllm_config()
+        vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector="MultiConnector",
+            kv_role="kv_consumer",
+            kv_connector_extra_config={
+                "connectors": [
+                    {
+                        "kv_connector": "SfaRemoteD2HConnector",
+                        "kv_role": "kv_consumer",
+                    }
+                ]
+            },
+        )
+
+        config = SparseKVOffloadConfig.from_additional_config(
+            vllm_config,
             {
                 "enabled": True,
                 "fused_op_type": "nano",

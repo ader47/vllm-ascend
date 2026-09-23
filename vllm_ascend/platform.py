@@ -911,11 +911,16 @@ def _disable_nano_pd_decode_prefix_caching(vllm_config: VllmConfig, ascend_confi
     """Disable Nano D-local sharing using the validated offload configuration."""
     sparse_config = ascend_config.sparse_kv_offload_config
     transfer_config = vllm_config.kv_transfer_config
+    has_connector = getattr(transfer_config, "has_connector", None)
+    has_sfa_remote_d2h = transfer_config is not None and (
+        has_connector("SfaRemoteD2HConnector")
+        if callable(has_connector)
+        else transfer_config.kv_connector == "SfaRemoteD2HConnector"
+    )
     if (
         not sparse_config.enabled
         or not sparse_config.use_nano
-        or transfer_config is None
-        or transfer_config.kv_connector != "SfaRemoteD2HConnector"
+        or not has_sfa_remote_d2h
         or transfer_config.kv_role != "kv_consumer"
         or not vllm_config.cache_config.enable_prefix_caching
     ):

@@ -1,7 +1,7 @@
 """Regression tests for SFA KV-offload attention metadata."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -304,14 +304,97 @@ def test_nano_prefix_advances_only_after_published_completion():
 
     before_completion = _populate_nano_metadata(builder, common)
     assert before_completion.nano_prefix_lens.tolist() == [base]
-    assert before_completion.nano_tail_lengths.tolist() == [[128, 0]]
     assert before_completion.nano_logical_lens.tolist() == [base + 129]
+    assert not hasattr(before_completion, "nano_copy_src_offsets")
 
     common.req_topk_buffer_stable_prefixes.fill_(base + 128)
     after_completion = _populate_nano_metadata(builder, common)
     assert after_completion.nano_prefix_lens.tolist() == [base + 128]
-    assert after_completion.nano_tail_lengths.tolist() == [[0, 0]]
     assert after_completion.nano_logical_lens.tolist() == [base + 1]
+
+
+def test_nano_decode_uses_fused_resident_tail_write_without_per_token_d2h():
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    k_nope = torch.tensor([[[[1.0, 2.0]]], [[[3.0, 4.0]]]])
+    k_pe = torch.tensor([[[[5.0]]], [[[6.0]]]])
+    impl._is_decode_only = lambda _metadata: True
+    impl._compute_kv_only = MagicMock()
+    impl._offload_layer_name = lambda: "layer"
+    impl._cpu_cache_pair = MagicMock()
+    impl.num_kv_heads = 1
+    impl.kv_lora_rank = 2
+    impl.qk_rope_head_dim = 1
+    impl.block_size = 2
+    impl.kv_a_layernorm = SimpleNamespace(
+        weight=torch.ones(2),
+        variance_epsilon=1e-5,
+    )
+    manager = MagicMock()
+    manager._get_offload_layer_id.return_value = 0
+    resident_k = torch.zeros((2, 4, 1, 2))
+    resident_v = torch.zeros((2, 4, 1, 1))
+    manager.topk_buffers_k = [resident_k]
+    manager.topk_buffers_v = [resident_v]
+    metadata = SimpleNamespace(
+        nano_enabled=True,
+        nano_device_slots=torch.tensor([2, 5]),
+    )
+
+    with (
+        patch(MODULE + ".get_sparse_kv_offload_manager", return_value=manager),
+        patch(
+            MODULE + ".torch_npu.npu_kv_rmsnorm_rope_cache",
+            return_value=(resident_v.view(-1, 2, 1, 1), resident_k.view(-1, 2, 1, 2), k_pe, k_nope),
+        ) as fused_write,
+    ):
+        result = impl.exec_kv(
+            torch.zeros((2, 3)),
+            torch.zeros((2, 1)),
+            torch.zeros((2, 1)),
+            (),
+            torch.tensor([10, 11]),
+            metadata,
+        )
+
+    assert result[0] is k_pe
+    assert result[1] is k_nope
+    fused_write.assert_called_once()
+    args = fused_write.call_args.args
+    assert args[5].shape == (4, 2, 1, 1)
+    assert args[6].shape == (4, 2, 1, 2)
+    assert args[5].data_ptr() == resident_v.data_ptr()
+    assert args[6].data_ptr() == resident_k.data_ptr()
+    torch.testing.assert_close(args[4], metadata.nano_device_slots)
+    assert fused_write.call_args.kwargs["is_output_kv"] is True
+    impl._compute_kv_only.assert_not_called()
+    impl._cpu_cache_pair.assert_not_called()
+    manager.offload_new_kv.assert_not_called()
+
+
+def test_non_nano_decode_keeps_existing_per_token_offload():
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    k_nope = torch.ones((1, 1, 1, 2))
+    k_pe = torch.ones((1, 1, 1, 1))
+    impl._is_decode_only = lambda _metadata: True
+    impl._compute_kv_only = lambda *_args: (k_nope, k_pe)
+    impl._offload_layer_name = lambda: "layer"
+    impl._cpu_cache_pair = MagicMock(return_value=(torch.empty(0), torch.empty(0)))
+    impl._in_graph_runtime = lambda: False
+    manager = MagicMock()
+    slots = torch.tensor([10])
+
+    with patch(MODULE + ".get_sparse_kv_offload_manager", return_value=manager):
+        impl.exec_kv(
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            (),
+            slots,
+            SimpleNamespace(nano_enabled=False),
+        )
+
+    manager.offload_new_kv.assert_called_once()
+    assert manager.offload_new_kv.call_args.kwargs["slot_mapping"] is slots
 
 
 def test_nano_reused_topk_passes_resident_tail_to_attention():

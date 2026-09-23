@@ -1533,8 +1533,15 @@ def test_consumer_scheduler_binds_nano_tail_at_alloc(prompt_len, tail_tokens, ta
     assert req_meta.tail_block_index == tail_block_index
     assert req_meta.kv_tokens == prompt_len
 
-    scheduler.request_finished_all_groups(request, ([1, 2], [3]))
+    delay_free, _ = scheduler.request_finished_all_groups(request, ([1, 2], [3]))
+    assert delay_free is True
+    assert scheduler._nano_slot_allocator.get("req-tail") == 0
+    release_meta = scheduler.build_connector_meta(MagicMock())
+    assert release_meta.nano_releases == {"req-tail": 0}
+
+    scheduler.update_connector_output(SimpleNamespace(finished_sending={"req-tail"}))
     assert scheduler._nano_slot_allocator.get("req-tail") is None
+    assert scheduler._nano_pending_releases == {}
 
 
 def test_consumer_worker_records_nano_slot_for_runner():
@@ -1570,6 +1577,46 @@ def test_connector_exposes_nano_slot_bindings():
     connector = SfaRemoteD2HConnector.__new__(SfaRemoteD2HConnector)
     connector.connector_worker = SimpleNamespace(nano_slots_by_req={"req-a": 2})
     assert connector.get_nano_slot_bindings() == {"req-a": 2}
+
+
+def test_consumer_worker_maps_release_before_initial_request_metadata():
+    worker = SFAPDRD2HConsumerWorker.__new__(SFAPDRD2HConsumerWorker)
+    worker.request_map = {}
+    worker._dest_blocks_by_req = {}
+    worker._cpu_blocks_by_req = {}
+    worker.nano_slots_by_req = {}
+    worker._nano_tail_by_req = {}
+
+    worker.start_load_kv(SimpleNamespace(requests=[], nano_releases={"req-cancelled": 3}))
+
+    assert worker.nano_slots_by_req == {"req-cancelled": 3}
+
+
+def test_consumer_worker_delays_nano_cleanup_until_slot_is_releasable():
+    worker = SFAPDRD2HConsumerWorker.__new__(SFAPDRD2HConsumerWorker)
+    worker.tp_rank = 0
+    worker.tp_size = 1
+    worker.request_map = {"req-tail": "req-tail"}
+    worker._dest_blocks_by_req = {"req-tail": ([1], [2])}
+    worker._cpu_blocks_by_req = {"req-tail": 1}
+    worker.nano_slots_by_req = {"req-tail": 3}
+    worker._nano_tail_by_req = {}
+    worker._pending_nano_release_req_ids = set()
+    worker._pending_done = set()
+    worker._terminal_ext_ids = set()
+    worker._invalid_block_ids = set()
+    worker._mf_read_thread = None
+    worker.offload_manager = MagicMock()
+    worker.offload_manager.nano_d2h_slot_releasable.side_effect = [False, True]
+
+    assert worker.get_finished({"req-tail"}) == (set(), set())
+    assert worker.nano_slots_by_req == {"req-tail": 3}
+    worker.offload_manager.release_nano_d2h_slots.assert_not_called()
+
+    assert worker.get_finished() == ({"req-tail"}, set())
+    worker.offload_manager.release_nano_d2h_slots.assert_called_once_with([3])
+    assert worker.nano_slots_by_req == {}
+    assert worker._pending_nano_release_req_ids == set()
 
 
 def _make_tail_read_thread(*, tp_rank: int = 0, tp_size: int = 1) -> MembPullReadThread:

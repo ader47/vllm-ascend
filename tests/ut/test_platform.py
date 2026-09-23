@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from vllm.config import set_current_vllm_config
+from vllm.config import KVTransferConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.platforms import PlatformEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -59,6 +59,31 @@ def test_nano_pd_decode_prefix_caching_policy(prefix_caching, offload_enabled, u
         _disable_nano_pd_decode_prefix_caching(config, ascend_config)
         assert config.cache_config.enable_prefix_caching == (prefix_caching and not disable)
         assert warning.call_count == int(prefix_caching and disable)
+
+
+def test_nano_pd_decode_prefix_caching_policy_supports_multi_connector():
+    config = SimpleNamespace(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MultiConnector",
+            kv_role="kv_consumer",
+            kv_connector_extra_config={
+                "connectors": [
+                    {
+                        "kv_connector": "SfaRemoteD2HConnector",
+                        "kv_role": "kv_consumer",
+                    }
+                ]
+            },
+        ),
+        cache_config=SimpleNamespace(enable_prefix_caching=True),
+    )
+    ascend_config = SimpleNamespace(
+        sparse_kv_offload_config=SimpleNamespace(enabled=True, use_nano=True),
+    )
+
+    _disable_nano_pd_decode_prefix_caching(config, ascend_config)
+
+    assert config.cache_config.enable_prefix_caching is False
 
 
 class TestNPUPlatform(TestBase):

@@ -81,7 +81,7 @@ def make_impl():
     return impl
 
 
-def test_device_lengths_tail_geometry_and_rejection():
+def test_device_lengths_resident_tail_layout_and_rejection():
     builder = make_builder()
     cm = common([4, 5], [10371, 8321])
     metadata = populate(builder, cm)
@@ -89,13 +89,9 @@ def test_device_lengths_tail_geometry_and_rejection():
     assert metadata.nano_prefix_lens.cpu().tolist() == [10240, 8320]
     assert metadata.nano_cache_tokens.cpu().tolist() == [8192, 8192]
     assert metadata.nano_logical_lens.cpu().tolist() == [8323, 8193]
-    # Current query KV is scattered locally: descriptors still describe prior KV
-    # so prefix rollback can eager-restore. PD decode skips the graph H2D.
-    assert metadata.nano_skip_tail_restore is True
-    assert metadata.nano_tail_lengths.cpu().tolist() == [[127, 0], [0, 0]]
-    assert metadata.nano_copy_count.item() == 8
-    assert metadata.nano_copy_lengths.cpu().tolist() == [127 * 1024, 0, 0, 0, 127 * 128, 0, 0, 0]
-    assert metadata.nano_tail_src.cpu().tolist() == [[10240, 10368], [24704, 24832]]
+    # Nano decode keeps the two rotating tail pages resident. Tail H2D copy
+    # descriptors are intentionally absent from captured metadata.
+    assert not hasattr(metadata, "nano_copy_src_offsets")
     assert metadata.nano_hbm_block_table[:, 64:66].cpu().tolist() == [[130, 131], [65, 64]]
     stride = 8192 + 256
     assert metadata.nano_device_slots.cpu().tolist() == [stride + 8192 + pos % 256 for pos in range(10367, 10371)] + [
@@ -137,7 +133,7 @@ def test_inactive_capture_becomes_active_on_graph_replay():
     # Private pools 4 and 5; positive cache budgets avoid copy-SFA's cold-fill predicate.
     assert metadata.nano_pool_entries.cpu().tolist() == [4, 5]
     assert metadata.nano_cache_tokens.cpu().tolist() == [2048, 2048]
-    assert metadata.nano_tail_lengths.count_nonzero().item() == 0
+    assert not hasattr(metadata, "nano_tail_lengths")
     assert metadata.nano_device_slots.min().item() >= 4 * (8192 + 256)
     for _ in range(3):
         impl._prepare_nano_lim_state(metadata)

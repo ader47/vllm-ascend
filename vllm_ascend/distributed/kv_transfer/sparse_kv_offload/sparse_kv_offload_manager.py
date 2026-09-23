@@ -903,6 +903,39 @@ class SparseKVOffloadManager:
         self.nano_d2h_inflight_destination_slots_cpu[slots] = 0
         self.nano_d2h_inflight_target_prefixes_cpu[slots] = 0
 
+    def nano_d2h_slot_releasable(self, pool_slot: int) -> bool:
+        """Return whether terminal cleanup may release one request row."""
+        slot = int(pool_slot)
+        if slot < 0 or slot >= self.nano_d2h_capacity:
+            raise ValueError("Nano D2H pool slot is outside the configured capacity")
+        return not bool(self.nano_d2h_inflight_active_cpu[slot])
+
+    def release_nano_d2h_slots(self, pool_slots: list[int]) -> None:
+        """Invalidate terminal request rows after their last D2H retires."""
+        slots = np.asarray(pool_slots, dtype=np.int64)
+        if slots.ndim != 1:
+            raise ValueError("Nano D2H release slots must be one-dimensional")
+        if slots.size == 0:
+            return
+        if np.any((slots < 0) | (slots >= self.nano_d2h_capacity)):
+            raise ValueError("Nano D2H pool slot is outside the configured capacity")
+        if np.unique(slots).size != slots.size:
+            raise ValueError("Nano D2H release slots must be unique")
+        if np.any(self.nano_d2h_inflight_active_cpu[slots]):
+            raise RuntimeError("Nano D2H pool slot cannot be released while inflight")
+
+        self.nano_d2h_owner_generations_cpu[slots] = NANO_D2H_INVALID_GENERATION
+        self.nano_d2h_stable_prefixes_cpu[slots] = 0
+        # The inflight fields share the pinned request-plan staging tensor.
+        # A batch for other requests may currently be copying that whole
+        # tensor to the D2H stream, so do not mutate it from terminal cleanup.
+        # The next planner clears every field before constructing a new plan.
+        if not self.nano_d2h_inflight_batch_active:
+            self.nano_d2h_inflight_generations_cpu[slots] = NANO_D2H_INVALID_GENERATION
+            self.nano_d2h_inflight_source_slots_cpu[slots] = 0
+            self.nano_d2h_inflight_destination_slots_cpu[slots] = 0
+            self.nano_d2h_inflight_target_prefixes_cpu[slots] = 0
+
     def plan_nano_d2h_requests(
         self,
         num_computed_tokens: np.ndarray,
@@ -1279,7 +1312,6 @@ class SparseKVOffloadManager:
                 cpu_v_shape,
             )
         if self.use_nano:
-            self._bind_nano_copy_bases()
             self._allocate_nano_d2h_descriptor_state(device)
             self._allocate_nano_d2h_execution_state()
 
@@ -1494,54 +1526,6 @@ class SparseKVOffloadManager:
         self.lru_miss_position_workspace_ptr = self.lru_miss_position_workspace.data_ptr()
         self.lru_epochs_ptr = self.lru_epochs.data_ptr()
         self.lru_physical_row_workspace_ptr = self.lru_physical_row_workspace.data_ptr()
-
-    def _bind_nano_copy_bases(self) -> None:
-        """Pin host/device row bases used by eager prefix-rollback tail restore."""
-        if not self.k_caches_cpu or not self.topk_buffers_k:
-            raise RuntimeError("nano tail restore requires host and device KV bases")
-        device = self.topk_buffers_k[0].device
-        descriptor_rows = 4 * nano_pool_capacity(self.max_num_reqs)
-        self.nano_copy_src = torch.empty(descriptor_rows, dtype=torch.int64, device=device)
-        self.nano_copy_dst = torch.empty_like(self.nano_copy_src)
-        self.nano_host_bases = []
-        self.nano_device_bases = []
-        for layer_id in range(len(self.topk_buffers_k)):
-            self.nano_host_bases.append(
-                torch.tensor(
-                    [self.k_caches_cpu[layer_id].data_ptr(), self.v_caches_cpu[layer_id].data_ptr()],
-                    dtype=torch.int64,
-                    device=device,
-                ).view(2, 1)
-            )
-            self.nano_device_bases.append(
-                torch.tensor(
-                    [self.topk_buffers_k[layer_id].data_ptr(), self.topk_buffers_v[layer_id].data_ptr()],
-                    dtype=torch.int64,
-                    device=device,
-                ).view(2, 1)
-            )
-
-    def restore_nano_tails(self, metadata) -> None:
-        """Copy the current tail descriptors for every layer. Used on prefix rollback."""
-        src_off = getattr(metadata, "nano_copy_src_offsets", None)
-        dst_off = getattr(metadata, "nano_copy_dst_offsets", None)
-        lengths = getattr(metadata, "nano_copy_lengths", None)
-        count = getattr(metadata, "nano_copy_count", None)
-        if src_off is None or dst_off is None or lengths is None or count is None:
-            return
-        if not getattr(self, "nano_host_bases", None):
-            raise RuntimeError("nano KV base addresses must be bound before tail restore")
-        n = src_off.numel()
-        for host_bases, device_bases in zip(self.nano_host_bases, self.nano_device_bases):
-            torch.add(src_off.view(2, -1), host_bases, out=self.nano_copy_src[:n].view(2, -1))
-            torch.add(dst_off.view(2, -1), device_bases, out=self.nano_copy_dst[:n].view(2, -1))
-            self.copy_nano_kv(self.nano_copy_src[:n], self.nano_copy_dst[:n], lengths, count)
-
-    def copy_nano_kv(self, sources, destinations, lengths, count) -> None:
-        """Enqueue bounded descriptor copies on the current compute stream."""
-        result = offload.sparse_copy(sources, destinations, lengths, count, sources.device)
-        if result not in (None, 0):
-            raise RuntimeError(f"memfabric nano tail H2D failed with result={result}")
 
     def offload_new_kv(
         self,

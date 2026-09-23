@@ -167,6 +167,10 @@ class NanoTailDest:
 class SfaPDConsumerMetadata(KVConnectorMetadata):
     def __init__(self) -> None:
         self.requests: list[SfaPDConsumerReqMeta] = []
+        # Finished Nano requests whose request-owned HBM row and vLLM Host
+        # blocks must remain reserved until the worker acknowledges that no
+        # delayed D2H still references them.
+        self.nano_releases: dict[str, int] = {}
 
     def add_request(
         self,
@@ -189,6 +193,9 @@ class SfaPDConsumerMetadata(KVConnectorMetadata):
                 kv_tokens=kv_tokens,
             )
         )
+
+    def add_nano_release(self, request_id: str, pool_slot: int) -> None:
+        self.nano_releases[request_id] = pool_slot
 
 
 @dataclass

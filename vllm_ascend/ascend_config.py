@@ -1459,6 +1459,17 @@ class SparseKVOffloadConfig:
                     "nano requires decode-only offload without keep_device_kv_cache; "
                     "prefill/mixed fallback cannot preserve resident partial tails"
                 )
+            kv_transfer_config = vllm_config.kv_transfer_config
+            has_connector = getattr(kv_transfer_config, "has_connector", None)
+            has_nano_lifecycle = (
+                has_connector("SfaRemoteD2HConnector")
+                if callable(has_connector)
+                else getattr(kv_transfer_config, "kv_connector", None) == "SfaRemoteD2HConnector"
+            )
+            if not has_nano_lifecycle:
+                raise ValueError(
+                    "nano serving currently requires SfaRemoteD2HConnector to provide delayed-free lifecycle protection"
+                )
             speculative_config = vllm_config.speculative_config
             width = 1 + (speculative_config.num_speculative_tokens if speculative_config else 0)
             if vllm_config.cache_config.block_size != 128:

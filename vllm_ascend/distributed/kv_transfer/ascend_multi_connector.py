@@ -73,6 +73,22 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             if callable(wait):
                 wait()
 
+    def get_nano_slot_bindings(self) -> dict[str, int]:
+        """Expose request-owned Nano rows through MultiConnector."""
+        bindings: dict[str, int] = {}
+        for connector in self._connectors:
+            getter = getattr(connector, "get_nano_slot_bindings", None)
+            if not callable(getter):
+                continue
+            for req_id, pool_slot in getter().items():
+                previous = bindings.setdefault(req_id, pool_slot)
+                if previous != pool_slot:
+                    raise RuntimeError(
+                        "MultiConnector children returned conflicting Nano "
+                        f"slots for request {req_id}: {previous} and {pool_slot}"
+                    )
+        return bindings
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         if getattr(self, "_external_slot_release_sink_configured", False):
             # AscendStore owns the layer-entry reuse wait after accepting the

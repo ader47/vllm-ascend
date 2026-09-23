@@ -279,6 +279,10 @@ class SFAPDRD2HScheduler:
         self._request_trackers: dict[str, tuple[list[int], list[int]]] = {}
         # req_id -> (pool_slot, tail_tokens, tail_block_index, kv_tokens)
         self._nano_bindings: dict[str, tuple[int, int, int, int]] = {}
+        # Terminal requests keep both their vLLM blocks and request-owned Nano
+        # row until every worker has retired any D2H that can still reference
+        # the row. Entries are released by update_connector_output().
+        self._nano_pending_releases: dict[str, int] = {}
         self.main_block_size = self.block_size[self.main_group_idx]
         self._nano_slot_allocator = self._try_create_nano_slot_allocator(vllm_config)
         # req_ids awaiting their first build_connector_meta seed (so the worker
@@ -405,8 +409,21 @@ class SFAPDRD2HScheduler:
                     tail_block_index=tail_block_index,
                     kv_tokens=kv_tokens,
                 )
+        for req_id, pool_slot in getattr(self, "_nano_pending_releases", {}).items():
+            meta.add_nano_release(req_id, pool_slot)
         self._reqs_need_recv.clear()
         return meta
+
+    def update_connector_output(self, connector_output) -> None:
+        for req_id in connector_output.finished_sending or ():
+            pending_releases = getattr(self, "_nano_pending_releases", {})
+            if req_id not in pending_releases:
+                continue
+            pending_releases.pop(req_id)
+            self._nano_bindings.pop(req_id, None)
+            allocator = getattr(self, "_nano_slot_allocator", None)
+            if allocator is not None:
+                allocator.release(req_id)
 
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
         return self.request_finished_all_groups(request, (block_ids,))
@@ -419,12 +436,16 @@ class SFAPDRD2HScheduler:
         # vLLM owns the block lifecycle; the connector only drops its lookup.
         self._request_trackers.pop(request.request_id, None)
         self._reqs_need_recv.discard(request.request_id)
-        nano_bindings = getattr(self, "_nano_bindings", None)
-        if nano_bindings is not None:
-            nano_bindings.pop(request.request_id, None)
         allocator = getattr(self, "_nano_slot_allocator", None)
-        if allocator is not None:
-            allocator.release(request.request_id)
+        binding = getattr(self, "_nano_bindings", {}).get(request.request_id)
+        delay_free = allocator is not None and binding is not None
+        if delay_free:
+            pending_releases = getattr(self, "_nano_pending_releases", None)
+            if pending_releases is None:
+                pending_releases = self._nano_pending_releases = {}
+            pending_releases[request.request_id] = binding[0]
+        else:
+            getattr(self, "_nano_bindings", {}).pop(request.request_id, None)
         with self._metaserver_lock:
             self._cancelled_metaserver_requests.add(request.request_id)
             future = self._metaserver_futures.pop(request.request_id, None)
@@ -433,7 +454,7 @@ class SFAPDRD2HScheduler:
             future.cancel()
         if timer is not None:
             timer.cancel()
-        return False, None
+        return delay_free, None
 
     # ------------------------------------------------------------------
     # helpers

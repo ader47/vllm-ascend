@@ -132,6 +132,12 @@ class SfaRemoteD2HConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.build_connector_meta(scheduler_output)
 
+    def update_connector_output(self, connector_output) -> None:
+        assert self.connector_scheduler is not None
+        update = getattr(self.connector_scheduler, "update_connector_output", None)
+        if callable(update):
+            update(connector_output)
+
     def request_finished(self, request: "Request", block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)

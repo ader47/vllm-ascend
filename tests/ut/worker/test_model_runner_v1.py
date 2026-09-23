@@ -2150,6 +2150,74 @@ class TestCorrectOptimisticSeqLensCpu(unittest.TestCase):
             runner._correct_optimistic_seq_lens_cpu(1)
 
 
+class TestDelayedNanoD2HRunnerHooks(unittest.TestCase):
+    @staticmethod
+    def _build_runner(plan_count=1):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.sparse_kv_offload_enabled = True
+        runner.sparse_kv_offload_config = SimpleNamespace(use_nano=True)
+        manager = MagicMock()
+        manager.plan_nano_d2h_requests.return_value = plan_count
+        manager.retire_nano_d2h.return_value = 2
+        manager.record_nano_d2h_source_ready.return_value = True
+        runner.sparse_kv_offload_manager = manager
+        runner._offload_pool_slots = SimpleNamespace(np=np.array([3, 1], dtype=np.int32))
+        runner._offload_pool_generations = SimpleNamespace(np=np.array([7, 9], dtype=np.int64))
+        block_table = np.array([[10, 11], [20, 21]], dtype=np.int32)
+        runner.input_batch = SimpleNamespace(
+            num_computed_tokens_cpu=np.array([128, 255], dtype=np.int64),
+            block_table=[SimpleNamespace(get_numpy_array=lambda: block_table)],
+        )
+        return runner, manager, block_table
+
+    def test_plan_uses_cpu_request_state_and_launches_only_nonempty_batch(self):
+        runner, manager, block_table = self._build_runner()
+
+        self.assertEqual(runner._plan_and_launch_nano_d2h(2), 1)
+
+        args = manager.plan_nano_d2h_requests.call_args.args
+        np.testing.assert_array_equal(args[0], np.array([128, 255]))
+        np.testing.assert_array_equal(args[1], np.array([3, 1]))
+        np.testing.assert_array_equal(args[2], np.array([7, 9]))
+        np.testing.assert_array_equal(args[3], block_table)
+        np.testing.assert_array_equal(args[4], np.ones(2, dtype=np.bool_))
+        manager.launch_nano_d2h.assert_called_once_with()
+
+        runner, manager, _ = self._build_runner(plan_count=0)
+        self.assertEqual(runner._plan_and_launch_nano_d2h(2), 0)
+        manager.launch_nano_d2h.assert_not_called()
+
+    def test_retire_and_source_ready_delegate_to_manager(self):
+        runner, manager, _ = self._build_runner()
+
+        self.assertEqual(runner._retire_nano_d2h(), 2)
+        self.assertTrue(runner._record_nano_d2h_source_ready())
+        manager.retire_nano_d2h.assert_called_once_with()
+        manager.record_nano_d2h_source_ready.assert_called_once_with()
+
+    def test_disabled_hooks_are_noops(self):
+        runner, manager, _ = self._build_runner()
+        runner.sparse_kv_offload_enabled = False
+
+        self.assertEqual(runner._retire_nano_d2h(), 0)
+        self.assertEqual(runner._plan_and_launch_nano_d2h(2), 0)
+        self.assertFalse(runner._record_nano_d2h_source_ready())
+        runner._reject_unsupported_nano_preemptions({"req-preempted"})
+        manager.assert_not_called()
+
+    def test_preemption_is_rejected_after_delayed_d2h_is_retired(self):
+        runner, manager, _ = self._build_runner()
+
+        runner._retire_nano_d2h()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "does not support scheduler preemption yet.*req-a, req-b",
+        ):
+            runner._reject_unsupported_nano_preemptions({"req-b", "req-a"})
+
+        manager.retire_nano_d2h.assert_called_once_with()
+
+
 class TestKVPPExecute(unittest.TestCase):
     def test_history_gate_uses_only_actual_requests(self):
         from vllm_ascend.worker import model_runner_v1 as module

@@ -25,7 +25,8 @@ fix(pd): join compute stream once after D2D recv
 - CPU 只生成固定容量的请求级复制计划；全层 K/V 描述符在专用 D2H stream 上展开。
 - 不增加 Python 后台线程；NPU stream 和 event 负责异步提交、跨流依赖及完成顺序。
 - Target/MTP graph 不增加卸载、描述符或同步操作；融合 KV 写入替换原有分离写入链路。
-- 支持 ACL graph、graph padding、请求槽位复用、PD、preemption 和 delayed-free。
+- 支持 ACL graph、graph padding、请求槽位复用、PD 和 terminal delayed-free。
+- 第一版明确拒绝 scheduler preemption；恢复 resident tail 需要独立的重算/恢复协议。
 - 第一版只保留一批 INFLIGHT D2H，不增加 PENDING 队列、第三个 tail page 或后台线程。
 
 ## 为什么从 `9b5c8fbee3` 开始
@@ -98,7 +99,8 @@ D2H 与本层 Attention 和后续层计算重叠
    描述符并启动异步 D2H。
 5. D2H stream 等待上一轮 compute stream 记录的 `source_ready`。
 6. 下一轮边界等待上一批 D2H，完成跨 TP 通知后推进 `stable_prefix`。
-7. 请求结束、PD 消费、preemption 和 slot 复用接入 delayed-free/flush 协议。
+7. 请求结束和 slot 复用接入 delayed-free 协议；scheduler preemption 在恢复协议完成前
+   fail fast。
 8. 删除逐层 Host→HBM tail restore、旧 graph join 和旧逐层 TP completion broadcast。
 
 不能只删除逐 token D2H 而尚未接通满块 D2H，否则 Host KV 会缺失；也不能只切换
@@ -477,7 +479,8 @@ restore、卸载 event wait 或 completion 更新。
 
 - 新 generation 第一次进入 Nano 时，从已确认 Host-ready 的边界做一次初始化恢复；
 - PD connector 明确预载的 tail；
-- preemption 恢复时，由 lifecycle 协议确认 Host 数据完整后恢复。
+- 后续若支持 preemption，必须由 lifecycle 协议确认 Host 数据完整后恢复；第一版不走
+  这条路径。
 
 同一 generation 的 resident tail 不恢复。tail residency/restore mask 在共享 indexer
 owner 处每请求更新一次，后续层复用，不能在每层产生 `ScatterElements`。
@@ -485,40 +488,44 @@ owner 处每请求更新一次，后续层复用，不能在每层产生 `Scatte
 同一 generation 进入 Nano 后，不允许静默切换到依赖 Host partial tail 的非 Nano
 fallback。图不适用时只能切换到具有相同 tail residency 语义的 eager Nano，或明确拒绝。
 
-## 请求结束、抢占与 delayed-free
+## 请求结束与 delayed-free
 
 正常请求如果在下一轮仍在 batch 中，可以直接根据 `num_computed_tokens` 启动 D2H。
-特殊情况是请求在 A 写满的同一轮结束或被抢占：它可能不会出现在下一轮正常 batch，
-因此不能依赖热路径 planner 找到它。
+特殊情况是请求在 A 写满的同一轮结束：它可能不会出现在下一轮正常 batch，因此不能
+依赖热路径 planner 找到它。
 
-这类冷路径使用相同数据源直接处理，而不是重新引入 PENDING 状态：
+结束请求不再有 Host 消费者，因此不发布尚未进入热路径计划的新满块，也不重新引入
+PENDING 状态：
 
 ```text
-finished/preempted request
-    ├─ Host 不需要该新满块
-    │      └─ 等待必要的旧 INFLIGHT 后直接释放，不启动新 D2H
-    └─ Host/PD 后续需要该满块
-           ├─ 根据最终 num_computed_tokens 构造一次性 flush 描述符
-           ├─ 等待 source_ready
-           ├─ 启动并等待 D2H
-           └─ 完成后允许释放
+finished request
+    └─ 等待必要的旧 INFLIGHT 后直接释放，不启动新 D2H
 ```
+
+Decode→其他消费者的再次 handoff 或显式 Host 持久化不属于第一版；增加这类消费者时，
+必须另行实现 terminal flush，不能复用上述取消语义。
 
 connector 必须接入 `SupportsHMA.request_finished_all_groups()` delayed-free 协议：
 
 1. 仍有 Nano binding 的结束请求保守返回 `True`。
 2. 回执前保留 HBM source、Host destination、Nano slot、binding 和 generation。
-3. worker 完成取消/flush/等待后返回 `finished_sending(request_id)`。
+3. worker 确认该 slot 不再被 INFLIGHT 引用后返回 `finished_sending(request_id)`。
 4. scheduler 收到回执后才释放 block 和 slot。
 
-终止通知必须在 `_update_states()` 或其他可能重绑 block/slot 的操作之前被 worker 捕获，
-但此时只标记请求进入 cleanup 并保留资源。随后先由统一的 `retire_nano_d2h()` 消费上一
-批全局 INFLIGHT，再对仍未 Host-ready 的终止请求执行 cancel/flush；冷路径不能私自
-消费同一批 INFLIGHT 后又让正常 retire 重复处理。
+scheduler 在释放 block/slot 前把终止请求标为 delayed-free，并持续下发 release metadata。
+下一次真实 execute 先由统一的 `retire_nano_d2h()` 消费上一批全局 INFLIGHT；随后 worker
+确认 slot 可释放并回执。冷路径不能私自消费同一批 INFLIGHT 后又让正常 retire 重复处理。
 
-请求暂时未被调度不等于结束或抢占，不能因此释放 Nano slot。preemption/rebind 必须在
-任何新请求写入该 slot 前等待旧 INFLIGHT；恢复时分配新 generation，并重新初始化
+请求暂时未被调度不等于结束，不能因此释放 Nano slot。slot rebind 必须在任何新请求
+写入该 slot 前等待旧 INFLIGHT；新请求分配新 generation，并重新初始化
 `stable_prefix`。旧 completion 即使迟到，也只能完成资源回收，不能推进新 generation。
+
+第一版不支持 scheduler preemption。普通 vLLM preemption 会释放请求 block、把
+`num_computed_tokens` 清零并在恢复时本地重算；这与保留旧 resident tail 和
+`stable_prefix` 的 Nano 状态不兼容。runner 必须先 retire 已提交 D2H，再在
+`_update_states()` 之前检测 `preempted_req_ids` 并明确失败，不能继续使用旧 binding。
+完整支持需要同时定义 block 保留、输出 token 重算、tail 重建和新 generation 的协议，
+不在第一版范围内。
 
 第一版 delayed Nano 只在存在 delayed-free lifecycle provider 时启用。没有 provider
 时必须明确拒绝，不能让 scheduler 立即复用 DMA 正在访问的资源。
@@ -529,7 +536,7 @@ connector 必须接入 `SupportsHMA.request_finished_all_groups()` delayed-free 
 消费者必须依赖 `stable_prefix` 或 D2H completion：
 
 - Attention/LIM 只把 `stable_prefix` 之前的数据当作 Host-backed history；
-- 请求结束、PD handoff 或显式 Host 消费先执行 flush/等待；
+- 请求结束先完成 delayed-free；第一版不提供 Decode→其他 Host 消费者的 handoff；
 - prefix cache 只有在能够等待 Host-ready 时才能发布新块。
 
 Nano PD Decode 保持禁用本地 prefix cache，直到 scheduler 能按 Host-ready 状态约束
@@ -550,29 +557,29 @@ def plan_and_launch_nano_d2h(num_computed_tokens, request_metadata):
 def record_nano_source_ready():
     """在本轮最后一个 KV writer 之后记录 source-ready。"""
 
-def flush_or_cancel_nano_requests(finished_or_preempted):
-    """在冷路径保护资源并完成 delayed-free。"""
+def release_finished_nano_requests(finished):
+    """等待旧 INFLIGHT 不再引用 slot 后完成 terminal delayed-free。"""
 ```
 
 每个真实 outer iteration 的顺序为：
 
 ```text
-0. 捕获 finished/preempted，标记 cleanup 并阻止相关 block/slot 复用
+0. scheduler 对 finished 请求保持 delayed-free；发现 preempted 时进入明确失败路径
 1. 统一 retire 上一批 INFLIGHT；仅有真实批次时跨 TP 推进 stable_prefix
-2. 对终止请求执行剩余 cancel/flush，完成后发送 delayed-free 回执
+2. worker 对不再被 INFLIGHT 引用的 finished slot 回执，scheduler 才释放资源
 3. 执行现有 input preparation，得到准确 num_computed_tokens
-4. CPU planner 检查满块、冻结请求级计划并向 D2H stream 提交本轮 INFLIGHT
-5. 使用本轮 stable_prefix 构造 metadata
+4. 使用 retire 后、本轮固定的 stable_prefix 构造 metadata
+5. CPU planner 检查满块、冻结请求级计划并向 D2H stream 提交本轮 INFLIGHT
 6. replay Target/MTP graph
 7. 在最后一个 KV writer 后 record source_ready
 ```
 
-步骤 4 只在 D2H stream 排队，不等待本轮复制完成，因此可与步骤 6 重叠。步骤 1 是
+步骤 5 只在 D2H stream 排队，不等待本轮复制完成，因此可与步骤 6 重叠。步骤 1 是
 正常热路径唯一等待上一轮满块 D2H 的位置；如果复制已经被上一轮模型图掩盖，它立即
 返回，否则只等待剩余时间。没有 active INFLIGHT 时步骤 1 不执行 D2H event wait。
 
-无 forward invocation 如果存在 INFLIGHT 或 finished/preempted cleanup，仍需执行相应
-retire/flush；否则可以直接 no-op。它不启动普通 planner，也不记录 `source_ready`。
+无 forward invocation 如果存在 INFLIGHT 或 finished cleanup，仍需执行相应
+retire/release；否则可以直接 no-op。它不启动普通 planner，也不记录 `source_ready`。
 capture/dummy invocation 不属于真实 outer iteration。
 
 ## 安全不变量
@@ -592,7 +599,8 @@ capture/dummy invocation 不属于真实 outer iteration。
 13. 所有 TP rank 必须冻结相同批次状态，并只对真实 INFLIGHT 以一致顺序参加 completion
     collective。
 14. graph capture/dummy run 不能推进真实状态。
-15. 请求释放或 slot 复用前必须完成 delayed-free/flush。
+15. 请求释放或 slot 复用前必须完成 delayed-free；第一版遇到 scheduler preemption 必须
+    在状态复用前失败。
 16. 没有 lifecycle provider 时不能启用 delayed Nano。
 17. `num_computed_tokens - stable_prefix` 不得达到两个完整块。
 18. CPU planner 只能读取生命周期维护的 CPU metadata，不能触发每轮 NPU→CPU 读回。
@@ -618,7 +626,7 @@ capture/dummy invocation 不属于真实 outer iteration。
 - 保存 generation、stable-prefix 和单批 INFLIGHT 状态。
 - 维护 planner 所需的 CPU generation/stable-prefix 视图。
 - 预分配 pinned Host 请求级 plan、device plan 和全层 descriptor buffer。
-- 增加图外 plan/launch、retire 和 terminal flush 接口。
+- 增加图外 plan/launch、retire 和 terminal release 接口。
 - D2H stream 顺序执行 plan H2D、全层描述符展开、source-ready wait 和异步复制。
 - pool capacity 使用完整可分配容量。
 - 删除 PENDING、finalize、pending snapshot 和旧逐层 TP broadcast。
@@ -629,15 +637,14 @@ capture/dummy invocation 不属于真实 outer iteration。
 - 不在 rejection 后调用 `finalize_nano_pending_blocks()`。
 - graph 前 retire 上一批并异步 launch 新一批。
 - graph/proposal 完成后记录 source-ready。
-- 在 `_update_states()` 可能复用资源前捕获 terminal/preemption，先标记保护，再按
-  retire → cancel/flush 顺序执行 cleanup。
-- no-forward、finished 和 preempted 路径接入 cleanup。
+- 在 `_update_states()` 可能复用 worker 状态前先 retire，再拒绝当前不支持的 preemption。
+- no-forward 和 finished 路径接入 cleanup。
 - stable-prefix 更新排在跨 TP completion 之后。
 
 ### `sfa_pd_rd2h` connector scheduler/worker
 
 - 接入 delayed-free，回执前不释放 block、slot、binding 或 generation。
-- PD handoff 和 terminal Host 消费先 flush/等待。
+- terminal release 等待旧 INFLIGHT；第一版不支持 Decode→其他 Host 消费者的再次 handoff。
 - 无 lifecycle provider 或无 completion 依赖的运行中 Host consumer 明确拒绝。
 
 ### `llm_base_proposer.py`
@@ -678,8 +685,9 @@ capture/dummy invocation 不属于真实 outer iteration。
 - dummy、inactive 和 rejected rows 不产生非零复制长度。
 - MTP step 1+ 和 TopK 复用保持真实 tail 可见。
 - Host restore 不覆盖 resident/INFLIGHT tail。
-- 请求结束时按 Host 消费需要执行取消或一次性 flush。
-- INFLIGHT 请求结束/抢占后，`finished_sending` 前资源不复用。
+- 请求结束时不发布尚未计划的新满块，并等待已有 INFLIGHT。
+- INFLIGHT 请求结束后，`finished_sending` 前资源不复用。
+- scheduler preemption 在 `_update_states()` 前明确失败。
 - 暂时未调度的请求继续保留 Nano slot。
 - 暂时未调度后重新出现的满块使用最新 compute frontier，仍能安全启动 D2H。
 - 无 forward invocation 可以完成已有 INFLIGHT 和 terminal cleanup。
@@ -722,7 +730,7 @@ capture/dummy invocation 不属于真实 outer iteration。
 - `stable_prefix` 只在 D2H 完成后推进。
 - 所有 TP rank 只在 TP0 completion 之后推进相同状态。
 - TP>1 无 INFLIGHT 的轮次不增加 completion collective。
-- 请求结束、preemption、PD handoff 和资源复用没有未完成 DMA。
+- 请求结束和资源复用没有未完成 DMA；preemption 被明确拒绝而不是静默破坏状态。
 - profiling 证明 D2H 离开图内关键路径，且未引入热路径 NPU→CPU 同步。
 - profiling 证明请求级 planner 没有按层展开，也没有新增 Python 后台线程。
 - 不保留逐层 tail restore、逐层 TP completion broadcast 或每层请求级

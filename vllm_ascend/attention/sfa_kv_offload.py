@@ -155,7 +155,6 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         self.nano_stride_blocks = cfg.topk_buffer_size // 128 + 2
         self.nano_rows = torch.arange(requests, dtype=torch.int32, device=device)
         self.nano_blocks = torch.arange(self.nano_stride_blocks, dtype=torch.int32, device=device)
-        self.nano_parts = torch.arange(2, dtype=torch.int64, device=device)
         self.nano_vectors = {
             name: torch.empty((steps, requests), dtype=dtype, device=device)
             for name, dtype in (
@@ -178,17 +177,6 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         self.nano_token_positions = torch.arange(tokens, dtype=torch.int64, device=device)
         self.nano_device_slots = torch.empty((steps, tokens), dtype=torch.int64, device=device)
         self.nano_token_active = torch.empty((steps, tokens), dtype=torch.bool, device=device)
-        self.nano_tail_src = torch.empty((steps, requests, 2), dtype=torch.int64, device=device)
-        self.nano_tail_dst = torch.empty_like(self.nano_tail_src)
-        self.nano_tail_lengths = torch.empty((steps, requests, 2), dtype=torch.int32, device=device)
-        hf_config = vllm_config.model_config.hf_text_config
-        self.nano_token_bytes = torch.tensor(
-            [hf_config.kv_lora_rank * 2, hf_config.qk_rope_head_dim * 2], dtype=torch.int64, device=device
-        ).view(2, 1, 1)
-        self.nano_copy_src_offsets = torch.empty((steps, requests * 4), dtype=torch.int64, device=device)
-        self.nano_copy_dst_offsets = torch.empty_like(self.nano_copy_src_offsets)
-        self.nano_copy_lengths = torch.empty((steps, requests * 4), dtype=torch.int32, device=device)
-        self.nano_copy_count = torch.empty((steps, 1), dtype=torch.int32, device=device)
 
     def _populate_offload_metadata(
         self,
@@ -300,39 +288,6 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
                 )
             self.nano_source_block_table[draft_index, :count].copy_(source)
             metadata.nano_source_block_table = self.nano_source_block_table[draft_index, :count]
-            tail_blocks = prefix[:, None].to(torch.int64) // 128 + self.nano_parts
-            source_ids = source.gather(1, tail_blocks.clamp(0, source.shape[1] - 1)).to(torch.int64)
-            # Restore previously computed KV only. Every TP rank scatters
-            # its current query KV directly into its local tails, so it never
-            # races a read of another TP rank's current-token D2H write.
-            lengths = (seq_lens[:, None] - widths[:, None] - prefix[:, None] - self.nano_parts * 128).clamp(0, 128)
-            lengths = torch.where(active[:, None] & (tail_blocks < source.shape[1]) & (source_ids >= 0), lengths, 0)
-            self.nano_tail_src[draft_index, :count].copy_(source_ids.clamp_min(0) * 128)
-            self.nano_tail_dst[draft_index, :count].copy_(
-                safe_pools[:, None].to(torch.int64) * self.nano_stride_blocks * 128
-                + self.nano_hot_tokens
-                + tail_blocks % 2 * 128
-            )
-            self.nano_tail_lengths[draft_index, :count].copy_(lengths)
-            metadata.nano_tail_src = self.nano_tail_src[draft_index, :count]
-            metadata.nano_tail_dst = self.nano_tail_dst[draft_index, :count]
-            metadata.nano_tail_lengths = self.nano_tail_lengths[draft_index, :count]
-            descriptor_count = count * 4
-            self.nano_copy_src_offsets[draft_index, :descriptor_count].copy_(
-                (metadata.nano_tail_src[None] * self.nano_token_bytes).reshape(-1)
-            )
-            self.nano_copy_dst_offsets[draft_index, :descriptor_count].copy_(
-                (metadata.nano_tail_dst[None] * self.nano_token_bytes).reshape(-1)
-            )
-            self.nano_copy_lengths[draft_index, :descriptor_count].copy_(
-                (metadata.nano_tail_lengths[None] * self.nano_token_bytes).reshape(-1)
-            )
-            self.nano_copy_count[draft_index].fill_(descriptor_count)
-            metadata.nano_copy_src_offsets = self.nano_copy_src_offsets[draft_index, :descriptor_count]
-            metadata.nano_copy_dst_offsets = self.nano_copy_dst_offsets[draft_index, :descriptor_count]
-            metadata.nano_copy_lengths = self.nano_copy_lengths[draft_index, :descriptor_count]
-            metadata.nano_copy_count = self.nano_copy_count[draft_index]
-            metadata.nano_skip_tail_restore = self.is_pd_decode_consumer
             tokens = common_attn_metadata.num_input_tokens
             positions = self.nano_token_positions[:tokens]
             token_rows = torch.searchsorted(ends.contiguous(), positions.to(torch.int32), right=True).clamp_max(
@@ -465,12 +420,6 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 self.nano_reuse_request_count = 0
                 self.nano_query_scale = None
                 self.nano_key_scale = None
-            # Descriptor storage belongs to the attention implementation;
-            # per-step source/destination geometry is supplied by metadata.
-            self.nano_copy_src = torch.empty(requests * 4, dtype=torch.int64, device=device)
-            self.nano_copy_dst = torch.empty_like(self.nano_copy_src)
-            self.nano_host_bases = None
-            self.nano_device_bases = None
         self.lru_resident_capacity = offload_cfg.topk_buffer_size
         self.sfa_sparse_topk = offload_cfg.topk
 
@@ -695,40 +644,6 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             )
         )
 
-    def bind_nano_kv_cache(self, manager, layer_name) -> None:
-        """Bind immutable layer addresses after cache registration, before capture."""
-        layer_id = manager._get_offload_layer_id(layer_name)
-        device = manager.topk_buffers_k[layer_id].device
-        self.nano_host_bases = torch.tensor(
-            [manager.k_caches_cpu[layer_id].data_ptr(), manager.v_caches_cpu[layer_id].data_ptr()],
-            dtype=torch.int64,
-            device=device,
-        ).view(2, 1)
-        self.nano_device_bases = torch.tensor(
-            [manager.topk_buffers_k[layer_id].data_ptr(), manager.topk_buffers_v[layer_id].data_ptr()],
-            dtype=torch.int64,
-            device=device,
-        ).view(2, 1)
-
-    def _nano_restore_tail(self, metadata, manager, layer_name):
-        # Byte offsets and lengths are common to every layer and are already
-        # prepared by the metadata builder. Only these two base-address adds
-        # remain per layer; there is no per-layer mask/cast/length preparation.
-        if self.nano_host_bases is None:
-            raise RuntimeError("nano KV base addresses must be bound before graph capture")
-        count = metadata.nano_copy_src_offsets.numel()
-        torch.add(
-            metadata.nano_copy_src_offsets.view(2, -1), self.nano_host_bases, out=self.nano_copy_src[:count].view(2, -1)
-        )
-        torch.add(
-            metadata.nano_copy_dst_offsets.view(2, -1),
-            self.nano_device_bases,
-            out=self.nano_copy_dst[:count].view(2, -1),
-        )
-        manager.copy_nano_kv(
-            self.nano_copy_src[:count], self.nano_copy_dst[:count], metadata.nano_copy_lengths, metadata.nano_copy_count
-        )
-
     def compact_nano_topk_metadata(self, slot_ids: torch.Tensor) -> None:
         """Compact draft-step-0 LIM rows for direct reuse by later steps."""
         count = min(self.nano_reuse_request_count, slot_ids.numel())
@@ -759,8 +674,6 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             topk_misses = self.nano_reuse_topk_misses[:tokens]
             misses = self.nano_reuse_misses[:count]
         else:
-            if not metadata.nano_skip_tail_restore:
-                self._nano_restore_tail(metadata, manager, layer_name)
             topk_misses = owner.nano_topk_misses[:tokens]
             misses = owner.nano_misses[:count]
         # copy-SFA accepts either no sparse prefix or at least TopK entries.
@@ -828,20 +741,47 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         attn_metadata: M,
     ):
         if self._is_decode_only(attn_metadata):
-            k_nope, k_pe = self._compute_kv_only(kv_no_split, cos, sin)
             manager = get_sparse_kv_offload_manager()
             layer_name = self._offload_layer_name()
-            k_cache_cpu, v_cache_cpu = self._cpu_cache_pair(manager, layer_name)
             if attn_metadata.nano_enabled:
                 layer_id = manager._get_offload_layer_id(layer_name)
-                device_slots = attn_metadata.nano_device_slots
-                for cache_tensor, value in (
-                    (manager.topk_buffers_k[layer_id], k_nope),
-                    (manager.topk_buffers_v[layer_id], k_pe),
-                ):
-                    rows = cache_tensor.view(-1, cache_tensor.shape[-1])
-                    rows.index_copy_(0, device_slots[: value.shape[0]], value.reshape(value.shape[0], -1))
-                slots = torch.where(attn_metadata.nano_token_active[: slots.numel()], slots, -1)
+                assert self.kv_a_layernorm is not None
+                resident_k = manager.topk_buffers_k[layer_id].view(
+                    -1,
+                    self.block_size,
+                    self.num_kv_heads,
+                    self.kv_lora_rank,
+                )
+                resident_v = manager.topk_buffers_v[layer_id].view(
+                    -1,
+                    self.block_size,
+                    self.num_kv_heads,
+                    self.qk_rope_head_dim,
+                )
+                batch = kv_no_split.shape[0]
+                kv_no_split = kv_no_split.view(
+                    batch,
+                    self.num_kv_heads,
+                    1,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                )
+                _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
+                    kv_no_split,
+                    self.kv_a_layernorm.weight,
+                    cos,
+                    sin,
+                    attn_metadata.nano_device_slots[:batch].to(torch.int64),
+                    resident_v,
+                    resident_k,
+                    epsilon=self.kv_a_layernorm.variance_epsilon,
+                    cache_mode="PA",
+                    is_output_kv=True,
+                )
+                # Resident Nano tails are the source of truth. Full blocks are
+                # copied once by the graph-external delayed D2H pipeline.
+                return k_pe, k_nope
+            k_nope, k_pe = self._compute_kv_only(kv_no_split, cos, sin)
+            k_cache_cpu, v_cache_cpu = self._cpu_cache_pair(manager, layer_name)
             manager.offload_new_kv(
                 layer_name=layer_name,
                 slot_mapping=slots,

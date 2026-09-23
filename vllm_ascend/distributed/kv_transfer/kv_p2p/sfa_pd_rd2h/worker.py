@@ -150,6 +150,10 @@ class SFAPDRD2HConsumerWorker:
         self._dest_blocks_by_req: dict[str, tuple[list[int], list[int]]] = {}
         # Internal req_id -> early-bound nano top-k row used by the runner.
         self.nano_slots_by_req: dict[str, int] = {}
+        # Terminal Nano requests remain here until their row is no longer
+        # referenced by delayed D2H. get_finished() then emits the scheduler's
+        # normal finished_sending acknowledgement.
+        self._pending_nano_release_req_ids: set[str] = set()
         # external_req_id -> circular-tail destination. Shared with the read thread.
         self._nano_tail_by_req: dict[str, NanoTailDest] = {}
         self._topk_k_bases: list[int] = []
@@ -225,6 +229,8 @@ class SFAPDRD2HConsumerWorker:
                             tail_tokens=tail_tokens,
                             tail_block_index=int(getattr(req, "tail_block_index", 0) or 0),
                         )
+        for req_id, pool_slot in getattr(metadata, "nano_releases", {}).items():
+            self.nano_slots_by_req.setdefault(req_id, int(pool_slot))
 
     def save_kv_layer(
         self,
@@ -268,6 +274,7 @@ class SFAPDRD2HConsumerWorker:
             getattr(self, "_nano_tail_by_req", {}).pop(ext_id, None)
             self._pending_done.discard(ext_id)
             self._terminal_ext_ids.discard(ext_id)
+            getattr(self, "_pending_nano_release_req_ids", set()).discard(req_id)
         # Drop any partial contributor-completion state so a dead contributor or a
         # retried external id cannot complete a later request on stale arrivals.
         if self._mf_read_thread is not None:
@@ -290,6 +297,7 @@ class SFAPDRD2HConsumerWorker:
         return [status for status in gathered if status is not None]
 
     def get_finished(self, finished_req_ids: set[str] | None = None) -> tuple[set[str], set[str]]:
+        done_sending: set[str] = set()
         done_recving: set[str] = set()
         local_failed: set[str] = set()
 
@@ -341,9 +349,29 @@ class SFAPDRD2HConsumerWorker:
         # resolution loop above, leaking any finished req whose DONE arrives in
         # the same step (unmappable -> stuck in _pending_done forever).
         if finished_req_ids:
-            self._cleanup_request_state(finished_req_ids)
+            nano_finished = {req_id for req_id in finished_req_ids if req_id in getattr(self, "nano_slots_by_req", {})}
+            pending_nano = getattr(self, "_pending_nano_release_req_ids", None)
+            if pending_nano is None:
+                pending_nano = self._pending_nano_release_req_ids = set()
+            pending_nano.update(nano_finished)
+            self._cleanup_request_state(set(finished_req_ids) - nano_finished)
 
-        return set(), done_recving
+        pending_nano = getattr(self, "_pending_nano_release_req_ids", set())
+        if pending_nano:
+            if self.offload_manager is None:
+                raise RuntimeError("Nano delayed-free requires the sparse KV offload manager")
+            releasable = {
+                req_id
+                for req_id in pending_nano
+                if self.offload_manager.nano_d2h_slot_releasable(self.nano_slots_by_req[req_id])
+            }
+            if releasable:
+                slots = [self.nano_slots_by_req[req_id] for req_id in sorted(releasable)]
+                self.offload_manager.release_nano_d2h_slots(slots)
+                self._cleanup_request_state(releasable)
+                done_sending.update(releasable)
+
+        return done_sending, done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         result = self._invalid_block_ids

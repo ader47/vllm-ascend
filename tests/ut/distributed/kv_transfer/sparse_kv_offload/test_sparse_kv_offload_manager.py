@@ -912,6 +912,55 @@ class TestNanoD2HPlanner(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertTrue(manager.nano_d2h_inflight_batch_active)
 
+    def test_terminal_release_rejects_inflight_then_invalidates_owner(self):
+        manager = self._manager()
+        manager.initialize_nano_d2h_slots(
+            np.array([1]),
+            np.array([7]),
+            np.array([128]),
+        )
+        manager.plan_nano_d2h_requests(
+            np.array([256]),
+            np.array([1]),
+            np.array([7]),
+            np.array([[4, 5]], dtype=np.int32),
+            np.array([True]),
+        )
+
+        self.assertFalse(manager.nano_d2h_slot_releasable(1))
+        with self.assertRaisesRegex(RuntimeError, "cannot be released while inflight"):
+            manager.release_nano_d2h_slots([1])
+
+        manager.nano_d2h_inflight_active_cpu[1] = False
+        manager.nano_d2h_inflight_batch_active = False
+        self.assertTrue(manager.nano_d2h_slot_releasable(1))
+        manager.release_nano_d2h_slots([1])
+        self.assertEqual(manager.nano_d2h_owner_generations_cpu[1], -1)
+        self.assertEqual(manager.nano_d2h_stable_prefixes_cpu[1], 0)
+        self.assertEqual(manager.nano_d2h_inflight_generations_cpu[1], -1)
+
+    def test_terminal_release_does_not_mutate_another_active_plan_staging_buffer(self):
+        manager = self._manager(max_num_reqs=2)
+        manager.initialize_nano_d2h_slots(
+            np.array([0, 1]),
+            np.array([5, 7]),
+            np.array([0, 0]),
+        )
+        manager.plan_nano_d2h_requests(
+            np.array([128, 0]),
+            np.array([0, 1]),
+            np.array([5, 7]),
+            np.array([[4], [6]], dtype=np.int32),
+            np.array([True, True]),
+        )
+        plan_before_release = manager.nano_d2h_plan_host.clone()
+
+        manager.release_nano_d2h_slots([1])
+
+        torch.testing.assert_close(manager.nano_d2h_plan_host, plan_before_release)
+        self.assertEqual(manager.nano_d2h_owner_generations_cpu[1], -1)
+        self.assertEqual(manager.nano_d2h_stable_prefixes_cpu[1], 0)
+
     def test_completion_wait_failure_keeps_inflight_state_protected(self):
         manager, calls = self._manager_with_execution_state()
         manager.initialize_nano_d2h_slots(
