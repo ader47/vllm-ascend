@@ -756,10 +756,9 @@ class TestNanoD2HPlanner(unittest.TestCase):
 
         count = manager.prepare_nano_d2h_descriptors()
 
-        capacity = manager.nano_d2h_capacity
         request_stride = manager.topk_buffer_size + 2 * manager.block_size
         source_slot = request_stride + manager.topk_buffer_size
-        self.assertEqual(count, manager.num_layers * 2 * capacity)
+        self.assertEqual(count, manager.num_layers * 2)
         self.assertTrue(torch.equal(manager.nano_d2h_plan_npu, manager.nano_d2h_plan_host))
         self.assertEqual(manager.nano_d2h_plan_generations_npu[1].item(), 9)
         self.assertEqual(manager.nano_d2h_plan_target_prefixes_npu[1].item(), 128)
@@ -772,26 +771,28 @@ class TestNanoD2HPlanner(unittest.TestCase):
             manager.nano_d2h_plan_target_prefixes_npu,
         ):
             self.assertEqual(field.untyped_storage().data_ptr(), plan_storage)
+        source_ptrs = manager.nano_d2h_source_ptrs_npu[:count].view(manager.num_layers, 2, 1)
+        destination_ptrs = manager.nano_d2h_destination_ptrs_npu[:count].view(manager.num_layers, 2, 1)
+        lengths = manager.nano_d2h_lengths_npu[:count].view(manager.num_layers, 2, 1)
         self.assertEqual(
-            manager.nano_d2h_source_ptrs_npu[:, :, 1].tolist(),
+            source_ptrs[:, :, 0].tolist(),
             [
                 [1_000 + source_slot * 4, 2_000 + source_slot * 6],
                 [3_000 + source_slot * 4, 4_000 + source_slot * 6],
             ],
         )
         self.assertEqual(
-            manager.nano_d2h_destination_ptrs_npu[:, :, 1].tolist(),
+            destination_ptrs[:, :, 0].tolist(),
             [
                 [100_000 + 7 * 128 * 4, 200_000 + 7 * 128 * 6],
                 [300_000 + 7 * 128 * 4, 400_000 + 7 * 128 * 6],
             ],
         )
         self.assertEqual(
-            manager.nano_d2h_lengths_npu[:, :, 1].tolist(),
+            lengths[:, :, 0].tolist(),
             [[128 * 4, 128 * 6], [128 * 4, 128 * 6]],
         )
-        self.assertTrue(torch.all(manager.nano_d2h_lengths_npu[:, :, 0] == 0))
-        self.assertTrue(torch.all(manager.nano_d2h_lengths_npu[:, :, 2:] == 0))
+        self.assertTrue(torch.all(lengths > 0))
 
     def test_descriptor_expansion_requires_tp0_and_an_inflight_batch(self):
         manager = self._manager()
@@ -881,6 +882,48 @@ class TestNanoD2HPlanner(unittest.TestCase):
         self.assertTrue(manager.nano_d2h_inflight_launched)
         with self.assertRaisesRegex(RuntimeError, "already been launched"):
             manager.launch_nano_d2h()
+
+    def test_launch_chunks_compact_descriptors(self):
+        manager, calls = self._manager_with_execution_state()
+        manager.initialize_nano_d2h_slots(
+            np.array([0]),
+            np.array([3]),
+            np.array([0]),
+        )
+        manager.plan_nano_d2h_requests(
+            np.array([128]),
+            np.array([0]),
+            np.array([3]),
+            np.array([[7]], dtype=np.int32),
+            np.array([True]),
+        )
+        manager.record_nano_d2h_source_ready()
+
+        copies = []
+
+        def sparse_copy(sources, destinations, lengths, count, device):
+            copies.append((sources.numel(), destinations.numel(), lengths.numel(), count.item(), device))
+            return 0
+
+        with (
+            patch.object(manager_module, "NANO_D2H_COPY_CHUNK_SIZE", 1),
+            patch.object(
+                manager_module,
+                "offload",
+                SimpleNamespace(sparse_copy=sparse_copy),
+                create=True,
+            ),
+        ):
+            self.assertTrue(manager.launch_nano_d2h())
+
+        self.assertEqual(
+            copies,
+            [
+                (1, 1, 1, 1, torch.device("cpu")),
+                (1, 1, 1, 1, torch.device("cpu")),
+            ],
+        )
+        self.assertIn(("record", "event-2", manager._npu_runtime.d2h_stream), calls)
 
     def test_launch_requires_plan_and_source_frontier_and_is_tp0_only(self):
         manager, calls = self._manager_with_execution_state()

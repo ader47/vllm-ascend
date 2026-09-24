@@ -58,6 +58,7 @@ NANO_D2H_PLAN_DESTINATION_SLOT_ROW = 3
 NANO_D2H_PLAN_TARGET_PREFIX_ROW = 4
 NANO_D2H_PLAN_FIELD_COUNT = 5
 NANO_D2H_SOURCE_EVENT_COUNT = 2
+NANO_D2H_COPY_CHUNK_SIZE = 64
 
 FSA_EXTERNAL_PLAN_READY_MARKER = 0x5A45
 FSA_PAIRED_SELECTION_COPY_MARKER = 0x5A56
@@ -646,6 +647,21 @@ class SparseKVOffloadManager:
         self.nano_d2h_inflight_source_slots_cpu = self.nano_d2h_inflight_source_slots_host.numpy()
         self.nano_d2h_inflight_destination_slots_cpu = self.nano_d2h_inflight_destination_slots_host.numpy()
         self.nano_d2h_inflight_target_prefixes_cpu = self.nano_d2h_inflight_target_prefixes_host.numpy()
+        self.nano_d2h_compact_source_slots_host = torch.empty(
+            capacity,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=True,
+        )
+        self.nano_d2h_compact_destination_slots_host = torch.empty(
+            capacity,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=True,
+        )
+        self.nano_d2h_compact_source_slots_cpu = self.nano_d2h_compact_source_slots_host.numpy()
+        self.nano_d2h_compact_destination_slots_cpu = self.nano_d2h_compact_destination_slots_host.numpy()
+        self.nano_d2h_inflight_active_count = 0
         self.nano_d2h_inflight_batch_active = False
         self.nano_d2h_inflight_launched = False
         self.nano_d2h_next_batch_epoch = 0
@@ -667,18 +683,15 @@ class SparseKVOffloadManager:
         self.nano_d2h_plan_destination_slots_npu = self.nano_d2h_plan_npu[NANO_D2H_PLAN_DESTINATION_SLOT_ROW]
         self.nano_d2h_plan_target_prefixes_npu = self.nano_d2h_plan_npu[NANO_D2H_PLAN_TARGET_PREFIX_ROW]
 
-        descriptor_shape = (self.num_layers, 2, capacity)
-        self.nano_d2h_source_ptrs_npu = torch.empty(descriptor_shape, dtype=torch.int64, device=device)
-        self.nano_d2h_destination_ptrs_npu = torch.empty(descriptor_shape, dtype=torch.int64, device=device)
-        self.nano_d2h_lengths_npu = torch.empty(descriptor_shape, dtype=torch.int32, device=device)
-        self.nano_d2h_address_offsets_npu = torch.empty((1, 2, capacity), dtype=torch.int64, device=device)
-        self.nano_d2h_descriptor_count = self.num_layers * 2 * capacity
-        self.nano_d2h_descriptor_count_npu = torch.full(
-            (1,),
-            self.nano_d2h_descriptor_count,
-            dtype=torch.int32,
-            device=device,
-        )
+        max_descriptor_count = self.num_layers * 2 * capacity
+        self.nano_d2h_source_ptrs_npu = torch.empty(max_descriptor_count, dtype=torch.int64, device=device)
+        self.nano_d2h_destination_ptrs_npu = torch.empty(max_descriptor_count, dtype=torch.int64, device=device)
+        self.nano_d2h_lengths_npu = torch.empty(max_descriptor_count, dtype=torch.int32, device=device)
+        self.nano_d2h_address_offsets_npu = torch.empty(2 * capacity, dtype=torch.int64, device=device)
+        self.nano_d2h_compact_source_slots_npu = torch.empty(capacity, dtype=torch.int64, device=device)
+        self.nano_d2h_compact_destination_slots_npu = torch.empty(capacity, dtype=torch.int64, device=device)
+        self.nano_d2h_descriptor_count = 0
+        self.nano_d2h_descriptor_count_npu = torch.empty((1,), dtype=torch.int32, device=device)
 
         source_bases = [[self.addr_k_bases[layer], self.addr_v_bases[layer]] for layer in range(self.num_layers)]
         destination_bases = [[self.gvas_k_bases[layer], self.gvas_v_bases[layer]] for layer in range(self.num_layers)]
@@ -737,34 +750,52 @@ class SparseKVOffloadManager:
         if not self.nano_d2h_inflight_batch_active:
             raise RuntimeError("Nano D2H has no inflight request plan to expand")
 
+        active_count = self.nano_d2h_inflight_active_count
+        if active_count <= 0:
+            raise RuntimeError("Nano D2H inflight request plan has no active requests")
         self.nano_d2h_plan_npu.copy_(self.nano_d2h_plan_host, non_blocking=True)
+        self.nano_d2h_compact_source_slots_npu[:active_count].copy_(
+            self.nano_d2h_compact_source_slots_host[:active_count],
+            non_blocking=True,
+        )
+        self.nano_d2h_compact_destination_slots_npu[:active_count].copy_(
+            self.nano_d2h_compact_destination_slots_host[:active_count],
+            non_blocking=True,
+        )
+
+        descriptor_count = self.num_layers * 2 * active_count
+        source_ptrs = self.nano_d2h_source_ptrs_npu[:descriptor_count].view(self.num_layers, 2, active_count)
+        destination_ptrs = self.nano_d2h_destination_ptrs_npu[:descriptor_count].view(
+            self.num_layers,
+            2,
+            active_count,
+        )
+        lengths = self.nano_d2h_lengths_npu[:descriptor_count].view(self.num_layers, 2, active_count)
+        address_offsets = self.nano_d2h_address_offsets_npu[: 2 * active_count].view(1, 2, active_count)
 
         torch.mul(
-            self.nano_d2h_plan_source_slots_npu.view(1, 1, -1),
+            self.nano_d2h_compact_source_slots_npu[:active_count].view(1, 1, active_count),
             self.nano_d2h_token_bytes_npu,
-            out=self.nano_d2h_address_offsets_npu,
+            out=address_offsets,
         )
         torch.add(
             self.nano_d2h_source_bases_npu,
-            self.nano_d2h_address_offsets_npu,
-            out=self.nano_d2h_source_ptrs_npu,
+            address_offsets,
+            out=source_ptrs,
         )
         torch.mul(
-            self.nano_d2h_plan_destination_slots_npu.view(1, 1, -1),
+            self.nano_d2h_compact_destination_slots_npu[:active_count].view(1, 1, active_count),
             self.nano_d2h_block_bytes_npu,
-            out=self.nano_d2h_address_offsets_npu,
+            out=address_offsets,
         )
         torch.add(
             self.nano_d2h_destination_bases_npu,
-            self.nano_d2h_address_offsets_npu,
-            out=self.nano_d2h_destination_ptrs_npu,
+            address_offsets,
+            out=destination_ptrs,
         )
-        self.nano_d2h_lengths_npu.copy_(self.nano_d2h_block_bytes_npu)
-        self.nano_d2h_lengths_npu.masked_fill_(
-            self.nano_d2h_plan_active_npu.view(1, 1, -1) == 0,
-            0,
-        )
-        return self.nano_d2h_descriptor_count
+        lengths.copy_(self.nano_d2h_block_bytes_npu)
+        self.nano_d2h_descriptor_count = descriptor_count
+        return descriptor_count
 
     def launch_nano_d2h(self) -> bool:
         """Asynchronously launch the frozen full-block batch on TP0."""
@@ -784,29 +815,32 @@ class SparseKVOffloadManager:
         if source_slot is None:
             raise RuntimeError("Nano D2H has no source-ready compute frontier")
         with runtime.stream(self.nano_d2h_stream):
-            self.prepare_nano_d2h_descriptors()
+            descriptor_count = self.prepare_nano_d2h_descriptors()
             self.nano_d2h_stream.wait_event(self.nano_d2h_source_ready_events[source_slot])
             # TODO: use an asynchronous SDMA copy API after its descriptor and
             # completion semantics are available; keep the existing MTE path
             # for the first implementation.
             try:
-                result = offload.sparse_copy(
-                    self.nano_d2h_source_ptrs_npu.view(-1),
-                    self.nano_d2h_destination_ptrs_npu.view(-1),
-                    self.nano_d2h_lengths_npu.view(-1),
-                    self.nano_d2h_descriptor_count_npu,
-                    self.nano_d2h_source_ptrs_npu.device,
-                )
+                for start in range(0, descriptor_count, NANO_D2H_COPY_CHUNK_SIZE):
+                    end = min(start + NANO_D2H_COPY_CHUNK_SIZE, descriptor_count)
+                    self.nano_d2h_descriptor_count_npu.fill_(end - start)
+                    result = offload.sparse_copy(
+                        self.nano_d2h_source_ptrs_npu[start:end],
+                        self.nano_d2h_destination_ptrs_npu[start:end],
+                        self.nano_d2h_lengths_npu[start:end],
+                        self.nano_d2h_descriptor_count_npu,
+                        self.nano_d2h_source_ptrs_npu.device,
+                    )
+                    if result not in (None, 0):
+                        diagnostics = self._nano_d2h_inflight_diagnostics()
+                        logger.error("Nano D2H sparse_copy returned result=%s: %s", result, diagnostics)
+                        raise RuntimeError(f"memfabric delayed Nano D2H failed with result={result}; {diagnostics}")
             except Exception:
                 logger.exception(
                     "Nano D2H sparse_copy submission failed: %s",
                     self._nano_d2h_inflight_diagnostics(),
                 )
                 raise
-            if result not in (None, 0):
-                diagnostics = self._nano_d2h_inflight_diagnostics()
-                logger.error("Nano D2H sparse_copy returned result=%s: %s", result, diagnostics)
-                raise RuntimeError(f"memfabric delayed Nano D2H failed with result={result}; {diagnostics}")
             self.nano_d2h_complete_event.record(self.nano_d2h_stream)
         self.nano_d2h_inflight_launched = True
         return True
@@ -834,6 +868,7 @@ class SparseKVOffloadManager:
         self.nano_d2h_inflight_source_slots_cpu.fill(0)
         self.nano_d2h_inflight_destination_slots_cpu.fill(0)
         self.nano_d2h_inflight_target_prefixes_cpu.fill(0)
+        self.nano_d2h_inflight_active_count = 0
         self.nano_d2h_inflight_batch_active = False
         self.nano_d2h_inflight_launched = False
         self.nano_d2h_inflight_batch_epoch = NANO_D2H_INVALID_EPOCH
@@ -1014,6 +1049,7 @@ class SparseKVOffloadManager:
         self.nano_d2h_inflight_source_slots_cpu.fill(0)
         self.nano_d2h_inflight_destination_slots_cpu.fill(0)
         self.nano_d2h_inflight_target_prefixes_cpu.fill(0)
+        self.nano_d2h_inflight_active_count = 0
 
         if not np.any(active_rows):
             return 0
@@ -1089,10 +1125,14 @@ class SparseKVOffloadManager:
         self.nano_d2h_inflight_source_slots_cpu[ready_slots] = source_slots
         self.nano_d2h_inflight_destination_slots_cpu[ready_slots] = destination_slots
         self.nano_d2h_inflight_target_prefixes_cpu[ready_slots] = ready_prefixes + self.block_size
+        ready_count = int(ready_slots.size)
+        self.nano_d2h_compact_source_slots_cpu[:ready_count] = source_slots
+        self.nano_d2h_compact_destination_slots_cpu[:ready_count] = destination_slots
+        self.nano_d2h_inflight_active_count = ready_count
         self.nano_d2h_inflight_batch_epoch = self.nano_d2h_next_batch_epoch
         self.nano_d2h_next_batch_epoch += 1
         self.nano_d2h_inflight_batch_active = True
-        return int(ready_slots.size)
+        return ready_count
 
     def _nano_d2h_inflight_diagnostics(self) -> str:
         active_slots = np.flatnonzero(self.nano_d2h_inflight_active_cpu)
